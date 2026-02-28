@@ -1,0 +1,682 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Stone Node</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --bg:#0d1117;--card:#161b22;--border:#30363d;--accent:#58a6ff;
+  --green:#3fb950;--red:#f85149;--orange:#d29922;--text:#e6edf3;
+  --muted:#8b949e;--input-bg:#0d1117;--nav-bg:#010409;
+}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;
+  background:var(--bg);color:var(--text);min-height:100vh;margin:0}
+
+/* ─── Navbar ─── */
+.navbar{background:var(--nav-bg);border-bottom:1px solid var(--border);padding:0 24px;
+  display:flex;align-items:center;height:56px;position:sticky;top:0;z-index:100}
+.nav-logo{font-size:18px;font-weight:700;color:var(--accent);margin-right:32px;display:flex;align-items:center;gap:8px}
+.nav-links{display:flex;gap:4px}
+.nav-links button{background:none;border:none;color:var(--muted);font-size:14px;padding:8px 16px;
+  border-radius:6px;cursor:pointer;transition:all .2s;font-weight:500}
+.nav-links button:hover{color:var(--text);background:var(--card)}
+.nav-links button.active{color:var(--text);background:var(--card)}
+.nav-wallet{margin-left:auto;display:flex;align-items:center;gap:16px;font-size:13px}
+.nav-balance{color:var(--green);font-weight:700;font-size:15px}
+.nav-addr{color:var(--muted);font-family:monospace;font-size:11px;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+/* ─── Layout ─── */
+.main{max-width:960px;margin:0 auto;padding:24px 16px}
+.hidden{display:none!important}
+
+/* ─── Cards ─── */
+.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:28px;margin-bottom:20px}
+.card h2{font-size:20px;margin-bottom:8px}
+.card p.sub{color:var(--muted);font-size:14px;margin-bottom:20px}
+label{display:block;font-size:13px;color:var(--muted);margin-bottom:6px;margin-top:16px}
+label:first-of-type{margin-top:0}
+input[type=text],input[type=password],input[type=number],textarea{
+  width:100%;padding:10px 12px;background:var(--input-bg);border:1px solid var(--border);
+  border-radius:8px;color:var(--text);font-size:14px;outline:none;transition:border .2s}
+input:focus,textarea:focus{border-color:var(--accent)}
+textarea{resize:vertical;min-height:80px;font-family:monospace;font-size:13px}
+.btn{display:inline-block;padding:10px 24px;border:none;border-radius:8px;font-size:14px;
+  font-weight:600;cursor:pointer;transition:background .2s;text-align:center}
+.btn-block{width:100%;margin-top:20px}
+.btn-primary{background:var(--accent);color:#fff}
+.btn-primary:hover{background:#79c0ff}
+.btn-green{background:var(--green);color:#fff}
+.btn-green:hover{background:#56d364}
+.btn-sm{padding:8px 16px;font-size:13px}
+.btn-outline{background:transparent;border:1px solid var(--border);color:var(--muted)}
+.btn-outline:hover{border-color:var(--accent);color:var(--accent)}
+.error{color:var(--red);font-size:13px;margin-top:8px;display:none}
+.success{color:var(--green);font-size:13px;margin-top:8px;display:none}
+.steps{display:flex;gap:8px;margin-bottom:24px}
+.step{flex:1;height:4px;border-radius:2px;background:var(--border);transition:background .3s}
+.step.done{background:var(--green)}
+.step.active{background:var(--accent)}
+.mnemonic-box{background:var(--bg);border:1px solid var(--orange);border-radius:8px;
+  padding:16px;margin-top:12px;font-family:monospace;font-size:15px;line-height:1.8;
+  word-spacing:6px;text-align:center;color:var(--orange);user-select:all}
+.mnemonic-warn{color:var(--red);font-size:12px;margin-top:8px;text-align:center}
+.wallet-addr{color:var(--green);font-size:13px;font-family:monospace;word-break:break-all;margin-top:4px}
+.pw-rules{font-size:12px;color:var(--muted);margin-top:6px}
+.pw-rules span{display:inline-block;margin-right:8px}
+.pw-rules span.ok{color:var(--green)}
+.pw-rules span.fail{color:var(--red)}
+
+/* ─── Dashboard ─── */
+.dash-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:20px}
+@media(max-width:700px){.dash-grid{grid-template-columns:1fr 1fr}}
+.stat{background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:18px}
+.stat .label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.6px}
+.stat .value{font-size:24px;font-weight:700;margin-top:6px}
+.stat .value.green{color:var(--green)}
+.stat .value.accent{color:var(--accent)}
+.stat .value.orange{color:var(--orange)}
+.stat .sub-val{font-size:12px;color:var(--muted);margin-top:2px}
+
+/* Storage bar */
+.storage-bar-outer{background:var(--border);border-radius:6px;height:12px;margin-top:8px;overflow:hidden}
+.storage-bar-inner{background:var(--accent);height:100%;border-radius:6px;transition:width .5s}
+
+/* Sections */
+.section{margin-bottom:20px}
+.section-title{font-size:14px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:12px}
+.peer-list{list-style:none;font-size:13px;font-family:monospace;color:var(--muted)}
+.peer-list li{padding:6px 0;border-bottom:1px solid var(--border)}
+
+/* Send panel */
+.send-panel{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media(max-width:600px){.send-panel{grid-template-columns:1fr}}
+.send-card{background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:20px}
+.send-card h3{font-size:16px;margin-bottom:12px}
+.tx-result{margin-top:12px;padding:12px;background:rgba(63,185,80,.1);border:1px solid var(--green);
+  border-radius:8px;font-size:13px;font-family:monospace;word-break:break-all;display:none}
+
+/* Reward preview */
+.reward-preview{background:rgba(88,166,255,.08);border:1px solid var(--accent);border-radius:8px;
+  padding:16px;margin-top:12px;display:none}
+.reward-preview .rp-row{display:flex;justify-content:space-between;font-size:14px;margin:4px 0}
+.reward-preview .rp-val{font-weight:700;color:var(--green)}
+
+/* Settings grid */
+.settings-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media(max-width:600px){.settings-grid{grid-template-columns:1fr}}
+
+/* Shard Health */
+.shard-status-badge{display:inline-block;padding:3px 10px;border-radius:12px;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.5px}
+.shard-status-badge.healthy{background:rgba(63,185,80,.15);color:var(--green)}
+.shard-status-badge.degraded{background:rgba(210,153,34,.15);color:var(--orange)}
+.shard-status-badge.critical{background:rgba(248,81,73,.15);color:var(--red)}
+.shard-status-badge.no_ec_data{background:rgba(139,148,158,.15);color:var(--muted)}
+.shard-status-badge.offline{background:rgba(139,148,158,.15);color:var(--muted)}
+.shard-stats-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:14px}
+@media(max-width:600px){.shard-stats-grid{grid-template-columns:1fr}}
+.shard-stat{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px;text-align:center}
+.shard-stat .ss-val{font-size:20px;font-weight:700;margin-bottom:2px}
+.shard-stat .ss-label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
+.shard-doc-list{margin-top:14px;max-height:240px;overflow-y:auto}
+.shard-doc{display:flex;align-items:center;gap:10px;padding:8px 12px;border-bottom:1px solid var(--border);font-size:13px}
+.shard-doc:last-child{border-bottom:none}
+.shard-doc .sd-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.shard-doc .sd-dot.healthy{background:var(--green)}
+.shard-doc .sd-dot.degraded{background:var(--orange)}
+.shard-doc .sd-dot.critical{background:var(--red)}
+.shard-doc .sd-title{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.shard-doc .sd-meta{color:var(--muted);font-size:11px;white-space:nowrap}
+</style>
+</head>
+<body>
+
+<!-- ═══════════════════ NAVBAR ═══════════════════ -->
+<nav class="navbar hidden" id="navbar">
+  <div class="nav-logo">⛏ Stone Node</div>
+  <div class="nav-links">
+    <button onclick="navTo('dashboard')" id="nav-btn-dashboard" class="active">Dashboard</button>
+    <button onclick="navTo('settings')" id="nav-btn-settings">Einstellungen</button>
+  </div>
+  <div class="nav-wallet">
+    <span class="nav-balance" id="nav-balance">0 STONE</span>
+    <span class="nav-addr" id="nav-addr" title="">—</span>
+  </div>
+</nav>
+
+<div class="main">
+
+  <!-- ═══ LOGIN ═══ -->
+  <div id="view-login" class="card hidden" style="max-width:480px;margin:60px auto">
+    <div style="text-align:center;margin-bottom:24px"><span style="font-size:32px">⛏</span>
+    <h2 style="margin-top:8px">Stone Node — Anmeldung</h2></div>
+    <p class="sub" style="text-align:center">Node ist bereits eingerichtet. Bitte Passwort eingeben.</p>
+    <label>Passwort</label>
+    <input type="password" id="login-pw" placeholder="Dein Node-Passwort" autocomplete="current-password"
+      onkeydown="if(event.key==='Enter')doLogin()">
+    <div class="error" id="login-error"></div>
+    <button class="btn btn-primary btn-block" onclick="doLogin()">Anmelden</button>
+  </div>
+
+  <!-- ═══ SETUP STEP 1: PASSWORD ═══ -->
+  <div id="view-step1" class="card hidden" style="max-width:480px;margin:60px auto">
+    <div class="steps"><div class="step active"></div><div class="step"></div><div class="step"></div><div class="step"></div></div>
+    <h2>Schritt 1 — Passwort festlegen</h2>
+    <p class="sub">Dieses Passwort schützt den Zugang zum Node-Dashboard.</p>
+    <label>Passwort</label>
+    <input type="password" id="pw1" placeholder="Sicheres Passwort wählen" oninput="checkPwRules()">
+    <div class="pw-rules" id="pw-rules">
+      <span id="r-len" class="fail">≥ 8 Zeichen</span>
+      <span id="r-upper" class="fail">Großbuchstabe</span>
+      <span id="r-lower" class="fail">Kleinbuchstabe</span>
+      <span id="r-digit" class="fail">Zahl</span>
+      <span id="r-special" class="fail">Sonderzeichen</span>
+    </div>
+    <label>Passwort bestätigen</label>
+    <input type="password" id="pw2" placeholder="Nochmal eingeben">
+    <div class="error" id="step1-error"></div>
+    <button class="btn btn-primary btn-block" onclick="submitPassword()">Weiter →</button>
+  </div>
+
+  <!-- ═══ SETUP STEP 2: NODE NAME + WALLET ═══ -->
+  <div id="view-step2" class="card hidden" style="max-width:480px;margin:60px auto">
+    <div class="steps"><div class="step done"></div><div class="step active"></div><div class="step"></div><div class="step"></div></div>
+    <h2>Schritt 2 — Node benennen</h2>
+    <p class="sub">Gib deinem Node einen Namen. Eine StoneCoin-Wallet wird automatisch generiert.</p>
+    <label>Node-Name</label>
+    <input type="text" id="node-name" placeholder="z.B. mein-server-1">
+    <div class="error" id="step2-error"></div>
+    <div id="wallet-result" class="hidden">
+      <label>Wallet-Adresse</label>
+      <div class="wallet-addr" id="wallet-addr"></div>
+      <label>🔑 12-Wort Mnemonic (NUR JETZT sichtbar!)</label>
+      <div class="mnemonic-box" id="mnemonic-words"></div>
+      <div class="mnemonic-warn">⚠️ Schreib dir diese 12 Wörter auf! Sie werden NICHT erneut angezeigt.</div>
+    </div>
+    <button class="btn btn-primary btn-block" id="btn-step2" onclick="submitNode()">Wallet generieren →</button>
+    <button class="btn btn-green btn-block hidden" id="btn-step2-next" onclick="goStep3()">Weiter zu Schritt 3 →</button>
+  </div>
+
+  <!-- ═══ SETUP STEP 3: STORAGE ═══ -->
+  <div id="view-step3" class="card hidden" style="max-width:480px;margin:60px auto">
+    <div class="steps"><div class="step done"></div><div class="step done"></div><div class="step active"></div><div class="step"></div></div>
+    <h2>Schritt 3 — Speicher bereitstellen</h2>
+    <p class="sub">Wie viel Speicher stellst du dem Netzwerk zur Verfügung? Du erhältst dafür STONE-Token als Belohnung.</p>
+    <label>Bereitgestellter Speicher (GB)</label>
+    <input type="number" id="storage-gb" placeholder="z.B. 100" min="1" oninput="previewReward()">
+    <div class="reward-preview" id="reward-preview">
+      <div class="rp-row"><span>Pro Tag</span><span class="rp-val" id="rp-day">—</span></div>
+      <div class="rp-row"><span>Pro Monat</span><span class="rp-val" id="rp-month">—</span></div>
+    </div>
+    <p class="sub" style="margin-top:12px;margin-bottom:0;font-size:12px">
+      Staffelung: 1-10 GB → 0.5 STONE/GB/Tag · 11-100 GB → 1.0 · 101-1000 GB → 2.0 · 1001+ GB → 3.0
+    </p>
+    <div class="error" id="step3-error"></div>
+    <button class="btn btn-primary btn-block" onclick="submitStorage()">Weiter →</button>
+  </div>
+
+  <!-- ═══ SETUP STEP 4: PEERS ═══ -->
+  <div id="view-step4" class="card hidden" style="max-width:480px;margin:60px auto">
+    <div class="steps"><div class="step done"></div><div class="step done"></div><div class="step done"></div><div class="step active"></div></div>
+    <h2>Schritt 4 — Seed-Peers</h2>
+    <p class="sub">Trage bekannte Peer-Adressen ein (eine pro Zeile). Kann auch leer bleiben.</p>
+    <label>Seed-Peers (Multiaddr-Format)</label>
+    <textarea id="peers-input" placeholder="/ip4/203.0.113.1/tcp/4001/p2p/12D3KooW...">/ip4/100.90.28.68/tcp/4001/p2p/12D3KooWLqikBBCRhCZ2MgSYG3R579BNUgrN5E6dZnYSEYdmAKTd</textarea>
+    <p class="sub" style="margin-top:8px;margin-bottom:0;font-size:12px;color:var(--orange)">
+      ⚠️ Hinweis: Seed-Peer-Adressen müssen die <strong>öffentliche IP</strong> des Peers verwenden, nicht eine lokale/VPN-IP.
+    </p>
+    <div class="error" id="step4-error"></div>
+    <button class="btn btn-green btn-block" onclick="finishSetup()">✅ Setup abschließen</button>
+  </div>
+
+  <!-- ═══════════════════ DASHBOARD ═══════════════════ -->
+  <div id="view-dashboard" class="hidden">
+    <!-- Node status banner -->
+    <div id="node-status-banner" class="card" style="padding:12px 20px;display:flex;align-items:center;gap:12px;margin-bottom:16px">
+      <span id="node-status-dot" style="width:12px;height:12px;border-radius:50%;background:var(--red);display:inline-block"></span>
+      <span id="node-status-text" style="font-weight:600">Node wird gestartet…</span>
+      <span id="node-peer-id" style="margin-left:auto;font-size:11px;color:var(--muted);font-family:monospace;max-width:280px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></span>
+    </div>
+
+    <!-- Stats row -->
+    <div class="dash-grid">
+      <div class="stat">
+        <div class="label">Uptime</div>
+        <div class="value accent" id="dash-uptime">—</div>
+      </div>
+      <div class="stat">
+        <div class="label">Peers verbunden</div>
+        <div class="value green" id="dash-peers">0</div>
+      </div>
+      <div class="stat">
+        <div class="label">Blöcke</div>
+        <div class="value accent" id="dash-blocks">0</div>
+        <div class="sub-val" id="dash-mempool"></div>
+      </div>
+      <div class="stat">
+        <div class="label">Reward / Tag</div>
+        <div class="value orange" id="dash-reward">—</div>
+        <div class="sub-val" id="dash-reward-month"></div>
+      </div>
+    </div>
+
+    <!-- Storage -->
+    <div class="card">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <h2 style="margin:0">💾 Speicher</h2>
+        <span style="color:var(--muted);font-size:13px" id="dash-storage-summary">—</span>
+      </div>
+      <div class="storage-bar-outer" style="margin-top:12px">
+        <div class="storage-bar-inner" id="dash-storage-bar" style="width:0%"></div>
+      </div>
+      <div style="display:flex;justify-content:space-between;margin-top:8px;font-size:13px;color:var(--muted)">
+        <span>Belegt: <strong id="dash-storage-used">—</strong></span>
+        <span>Frei: <strong id="dash-storage-free">—</strong></span>
+        <span>Gesamt: <strong id="dash-storage-total">—</strong></span>
+      </div>
+    </div>
+
+    <!-- Shard Health -->
+    <div class="card" id="shard-health-card">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <h2 style="margin:0">🧩 Erasure-Coding / Shards</h2>
+        <span class="shard-status-badge offline" id="shard-status-badge">offline</span>
+      </div>
+      <div class="shard-stats-grid" id="shard-stats-grid">
+        <div class="shard-stat">
+          <div class="ss-val green" id="shard-healthy">0</div>
+          <div class="ss-label">Healthy</div>
+        </div>
+        <div class="shard-stat">
+          <div class="ss-val orange" id="shard-degraded">0</div>
+          <div class="ss-label">Degraded</div>
+        </div>
+        <div class="shard-stat">
+          <div class="ss-val" style="color:var(--red)" id="shard-critical">0</div>
+          <div class="ss-label">Critical</div>
+        </div>
+      </div>
+      <div style="display:flex;gap:20px;margin-top:14px;font-size:13px;color:var(--muted)">
+        <span>Lokale Shards: <strong id="shard-local-count">0</strong></span>
+        <span>Lokal: <strong id="shard-local-bytes">0 B</strong></span>
+        <span>EC-Dokumente: <strong id="shard-ec-docs">0</strong></span>
+        <span>EC-Chunks: <strong id="shard-ec-chunks">0</strong></span>
+      </div>
+      <div id="shard-doc-list" class="shard-doc-list"></div>
+      <div id="shard-no-data" style="text-align:center;padding:20px 0;color:var(--muted);font-size:13px;display:none">
+        Keine Erasure-Coding-Daten vorhanden. Dateien müssen erst mit EC-Sharding hochgeladen werden.
+      </div>
+    </div>
+
+    <!-- Send + Peers -->
+    <div class="send-panel">
+      <!-- Send STONE -->
+      <div class="send-card">
+        <h3>📤 STONE senden</h3>
+        <label>Empfänger-Adresse (64 hex)</label>
+        <input type="text" id="send-to" placeholder="abc123...def456" maxlength="64">
+        <label>Betrag (STONE)</label>
+        <input type="number" id="send-amount" placeholder="0.0" min="0" step="0.0001">
+        <div class="error" id="send-error"></div>
+        <div class="tx-result" id="send-result"></div>
+        <button class="btn btn-primary btn-block" onclick="doSend()">Senden</button>
+      </div>
+      <!-- Peers -->
+      <div class="send-card">
+        <h3>🌐 Seed-Peers</h3>
+        <ul class="peer-list" id="dash-peer-list"><li>—</li></ul>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════ SETTINGS ═══════════════════ -->
+  <div id="view-settings" class="hidden">
+    <div class="card">
+      <h2>⚙️ Einstellungen</h2>
+      <p class="sub">Hier kannst du die Node-Konfiguration anpassen. Änderungen werden sofort in die .env geschrieben.</p>
+      <div class="settings-grid">
+        <div>
+          <label>Node-Name</label>
+          <input type="text" id="set-name">
+        </div>
+        <div>
+          <label>Bereitgestellter Speicher (GB)</label>
+          <input type="number" id="set-storage" min="1">
+        </div>
+        <div>
+          <label>HTTP-Port</label>
+          <input type="number" id="set-http">
+        </div>
+        <div>
+          <label>P2P-Port</label>
+          <input type="number" id="set-p2p">
+        </div>
+        <div style="grid-column:1/-1">
+          <label>Daten-Verzeichnis</label>
+          <input type="text" id="set-datadir">
+        </div>
+        <div style="grid-column:1/-1">
+          <label>Seed-Peers (eine pro Zeile)</label>
+          <textarea id="set-peers" rows="4"></textarea>
+        </div>
+      </div>
+      <div style="display:flex;gap:12px;margin-top:20px">
+        <button class="btn btn-green" onclick="saveSettings()">💾 Speichern</button>
+      </div>
+      <div class="success" id="set-success">Einstellungen gespeichert!</div>
+      <div class="error" id="set-error"></div>
+
+      <div style="margin-top:24px;padding-top:20px;border-top:1px solid var(--border)">
+        <label>Wallet-Adresse (nur lesen)</label>
+        <div class="wallet-addr" id="set-wallet">—</div>
+        <label style="margin-top:12px">Öffentliche IP</label>
+        <div style="color:var(--accent);font-family:monospace" id="set-public-ip">—</div>
+      </div>
+    </div>
+  </div>
+
+</div><!-- /main -->
+
+<script>
+let TOKEN = localStorage.getItem('stone_token') || '';
+
+async function api(url, method, body) {
+  const opts = { method, headers: {'Content-Type':'application/json'} };
+  if (TOKEN) opts.headers['Authorization'] = 'Bearer ' + TOKEN;
+  if (body) opts.body = JSON.stringify(body);
+  const r = await fetch(url, opts);
+  return { status: r.status, data: await r.json() };
+}
+
+function show(id) {
+  ['view-login','view-step1','view-step2','view-step3','view-step4','view-dashboard','view-settings'].forEach(v => {
+    document.getElementById(v).classList.add('hidden');
+  });
+  document.getElementById(id).classList.remove('hidden');
+}
+
+function showError(id, msg) {
+  const el = document.getElementById(id);
+  el.textContent = msg; el.style.display = 'block';
+}
+function hideError(id) { document.getElementById(id).style.display = 'none'; }
+
+// ── Navbar ──
+function showNavbar(visible) {
+  document.getElementById('navbar').classList.toggle('hidden', !visible);
+}
+function navTo(page) {
+  document.getElementById('nav-btn-dashboard').classList.toggle('active', page==='dashboard');
+  document.getElementById('nav-btn-settings').classList.toggle('active', page==='settings');
+  if (page === 'dashboard') { show('view-dashboard'); refreshDashboard(); }
+  else if (page === 'settings') { show('view-settings'); loadSettings(); }
+}
+
+// ── Init ──
+async function init() {
+  try {
+    const { data } = await api('/api/status', 'GET');
+    if (data.setup_complete) {
+      if (TOKEN) { showNavbar(true); navTo('dashboard'); }
+      else { showNavbar(false); show('view-login'); }
+    } else if (!data.has_password) {
+      showNavbar(false); show('view-step1');
+    } else if (!data.has_node_name) {
+      showNavbar(false); show('view-step2');
+    } else if (!data.has_storage) {
+      showNavbar(false); show('view-step3');
+    } else {
+      showNavbar(false); show('view-step4');
+    }
+  } catch(e) { showNavbar(false); show('view-step1'); }
+}
+
+// ── Password rules ──
+function checkPwRules() {
+  const pw = document.getElementById('pw1').value;
+  [['r-len', pw.length >= 8],['r-upper', /[A-Z]/.test(pw)],['r-lower', /[a-z]/.test(pw)],
+   ['r-digit', /[0-9]/.test(pw)],['r-special', /[^a-zA-Z0-9]/.test(pw)]].forEach(([id,ok]) => {
+    document.getElementById(id).className = ok ? 'ok' : 'fail';
+  });
+}
+
+// ── Step 1: Password ──
+async function submitPassword() {
+  hideError('step1-error');
+  const pw1 = document.getElementById('pw1').value;
+  const pw2 = document.getElementById('pw2').value;
+  if (pw1 !== pw2) { showError('step1-error', 'Passwörter stimmen nicht überein'); return; }
+  const { data } = await api('/api/setup/password', 'POST', { password: pw1 });
+  if (!data.ok) { showError('step1-error', data.error); return; }
+  TOKEN = data.token;
+  localStorage.setItem('stone_token', TOKEN);
+  show('view-step2');
+}
+
+// ── Step 2: Node + Wallet ──
+async function submitNode() {
+  hideError('step2-error');
+  const name = document.getElementById('node-name').value.trim();
+  if (!name) { showError('step2-error', 'Bitte Node-Name eingeben'); return; }
+  const { data } = await api('/api/setup/node', 'POST', { node_name: name });
+  if (!data.ok) { showError('step2-error', data.error); return; }
+  document.getElementById('wallet-addr').textContent = data.wallet_address;
+  document.getElementById('mnemonic-words').textContent = data.mnemonic;
+  document.getElementById('wallet-result').classList.remove('hidden');
+  document.getElementById('btn-step2').classList.add('hidden');
+  document.getElementById('btn-step2-next').classList.remove('hidden');
+  document.getElementById('node-name').disabled = true;
+}
+function goStep3() { show('view-step3'); }
+
+// ── Step 3: Storage ──
+let rewardTimer = null;
+function previewReward() {
+  clearTimeout(rewardTimer);
+  rewardTimer = setTimeout(async () => {
+    const gb = parseInt(document.getElementById('storage-gb').value) || 0;
+    if (gb < 1) { document.getElementById('reward-preview').style.display='none'; return; }
+    const { data } = await api('/api/reward-preview', 'POST', { gb });
+    document.getElementById('rp-day').textContent = data.reward_per_day.toFixed(2) + ' STONE';
+    document.getElementById('rp-month').textContent = data.reward_per_month.toFixed(2) + ' STONE';
+    document.getElementById('reward-preview').style.display='block';
+  }, 300);
+}
+async function submitStorage() {
+  hideError('step3-error');
+  const gb = parseInt(document.getElementById('storage-gb').value) || 0;
+  if (gb < 1) { showError('step3-error', 'Mindestens 1 GB angeben'); return; }
+  const { data } = await api('/api/setup/storage', 'POST', { offered_gb: gb });
+  if (!data.ok) { showError('step3-error', data.error); return; }
+  show('view-step4');
+}
+
+// ── Step 4: Peers + Finish ──
+async function finishSetup() {
+  hideError('step4-error');
+  const raw = document.getElementById('peers-input').value;
+  const peers = raw.split('\n').map(l=>l.trim()).filter(l=>l.length>0);
+  await api('/api/setup/peers', 'POST', { seed_peers: peers });
+  const { data } = await api('/api/setup/finish', 'POST');
+  if (!data.ok) { showError('step4-error', data.error); return; }
+  showNavbar(true);
+  navTo('dashboard');
+  // Node startet im Hintergrund — Status wird per Auto-Refresh aktualisiert
+}
+
+// ── Login ──
+async function doLogin() {
+  hideError('login-error');
+  const pw = document.getElementById('login-pw').value;
+  const { data } = await api('/api/login', 'POST', { password: pw });
+  if (!data.ok) { showError('login-error', data.error); return; }
+  TOKEN = data.token;
+  localStorage.setItem('stone_token', TOKEN);
+  showNavbar(true);
+  navTo('dashboard');
+}
+
+// ── Dashboard ──
+async function refreshDashboard() {
+  try {
+    const { data } = await api('/api/dashboard', 'GET');
+    if (!data.ok) return;
+    // Navbar
+    document.getElementById('nav-balance').textContent = data.wallet_balance.toFixed(4) + ' STONE';
+    document.getElementById('nav-addr').textContent = data.wallet_address.substring(0,10) + '…';
+    document.getElementById('nav-addr').title = data.wallet_address;
+    // Node status
+    const dot = document.getElementById('node-status-dot');
+    const txt = document.getElementById('node-status-text');
+    if (data.node_running) {
+      dot.style.background = 'var(--green)';
+      txt.textContent = 'Node aktiv — verbunden mit dem Netzwerk';
+    } else {
+      dot.style.background = 'var(--orange)';
+      txt.textContent = 'Node wird gestartet…';
+    }
+    document.getElementById('node-peer-id').textContent = data.p2p_peer_id ? 'PeerId: ' + data.p2p_peer_id.substring(0,16) + '…' : '';
+    document.getElementById('node-peer-id').title = data.p2p_peer_id || '';
+    // Stats
+    document.getElementById('dash-uptime').textContent = fmtUptime(data.uptime_secs);
+    document.getElementById('dash-peers').textContent = data.peers_connected;
+    document.getElementById('dash-blocks').textContent = data.block_count;
+    document.getElementById('dash-mempool').textContent = data.mempool_size > 0 ? data.mempool_size + ' TX pending' : '';
+    document.getElementById('dash-reward').textContent = data.reward_per_day.toFixed(2) + ' ⛏';
+    document.getElementById('dash-reward-month').textContent = '≈ ' + (data.reward_per_day*30).toFixed(1) + ' STONE/Monat';
+    // Storage
+    const s = data.storage;
+    document.getElementById('dash-storage-summary').textContent = s.usage_pct.toFixed(1) + '% belegt';
+    document.getElementById('dash-storage-bar').style.width = Math.min(s.usage_pct, 100).toFixed(1) + '%';
+    document.getElementById('dash-storage-used').textContent = s.used_human;
+    document.getElementById('dash-storage-free').textContent = s.free_human;
+    document.getElementById('dash-storage-total').textContent = s.total_gb + ' GB';
+    // Peers
+    const list = document.getElementById('dash-peer-list');
+    list.innerHTML = '';
+    if (data.seed_peers.length === 0) { list.innerHTML = '<li>Keine Peers konfiguriert</li>'; }
+    else { data.seed_peers.forEach(p => { const li=document.createElement('li'); li.textContent=p; list.appendChild(li); }); }
+    // Shard Health
+    renderShardHealth(data.shard_health);
+  } catch(e) { console.error(e); }
+}
+
+function humanBytes(b) {
+  if (b === 0) return '0 B';
+  const units = ['B','KB','MB','GB','TB'];
+  const i = Math.min(Math.floor(Math.log(b)/Math.log(1024)), units.length-1);
+  return (b/Math.pow(1024,i)).toFixed(i>0?1:0)+' '+units[i];
+}
+
+function renderShardHealth(sh) {
+  if (!sh) return;
+  // Status badge
+  const badge = document.getElementById('shard-status-badge');
+  badge.className = 'shard-status-badge ' + sh.status;
+  const statusLabels = { healthy:'Healthy', degraded:'Degraded', critical:'Critical', no_ec_data:'Keine EC-Daten', offline:'Offline' };
+  badge.textContent = statusLabels[sh.status] || sh.status;
+  // Stats
+  document.getElementById('shard-healthy').textContent = sh.healthy_chunks;
+  document.getElementById('shard-degraded').textContent = sh.degraded_chunks;
+  document.getElementById('shard-critical').textContent = sh.critical_chunks;
+  // Meta
+  document.getElementById('shard-local-count').textContent = sh.local_shards;
+  document.getElementById('shard-local-bytes').textContent = humanBytes(sh.local_bytes);
+  document.getElementById('shard-ec-docs').textContent = sh.ec_documents;
+  document.getElementById('shard-ec-chunks').textContent = sh.ec_chunks;
+  // No-data hint
+  const noData = document.getElementById('shard-no-data');
+  const docList = document.getElementById('shard-doc-list');
+  if (sh.status === 'no_ec_data' || sh.status === 'offline') {
+    noData.style.display = 'block';
+    docList.innerHTML = '';
+  } else {
+    noData.style.display = 'none';
+    // Document list
+    docList.innerHTML = '';
+    (sh.documents || []).forEach(d => {
+      const row = document.createElement('div');
+      row.className = 'shard-doc';
+      const dot = document.createElement('span');
+      dot.className = 'sd-dot ' + d.status;
+      const title = document.createElement('span');
+      title.className = 'sd-title';
+      title.textContent = d.title || d.doc_id.substring(0,12) + '…';
+      title.title = d.doc_id;
+      const meta = document.createElement('span');
+      meta.className = 'sd-meta';
+      meta.textContent = d.chunks + ' Chunks · EC(' + d.ec_k + ',' + d.ec_m + ') · ' + humanBytes(d.size);
+      row.appendChild(dot);
+      row.appendChild(title);
+      row.appendChild(meta);
+      docList.appendChild(row);
+    });
+  }
+}
+
+// ── Send ──
+async function doSend() {
+  hideError('send-error');
+  document.getElementById('send-result').style.display='none';
+  const to = document.getElementById('send-to').value.trim();
+  const amount = parseFloat(document.getElementById('send-amount').value) || 0;
+  if (!to || to.length !== 64) { showError('send-error', 'Empfänger-Adresse muss 64 hex Zeichen sein'); return; }
+  if (amount <= 0) { showError('send-error', 'Betrag muss > 0 sein'); return; }
+  const { data } = await api('/api/send', 'POST', { to, amount });
+  if (!data.ok) { showError('send-error', data.error); return; }
+  const el = document.getElementById('send-result');
+  el.innerHTML = '✅ Gesendet! TX: <br>' + data.tx_hash;
+  el.style.display = 'block';
+  document.getElementById('send-to').value = '';
+  document.getElementById('send-amount').value = '';
+  refreshDashboard();
+}
+
+// ── Settings ──
+async function loadSettings() {
+  const { data } = await api('/api/settings', 'GET');
+  if (!data.ok) return;
+  document.getElementById('set-name').value = data.node_name;
+  document.getElementById('set-storage').value = data.storage_offered_gb;
+  document.getElementById('set-http').value = data.http_port;
+  document.getElementById('set-p2p').value = data.p2p_port;
+  document.getElementById('set-datadir').value = data.data_dir;
+  document.getElementById('set-peers').value = data.seed_peers.join('\n');
+  document.getElementById('set-wallet').textContent = data.wallet_address;
+  document.getElementById('set-public-ip').textContent = data.public_ip || '—';
+}
+async function saveSettings() {
+  hideError('set-error');
+  document.getElementById('set-success').style.display = 'none';
+  const body = {
+    node_name: document.getElementById('set-name').value,
+    storage_offered_gb: parseInt(document.getElementById('set-storage').value) || 1,
+    http_port: parseInt(document.getElementById('set-http').value) || 8080,
+    p2p_port: parseInt(document.getElementById('set-p2p').value) || 4001,
+    data_dir: document.getElementById('set-datadir').value,
+    seed_peers: document.getElementById('set-peers').value.split('\n').map(l=>l.trim()).filter(l=>l),
+  };
+  const { data } = await api('/api/settings', 'POST', body);
+  if (!data.ok) { showError('set-error', data.error || 'Fehler'); return; }
+  document.getElementById('set-success').style.display = 'block';
+  setTimeout(() => document.getElementById('set-success').style.display = 'none', 3000);
+}
+
+// ── Helpers ──
+function fmtUptime(s) {
+  const d = Math.floor(s/86400), h = Math.floor((s%86400)/3600), m = Math.floor((s%3600)/60);
+  if (d > 0) return d+'d '+h+'h '+m+'m';
+  if (h > 0) return h+'h '+m+'m';
+  return m+'m '+(s%60)+'s';
+}
+
+// Auto-refresh
+setInterval(() => {
+  if (!document.getElementById('view-dashboard').classList.contains('hidden')) refreshDashboard();
+}, 5000);
+
+init();
+</script>
+</body>
+</html>

@@ -1,0 +1,19 @@
+{
+  "setup_complete": true,
+  "password_hash": "6c0ab7af6713f96528667134a2bd404eda94152ec2f240a1c2e2d2322e349e78",
+  "node_name": "MeineNode1",
+  "wallet_address": "e3f130548fac7b4bc73feaf0fce1fd819df3f8303c5eaa596a9fd54c81eafac5",
+  "mnemonic_once": "",
+  "seed_peers": [
+    "/ip4/100.90.28.68/tcp/4001/p2p/12D3KooWLqikBBCRhCZ2MgSYG3R579BNUgrN5E6dZnYSEYdmAKTd"
+  ],
+  "http_port": 8080,
+  "p2p_port": 4001,
+  "data_dir": "./stone_data",
+  "api_key": "sk_e27e05ae6e1124b89306c0d03593e1ff258d3a4a2e64b67f53d38e827c553cad",
+  "created_at": "2026-02-28 16:55:46",
+  "storage_offered_gb": 100,
+  "reward_per_day": 95.0,
+  "public_ip": "61.8.141.250",
+  "wallet_balance": 1000.0
+}

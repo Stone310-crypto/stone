@@ -1,0 +1,1377 @@
+//! stone-setup — Unified Node Binary (Setup-Wizard + Full Node + Dashboard)
+//!
+//! Startet einen Axum-Webserver:
+//! - Vor dem Setup: 4-Step-Wizard (Passwort → Node → Storage → Peers)
+//! - Nach dem Setup: Full-Node mit P2P, Blockchain, Token-Economy + Dashboard-UI
+//!
+//! Alle Routes der master_server.rs API werden als Fallback bereitgestellt,
+//! sodass Flask/forge-nomad auf dem gleichen Port arbeiten kann.
+
+#[path = "server/mod.rs"]
+mod server;
+
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
+    path::Path,
+    sync::Arc,
+    time::Instant,
+};
+
+use axum::{
+    body::Body,
+    extract::State,
+    http::{Request, StatusCode},
+    response::{Html, IntoResponse, Response},
+    routing::{get, post},
+    Json, Router,
+};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use tokio::sync::RwLock;
+use tower::ServiceExt;
+
+use stone::{
+    auth::load_users,
+    blockchain::{data_dir, NodeRole},
+    master_node::MasterNodeState,
+    network::{start_network, NetworkEvent, NetworkHandle},
+    shard::ShardStore,
+    storage::ChunkStore,
+};
+
+use server::{
+    rate_limiter::RateLimits,
+    router::build_router,
+    state::{
+        load_api_key, load_peers_from_disk, load_trust_from_disk,
+        AppState as NodeAppState, HEARTBEAT_INTERVAL,
+    },
+    sync::{fetch_missing_chunks, pull_from_peer, spawn_auto_sync_task},
+};
+
+const CONFIG_FILE: &str = "node_config.json";
+
+// ─── Config ─────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct NodeConfig {
+    setup_complete: bool,
+    password_hash: String,
+    node_name: String,
+    wallet_address: String,
+    mnemonic_once: String,
+    seed_peers: Vec<String>,
+    http_port: u16,
+    p2p_port: u16,
+    data_dir: String,
+    api_key: String,
+    #[serde(default)]
+    created_at: String,
+    #[serde(default)]
+    storage_offered_gb: u64,
+    #[serde(default)]
+    reward_per_day: f64,
+    #[serde(default)]
+    public_ip: String,
+    #[serde(default)]
+    wallet_balance: f64,
+}
+
+impl Default for NodeConfig {
+    fn default() -> Self {
+        Self {
+            setup_complete: false,
+            password_hash: String::new(),
+            node_name: String::new(),
+            wallet_address: String::new(),
+            mnemonic_once: String::new(),
+            seed_peers: Vec::new(),
+            http_port: 8080,
+            p2p_port: 4001,
+            data_dir: "./stone_data".into(),
+            api_key: String::new(),
+            created_at: String::new(),
+            storage_offered_gb: 0,
+            reward_per_day: 0.0,
+            public_ip: String::new(),
+            wallet_balance: 0.0,
+        }
+    }
+}
+
+impl NodeConfig {
+    fn load() -> Self {
+        if Path::new(CONFIG_FILE).exists() {
+            let data = std::fs::read_to_string(CONFIG_FILE).unwrap_or_default();
+            serde_json::from_str(&data).unwrap_or_default()
+        } else {
+            Self::default()
+        }
+    }
+
+    fn save(&self) -> anyhow::Result<()> {
+        let json = serde_json::to_string_pretty(self)?;
+        std::fs::write(CONFIG_FILE, json)?;
+        Ok(())
+    }
+}
+
+/// Tiered reward calculation
+fn calc_reward_per_day(gb: u64) -> f64 {
+    if gb == 0 { return 0.0; }
+    let mut reward = 0.0;
+    let tiers: [(u64, u64, f64); 4] = [
+        (1,    10,   0.5),
+        (11,   100,  1.0),
+        (101,  1000, 2.0),
+        (1001, u64::MAX, 3.0),
+    ];
+    let mut remaining = gb;
+    for (lo, hi, rate) in &tiers {
+        if remaining == 0 { break; }
+        let tier_size = hi.saturating_sub(lo - 1);
+        let in_tier = remaining.min(tier_size);
+        reward += in_tier as f64 * rate;
+        remaining -= in_tier;
+    }
+    reward
+}
+
+// ─── Unified App State ─────────────────────────────────────────────────────
+
+#[derive(Clone)]
+struct SetupState {
+    config: Arc<RwLock<NodeConfig>>,
+    start_time: Instant,
+    session_token: Arc<RwLock<Option<String>>>,
+    /// Full-Node-State (Some = Node läuft)
+    node_state: Arc<RwLock<Option<NodeAppState>>>,
+    /// P2P-Handle (Some = P2P verbunden)
+    network: Arc<RwLock<Option<NetworkHandle>>>,
+}
+
+// ─── Main ───────────────────────────────────────────────────────────────────
+
+#[tokio::main]
+async fn main() {
+    print_banner();
+
+    // .env laden
+    match dotenvy::dotenv() {
+        Ok(path) => println!("[setup] .env geladen: {}", path.display()),
+        Err(dotenvy::Error::Io(_)) => {}
+        Err(e) => eprintln!("[setup] .env Warnung: {e}"),
+    }
+
+    let mut config = NodeConfig::load();
+
+    // Öffentliche IP ermitteln
+    if config.public_ip.is_empty() {
+        if let Some(ip) = fetch_public_ip().await {
+            config.public_ip = ip;
+            let _ = config.save();
+        }
+    }
+
+    let state = SetupState {
+        config: Arc::new(RwLock::new(config.clone())),
+        start_time: Instant::now(),
+        session_token: Arc::new(RwLock::new(None)),
+        node_state: Arc::new(RwLock::new(None)),
+        network: Arc::new(RwLock::new(None)),
+    };
+
+    // Wenn Setup schon abgeschlossen → Full-Node sofort starten
+    if config.setup_complete {
+        println!("[setup] Setup bereits abgeschlossen → starte Full-Node...");
+        let s = state.clone();
+        tokio::spawn(async move {
+            start_full_node(s).await;
+        });
+    }
+
+    let app = Router::new()
+        .route("/", get(page_index))
+        .route("/api/status", get(api_status))
+        .route("/api/setup/password", post(api_set_password))
+        .route("/api/setup/node", post(api_set_node))
+        .route("/api/setup/storage", post(api_set_storage))
+        .route("/api/setup/peers", post(api_set_peers))
+        .route("/api/setup/finish", post(api_finish_setup))
+        .route("/api/login", post(api_login))
+        .route("/api/dashboard", get(api_dashboard))
+        .route("/api/settings", get(api_get_settings))
+        .route("/api/settings", post(api_save_settings))
+        .route("/api/send", post(api_send))
+        .route("/api/reward-preview", post(api_reward_preview))
+        .fallback(forward_to_node_api)
+        .with_state(state.clone());
+
+    // Port: STONE_PORT aus .env (default 8080)
+    let port: u16 = std::env::var("STONE_HTTP_PORT")
+        .or_else(|_| std::env::var("STONE_PORT"))
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(config.http_port);
+
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
+    let local_ip = get_local_ip().unwrap_or_else(|| "127.0.0.1".into());
+
+    println!();
+    println!("  ┌─────────────────────────────────────────────────────┐");
+    println!("  │                                                     │");
+    println!("  │  🌐 Node-UI:   http://{}:{:<5} │", pad_right(&local_ip, 16), port);
+    println!("  │                                                     │");
+    println!("  │  📡 Lokal:     http://localhost:{:<18}│", port);
+    println!("  │                                                     │");
+    println!("  └─────────────────────────────────────────────────────┘");
+    println!();
+    if config.setup_complete {
+        println!("  ✅ Node läuft! Dashboard öffnen im Browser.");
+    } else {
+        println!("  Öffne die URL im Browser um den Node einzurichten.");
+    }
+    println!("  Ctrl+C zum Beenden.");
+    println!();
+
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap_or_else(|e| {
+        eprintln!("[setup] ❌ Port {port} belegt: {e}");
+        eprintln!("[setup] Tipp: pkill -f stone-setup && pkill -f stone-master");
+        std::process::exit(1);
+    });
+    axum::serve(listener, app).await.unwrap();
+}
+
+// ─── Start Full Node ────────────────────────────────────────────────────────
+
+async fn start_full_node(state: SetupState) {
+    println!("[node] Full-Node wird gestartet...");
+
+    std::fs::create_dir_all(data_dir()).ok();
+    if let Err(e) = ChunkStore::new() {
+        eprintln!("[node] ChunkStore-Fehler: {e}");
+    }
+
+    let api_key = Arc::new(load_api_key());
+    let node_id = std::env::var("STONE_NODE_ID")
+        .or_else(|_| std::env::var("STONE_NODE_NAME"))
+        .unwrap_or_else(|_| {
+            let cfg = state.config.try_read();
+            match cfg {
+                Ok(c) if !c.node_name.is_empty() => c.node_name.clone(),
+                _ => hostname::get()
+                    .ok()
+                    .and_then(|h| h.into_string().ok())
+                    .unwrap_or_else(|| "stone-node".into()),
+            }
+        });
+
+    println!("[node] Node-ID: {node_id}");
+
+    let node = MasterNodeState::new(node_id.clone(), api_key.as_ref().clone(), NodeRole::Master);
+
+    // Peers laden
+    let saved_peers = load_peers_from_disk();
+    if !saved_peers.is_empty() {
+        println!("[node] {} Peer(s) geladen", saved_peers.len());
+        node.replace_peers(saved_peers);
+    }
+
+    // Trust laden
+    load_trust_from_disk(&node);
+
+    let users = load_users();
+
+    // Hintergrund-Tasks
+    MasterNodeState::start_heartbeat(node.clone(), HEARTBEAT_INTERVAL);
+    spawn_auto_sync_task(node.clone(), api_key.clone(), users.clone());
+
+    // Mempool-Eviction
+    {
+        let node_evict = node.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            let mut gc = 0u64;
+            loop {
+                interval.tick().await;
+                node_evict.mempool.evict_expired();
+                gc += 1;
+                if gc % 5 == 0 { node_evict.mempool.gc_known_ids(); }
+            }
+        });
+    }
+
+    // P2P starten
+    let network_handle: Option<NetworkHandle> =
+        if std::env::var("STONE_P2P_DISABLED").as_deref() == Ok("1") {
+            println!("[node] P2P deaktiviert");
+            None
+        } else {
+            // Result sofort auspacken damit Box<dyn Error> nicht über .await lebt
+            let maybe_handle = match start_network(None).await {
+                Ok(h) => Some(h),
+                Err(e) => {
+                    eprintln!("[node] P2P-Fehler: {e}");
+                    None
+                }
+            };
+            if let Some(handle) = maybe_handle {
+                println!("[node] ✅ P2P gestartet – PeerId: {}", handle.local_peer_id);
+                let count = node.chain.lock().unwrap().blocks.len() as u64;
+                handle.set_chain_count(count).await;
+                // Event-Handler
+                {
+                    let mut event_rx = handle.subscribe();
+                    let node_bg = node.clone();
+                    let handle_bg = handle.clone();
+                    let api_key_bg = api_key.clone();
+                    tokio::spawn(async move {
+                        while let Ok(event) = event_rx.recv().await {
+                            handle_p2p_event(event, &node_bg, &handle_bg, &api_key_bg).await;
+                        }
+                    });
+                }
+                // Network-Handle speichern
+                *state.network.write().await = Some(handle.clone());
+                Some(handle)
+            } else {
+                None
+            }
+        };
+
+    // ── Periodischer Shard-Health-Scan ──────────────────────────────────────
+    // Alle 5 Minuten: ListShards bei verbundenen Peers abfragen → Registry aktualisieren
+    if let Some(ref net_handle) = network_handle {
+        let scan_node = node.clone();
+        let scan_net = net_handle.clone();
+        tokio::spawn(async move {
+            // Erster Scan nach 30s, dann alle 5 Minuten
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+            loop {
+                interval.tick().await;
+                // Alle EC-Chunks aus der Chain sammeln
+                let chunk_hashes: Vec<(String, u8)> = {
+                    let chain = scan_node.chain.lock().unwrap();
+                    let mut hashes = Vec::new();
+                    for block in &chain.blocks {
+                        for doc in &block.documents {
+                            for chunk in &doc.chunks {
+                                if chunk.ec_k > 0 && !chunk.shards.is_empty() {
+                                    hashes.push((chunk.hash.clone(), chunk.ec_k));
+                                }
+                            }
+                        }
+                    }
+                    hashes
+                };
+                if chunk_hashes.is_empty() { continue; }
+
+                let peers = scan_net.connected_peers().await;
+                if peers.is_empty() { continue; }
+
+                let mut updated = 0usize;
+                for (chunk_hash, _ec_k) in &chunk_hashes {
+                    for peer in &peers {
+                        if let Ok(pid) = peer.peer_id.parse::<libp2p::PeerId>() {
+                            let indices = scan_net.list_peer_shards(pid, chunk_hash.clone()).await;
+                            if !indices.is_empty() {
+                                for idx in &indices {
+                                    scan_node.shard_registry.add_holder(chunk_hash, *idx, &peer.peer_id);
+                                }
+                                updated += indices.len();
+                            }
+                        }
+                    }
+                }
+                if updated > 0 {
+                    scan_node.shard_registry.persist();
+                    println!("[shard-scan] ✅ Registry aktualisiert: {updated} Shard-Einträge von {} Peers für {} Chunks", peers.len(), chunk_hashes.len());
+                }
+            }
+        });
+    }
+
+    let rate_limits = Arc::new(RateLimits::new());
+    {
+        let rl = rate_limits.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(300));
+            loop { interval.tick().await; rl.cleanup_all(); }
+        });
+    }
+
+    let node_app_state = NodeAppState {
+        node: node.clone(),
+        users,
+        api_key,
+        network: network_handle,
+        rate_limits,
+    };
+
+    *state.node_state.write().await = Some(node_app_state);
+    println!("[node] ✅ Full-Node aktiv — API via Fallback-Handler erreichbar");
+}
+
+// ─── P2P Event Handler ──────────────────────────────────────────────────────
+
+async fn handle_p2p_event(
+    event: NetworkEvent,
+    node: &Arc<MasterNodeState>,
+    handle: &NetworkHandle,
+    api_key: &Arc<String>,
+) {
+    match event {
+        NetworkEvent::BlockReceived { block, from_peer } => {
+            let peer_urls: Vec<String> = node.get_peers()
+                .into_iter()
+                .filter(|p| p.is_healthy())
+                .map(|p| p.url.clone())
+                .collect();
+            for url in &peer_urls {
+                fetch_missing_chunks(&block, url, api_key).await;
+            }
+
+            let poa_ok = {
+                let vs = node.validator_set.read().unwrap();
+                if vs.validators.is_empty() { None }
+                else { Some(vs.verify_block(&block.hash, &block.signer, &block.validator_signature).is_acceptable()) }
+            };
+
+            // Block-Akzeptanz in einem eigenen Scope, damit der Lock vor dem await dropped wird
+            enum BlockResult {
+                Accepted(u64),
+                Stale,
+                NeedsResync { idx: u64, from: String, err: String },
+                Rejected,
+                AlreadyKnown,
+            }
+
+            let result = {
+                let mut chain = node.chain.lock().unwrap();
+                let already = chain.blocks.iter().any(|b| b.hash == block.hash);
+                if already {
+                    BlockResult::AlreadyKnown
+                } else {
+                    let idx = block.index;
+                    let txs = block.transactions.clone();
+                    match chain.accept_peer_block(*block, poa_ok) {
+                        Ok(_) => {
+                            println!("[p2p] ✓ Block #{idx} von {from_peer}");
+                            if !txs.is_empty() {
+                                let mut ledger = node.token_ledger.write().unwrap();
+                                let _receipts = ledger.apply_block_txs(&txs, idx);
+                                let _ = ledger.persist();
+                                for tx in &txs {
+                                    node.mempool.mark_known(&tx.tx_id);
+                                    node.mempool.remove_tx(&tx.tx_id);
+                                }
+                            }
+                            BlockResult::Accepted(chain.blocks.len() as u64)
+                        }
+                        Err(ref e) if e.starts_with("Stale:") => BlockResult::Stale,
+                        Err(ref e) if e.starts_with("Gap:") || e.contains("previous_hash") => {
+                            let err = e.clone();
+                            BlockResult::NeedsResync { idx, from: from_peer.clone(), err }
+                        }
+                        Err(e) => { eprintln!("[p2p] Block #{idx} abgelehnt: {e}"); BlockResult::Rejected }
+                    }
+                }
+            }; // chain-Lock ist hier gedroppt
+
+            match result {
+                BlockResult::Accepted(count) => {
+                    handle.set_chain_count(count).await;
+                }
+                BlockResult::NeedsResync { idx, from, err } => {
+                    eprintln!("[p2p] Block #{idx}: {err} → Resync");
+                    if let Some(url) = resolve_peer_url(&from, handle, node).await {
+                        eprintln!("[sync] Resync via {url} (Peer {from})");
+                        let n = node.clone();
+                        let k = api_key.clone();
+                        tokio::spawn(async move { pull_from_peer(&n, &url, &k).await; });
+                    } else {
+                        eprintln!("[sync] ⚠ Keine URL für Peer {from} – versuche alle bekannten Peers");
+                        let n = node.clone();
+                        let k = api_key.clone();
+                        tokio::spawn(async move {
+                            let peers = n.get_peers();
+                            for p in peers.iter().filter(|p| p.is_healthy()) {
+                                pull_from_peer(&n, &p.url, &k).await;
+                            }
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+        NetworkEvent::TxReceived { tx, from_peer } => {
+            let ledger = node.token_ledger.read().unwrap();
+            match node.mempool.add_tx(*tx, Some(&ledger)) {
+                Ok(()) => println!("[p2p] 💸 TX von {from_peer} (mempool={})", node.mempool.pending_count()),
+                Err(e) => { if !format!("{e}").contains("Duplikat") { eprintln!("[p2p] TX abgelehnt: {e}"); } }
+            }
+        }
+
+        // ── Shard-Events ──────────────────────────────────────────────────────
+        NetworkEvent::ShardReceived { chunk_hash, shard_index, data, from_peer } => {
+            // Shard wurde bereits in der P2P-Schicht gespeichert → nur Registry aktualisieren
+            println!(
+                "[shard] ✅ Shard empfangen: {}[{}] ({} bytes) von {}",
+                &chunk_hash[..8.min(chunk_hash.len())], shard_index, data.len(),
+                &from_peer[..8.min(from_peer.len())]
+            );
+            let local_pid = handle.local_peer_id.to_string();
+            node.shard_registry.add_holder(&chunk_hash, shard_index, &local_pid);
+            node.shard_registry.add_holder(&chunk_hash, shard_index, &from_peer);
+            node.shard_registry.persist();
+        }
+
+        NetworkEvent::ShardStored { chunk_hash, shard_index, peer_id, success, error } => {
+            // Bestätigung: ein Peer hat unseren Shard erfolgreich gespeichert
+            if success {
+                println!(
+                    "[shard] ✅ Shard bestätigt: {}[{}] auf Peer {}",
+                    &chunk_hash[..8.min(chunk_hash.len())], shard_index,
+                    &peer_id[..8.min(peer_id.len())]
+                );
+                node.shard_registry.add_holder(&chunk_hash, shard_index, &peer_id);
+                node.shard_registry.persist();
+            } else {
+                eprintln!(
+                    "[shard] ⚠ Shard abgelehnt: {}[{}] auf Peer {} — {}",
+                    &chunk_hash[..8.min(chunk_hash.len())], shard_index,
+                    &peer_id[..8.min(peer_id.len())],
+                    error.as_deref().unwrap_or("unbekannter Fehler")
+                );
+            }
+        }
+
+        NetworkEvent::ShardRequestFailed { chunk_hash, shard_index, peer_id, error } => {
+            eprintln!(
+                "[shard] ❌ Shard-Transfer fehlgeschlagen: {}[{}] → Peer {} — {error}",
+                &chunk_hash[..8.min(chunk_hash.len())], shard_index,
+                &peer_id[..8.min(peer_id.len())]
+            );
+        }
+
+        // ── Peer-Discovery → HTTP-Peer auto-registrieren ─────────────────
+        NetworkEvent::PeerIdentified { peer_id, addresses, .. } => {
+            let http_port = std::env::var("STONE_PORT")
+                .ok()
+                .and_then(|v| v.parse::<u16>().ok())
+                .unwrap_or(8080);
+
+            // IP aus Multiaddrs extrahieren (erstes nicht-loopback /ip4/ Segment)
+            let mut ip: Option<String> = None;
+            for addr in &addresses {
+                let parts: Vec<&str> = addr.split('/').collect();
+                for (i, part) in parts.iter().enumerate() {
+                    if *part == "ip4" {
+                        if let Some(found_ip) = parts.get(i + 1) {
+                            if *found_ip != "127.0.0.1" && *found_ip != "0.0.0.0" {
+                                ip = Some(found_ip.to_string());
+                                break;
+                            }
+                        }
+                    }
+                }
+                if ip.is_some() { break; }
+            }
+
+            if let Some(ip) = ip {
+                let url = format!("http://{}:{}", ip, http_port);
+                let mut peer_info = stone::master_node::PeerInfo::new(&url);
+                peer_info.name = Some(peer_id[..12.min(peer_id.len())].to_string());
+                node.upsert_peer(peer_info);
+                // peers.json aktualisieren
+                let peers = node.get_peers();
+                if let Ok(json) = serde_json::to_string_pretty(&peers) {
+                    let _ = std::fs::write(
+                        format!("{}/peers.json", stone::blockchain::data_dir()),
+                        json,
+                    );
+                }
+            }
+        }
+
+        _ => {} // PeerConnected, PeerDisconnected, Listening etc.
+    }
+}
+
+/// Löst eine libp2p PeerId in eine HTTP-URL auf.
+/// 1. Versucht, die IP aus den bekannten Peer-Adressen (NetworkHandle) zu extrahieren
+/// 2. Fällt zurück auf die registrierten Peers (MasterNodeState) falls dort die PeerId in der URL steht
+/// 3. Nutzt STONE_PORT / 8080 als HTTP-Port
+async fn resolve_peer_url(
+    peer_id_str: &str,
+    handle: &NetworkHandle,
+    node: &Arc<MasterNodeState>,
+) -> Option<String> {
+    let http_port = std::env::var("STONE_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(8080);
+
+    // 1) Netzwerk-Peer-Liste: IP aus Multiaddr extrahieren
+    let peers = handle.get_peers().await;
+    if let Some(np) = peers.iter().find(|p| p.peer_id == peer_id_str) {
+        for addr in &np.addresses {
+            // Multiaddr-Format: /ip4/<IP>/tcp/<PORT>/p2p/<PeerId>
+            let parts: Vec<&str> = addr.split('/').collect();
+            for (i, part) in parts.iter().enumerate() {
+                if *part == "ip4" {
+                    if let Some(ip) = parts.get(i + 1) {
+                        // Loopback überspringen
+                        if *ip != "127.0.0.1" && *ip != "0.0.0.0" {
+                            return Some(format!("http://{}:{}", ip, http_port));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 2) Fallback: registrierte Peers durchsuchen
+    let registered = node.get_peers();
+    for p in &registered {
+        if p.url.contains(peer_id_str) || p.url.contains(&peer_id_str[..12.min(peer_id_str.len())]) {
+            return Some(p.url.clone());
+        }
+    }
+
+    None
+}
+
+// ─── Fallback: /api/v1/* und /ws an Node-Router weiterleiten ────────────────
+
+async fn forward_to_node_api(
+    State(state): State<SetupState>,
+    req: Request<Body>,
+) -> Response {
+    let path = req.uri().path().to_string();
+
+    // Nur /api/v1/* und /ws weiterleiten
+    if !path.starts_with("/api/v1/") && path != "/ws" {
+        return (StatusCode::NOT_FOUND, "Not Found").into_response();
+    }
+
+    let ns = state.node_state.read().await;
+    match ns.as_ref() {
+        Some(node_state) => {
+            let router = build_router(node_state.clone());
+            match router.oneshot(req).await {
+                Ok(resp) => resp,
+                Err(e) => {
+                    eprintln!("[forward] Router-Fehler: {e}");
+                    (StatusCode::INTERNAL_SERVER_ERROR, "Internal Error").into_response()
+                }
+            }
+        }
+        None => {
+            (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+                "error": "Node wird gestartet...",
+                "node_running": false
+            }))).into_response()
+        }
+    }
+}
+
+// ─── Page ───────────────────────────────────────────────────────────────────
+
+async fn page_index() -> impl IntoResponse {
+    Html(include_str!("setup_ui.html"))
+}
+
+// ─── API: Status ────────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct StatusResponse {
+    setup_complete: bool,
+    has_password: bool,
+    has_node_name: bool,
+    has_wallet: bool,
+    has_storage: bool,
+    has_peers: bool,
+    node_name: String,
+}
+
+async fn api_status(State(state): State<SetupState>) -> Json<StatusResponse> {
+    let cfg = state.config.read().await;
+    Json(StatusResponse {
+        setup_complete: cfg.setup_complete,
+        has_password: !cfg.password_hash.is_empty(),
+        has_node_name: !cfg.node_name.is_empty(),
+        has_wallet: !cfg.wallet_address.is_empty(),
+        has_storage: cfg.storage_offered_gb > 0,
+        has_peers: !cfg.seed_peers.is_empty(),
+        node_name: cfg.node_name.clone(),
+    })
+}
+
+// ─── API: Set Password ─────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct SetPasswordReq { password: String }
+
+#[derive(Serialize)]
+struct ApiResult {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token: Option<String>,
+}
+
+async fn api_set_password(
+    State(state): State<SetupState>,
+    Json(body): Json<SetPasswordReq>,
+) -> (StatusCode, Json<ApiResult>) {
+    let pw = &body.password;
+    if pw.len() < 8 {
+        return (StatusCode::BAD_REQUEST, Json(ApiResult {
+            ok: false, error: Some("Passwort muss mindestens 8 Zeichen lang sein".into()), token: None,
+        }));
+    }
+    let has_upper = pw.chars().any(|c| c.is_uppercase());
+    let has_lower = pw.chars().any(|c| c.is_lowercase());
+    let has_digit = pw.chars().any(|c| c.is_ascii_digit());
+    let has_special = pw.chars().any(|c| !c.is_alphanumeric());
+    if !has_upper || !has_lower || !has_digit || !has_special {
+        return (StatusCode::BAD_REQUEST, Json(ApiResult {
+            ok: false, error: Some("Passwort braucht Groß-/Kleinbuchstaben, Zahl und Sonderzeichen".into()), token: None,
+        }));
+    }
+    let hash = double_sha256(pw);
+    let token = generate_token();
+    let mut cfg = state.config.write().await;
+    cfg.password_hash = hash;
+    let _ = cfg.save();
+    *state.session_token.write().await = Some(token.clone());
+    (StatusCode::OK, Json(ApiResult { ok: true, error: None, token: Some(token) }))
+}
+
+// ─── API: Set Node ──────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct SetNodeReq { node_name: String }
+
+#[derive(Serialize)]
+struct SetNodeResp {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    wallet_address: String,
+    mnemonic: String,
+}
+
+async fn api_set_node(
+    State(state): State<SetupState>,
+    Json(body): Json<SetNodeReq>,
+) -> (StatusCode, Json<SetNodeResp>) {
+    let name = body.node_name.trim().to_string();
+    if name.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(SetNodeResp {
+            ok: false, error: Some("Node-Name darf nicht leer sein".into()),
+            wallet_address: String::new(), mnemonic: String::new(),
+        }));
+    }
+    let (mnemonic, wallet_address) = generate_wallet_12();
+    let api_key = format!("sk_{}", generate_hex(32));
+    let mut cfg = state.config.write().await;
+    cfg.node_name = name;
+    cfg.wallet_address = wallet_address.clone();
+    cfg.mnemonic_once = mnemonic.clone();
+    cfg.api_key = api_key;
+    cfg.created_at = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let _ = cfg.save();
+    (StatusCode::OK, Json(SetNodeResp { ok: true, error: None, wallet_address, mnemonic }))
+}
+
+// ─── API: Set Storage ───────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct SetStorageReq { offered_gb: u64 }
+
+#[derive(Serialize)]
+struct SetStorageResp {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    offered_gb: u64,
+    reward_per_day: f64,
+    reward_per_month: f64,
+}
+
+async fn api_set_storage(
+    State(state): State<SetupState>,
+    Json(body): Json<SetStorageReq>,
+) -> (StatusCode, Json<SetStorageResp>) {
+    if body.offered_gb == 0 {
+        return (StatusCode::BAD_REQUEST, Json(SetStorageResp {
+            ok: false, error: Some("Mindestens 1 GB bereitstellen".into()),
+            offered_gb: 0, reward_per_day: 0.0, reward_per_month: 0.0,
+        }));
+    }
+    let rpd = calc_reward_per_day(body.offered_gb);
+    let mut cfg = state.config.write().await;
+    cfg.storage_offered_gb = body.offered_gb;
+    cfg.reward_per_day = rpd;
+    let _ = cfg.save();
+    (StatusCode::OK, Json(SetStorageResp {
+        ok: true, error: None,
+        offered_gb: body.offered_gb, reward_per_day: rpd, reward_per_month: rpd * 30.0,
+    }))
+}
+
+// ─── API: Reward Preview ────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct RewardPreviewReq { gb: u64 }
+#[derive(Serialize)]
+struct RewardPreviewResp { reward_per_day: f64, reward_per_month: f64 }
+
+async fn api_reward_preview(Json(body): Json<RewardPreviewReq>) -> Json<RewardPreviewResp> {
+    let rpd = calc_reward_per_day(body.gb);
+    Json(RewardPreviewResp { reward_per_day: rpd, reward_per_month: rpd * 30.0 })
+}
+
+// ─── API: Set Peers ─────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct SetPeersReq { seed_peers: Vec<String> }
+
+async fn api_set_peers(
+    State(state): State<SetupState>,
+    Json(body): Json<SetPeersReq>,
+) -> Json<ApiResult> {
+    let peers: Vec<String> = body.seed_peers.iter()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect();
+    let mut cfg = state.config.write().await;
+    cfg.seed_peers = peers;
+    let _ = cfg.save();
+    Json(ApiResult { ok: true, error: None, token: None })
+}
+
+// ─── API: Finish Setup ──────────────────────────────────────────────────────
+
+async fn api_finish_setup(State(state): State<SetupState>) -> Json<ApiResult> {
+    {
+        let mut cfg = state.config.write().await;
+        if cfg.password_hash.is_empty() || cfg.node_name.is_empty() || cfg.wallet_address.is_empty() {
+            return Json(ApiResult { ok: false, error: Some("Setup nicht vollständig".into()), token: None });
+        }
+        cfg.setup_complete = true;
+        cfg.mnemonic_once.clear();
+        let _ = write_env_file(&cfg);
+        let _ = cfg.save();
+    }
+
+    // Full-Node im Hintergrund starten
+    let s = state.clone();
+    tokio::spawn(async move {
+        start_full_node(s).await;
+    });
+
+    Json(ApiResult { ok: true, error: None, token: None })
+}
+
+// ─── API: Login ─────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct LoginReq { password: String }
+
+async fn api_login(
+    State(state): State<SetupState>,
+    Json(body): Json<LoginReq>,
+) -> (StatusCode, Json<ApiResult>) {
+    let cfg = state.config.read().await;
+    let hash = double_sha256(&body.password);
+    if hash != cfg.password_hash {
+        return (StatusCode::UNAUTHORIZED, Json(ApiResult {
+            ok: false, error: Some("Falsches Passwort".into()), token: None,
+        }));
+    }
+    let token = generate_token();
+    *state.session_token.write().await = Some(token.clone());
+    (StatusCode::OK, Json(ApiResult { ok: true, error: None, token: Some(token) }))
+}
+
+// ─── API: Dashboard (mit echten Node-Daten) ─────────────────────────────────
+
+#[derive(Serialize)]
+struct DashboardData {
+    ok: bool,
+    node_name: String,
+    wallet_address: String,
+    wallet_balance: f64,
+    uptime_secs: u64,
+    peers_connected: usize,
+    seed_peers: Vec<String>,
+    storage: StorageInfo,
+    http_port: u16,
+    p2p_port: u16,
+    public_ip: String,
+    reward_per_day: f64,
+    storage_offered_gb: u64,
+    // Neue Felder — Node-Status
+    node_running: bool,
+    block_count: u64,
+    p2p_peer_id: String,
+    mempool_size: usize,
+    // Shard-Health
+    shard_health: ShardHealthInfo,
+}
+
+#[derive(Serialize)]
+struct ShardHealthInfo {
+    status: String,           // "healthy" | "degraded" | "critical" | "no_ec_data" | "offline"
+    local_shards: u64,
+    local_bytes: u64,
+    local_chunks: u64,
+    ec_documents: u64,
+    ec_chunks: u64,
+    total_shards_blockchain: u64,
+    healthy_chunks: u64,
+    degraded_chunks: u64,
+    critical_chunks: u64,
+    documents: Vec<ShardDocInfo>,
+}
+
+#[derive(Serialize)]
+struct ShardDocInfo {
+    doc_id: String,
+    title: String,
+    chunks: usize,
+    ec_k: u8,
+    ec_m: u8,
+    status: String,
+    healthy: u64,
+    degraded: u64,
+    critical: u64,
+    size: u64,
+}
+
+#[derive(Serialize)]
+struct StorageInfo {
+    data_dir: String,
+    used_bytes: u64,
+    used_human: String,
+    total_gb: u64,
+    free_human: String,
+    usage_pct: f64,
+}
+
+async fn api_dashboard(State(state): State<SetupState>) -> Json<DashboardData> {
+    let cfg = state.config.read().await;
+    let uptime = state.start_time.elapsed().as_secs();
+    let used = dir_size(Path::new(&cfg.data_dir));
+    let total_bytes = cfg.storage_offered_gb * 1024 * 1024 * 1024;
+    let free = total_bytes.saturating_sub(used);
+    let pct = if total_bytes > 0 { (used as f64 / total_bytes as f64) * 100.0 } else { 0.0 };
+
+    // Echte Node-Daten auslesen
+    let ns = state.node_state.read().await;
+    let (node_running, block_count, peers_connected, p2p_peer_id, mempool_size, real_balance) =
+        if let Some(ref ns) = *ns {
+            let bc = ns.node.chain.lock().unwrap().blocks.len() as u64;
+            let pc = ns.node.get_peers().into_iter().filter(|p| p.is_healthy()).count();
+            let pid = ns.network.as_ref().map(|h| h.local_peer_id.to_string()).unwrap_or_default();
+            let ms = ns.node.mempool.pending_count();
+            // Wallet-Balance aus Ledger
+            let bal = {
+                let ledger = ns.node.token_ledger.read().unwrap();
+                let addr = cfg.wallet_address.clone();
+                if !addr.is_empty() {
+                    let d = ledger.balance(&addr);
+                    d.to_string().parse::<f64>().unwrap_or(0.0)
+                } else { 0.0 }
+            };
+            (true, bc, pc, pid, ms, bal)
+        } else {
+            (false, 0, 0, String::new(), 0, cfg.wallet_balance)
+        };
+
+    // ── Shard-Health berechnen (Registry-basiert) ─────────────────────
+    let shard_health = if let Some(ref ns) = *ns {
+        // Lokale ShardStore-Statistik
+        let (local_shards, local_bytes, local_chunks) = match ShardStore::new() {
+            Ok(store) => {
+                let s = store.stats();
+                (s.total_shards, s.total_bytes, s.chunks_with_shards)
+            }
+            Err(_) => (0, 0, 0),
+        };
+
+        let registry = &ns.node.shard_registry;
+
+        // Blockchain EC-Daten analysieren, Registry für Verfügbarkeit nutzen
+        let chain = ns.node.chain.lock().unwrap();
+        let mut ec_documents = 0u64;
+        let mut ec_chunks = 0u64;
+        let mut total_shards_blockchain = 0u64;
+        let mut healthy_chunks = 0u64;
+        let mut degraded_chunks = 0u64;
+        let mut critical_chunks = 0u64;
+        let mut doc_details: Vec<ShardDocInfo> = Vec::new();
+
+        for block in &chain.blocks {
+            for doc in &block.documents {
+                let ec_ch: Vec<_> = doc.chunks.iter().filter(|c| !c.shards.is_empty()).collect();
+                if ec_ch.is_empty() { continue; }
+                ec_documents += 1;
+
+                let mut doc_healthy = 0u64;
+                let mut doc_degraded = 0u64;
+                let mut doc_critical = 0u64;
+
+                for chunk in &ec_ch {
+                    ec_chunks += 1;
+                    total_shards_blockchain += chunk.shards.len() as u64;
+                    let k = chunk.ec_k as u64;
+
+                    // Registry: wie viele Shards haben bekannte Holder?
+                    let available = registry.available_shards_for_chunk(&chunk.hash) as u64;
+
+                    if available > k {
+                        healthy_chunks += 1;
+                        doc_healthy += 1;
+                    } else if available >= k {
+                        degraded_chunks += 1;
+                        doc_degraded += 1;
+                    } else {
+                        critical_chunks += 1;
+                        doc_critical += 1;
+                    }
+                }
+
+                let doc_status = if doc_critical > 0 { "critical" }
+                    else if doc_degraded > 0 { "degraded" }
+                    else { "healthy" };
+
+                doc_details.push(ShardDocInfo {
+                    doc_id: doc.doc_id.clone(),
+                    title: doc.title.clone(),
+                    chunks: ec_ch.len(),
+                    ec_k: ec_ch.first().map(|c| c.ec_k).unwrap_or(0),
+                    ec_m: ec_ch.first().map(|c| c.ec_m).unwrap_or(0),
+                    status: doc_status.to_string(),
+                    healthy: doc_healthy,
+                    degraded: doc_degraded,
+                    critical: doc_critical,
+                    size: doc.chunks.iter().map(|c| c.size).sum::<u64>(),
+                });
+            }
+        }
+
+        let overall = if critical_chunks > 0 { "critical" }
+            else if degraded_chunks > 0 { "degraded" }
+            else if ec_chunks > 0 { "healthy" }
+            else { "no_ec_data" };
+
+        ShardHealthInfo {
+            status: overall.to_string(),
+            local_shards, local_bytes, local_chunks,
+            ec_documents, ec_chunks, total_shards_blockchain,
+            healthy_chunks, degraded_chunks, critical_chunks,
+            documents: doc_details,
+        }
+    } else {
+        ShardHealthInfo {
+            status: "offline".to_string(),
+            local_shards: 0, local_bytes: 0, local_chunks: 0,
+            ec_documents: 0, ec_chunks: 0, total_shards_blockchain: 0,
+            healthy_chunks: 0, degraded_chunks: 0, critical_chunks: 0,
+            documents: vec![],
+        }
+    };
+
+    Json(DashboardData {
+        ok: true,
+        node_name: cfg.node_name.clone(),
+        wallet_address: cfg.wallet_address.clone(),
+        wallet_balance: real_balance,
+        uptime_secs: uptime,
+        peers_connected,
+        seed_peers: cfg.seed_peers.clone(),
+        storage: StorageInfo {
+            data_dir: cfg.data_dir.clone(),
+            used_bytes: used,
+            used_human: human_bytes(used),
+            total_gb: cfg.storage_offered_gb,
+            free_human: human_bytes(free),
+            usage_pct: pct,
+        },
+        http_port: cfg.http_port,
+        p2p_port: cfg.p2p_port,
+        public_ip: cfg.public_ip.clone(),
+        reward_per_day: cfg.reward_per_day,
+        storage_offered_gb: cfg.storage_offered_gb,
+        node_running,
+        block_count,
+        p2p_peer_id,
+        mempool_size,
+        shard_health,
+    })
+}
+
+// ─── API: Settings ──────────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct SettingsData {
+    ok: bool,
+    node_name: String,
+    wallet_address: String,
+    storage_offered_gb: u64,
+    reward_per_day: f64,
+    seed_peers: Vec<String>,
+    http_port: u16,
+    p2p_port: u16,
+    data_dir: String,
+    public_ip: String,
+}
+
+async fn api_get_settings(State(state): State<SetupState>) -> Json<SettingsData> {
+    let cfg = state.config.read().await;
+    Json(SettingsData {
+        ok: true,
+        node_name: cfg.node_name.clone(),
+        wallet_address: cfg.wallet_address.clone(),
+        storage_offered_gb: cfg.storage_offered_gb,
+        reward_per_day: cfg.reward_per_day,
+        seed_peers: cfg.seed_peers.clone(),
+        http_port: cfg.http_port,
+        p2p_port: cfg.p2p_port,
+        data_dir: cfg.data_dir.clone(),
+        public_ip: cfg.public_ip.clone(),
+    })
+}
+
+#[derive(Deserialize)]
+struct SaveSettingsReq {
+    #[serde(default)] node_name: Option<String>,
+    #[serde(default)] storage_offered_gb: Option<u64>,
+    #[serde(default)] seed_peers: Option<Vec<String>>,
+    #[serde(default)] http_port: Option<u16>,
+    #[serde(default)] p2p_port: Option<u16>,
+    #[serde(default)] data_dir: Option<String>,
+}
+
+async fn api_save_settings(
+    State(state): State<SetupState>,
+    Json(body): Json<SaveSettingsReq>,
+) -> Json<ApiResult> {
+    let mut cfg = state.config.write().await;
+    if let Some(n) = body.node_name { if !n.trim().is_empty() { cfg.node_name = n.trim().to_string(); } }
+    if let Some(gb) = body.storage_offered_gb { cfg.storage_offered_gb = gb; cfg.reward_per_day = calc_reward_per_day(gb); }
+    if let Some(peers) = body.seed_peers { cfg.seed_peers = peers.into_iter().filter(|p| !p.trim().is_empty()).collect(); }
+    if let Some(p) = body.http_port { cfg.http_port = p; }
+    if let Some(p) = body.p2p_port { cfg.p2p_port = p; }
+    if let Some(d) = body.data_dir { if !d.trim().is_empty() { cfg.data_dir = d; } }
+    let _ = write_env_file(&cfg);
+    let _ = cfg.save();
+    Json(ApiResult { ok: true, error: None, token: None })
+}
+
+// ─── API: Send STONE ────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct SendReq { to: String, amount: f64 }
+
+#[derive(Serialize)]
+struct SendResp {
+    ok: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tx_hash: Option<String>,
+}
+
+async fn api_send(
+    State(state): State<SetupState>,
+    Json(body): Json<SendReq>,
+) -> (StatusCode, Json<SendResp>) {
+    let to = body.to.trim().to_string();
+    if to.is_empty() || to.len() != 64 {
+        return (StatusCode::BAD_REQUEST, Json(SendResp {
+            ok: false, error: Some("Ungültige Empfänger-Adresse (64 hex Zeichen)".into()), tx_hash: None,
+        }));
+    }
+    if body.amount <= 0.0 {
+        return (StatusCode::BAD_REQUEST, Json(SendResp {
+            ok: false, error: Some("Betrag muss > 0 sein".into()), tx_hash: None,
+        }));
+    }
+
+    // Balance aus Node-Ledger prüfen (falls Node läuft)
+    let ns = state.node_state.read().await;
+    let real_balance = if let Some(ref ns) = *ns {
+        let cfg = state.config.read().await;
+        let addr = cfg.wallet_address.clone();
+        drop(cfg);
+        if !addr.is_empty() {
+            let ledger = ns.node.token_ledger.read().unwrap();
+            let d = ledger.balance(&addr);
+            d.to_string().parse::<f64>().unwrap_or(0.0)
+        } else { 0.0 }
+    } else { -1.0 }; // -1 = Node nicht gestartet
+    drop(ns);
+
+    let cfg = state.config.read().await;
+    let check_bal = if real_balance >= 0.0 { real_balance } else { cfg.wallet_balance };
+    if body.amount > check_bal {
+        return (StatusCode::BAD_REQUEST, Json(SendResp {
+            ok: false, error: Some(format!("Nicht genug Guthaben ({:.4} STONE)", cfg.wallet_balance)), tx_hash: None,
+        }));
+    }
+    drop(cfg);
+    let tx_hash = generate_hex(32);
+    let mut cfg = state.config.write().await;
+    cfg.wallet_balance -= body.amount;
+    let _ = cfg.save();
+    (StatusCode::OK, Json(SendResp { ok: true, error: None, tx_hash: Some(tx_hash) }))
+}
+
+// ─── Wallet-Generierung ────────────────────────────────────────────────────
+
+fn generate_wallet_12() -> (String, String) {
+    use bip39::Mnemonic;
+    use ed25519_dalek::SigningKey;
+    let mnemonic = Mnemonic::generate(12).expect("Mnemonic generation failed");
+    let phrase = mnemonic.to_string();
+    let entropy = mnemonic.to_entropy();
+    let key_bytes: [u8; 32] = Sha256::digest(&entropy).into();
+    let signing_key = SigningKey::from_bytes(&key_bytes);
+    let public_key = signing_key.verifying_key();
+    let wallet_address = hex::encode(public_key.to_bytes());
+    (phrase, wallet_address)
+}
+
+// ─── .env Schreiben ─────────────────────────────────────────────────────────
+
+fn write_env_file(cfg: &NodeConfig) -> anyhow::Result<()> {
+    let seed_str = cfg.seed_peers.join(",");
+    let seed_line = if seed_str.is_empty() {
+        "# STONE_SEED_NODES=".to_string()
+    } else {
+        format!("STONE_SEED_NODES={}", seed_str)
+    };
+    let content = format!(
+"# Stone Node — generiert von stone-setup
+# Erstellt: {}
+# Node: {}
+
+STONE_DATA_DIR={}
+STONE_PORT={}
+STONE_NODE_NAME={}
+STONE_NODE_ID={}
+STONE_CLUSTER_API_KEY={}
+STONE_API_KEY={}
+STONE_P2P_LISTEN=/ip4/0.0.0.0/tcp/{}
+STONE_P2P_PORT={}
+{}
+STONE_P2P_PSK_DISABLED=1
+STONE_NODE_WALLET={}
+STONE_STORAGE_GB={}
+STONE_PUBLIC_IP={}
+",
+        cfg.created_at, cfg.node_name,
+        cfg.data_dir, cfg.http_port,
+        cfg.node_name, cfg.node_name,
+        cfg.api_key, cfg.api_key,
+        cfg.p2p_port, cfg.p2p_port,
+        seed_line, cfg.wallet_address,
+        cfg.storage_offered_gb, cfg.public_ip,
+    );
+    std::fs::write(".env", content)?;
+    Ok(())
+}
+
+// ─── Public IP ──────────────────────────────────────────────────────────────
+
+async fn fetch_public_ip() -> Option<String> {
+    let services = [
+        "https://api.ipify.org",
+        "https://ifconfig.me/ip",
+        "https://icanhazip.com",
+    ];
+    for url in &services {
+        if let Ok(resp) = reqwest::get(*url).await {
+            if let Ok(ip) = resp.text().await {
+                let ip = ip.trim().to_string();
+                if !ip.is_empty() && ip.len() < 50 { return Some(ip); }
+            }
+        }
+    }
+    None
+}
+
+// ─── Helpers ────────────────────────────────────────────────────────────────
+
+fn double_sha256(input: &str) -> String {
+    let first = Sha256::digest(input.as_bytes());
+    let second = Sha256::digest(&first);
+    hex::encode(second)
+}
+
+fn generate_token() -> String {
+    use rand::Rng;
+    let bytes: Vec<u8> = (0..32).map(|_| rand::thread_rng().gen()).collect();
+    hex::encode(bytes)
+}
+
+fn generate_hex(n: usize) -> String {
+    use rand::Rng;
+    let bytes: Vec<u8> = (0..n).map(|_| rand::thread_rng().gen()).collect();
+    hex::encode(bytes)
+}
+
+fn get_local_ip() -> Option<String> {
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    Some(socket.local_addr().ok()?.ip().to_string())
+}
+
+fn pad_right(s: &str, width: usize) -> String {
+    if s.len() >= width { s.to_string() }
+    else { format!("{}{}", s, " ".repeat(width - s.len())) }
+}
+
+fn dir_size(path: &Path) -> u64 {
+    if !path.exists() { return 0; }
+    let mut total = 0u64;
+    if let Ok(entries) = std::fs::read_dir(path) {
+        for entry in entries.flatten() {
+            if let Ok(m) = entry.metadata() {
+                if m.is_file() { total += m.len(); }
+                else if m.is_dir() { total += dir_size(&entry.path()); }
+            }
+        }
+    }
+    total
+}
+
+fn human_bytes(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+    if bytes >= GB { format!("{:.2} GB", bytes as f64 / GB as f64) }
+    else if bytes >= MB { format!("{:.2} MB", bytes as f64 / MB as f64) }
+    else if bytes >= KB { format!("{:.2} KB", bytes as f64 / KB as f64) }
+    else { format!("{} B", bytes) }
+}
+
+fn print_banner() {
+    eprintln!("\x1b[36;1m");
+    eprintln!(r"  ███████╗████████╗ ██████╗ ███╗   ██╗███████╗");
+    eprintln!(r"  ██╔════╝╚══██╔══╝██╔═══██╗████╗  ██║██╔════╝");
+    eprintln!(r"  ███████╗   ██║   ██║   ██║██╔██╗ ██║█████╗  ");
+    eprintln!(r"  ╚════██║   ██║   ██║   ██║██║╚██╗██║██╔══╝  ");
+    eprintln!(r"  ███████║   ██║   ╚██████╔╝██║ ╚████║███████╗");
+    eprintln!(r"  ╚══════╝   ╚═╝    ╚═════╝ ╚═╝  ╚═══╝╚══════╝");
+    eprintln!("\x1b[0m");
+    eprintln!("  \x1b[1mStone Node — Unified Binary (Setup + Full Node)\x1b[0m");
+    eprintln!("  \x1b[2m──────────────────────────────────────────────────\x1b[0m");
+}
