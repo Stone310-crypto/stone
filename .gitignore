@@ -42,3 +42,13 @@ ca/
 *.orig
 flycheck*/
 
+/stone_data/chain_db/
+/stone_data/chunks/
+/stone_data/keys/
+/stone_data/p2p.key
+/stone_data/p2p_config.json
+/stone_data/validators.json
+/stone_data/users.json
+/stone_data/chain.bin
+/stone_data
+
