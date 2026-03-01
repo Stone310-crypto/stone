@@ -22,6 +22,14 @@ path = "src/bin/db_dump.rs"
 name = "stone-setup"
 path = "src/bin/setup.rs"
 
+[[bin]]
+name = "stone-keygen"
+path = "src/bin/stone_keygen.rs"
+
+[[bin]]
+name = "stone-publish-update"
+path = "src/bin/stone_publish_update.rs"
+
 # ─── Abhängigkeiten ───────────────────────────────────────────────────────────
 [dependencies]
 # Serialisierung

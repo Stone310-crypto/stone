@@ -3,11 +3,11 @@
     "url": "http://100.90.28.68:8080",
     "name": "12D3KooWLqik",
     "ca": null,
-    "status": "Healthy",
-    "last_seen": 1772326751,
-    "last_hash": "c3a47198440a5d69e7f7a97bf57c256dfa3cb6c764baddaa7d000d2b5b6c6c6c",
-    "block_height": 5,
-    "latency_ms": 157,
+    "status": "Unreachable",
+    "last_seen": 0,
+    "last_hash": null,
+    "block_height": 0,
+    "latency_ms": null,
     "sync_failures": 0
   },
   {

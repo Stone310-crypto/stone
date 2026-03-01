@@ -357,6 +357,21 @@ async fn main() {
                                     }
                                 }
 
+                                // ── Update-Events ──────────────────────────────────
+                                NetworkEvent::UpdateManifestReceived { manifest_json, from_peer } => {
+                                    match serde_json::from_slice::<stone::updater::UpdateManifest>(&manifest_json) {
+                                        Ok(manifest) => {
+                                            println!(
+                                                "[updater] 🆕 Update v{} von Peer {} empfangen",
+                                                manifest.version,
+                                                &from_peer[..12.min(from_peer.len())]
+                                            );
+                                            // TODO: integrate with state.updater when available
+                                        }
+                                        Err(e) => eprintln!("[updater] Manifest-Parse: {e}"),
+                                    }
+                                }
+
                                 _ => {} // PeerConnected, Listening etc.
                                 }
                             }
@@ -392,6 +407,11 @@ async fn main() {
         api_key: api_key.clone(),
         network: network_handle,
         rate_limits,
+        updater: Arc::new(std::sync::RwLock::new({
+            let mut um = stone::updater::UpdateManager::new(&stone::blockchain::data_dir());
+            um.load_persisted_update();
+            um
+        })),
     };
 
     let router = build_router(state);

@@ -8,3 +8,4 @@ pub mod psk;
 pub mod shard;
 pub mod storage;
 pub mod token;
+pub mod updater;

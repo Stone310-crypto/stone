@@ -2,7 +2,7 @@
 
 use sha2::{Digest, Sha256};
 use std::{
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
     time::Duration,
 };
 use stone::{
@@ -11,6 +11,7 @@ use stone::{
     master_node::{MasterNodeState, PeerInfo, TrustEntry, TrustVote},
     network::NetworkHandle,
     storage::{ChunkStore, StoneStore},
+    updater::UpdateManager,
 };
 
 use super::rate_limiter::RateLimits;
@@ -35,6 +36,8 @@ pub struct AppState {
     pub network: Option<NetworkHandle>,
     /// Rate Limiter für verschiedene Endpoints
     pub rate_limits: Arc<RateLimits>,
+    /// OTA Update Manager
+    pub updater: Arc<RwLock<UpdateManager>>,
 }
 
 // ─── API-Key laden ────────────────────────────────────────────────────────────

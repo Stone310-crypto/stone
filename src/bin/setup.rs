@@ -301,6 +301,13 @@ async fn start_full_node(state: SetupState) {
         });
     }
 
+    // OTA Update Manager
+    let updater = Arc::new(std::sync::RwLock::new({
+        let mut um = stone::updater::UpdateManager::new(&data_dir());
+        um.load_persisted_update();
+        um
+    }));
+
     // P2P starten
     let network_handle: Option<NetworkHandle> =
         if std::env::var("STONE_P2P_DISABLED").as_deref() == Ok("1") {
@@ -325,9 +332,10 @@ async fn start_full_node(state: SetupState) {
                     let node_bg = node.clone();
                     let handle_bg = handle.clone();
                     let api_key_bg = api_key.clone();
+                    let updater_bg = updater.clone();
                     tokio::spawn(async move {
                         while let Ok(event) = event_rx.recv().await {
-                            handle_p2p_event(event, &node_bg, &handle_bg, &api_key_bg).await;
+                            handle_p2p_event(event, &node_bg, &handle_bg, &api_key_bg, Some(&updater_bg)).await;
                         }
                     });
                 }
@@ -407,6 +415,7 @@ async fn start_full_node(state: SetupState) {
         api_key,
         network: network_handle,
         rate_limits,
+        updater: updater.clone(),
     };
 
     *state.node_state.write().await = Some(node_app_state);
@@ -420,6 +429,7 @@ async fn handle_p2p_event(
     node: &Arc<MasterNodeState>,
     handle: &NetworkHandle,
     api_key: &Arc<String>,
+    updater: Option<&Arc<std::sync::RwLock<stone::updater::UpdateManager>>>,
 ) {
     match event {
         NetworkEvent::BlockReceived { block, from_peer } => {
@@ -553,6 +563,78 @@ async fn handle_p2p_event(
                 &chunk_hash[..8.min(chunk_hash.len())], shard_index,
                 &peer_id[..8.min(peer_id.len())]
             );
+        }
+
+        // ── Update-Events ─────────────────────────────────────────────────────
+        NetworkEvent::UpdateManifestReceived { manifest_json, from_peer } => {
+            if let Some(updater_ref) = updater {
+                match serde_json::from_slice::<stone::updater::UpdateManifest>(&manifest_json) {
+                    Ok(manifest) => {
+                        let mut um = updater_ref.write().unwrap();
+                        match um.receive_manifest(manifest.clone()) {
+                            Ok(true) => {
+                                println!(
+                                    "[updater] 🆕 Update v{} von Peer {} empfangen",
+                                    manifest.version,
+                                    &from_peer[..12.min(from_peer.len())]
+                                );
+                                // Auto-Download starten
+                                if um.config.auto_download {
+                                    let peer_urls: Vec<String> = node.get_peers()
+                                        .iter()
+                                        .map(|p| p.url.clone())
+                                        .collect();
+                                    let missing = um.missing_chunks();
+                                    drop(um); // Lock freigeben
+
+                                    if !missing.is_empty() {
+                                        let updater_clone = updater_ref.clone();
+                                        let node_clone = node.clone();
+                                        tokio::spawn(async move {
+                                            let client = reqwest::Client::builder()
+                                                .danger_accept_invalid_certs(true)
+                                                .timeout(std::time::Duration::from_secs(30))
+                                                .build()
+                                                .unwrap();
+                                            for idx in missing {
+                                                for url in &peer_urls {
+                                                    let chunk_url = format!(
+                                                        "{}/api/v1/updates/chunk/{}",
+                                                        url.trim_end_matches('/'), idx
+                                                    );
+                                                    if let Ok(resp) = client.get(&chunk_url).send().await {
+                                                        if resp.status().is_success() {
+                                                            if let Ok(data) = resp.bytes().await {
+                                                                let mut um = updater_clone.write().unwrap();
+                                                                if um.store_chunk(idx, data.to_vec()).is_ok() {
+                                                                    println!("[updater] ✓ Chunk {idx} heruntergeladen");
+                                                                    break;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            // Verifizieren
+                                            let mut um = updater_clone.write().unwrap();
+                                            if um.missing_chunks().is_empty() {
+                                                if let Err(e) = um.verify_and_prepare() {
+                                                    eprintln!("[updater] Verifizierung: {e}");
+                                                }
+                                            }
+                                        });
+                                    }
+                                }
+                            }
+                            Ok(false) => {} // Bereits bekannt oder nicht neuer
+                            Err(e) => eprintln!("[updater] Manifest abgelehnt: {e}"),
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[updater] Manifest-Deserialisierung: {e}");
+                    }
+                }
+            }
         }
 
         // ── Peer-Discovery → HTTP-Peer auto-registrieren ─────────────────

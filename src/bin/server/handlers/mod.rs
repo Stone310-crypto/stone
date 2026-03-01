@@ -10,5 +10,6 @@ pub mod poa;
 pub mod status;
 pub mod token;
 pub mod trust;
+pub mod updates;
 pub mod users;
 pub mod ws;

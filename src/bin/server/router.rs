@@ -41,6 +41,10 @@ use super::handlers::{
         handle_trust_pending, handle_trust_registry, handle_trust_request,
         handle_trust_revoke,
     },
+    updates::{
+        handle_update_chunk, handle_update_config, handle_update_download,
+        handle_update_install, handle_update_publish, handle_update_status,
+    },
     users::{handle_delete_user, handle_list_users},
     ws::handle_websocket,
 };
@@ -166,6 +170,13 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/wallet/:address/rotations", get(handle_wallet_rotations))
         .route("/api/v1/wallet/:address", get(handle_wallet_info))
         .route("/api/v1/wallet/:address/balance", get(handle_wallet_balance))
+        // ─── OTA Updates ─────────────────────────────────────────────────────
+        .route("/api/v1/updates/status", get(handle_update_status))
+        .route("/api/v1/updates/chunk/:index", get(handle_update_chunk))
+        .route("/api/v1/updates/publish", post(handle_update_publish))
+        .route("/api/v1/updates/install", post(handle_update_install))
+        .route("/api/v1/updates/download", post(handle_update_download))
+        .route("/api/v1/updates/config", post(handle_update_config))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
         .layer(build_cors())
         .with_state(state)

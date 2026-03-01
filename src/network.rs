@@ -353,6 +353,13 @@ pub enum NetworkEvent {
         tx: Box<crate::token::TokenTx>,
         from_peer: String,
     },
+
+    // ── Update-Events ─────────────────────────────────────────────────────
+    /// Ein Update-Manifest wurde per Gossipsub empfangen
+    UpdateManifestReceived {
+        manifest_json: Vec<u8>,
+        from_peer: String,
+    },
 }
 
 /// Befehle die von außen an den Swarm-Task gesendet werden.
@@ -400,6 +407,12 @@ pub enum NetworkCommand {
         peer_id: PeerId,
         chunk_hash: String,
         reply: tokio::sync::oneshot::Sender<Vec<u8>>,
+    },
+
+    /// Generische Gossipsub-Nachricht publizieren (z.B. Update-Manifest)
+    PublishGossip {
+        topic: gossipsub::TopicHash,
+        data: Vec<u8>,
     },
 }
 
@@ -1264,6 +1277,12 @@ impl SwarmTask {
                     self.handle_sync_handshake(message.data, propagation_source);
                 } else if topic == TOPIC_MEMPOOL {
                     self.handle_gossip_tx(message.data, propagation_source);
+                } else if topic == crate::updater::TOPIC_UPDATES {
+                    println!("[p2p] 🆕 Update-Manifest von {propagation_source} empfangen");
+                    let _ = self.event_tx.send(NetworkEvent::UpdateManifestReceived {
+                        manifest_json: message.data,
+                        from_peer: propagation_source.to_string(),
+                    });
                 } else {
                     let _ = message_id; // acknowledged
                 }
@@ -2118,6 +2137,21 @@ impl SwarmTask {
                 self.pending_shard_lists.insert(req_id, (chunk_hash, reply));
                 false
             }
+
+            NetworkCommand::PublishGossip { topic, data } => {
+                match self.swarm.behaviour_mut().gossipsub.publish(topic.clone(), data) {
+                    Ok(_) => {
+                        println!("[p2p] 📡 Gossip auf Topic {topic} gesendet");
+                    }
+                    Err(gossipsub::PublishError::InsufficientPeers) => {
+                        println!("[p2p] Gossip {topic} – keine Peers, übersprungen");
+                    }
+                    Err(e) => {
+                        eprintln!("[p2p] Gossip-Fehler auf {topic}: {e}");
+                    }
+                }
+                false
+            }
         }
     }
 }
@@ -2136,7 +2170,7 @@ struct SyncHandshake {
 // ─── Gossipsub: Topics abonnieren ─────────────────────────────────────────────
 
 fn subscribe_all_topics(gossipsub: &mut gossipsub::Behaviour) -> Result<(), String> {
-    for topic in [TOPIC_BLOCKS, TOPIC_PEERS, TOPIC_SYNC_HANDSHAKE, TOPIC_MEMPOOL] {
+    for topic in [TOPIC_BLOCKS, TOPIC_PEERS, TOPIC_SYNC_HANDSHAKE, TOPIC_MEMPOOL, crate::updater::TOPIC_UPDATES] {
         gossipsub.subscribe(&IdentTopic::new(topic))
             .map_err(|e| format!("Subscribe '{topic}': {e}"))?;
     }
@@ -2165,6 +2199,12 @@ impl NetworkHandle {
     /// Broadcastet eine Token-TX per Gossipsub an alle Peers.
     pub async fn broadcast_tx(&self, tx: crate::token::TokenTx) {
         let _ = self.cmd_tx.send(NetworkCommand::BroadcastTx(Box::new(tx))).await;
+    }
+
+    /// Publiziert eine generische Nachricht auf einem Gossipsub-Topic.
+    pub async fn publish_gossip(&self, topic: &str, data: Vec<u8>) {
+        let topic_hash = IdentTopic::new(topic).hash();
+        let _ = self.cmd_tx.send(NetworkCommand::PublishGossip { topic: topic_hash, data }).await;
     }
 
     /// Wählt einen Peer manuell an.
