@@ -10,6 +10,11 @@
 //!   GET    /api/v1/wallet/:address/balance      – Balance eines Accounts
 //!   GET    /api/v1/wallet/:address              – Vollständige Account-Info
 //!   POST   /api/v1/wallet/create               – Neues Ed25519-Wallet generieren
+//!   POST   /api/v1/token/stake                  – Token staken
+//!   POST   /api/v1/token/unstake                – Token unstaken
+//!   GET    /api/v1/staking/info                 – Staking-Pool Info
+//!   GET    /api/v1/staking/pool                 – Detaillierte Pool-Statistiken
+//!   GET    /api/v1/staking/staker/:address      – Staker-spezifische Info
 
 use axum::{
     Json,
@@ -142,13 +147,15 @@ pub async fn handle_token_transfer(
 ) -> impl IntoResponse {
     let tx = req.tx;
 
-    // Nur Transfers, Burns und Key-Rotations erlauben (Mint/Reward kommen nur vom System)
-    if tx.tx_type != TxType::Transfer && tx.tx_type != TxType::Burn && tx.tx_type != TxType::RotateKey {
+    // Nur Transfers, Burns, Key-Rotations, Stake und Unstake erlauben (Mint/Reward kommen nur vom System)
+    if tx.tx_type != TxType::Transfer && tx.tx_type != TxType::Burn && tx.tx_type != TxType::RotateKey
+        && tx.tx_type != TxType::Stake && tx.tx_type != TxType::Unstake
+    {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "ok": false,
-                "error": "Nur Transfer-, Burn- und RotateKey-Transaktionen können eingereicht werden",
+                "error": "Nur Transfer-, Burn-, RotateKey-, Stake- und Unstake-Transaktionen können eingereicht werden",
             })),
         );
     }
@@ -691,5 +698,174 @@ pub async fn handle_token_send(
                 })),
             )
         }
+    }
+}
+
+// ─── Staking API-Handler ─────────────────────────────────────────────────────
+
+/// POST /api/v1/token/stake
+///
+/// Nimmt eine bereits signierte Stake-TX entgegen und schiebt sie in den Mempool.
+pub async fn handle_token_stake(
+    State(state): State<AppState>,
+    Json(req): Json<TransferRequest>,
+) -> impl IntoResponse {
+    let tx = req.tx;
+
+    if tx.tx_type != TxType::Stake {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "TX-Typ muss 'Stake' sein",
+            })),
+        );
+    }
+
+    // In Mempool aufnehmen
+    let result = {
+        let ledger = state.node.token_ledger.read().unwrap();
+        state.node.mempool.add_tx(tx.clone(), Some(&ledger))
+    };
+
+    match result {
+        Ok(()) => {
+            if let Some(ref net) = state.network {
+                let net = net.clone();
+                let tx_clone = tx.clone();
+                tokio::spawn(async move { net.broadcast_tx(tx_clone).await; });
+            }
+            (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "status": "pending",
+                    "tx_id": tx.tx_id,
+                    "from": tx.from,
+                    "amount": tx.amount.to_string(),
+                    "message": "Stake-TX im Mempool – wird beim nächsten Block verarbeitet",
+                })),
+            )
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
+        ),
+    }
+}
+
+/// POST /api/v1/token/unstake
+///
+/// Nimmt eine bereits signierte Unstake-TX entgegen und schiebt sie in den Mempool.
+pub async fn handle_token_unstake(
+    State(state): State<AppState>,
+    Json(req): Json<TransferRequest>,
+) -> impl IntoResponse {
+    let tx = req.tx;
+
+    if tx.tx_type != TxType::Unstake {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "TX-Typ muss 'Unstake' sein",
+            })),
+        );
+    }
+
+    let result = {
+        let ledger = state.node.token_ledger.read().unwrap();
+        state.node.mempool.add_tx(tx.clone(), Some(&ledger))
+    };
+
+    match result {
+        Ok(()) => {
+            if let Some(ref net) = state.network {
+                let net = net.clone();
+                let tx_clone = tx.clone();
+                tokio::spawn(async move { net.broadcast_tx(tx_clone).await; });
+            }
+            (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "status": "pending",
+                    "tx_id": tx.tx_id,
+                    "from": tx.from,
+                    "amount": tx.amount.to_string(),
+                    "lock_period_days": 7,
+                    "message": "Unstake-TX im Mempool – 7 Tage Lock-Periode nach Verarbeitung",
+                })),
+            )
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
+        ),
+    }
+}
+
+/// GET /api/v1/staking/info
+///
+/// Öffentliche Staking-Pool-Übersicht: Gesamt-Stake, APY, Epoch, etc.
+pub async fn handle_staking_info(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let pool = state.node.staking_pool.read().unwrap();
+    let reward_pool_balance = {
+        let ledger = state.node.token_ledger.read().unwrap();
+        ledger.balance("pool:storage_rewards")
+    };
+
+    let info = pool.pool_info(reward_pool_balance);
+    (StatusCode::OK, Json(serde_json::json!(info)))
+}
+
+/// GET /api/v1/staking/pool
+///
+/// Detaillierte Pool-Statistiken inkl. Top-Staker.
+pub async fn handle_staking_pool(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let pool = state.node.staking_pool.read().unwrap();
+    let reward_pool_balance = {
+        let ledger = state.node.token_ledger.read().unwrap();
+        ledger.balance("pool:storage_rewards")
+    };
+
+    let info = pool.pool_info(reward_pool_balance);
+    let top_stakers = pool.top_stakers(20);
+
+    (StatusCode::OK, Json(serde_json::json!({
+        "pool": info,
+        "top_stakers": top_stakers,
+        "unstake_queue_size": pool.unstake_queue.len(),
+    })))
+}
+
+/// GET /api/v1/staking/staker/:address
+///
+/// Staker-spezifische Informationen.
+pub async fn handle_staker_info(
+    State(state): State<AppState>,
+    Path(address): Path<String>,
+) -> impl IntoResponse {
+    let pool = state.node.staking_pool.read().unwrap();
+
+    match pool.staker_info(&address) {
+        Some(info) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "staker": info,
+            })),
+        ),
+        None => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "Adresse hat keinen aktiven Stake",
+            })),
+        ),
     }
 }

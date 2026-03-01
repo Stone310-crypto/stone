@@ -307,6 +307,7 @@ async fn start_full_node(state: SetupState) {
 
     // Hintergrund-Tasks
     MasterNodeState::start_heartbeat(node.clone(), HEARTBEAT_INTERVAL);
+    MasterNodeState::start_mining_loop(node.clone());
     spawn_auto_sync_task(node.clone(), api_key.clone(), users.clone());
 
     // Mempool-Eviction

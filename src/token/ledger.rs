@@ -442,6 +442,7 @@ impl TokenLedger {
         // 3. Nonce-Prüfung (nur für Nutzer-Transaktionen)
         if tx.tx_type == TxType::Transfer || tx.tx_type == TxType::Burn || tx.tx_type == TxType::RotateKey
             || tx.tx_type == TxType::AccountRegister || tx.tx_type == TxType::AccountUpdate
+            || tx.tx_type == TxType::Stake || tx.tx_type == TxType::Unstake
         {
             // Prüfen ob der Key durch Rotation invalidiert wurde
             if let Some(active) = self.resolve_active_key(&tx.from) {
@@ -516,6 +517,53 @@ impl TokenLedger {
                         }
                     }
                 }
+                // Nonce erhöhen
+                *self.nonces.entry(tx.from.clone()).or_insert(0) += 1;
+            }
+            TxType::Stake => {
+                // from = Staker-Wallet, to = "pool:staking", amount = Stake-Betrag
+                // Balance vom Staker abziehen und auf pool:staking gutschreiben
+                let total_debit = tx.amount + tx.fee;
+                let balance = self.balance(&tx.from);
+                if balance < total_debit {
+                    return Err(LedgerError::InsufficientBalance {
+                        account: tx.from.clone(),
+                        available: balance,
+                        required: total_debit,
+                    });
+                }
+                *self.balances.entry(tx.from.clone()).or_insert(Decimal::ZERO) -= total_debit;
+                *self.balances.entry(super::staking::STAKING_POOL_ADDRESS.to_string()).or_insert(Decimal::ZERO) += tx.amount;
+                if tx.fee > Decimal::ZERO {
+                    self.total_supply -= tx.fee; // Fee wird verbrannt
+                }
+                // Nonce erhöhen
+                *self.nonces.entry(tx.from.clone()).or_insert(0) += 1;
+            }
+            TxType::Unstake => {
+                // from = Staker-Wallet, to = "pool:staking", amount = Unstake-Betrag
+                // Balance vom pool:staking abziehen (wird nach Lock-Periode an Wallet gutgeschrieben)
+                let pool_balance = self.balance(super::staking::STAKING_POOL_ADDRESS);
+                if pool_balance < tx.amount {
+                    return Err(LedgerError::InsufficientBalance {
+                        account: super::staking::STAKING_POOL_ADDRESS.to_string(),
+                        available: pool_balance,
+                        required: tx.amount,
+                    });
+                }
+                *self.balances.entry(super::staking::STAKING_POOL_ADDRESS.to_string()).or_insert(Decimal::ZERO) -= tx.amount;
+                // Fee abziehen und verbrennen
+                if tx.fee > Decimal::ZERO {
+                    let balance = self.balance(&tx.from);
+                    if balance >= tx.fee {
+                        *self.balances.entry(tx.from.clone()).or_insert(Decimal::ZERO) -= tx.fee;
+                        self.total_supply -= tx.fee;
+                    }
+                }
+                // Betrag geht zunächst auf ein Escrow (in der Lock-Queue) –
+                // der StakingPool verwaltet die Lock-Periode und gibt frei.
+                // Hier buchen wir den Betrag temporär auf eine Escrow-Adresse.
+                *self.balances.entry(format!("escrow:unstake:{}", tx.from)).or_insert(Decimal::ZERO) += tx.amount;
                 // Nonce erhöhen
                 *self.nonces.entry(tx.from.clone()).or_insert(0) += 1;
             }
@@ -764,5 +812,43 @@ impl TokenLedger {
 impl Default for TokenLedger {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl TokenLedger {
+    /// Gibt freigegebene Unstake-Beträge aus dem Escrow an die Wallets zurück.
+    ///
+    /// Wird vom Mining-Loop aufgerufen nachdem der StakingPool matured Unstakes
+    /// zurückgibt.
+    pub fn release_unstake_escrow(&mut self, address: &str, amount: Decimal) {
+        let escrow_key = format!("escrow:unstake:{}", address);
+        let escrow_balance = self.balance(&escrow_key);
+        let release = amount.min(escrow_balance);
+
+        if release > Decimal::ZERO {
+            *self.balances.entry(escrow_key).or_insert(Decimal::ZERO) -= release;
+            *self.balances.entry(address.to_string()).or_insert(Decimal::ZERO) += release;
+            println!(
+                "[token] 🔓 Unstake-Escrow: {} STONE → {}",
+                release, &address[..12.min(address.len())]
+            );
+        }
+    }
+
+    /// Gutschreibung von Staking-Rewards aus pool:storage_rewards.
+    ///
+    /// Transferiert `amount` von pool:storage_rewards auf die Ziel-Wallet.
+    pub fn credit_staking_reward(&mut self, address: &str, amount: Decimal) -> Result<(), LedgerError> {
+        let pool_balance = self.balance("pool:storage_rewards");
+        if pool_balance < amount {
+            return Err(LedgerError::InsufficientBalance {
+                account: "pool:storage_rewards".to_string(),
+                available: pool_balance,
+                required: amount,
+            });
+        }
+        *self.balances.entry("pool:storage_rewards".to_string()).or_insert(Decimal::ZERO) -= amount;
+        *self.balances.entry(address.to_string()).or_insert(Decimal::ZERO) += amount;
+        Ok(())
     }
 }

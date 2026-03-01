@@ -53,6 +53,12 @@ pub enum TxType {
     /// `from` = wallet_address, `to` = wallet_address,
     /// `memo` = JSON mit geänderten Feldern, amount = 0
     AccountUpdate,
+    /// Token in den Staking-Pool einzahlen.
+    /// `from` = Staker-Wallet, `to` = "pool:staking", `amount` = Stake-Betrag
+    Stake,
+    /// Token aus dem Staking-Pool auszahlen (nach Lock-Periode).
+    /// `from` = Staker-Wallet, `to` = "pool:staking", `amount` = Unstake-Betrag
+    Unstake,
 }
 
 impl std::fmt::Display for TxType {
@@ -65,6 +71,8 @@ impl std::fmt::Display for TxType {
             TxType::RotateKey       => write!(f, "rotate_key"),
             TxType::AccountRegister => write!(f, "account_register"),
             TxType::AccountUpdate   => write!(f, "account_update"),
+            TxType::Stake           => write!(f, "stake"),
+            TxType::Unstake         => write!(f, "unstake"),
         }
     }
 }
@@ -214,6 +222,11 @@ pub fn create_signed_tx(
         if amount != Decimal::ZERO {
             return Err(TxError::InvalidAmount(format!("{tx_type}: Betrag muss 0 sein")));
         }
+    } else if tx_type == TxType::Stake || tx_type == TxType::Unstake {
+        // Stake/Unstake: amount muss positiv sein, to wird auf pool:staking gesetzt
+        if amount <= Decimal::ZERO {
+            return Err(TxError::InvalidAmount("Stake-Betrag muss positiv sein".into()));
+        }
     } else if amount <= Decimal::ZERO {
         return Err(TxError::InvalidAmount("Betrag muss positiv sein".into()));
     }
@@ -318,6 +331,10 @@ pub fn validate_tx(tx: &TokenTx) -> Result<(), TxError> {
     if tx.tx_type == TxType::RotateKey || tx.tx_type == TxType::AccountRegister || tx.tx_type == TxType::AccountUpdate {
         if tx.amount != Decimal::ZERO {
             return Err(TxError::InvalidAmount(format!("{}: Betrag muss 0 sein", tx.tx_type)));
+        }
+    } else if tx.tx_type == TxType::Stake || tx.tx_type == TxType::Unstake {
+        if tx.amount <= Decimal::ZERO {
+            return Err(TxError::InvalidAmount("Stake-Betrag muss positiv sein".into()));
         }
     } else if tx.amount <= Decimal::ZERO {
         return Err(TxError::InvalidAmount("Betrag muss positiv sein".into()));
