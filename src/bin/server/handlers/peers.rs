@@ -13,13 +13,11 @@ use super::super::auth_middleware::require_admin;
 use super::super::state::{save_peers, AppState};
 use super::super::sync::pull_from_peer;
 
-/// GET /api/v1/peers
+/// GET /api/v1/peers (öffentlich)
 pub async fn handle_list_peers(
-    headers: HeaderMap,
     State(state): State<AppState>,
-) -> Result<impl IntoResponse, Response> {
-    require_admin(&headers, &state)?;
-    Ok((StatusCode::OK, axum::Json(state.node.get_peers())))
+) -> impl IntoResponse {
+    (StatusCode::OK, axum::Json(state.node.get_peers()))
 }
 
 /// POST /api/v1/peers

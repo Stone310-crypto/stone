@@ -1,26 +1,24 @@
 //! P2P network handlers.
 
 use axum::{
-    extract::{State},
+    extract::State,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use serde_json::json;
 
-use super::super::auth_middleware::{require_admin, require_user};
+use super::super::auth_middleware::require_admin;
 use super::super::state::AppState;
 
-/// GET /api/v1/p2p/peers
+/// GET /api/v1/p2p/peers (öffentlich)
 pub async fn handle_p2p_peers(
-    headers: HeaderMap,
     State(state): State<AppState>,
-) -> Result<impl IntoResponse, Response> {
-    require_admin(&headers, &state)?;
+) -> impl IntoResponse {
     let peers = match &state.network {
         Some(h) => h.get_peers().await,
         None => vec![],
     };
-    Ok(axum::Json(json!({ "peers": peers, "count": peers.len() })))
+    axum::Json(json!({ "peers": peers, "count": peers.len() }))
 }
 
 /// POST /api/v1/p2p/dial
@@ -56,12 +54,10 @@ pub async fn handle_p2p_dial(
     }
 }
 
-/// GET /api/v1/p2p/info
+/// GET /api/v1/p2p/info (öffentlich)
 pub async fn handle_p2p_info(
-    headers: HeaderMap,
     State(state): State<AppState>,
-) -> Result<impl IntoResponse, Response> {
-    require_user(&headers, &state)?;
+) -> impl IntoResponse {
     let p2p_port: u16 = std::env::var("STONE_P2P_PORT")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -91,7 +87,7 @@ pub async fn handle_p2p_info(
         None => vec![],
     };
 
-    Ok(axum::Json(json!({
+    axum::Json(json!({
         "peer_id":          peer_id,
         "p2p_addr":         local_addr,
         "p2p_port":         p2p_port,
@@ -99,17 +95,15 @@ pub async fn handle_p2p_info(
         "psk_active":       psk_active,
         "psk_fingerprint":  psk_fingerprint,
         "listen_addrs":     listen_addrs,
-    })))
+    }))
 }
 
-/// GET /api/v1/p2p/config
+/// GET /api/v1/p2p/config (öffentlich)
 pub async fn handle_p2p_config(
-    headers: HeaderMap,
-    State(state): State<AppState>,
-) -> Result<impl IntoResponse, Response> {
-    require_admin(&headers, &state)?;
+    State(_state): State<AppState>,
+) -> impl IntoResponse {
     let config = stone::network::P2pConfig::load_or_default();
-    Ok(axum::Json(config))
+    axum::Json(config)
 }
 
 /// GET /api/v1/p2p/status

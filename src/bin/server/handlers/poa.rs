@@ -37,14 +37,12 @@ pub struct CastVoteRequest {
     pub reason: String,
 }
 
-/// GET /api/v1/validators
+/// GET /api/v1/validators (öffentlich)
 pub async fn handle_list_validators(
-    headers: HeaderMap,
     State(state): State<AppState>,
-) -> Result<impl IntoResponse, Response> {
-    require_admin(&headers, &state)?;
+) -> impl IntoResponse {
     let vs = state.node.validator_set.read().unwrap();
-    Ok((
+    (
         StatusCode::OK,
         axum::Json(json!({
             "validators": vs.validators,
@@ -52,7 +50,7 @@ pub async fn handle_list_validators(
             "supermajority_threshold": vs.supermajority_threshold(),
             "poa_active": !vs.validators.is_empty(),
         })),
-    ))
+    )
 }
 
 /// POST /api/v1/validators
@@ -197,13 +195,10 @@ pub async fn handle_validator_self(
     )
 }
 
-/// GET /api/v1/consensus/status
+/// GET /api/v1/consensus/status (öffentlich)
 pub async fn handle_consensus_status(
-    headers: HeaderMap,
     State(state): State<AppState>,
-) -> Result<impl IntoResponse, Response> {
-    require_admin(&headers, &state)?;
-
+) -> impl IntoResponse {
     let vs = state.node.validator_set.read().unwrap();
     let voting = state.node.active_voting.lock().unwrap();
 
@@ -224,7 +219,7 @@ pub async fn handle_consensus_status(
         json!({ "active": false })
     };
 
-    Ok((StatusCode::OK, axum::Json(status)))
+    (StatusCode::OK, axum::Json(status))
 }
 
 /// POST /api/v1/consensus/vote
@@ -299,13 +294,10 @@ pub async fn handle_cast_vote(
     ))
 }
 
-/// GET /api/v1/forks
+/// GET /api/v1/forks (öffentlich)
 pub async fn handle_detect_forks(
-    headers: HeaderMap,
     State(state): State<AppState>,
-) -> Result<impl IntoResponse, Response> {
-    require_admin(&headers, &state)?;
-
+) -> impl IntoResponse {
     let chain = state.node.chain.lock().unwrap();
     let vs = state.node.validator_set.read().unwrap();
 
@@ -322,13 +314,13 @@ pub async fn handle_detect_forks(
         }
     }
 
-    Ok((
+    (
         StatusCode::OK,
         axum::Json(json!({
             "forks_detected": fork_groups.len(),
             "fork_groups": fork_groups,
         })),
-    ))
+    )
 }
 
 /// POST /api/v1/forks/resolve

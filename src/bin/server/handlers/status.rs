@@ -2,13 +2,12 @@
 
 use axum::{
     extract::State,
-    http::{HeaderMap, StatusCode},
-    response::{IntoResponse, Response},
+    http::StatusCode,
+    response::IntoResponse,
 };
 use serde_json::json;
 use stone::master_node::NodeStatusResponse;
 
-use super::super::auth_middleware::require_admin;
 use super::super::state::AppState;
 
 /// GET /api/v1/health – Kein Auth erforderlich
@@ -41,12 +40,10 @@ pub async fn handle_info(State(state): State<AppState>) -> impl IntoResponse {
     )
 }
 
-/// GET /api/v1/status – Vollständiger Node-Status (Admin)
+/// GET /api/v1/status – Vollständiger Node-Status (öffentlich)
 pub async fn handle_status(
-    headers: HeaderMap,
     State(state): State<AppState>,
-) -> Result<impl IntoResponse, Response> {
-    require_admin(&headers, &state)?;
+) -> impl IntoResponse {
     let resp = NodeStatusResponse {
         node_id: state.node.node_id.clone(),
         role: format!("{:?}", state.node.role),
@@ -56,24 +53,20 @@ pub async fn handle_status(
         started_at: state.node.started_at,
         trust: state.node.trust_summary(),
     };
-    Ok((StatusCode::OK, axum::Json(resp)))
+    (StatusCode::OK, axum::Json(resp))
 }
 
 /// GET /api/v1/metrics
 pub async fn handle_metrics(
-    headers: HeaderMap,
     State(state): State<AppState>,
-) -> Result<impl IntoResponse, Response> {
-    require_admin(&headers, &state)?;
-    Ok((StatusCode::OK, axum::Json(state.node.snapshot_metrics())))
+) -> impl IntoResponse {
+    (StatusCode::OK, axum::Json(state.node.snapshot_metrics()))
 }
 
-/// GET /api/v1/network — P2P-Netzwerkstatus + Server-Ressourcen
+/// GET /api/v1/network — P2P-Netzwerkstatus + Server-Ressourcen (öffentlich)
 pub async fn handle_network_stats(
-    headers: HeaderMap,
     State(state): State<AppState>,
-) -> Result<impl IntoResponse, Response> {
-    require_admin(&headers, &state)?;
+) -> impl IntoResponse {
 
     let net = if let Some(h) = &state.network {
         h.get_status().await
@@ -170,7 +163,7 @@ pub async fn handle_network_stats(
         chain.blocks.len() as u64
     };
 
-    Ok((StatusCode::OK, axum::Json(json!({
+    (StatusCode::OK, axum::Json(json!({
         "p2p": {
             "enabled":          state.network.is_some(),
             "local_peer_id":    local_peer_id,
@@ -195,7 +188,7 @@ pub async fn handle_network_stats(
             "docs_uploaded":    m.documents_uploaded,
             "ws_connections":   m.ws_connections,
         }
-    }))))
+    })))
 }
 
 pub fn format_uptime(secs: u64) -> String {
@@ -214,29 +207,25 @@ pub fn format_uptime(secs: u64) -> String {
     }
 }
 
-/// GET /api/v1/chain/verify
+/// GET /api/v1/chain/verify (öffentlich)
 pub async fn handle_verify(
-    headers: HeaderMap,
     State(state): State<AppState>,
-) -> Result<impl IntoResponse, Response> {
-    require_admin(&headers, &state)?;
+) -> impl IntoResponse {
     let chain = state.node.chain.lock().unwrap();
     let valid = chain.verify(&state.node.cluster_key);
-    Ok((
+    (
         StatusCode::OK,
         axum::Json(json!({
             "valid": valid,
             "blocks": chain.blocks.len(),
         })),
-    ))
+    )
 }
 
-/// GET /api/v1/shards/health — Erasure-Coding Shard-Gesundheitsübersicht
+/// GET /api/v1/shards/health — Erasure-Coding Shard-Gesundheitsübersicht (öffentlich)
 pub async fn handle_shard_health(
-    headers: HeaderMap,
     State(state): State<AppState>,
-) -> Result<impl IntoResponse, Response> {
-    require_admin(&headers, &state)?;
+) -> impl IntoResponse {
 
     // 1. Lokale Shard-Statistik vom Dateisystem
     let local_stats = match stone::shard::ShardStore::new() {
@@ -339,7 +328,7 @@ pub async fn handle_shard_health(
         "no_ec_data"
     };
 
-    Ok((StatusCode::OK, axum::Json(json!({
+    (StatusCode::OK, axum::Json(json!({
         "status": overall_status,
         "local_store": local_stats,
         "blockchain": {
@@ -352,5 +341,5 @@ pub async fn handle_shard_health(
             "critical_chunks":    critical_chunks,
         },
         "documents": doc_details,
-    }))))
+    })))
 }

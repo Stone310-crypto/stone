@@ -1,0 +1,23 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Stone Node Deployment Config
+#
+# Jeder [[node]] Block ist ein Server, zu dem deployed wird.
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[node]]
+name    = "server1"
+host    = "100.90.28.68"
+user    = "root"
+port    = "22"
+path    = "/opt/stone-node/target/release"
+service = "stone-node"
+bins    = "stone-setup stone-master"
+
+[[node]]
+name    = "server2"
+host    = "100.95.171.71"
+user    = "root"
+port    = "22"
+path    = "/opt/stone-node/target/release"
+service = "stone-node"
+bins    = "stone-setup stone-master"

@@ -16,6 +16,7 @@ stone_data/p2p_config.json
 stone_data/validators.json
 stone_data/users.json
 stone_data/chain.bin
+stone_data/
 
 # ─── TLS-Zertifikate & PKI ───────────────────────────────────────────────────
 # Produzierte Certs gehören nicht ins Repo — nur Root-CA für dev kann committed werden

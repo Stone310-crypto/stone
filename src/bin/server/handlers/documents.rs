@@ -18,7 +18,7 @@ use stone::{
     },
 };
 
-use super::super::auth_middleware::{require_admin, require_user};
+use super::super::auth_middleware::require_user;
 use super::super::state::{chunk_data, erasure_code_document, reconstruct_document_data, AppState};
 
 // ─── Query structs ────────────────────────────────────────────────────────────
@@ -185,13 +185,11 @@ fn guess_mime_from_magic(data: &[u8]) -> String {
 
 // ─── Handlers ────────────────────────────────────────────────────────────────
 
-/// GET /api/v1/documents – Alle aktiven Dokumente (Admin)
+/// GET /api/v1/documents – Alle aktiven Dokumente (öffentlich, nur Metadaten)
 pub async fn handle_list_documents(
-    headers: HeaderMap,
     Query(q): Query<DocQuery>,
     State(state): State<AppState>,
-) -> Result<impl IntoResponse, Response> {
-    require_admin(&headers, &state)?;
+) -> impl IntoResponse {
     let chain = state.node.chain.lock().unwrap();
     let per_page = q.per_page.unwrap_or(50).min(500) as usize;
     let page = q.page.unwrap_or(0) as usize;
@@ -219,7 +217,7 @@ pub async fn handle_list_documents(
     let total = docs.len();
     let paginated: Vec<_> = docs.into_iter().skip(page * per_page).take(per_page).collect();
 
-    Ok((
+    (
         StatusCode::OK,
         axum::Json(json!({
             "total": total,
@@ -227,7 +225,7 @@ pub async fn handle_list_documents(
             "per_page": per_page,
             "documents": paginated,
         })),
-    ))
+    )
 }
 
 /// GET /api/v1/documents/user/:user_id
@@ -271,13 +269,11 @@ pub async fn handle_list_user_documents(
     ))
 }
 
-/// GET /api/v1/documents/:doc_id
+/// GET /api/v1/documents/:doc_id (öffentlich, nur Metadaten)
 pub async fn handle_get_document(
-    headers: HeaderMap,
     Path(doc_id): Path<String>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, Response> {
-    let user = require_user(&headers, &state)?;
     let chain = state.node.chain.lock().unwrap();
     let (doc, block_index) = chain.find_document(&doc_id).ok_or_else(|| {
         (
@@ -286,14 +282,6 @@ pub async fn handle_get_document(
         )
             .into_response()
     })?;
-
-    if user.id != "admin" && doc.owner != user.id {
-        return Err((
-            StatusCode::FORBIDDEN,
-            axum::Json(json!({"error": "Kein Zugriff"})),
-        )
-            .into_response());
-    }
 
     let resp = stone::master_node::DocumentResponse::from(doc);
     Ok((
@@ -305,19 +293,16 @@ pub async fn handle_get_document(
     ))
 }
 
-/// GET /api/v1/documents/:doc_id/history
+/// GET /api/v1/documents/:doc_id/history (öffentlich)
 pub async fn handle_document_history(
-    headers: HeaderMap,
     Path(doc_id): Path<String>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, Response> {
-    let user = require_user(&headers, &state)?;
     let chain = state.node.chain.lock().unwrap();
 
     let history: Vec<_> = chain
         .document_history(&doc_id)
         .into_iter()
-        .filter(|(d, _)| user.id == "admin" || d.owner == user.id)
         .map(|(d, block_idx)| {
             json!({
                 "block_index": block_idx,
@@ -1090,14 +1075,11 @@ pub async fn handle_transfer_document(
     ))
 }
 
-/// GET /api/v1/documents/search – Volltextsuche
+/// GET /api/v1/documents/search – Volltextsuche (öffentlich)
 pub async fn handle_search_documents(
-    headers: HeaderMap,
     Query(q): Query<SearchQuery>,
     State(state): State<AppState>,
-) -> Result<impl IntoResponse, Response> {
-    let user = require_user(&headers, &state)?;
-
+) -> impl IntoResponse {
     let per_page = q.per_page.unwrap_or(50).min(500) as usize;
     let page = q.page.unwrap_or(0) as usize;
     let query_text = q.q.as_deref().unwrap_or("").to_lowercase();
@@ -1108,9 +1090,6 @@ pub async fn handle_search_documents(
         .list_all_documents()
         .into_iter()
         .filter(|(d, _)| {
-            if user.id != "admin" && d.owner != user.id {
-                return false;
-            }
             if let Some(ref owner_filter) = q.owner {
                 if &d.owner != owner_filter {
                     return false;
@@ -1151,7 +1130,7 @@ pub async fn handle_search_documents(
     let total = docs.len();
     let paginated: Vec<_> = docs.into_iter().skip(page * per_page).take(per_page).collect();
 
-    Ok((
+    (
         StatusCode::OK,
         axum::Json(json!({
             "total": total,
@@ -1160,5 +1139,5 @@ pub async fn handle_search_documents(
             "query": q.q,
             "documents": paginated,
         })),
-    ))
+    )
 }

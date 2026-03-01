@@ -3,30 +3,19 @@
 use axum::{
     body::Body,
     extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    http::StatusCode,
     response::{IntoResponse, Response},
 };
 use serde_json::json;
 use stone::storage::ChunkStore;
 
-use super::super::auth_middleware::require_user;
 use super::super::state::AppState;
 
-/// GET /api/v1/chunk/:hash – Chunk-Daten abrufen (für Peer-Sync)
+/// GET /api/v1/chunk/:hash – Chunk-Daten abrufen (öffentlich, für Peer-Sync & Explorer)
 pub async fn handle_get_chunk(
-    headers: HeaderMap,
     Path(hash): Path<String>,
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
 ) -> Result<Response, Response> {
-    let is_internal = headers
-        .get("x-node-request")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v == "internal")
-        .unwrap_or(false);
-
-    if !is_internal {
-        require_user(&headers, &state)?;
-    }
 
     if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err((
