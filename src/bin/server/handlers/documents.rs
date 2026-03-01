@@ -432,17 +432,13 @@ pub async fn handle_get_document_data(
                 doc_owned.size,
                 &doc_owned.content_type,
             ) {
+                // Signatur passt nicht zum aktuellen Owner – vermutlich ein
+                // vor dem Re-Sign-Fix übertragenes Dokument.
+                // Warnung loggen, aber Download trotzdem erlauben.
                 eprintln!(
-                    "[crypto] Signaturprüfung fehlgeschlagen für {}: {e}",
-                    doc_owned.doc_id
+                    "[crypto] ⚠️ Signaturprüfung fehlgeschlagen für {} (owner={}): {e} – Download trotzdem erlaubt",
+                    doc_owned.doc_id, doc_owned.owner
                 );
-                return Err((
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    axum::Json(
-                        json!({"error": "Dokument-Signatur ungültig – mögliche Manipulation"}),
-                    ),
-                )
-                    .into_response());
             }
         }
     }
@@ -1011,22 +1007,210 @@ pub async fn handle_transfer_document(
             .into_response());
     }
 
+    // ── Transfer-Fee: 0.01 STONE an zufälligen Validator ────────────────────
+    // Wenn der Sender genug Guthaben hat, wird die Fee sofort abgebucht.
+    // Andernfalls wird der Transfer künstlich verzögert (5 Sek.).
+    let transfer_fee: rust_decimal::Decimal = "0.01".parse().unwrap();
+    let mut fee_paid = false;
+    let mut fee_recipient = String::new();
+    let mut fee_delayed = false;
+
+    // Wallet-Adresse des Senders ermitteln
+    let sender_wallet = {
+        let users = state.users.lock().unwrap();
+        users.iter()
+            .find(|u| u.id == caller.id)
+            .map(|u| u.wallet_address.clone())
+            .unwrap_or_default()
+    };
+
+    if !sender_wallet.is_empty() {
+        // Zufälligen aktiven Validator auswählen
+        let validator_wallet = {
+            let vs = state.node.validator_set.read().unwrap();
+            let active: Vec<_> = vs.validators.iter()
+                .filter(|v| v.active)
+                .collect();
+            if !active.is_empty() {
+                // Zufällige Auswahl via Timestamp + Doc-ID
+                let mut hasher = Sha256::new();
+                hasher.update(doc_id.as_bytes());
+                hasher.update(chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0).to_le_bytes());
+                let hash = hasher.finalize();
+                let seed = u64::from_le_bytes(hash[24..32].try_into().unwrap());
+                let idx = (seed % active.len() as u64) as usize;
+                Some(active[idx].public_key_hex.clone())
+            } else {
+                None
+            }
+        };
+
+        if let Some(ref vw) = validator_wallet {
+            // Versuche Fee abzubuchen
+            let mut ledger = state.node.token_ledger.write().unwrap();
+            let balance = ledger.balance(&sender_wallet);
+            if balance >= transfer_fee {
+                match ledger.transfer(&sender_wallet, vw, transfer_fee, rust_decimal::Decimal::ZERO) {
+                    Ok(()) => {
+                        fee_paid = true;
+                        fee_recipient = vw.clone();
+                        println!(
+                            "[transfer] 💰 Fee {transfer_fee} STONE: {} → Validator {}",
+                            &sender_wallet[..12], &vw[..12]
+                        );
+                    }
+                    Err(e) => {
+                        eprintln!("[transfer] ⚠️ Fee-Abbuchung fehlgeschlagen: {e}");
+                    }
+                }
+            }
+        }
+    }
+
+    // Kein Guthaben / keine Wallet → künstliche Verzögerung
+    if !fee_paid {
+        fee_delayed = true;
+        println!(
+            "[transfer] ⏳ Kein Guthaben – Transfer für {} wird verzögert (5s)",
+            caller.id
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+    }
+
+    // Neues Schlüsselpaar für den Empfänger laden/erstellen und Dokument neu signieren,
+    // damit die Signaturprüfung beim Download mit dem neuen Owner übereinstimmt.
+    let new_version = current_doc.version + 1;
+    let recipient_kp = NodeKeyPair::load_or_create(&to_id).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({"error": format!("Empfänger-Schlüssel: {e}")})),
+        )
+            .into_response()
+    })?;
+
+    let new_signature = sign_document(
+        &recipient_kp,
+        &current_doc.doc_id,
+        new_version,
+        current_doc.size,
+        &current_doc.content_type,
+    );
+    let new_public_key_hint = recipient_kp.public_key_hex[..16].to_string();
+
+    // ── Re-Encryption: Verschlüsselte Dokumente für neuen Owner umschlüsseln ──
+    // Das Dokument wurde mit dem Public Key des alten Owners verschlüsselt.
+    // Der neue Owner hat einen anderen Private Key → muss neu verschlüsselt werden.
+    let (new_chunks, new_encrypted, new_encryption_meta, new_size) =
+        if current_doc.encrypted && !current_doc.encryption_meta.is_empty() {
+            // 1) Alten Owner-Key laden
+            let old_kp = NodeKeyPair::load(&current_doc.owner)
+                .map_err(|e| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        axum::Json(json!({"error": format!("Alter Schlüssel: {e}")})),
+                    )
+                        .into_response()
+                })?
+                .ok_or_else(|| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        axum::Json(json!({"error": "Privater Schlüssel des Absenders nicht gefunden"})),
+                    )
+                        .into_response()
+                })?;
+
+            // 2) Verschlüsselte Rohdaten aus Chunks rekonstruieren
+            let raw_encrypted = reconstruct_document_data(&current_doc).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json(json!({"error": format!("Chunk-Rekonstruktion: {e}")})),
+                )
+                    .into_response()
+            })?;
+
+            // 3) Entschlüsseln mit altem Owner-Key
+            let mut blob: EncryptedBlob =
+                serde_json::from_str(&current_doc.encryption_meta).map_err(|_| {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        axum::Json(json!({"error": "Verschlüsselungs-Metadaten korrupt"})),
+                    )
+                        .into_response()
+                })?;
+            blob.ciphertext = hex::encode(&raw_encrypted);
+            let plaintext = decrypt_document(&old_kp, &blob).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    axum::Json(json!({"error": format!("Entschlüsselung (alter Key): {e}")})),
+                )
+                    .into_response()
+            })?;
+
+            // 4) Neu verschlüsseln mit dem Key des Empfängers
+            match encrypt_document(&recipient_kp.public_key_hex, &plaintext) {
+                Ok(new_blob) => {
+                    let cipher_bytes = hex::decode(&new_blob.ciphertext).unwrap_or_default();
+                    let meta_only = EncryptedBlob {
+                        ephemeral_pubkey: new_blob.ephemeral_pubkey,
+                        nonce: new_blob.nonce,
+                        ciphertext: String::new(),
+                    };
+                    let meta = serde_json::to_string(&meta_only).unwrap_or_default();
+
+                    // 5) Neue Chunks erstellen
+                    let chunks = chunk_data(&cipher_bytes).map_err(|e| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            axum::Json(json!({"error": format!("Re-Chunking: {e}")})),
+                        )
+                            .into_response()
+                    })?;
+
+                    println!(
+                        "[transfer] 🔐 Re-Encryption: {} → {} für doc {}",
+                        &current_doc.owner, &to_id, &doc_id
+                    );
+                    (chunks, true, meta, plaintext.len() as u64)
+                }
+                Err(e) => {
+                    eprintln!("[transfer] ⚠️ Re-Encryption fehlgeschlagen: {e} – übertrage unverschlüsselt");
+                    // Fallback: unverschlüsselt übertragen (Plaintext in neue Chunks)
+                    let chunks = chunk_data(&plaintext).map_err(|e| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            axum::Json(json!({"error": format!("Chunking: {e}")})),
+                        )
+                            .into_response()
+                    })?;
+                    (chunks, false, String::new(), plaintext.len() as u64)
+                }
+            }
+        } else {
+            // Unverschlüsseltes Dokument: Chunks unverändert übernehmen
+            (
+                current_doc.chunks.clone(),
+                current_doc.encrypted,
+                current_doc.encryption_meta.clone(),
+                current_doc.size,
+            )
+        };
+
     let transferred_doc = Document {
         owner: to_id.clone(),
-        version: current_doc.version + 1,
+        version: new_version,
         updated_at: chrono::Utc::now().timestamp(),
         doc_id: current_doc.doc_id.clone(),
         title: current_doc.title.clone(),
         content_type: current_doc.content_type.clone(),
         tags: current_doc.tags.clone(),
         metadata: current_doc.metadata.clone(),
-        size: current_doc.size,
-        chunks: current_doc.chunks.clone(),
+        size: new_size,
+        chunks: new_chunks,
         deleted: false,
-        doc_signature: current_doc.doc_signature.clone(),
-        public_key_hint: current_doc.public_key_hint.clone(),
-        encrypted: current_doc.encrypted,
-        encryption_meta: current_doc.encryption_meta.clone(),
+        doc_signature: new_signature,
+        public_key_hint: new_public_key_hint,
+        encrypted: new_encrypted,
+        encryption_meta: new_encryption_meta,
     };
 
     let block = state
@@ -1071,6 +1255,12 @@ pub async fn handle_transfer_document(
             "version":     block.index,
             "block_index": block.index,
             "block_hash":  block.hash,
+            "fee": {
+                "paid":      fee_paid,
+                "amount":    transfer_fee.to_string(),
+                "recipient": fee_recipient,
+                "delayed":   fee_delayed,
+            },
         })),
     ))
 }

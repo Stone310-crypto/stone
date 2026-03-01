@@ -147,23 +147,32 @@ pub async fn handle_login(
             axum::Json(json!({"error": "Ungültige Wiederherstellungs-Phrase"})),
         );
     };
-    let users = state.users.lock().unwrap();
-    if let Some(user) = users.iter().find(|u| u.phrase_hash == hash).cloned() {
+    let mut users = state.users.lock().unwrap();
+    if let Some(idx) = users.iter().position(|u| u.phrase_hash == hash) {
         // Wallet-Adresse: entweder gespeichert oder live aus der Phrase ableiten
-        let wallet_addr = if user.wallet_address.is_empty() {
-            stone::auth::wallet_address_from_phrase(&req.phrase)
+        let mut needs_save = false;
+        let wallet_addr = if users[idx].wallet_address.is_empty() {
+            // Alt-Account ohne Wallet → jetzt ableiten und PERSISTIEREN
+            let addr = stone::auth::wallet_address_from_phrase(&req.phrase);
+            if !addr.is_empty() {
+                println!("[auth] 💰 Wallet nachträglich aktiviert für {}: {}", users[idx].name, &addr[..16]);
+                users[idx].wallet_address = addr.clone();
+                needs_save = true;
+            }
+            addr
         } else {
-            user.wallet_address.clone()
+            users[idx].wallet_address.clone()
         };
-        return (
-            StatusCode::OK,
-            axum::Json(json!({
-                "id": user.id,
-                "name": user.name,
-                "api_key": user.api_key,
-                "wallet_address": wallet_addr,
-            })),
-        );
+        let resp = json!({
+            "id": users[idx].id,
+            "name": users[idx].name,
+            "api_key": users[idx].api_key,
+            "wallet_address": wallet_addr,
+        });
+        if needs_save {
+            save_users(&users);
+        }
+        return (StatusCode::OK, axum::Json(resp));
     }
     drop(users);
     (
@@ -171,5 +180,79 @@ pub async fn handle_login(
         axum::Json(
             json!({"error": "Phrase nicht bekannt – bitte zuerst registrieren"}),
         ),
+    )
+}
+
+/// POST /api/v1/auth/wallet-claim
+///
+/// Erlaubt Alt-Accounts (ohne Wallet) einmalig eine Wallet-Adresse zu generieren.
+/// Benötigt die Recovery-Phrase zur Authentifizierung + Wallet-Ableitung.
+///
+/// Body: `{ "phrase": "wort1 wort2 … wort12" }`
+/// Antwort: `{ "ok": true, "wallet_address": "…" }` (oder Fehler)
+pub async fn handle_wallet_claim(
+    State(state): State<AppState>,
+    axum::Json(req): axum::Json<LoginPhraseRequest>,
+) -> impl IntoResponse {
+    let Some(hash) = resolve_phrase(&req.phrase) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"error": "Ungültige Wiederherstellungs-Phrase"})),
+        );
+    };
+
+    let mut users = state.users.lock().unwrap();
+    let Some(idx) = users.iter().position(|u| u.phrase_hash == hash) else {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(json!({"error": "Phrase nicht bekannt – bitte zuerst registrieren"})),
+        );
+    };
+
+    // Bereits eine Wallet?
+    if !users[idx].wallet_address.is_empty() {
+        let addr = users[idx].wallet_address.clone();
+        return (
+            StatusCode::OK,
+            axum::Json(json!({
+                "ok": true,
+                "wallet_address": addr,
+                "message": "Wallet bereits vorhanden",
+                "already_claimed": true,
+            })),
+        );
+    }
+
+    // Wallet aus Phrase ableiten
+    let addr = stone::auth::wallet_address_from_phrase(&req.phrase);
+    if addr.is_empty() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({"error": "Wallet-Ableitung fehlgeschlagen"})),
+        );
+    }
+
+    users[idx].wallet_address = addr.clone();
+    let user_clone = users[idx].clone();
+    save_users(&users);
+    println!("[auth] 💰 Wallet claimed für {}: {}", user_clone.name, &addr[..16]);
+
+    // An Peers syncen
+    let peers = state.node.get_peers();
+    let api_key = state.api_key.clone();
+    drop(users);
+
+    tokio::spawn(async move {
+        push_user_to_peers(&user_clone, &peers, &api_key).await;
+    });
+
+    (
+        StatusCode::OK,
+        axum::Json(json!({
+            "ok": true,
+            "wallet_address": addr,
+            "message": "Wallet erfolgreich aktiviert!",
+            "already_claimed": false,
+        })),
     )
 }

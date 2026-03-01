@@ -10,7 +10,7 @@ use tower_http::cors::{Any, CorsLayer};
 
 use super::state::{AppState, MAX_UPLOAD_BYTES};
 use super::handlers::{
-    auth::{handle_login, handle_signup, handle_sync_users},
+    auth::{handle_login, handle_signup, handle_sync_users, handle_wallet_claim},
     blocks::{handle_get_block, handle_list_blocks},
     chunks::handle_get_chunk,
     documents::{
@@ -123,6 +123,7 @@ pub fn build_router(state: AppState) -> Router {
         // Auth
         .route("/api/v1/auth/signup", post(handle_signup))
         .route("/api/v1/auth/login", post(handle_login))
+        .route("/api/v1/auth/wallet-claim", post(handle_wallet_claim))
         // Admin: User-Sync zwischen Nodes
         .route("/api/v1/admin/sync-users", post(handle_sync_users))
         // PoA: Validators
