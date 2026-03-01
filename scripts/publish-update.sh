@@ -21,7 +21,7 @@ cd "$SCRIPT_DIR/.."
 SIGNING_KEY="${STONE_SIGNING_KEY:-keys/update_signing.key}"
 TARGET="${STONE_UPDATE_TARGET:-x86_64-unknown-linux-gnu}"
 SEED_NODE="${STONE_SEED_NODE:-http://100.90.28.68:8080}"
-API_KEY="${STONE_API_KEY:-}"
+API_KEY="${STONE_PUBLISH_API_KEY:-${STONE_API_KEY:-}}"
 BINARY_NAME="stone-setup"
 CHANGELOG="${1:-}"  # Erstes Argument = Changelog
 
@@ -41,9 +41,9 @@ error() { echo -e "${RED}❌ $*${NC}" >&2; }
 # ─── Voraussetzungen prüfen ──────────────────────────────────────────────────
 
 if [ -z "$API_KEY" ]; then
-    # Versuche aus .env zu laden (STONE_API_KEY, dann STONE_CLUSTER_API_KEY)
+    # Versuche aus .env zu laden (STONE_PUBLISH_API_KEY hat Vorrang)
     if [ -f .env ]; then
-        for KEY_VAR in STONE_API_KEY STONE_CLUSTER_API_KEY; do
+        for KEY_VAR in STONE_PUBLISH_API_KEY STONE_API_KEY STONE_CLUSTER_API_KEY; do
             CANDIDATE=$(grep -E "^${KEY_VAR}=" .env | head -1 | cut -d'=' -f2 | tr -d '"' | tr -d "'")
             if [ -n "$CANDIDATE" ]; then
                 API_KEY="$CANDIDATE"

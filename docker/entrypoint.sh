@@ -15,6 +15,9 @@
 # ─────────────────────────────────────────────────────────────────────────────
 set -e
 
+# ── Docker-Kennung setzen (damit der Updater es erkennt) ─────────────────────
+export STONE_DOCKER=1
+
 NODE_NAME="${STONE_NODE_NAME:-}"
 PASSWORD="${STONE_PASSWORD:-}"
 STORAGE_GB="${STONE_STORAGE_GB:-50}"
@@ -24,6 +27,26 @@ P2P_PORT="${STONE_P2P_PORT:-4001}"
 
 DATA_DIR="/opt/stone-node/stone_data"
 CONFIG_FILE="/opt/stone-node/node_config.json"
+
+BINARY="/opt/stone-node/target/release/stone-setup"
+UPDATE_BINARY="$DATA_DIR/updates/stone-setup"
+
+# ── OTA-Update: Prüfe ob ein neues Binary auf dem Volume liegt ───────────────
+
+if [ -f "$UPDATE_BINARY" ] && [ -x "$UPDATE_BINARY" ]; then
+    # Versionsprüfung: Neues Binary muss lauffähig sein
+    if "$UPDATE_BINARY" --version >/dev/null 2>&1 || true; then
+        echo "🔄 OTA-Update gefunden → installiere neues Binary..."
+        cp "$BINARY" "${BINARY}.bak" 2>/dev/null || true
+        cp "$UPDATE_BINARY" "$BINARY"
+        chmod 755 "$BINARY"
+        rm -f "$UPDATE_BINARY"
+        echo "✅ Update installiert – starte mit neuer Version"
+    else
+        echo "⚠️  Update-Binary nicht lauffähig → ignoriert"
+        rm -f "$UPDATE_BINARY"
+    fi
+fi
 
 # ── Prüfungen ────────────────────────────────────────────────────────────────
 

@@ -31,6 +31,14 @@ pub async fn handle_update_status(
     let progress = updater.progress();
     let config = &updater.config;
 
+    // Prüfe ob ein Docker-Update auf dem Volume wartet
+    let docker_update_staged = if stone::updater::UpdateManager::is_docker() {
+        let update_path = format!("{}/updates/stone-setup", stone::blockchain::data_dir());
+        std::path::Path::new(&update_path).exists()
+    } else {
+        false
+    };
+
     (
         StatusCode::OK,
         axum::Json(json!({
@@ -44,6 +52,8 @@ pub async fn handle_update_status(
             "auto_install": config.auto_install,
             "auto_update_hour": config.auto_update_hour,
             "trusted_keys_count": config.trusted_keys.len(),
+            "docker": stone::updater::UpdateManager::is_docker(),
+            "docker_update_staged": docker_update_staged,
         })),
     )
 }
@@ -191,33 +201,55 @@ pub async fn handle_update_install(
         );
     }
 
-    // Antwort senden, dann Neustart
-    let resp = (
-        StatusCode::OK,
-        axum::Json(json!({
-            "status": "installed",
-            "message": "Update installiert. Node startet in 2 Sekunden neu.",
-        })),
-    );
+    let is_docker = stone::updater::UpdateManager::is_docker();
 
-    // Neustart in einem eigenen Task
-    tokio::spawn(async {
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-        println!("[updater] 🔄 Neustart...");
-        // Graceful restart: aktuellen Prozess durch neuen ersetzen
-        let exe = std::env::current_exe().expect("current_exe");
-        let args: Vec<String> = std::env::args().collect();
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            let err = std::process::Command::new(&exe).args(&args[1..]).exec();
-            eprintln!("[updater] exec fehlgeschlagen: {err}");
-        }
-        #[cfg(not(unix))]
-        {
+    // Antwort senden, dann Neustart
+    let resp = if is_docker {
+        (
+            StatusCode::OK,
+            axum::Json(json!({
+                "status": "installed",
+                "docker": true,
+                "message": "Update gestaged. Container-Restart erforderlich (docker restart <container>).",
+            })),
+        )
+    } else {
+        (
+            StatusCode::OK,
+            axum::Json(json!({
+                "status": "installed",
+                "docker": false,
+                "message": "Update installiert. Node startet in 2 Sekunden neu.",
+            })),
+        )
+    };
+
+    // Neustart nur bei Bare-Metal (Docker: Container muss extern restartet werden)
+    if !is_docker {
+        tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            println!("[updater] 🔄 Neustart...");
+            let exe = std::env::current_exe().expect("current_exe");
+            let args: Vec<String> = std::env::args().collect();
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                let err = std::process::Command::new(&exe).args(&args[1..]).exec();
+                eprintln!("[updater] exec fehlgeschlagen: {err}");
+            }
+            #[cfg(not(unix))]
+            {
+                std::process::exit(0);
+            }
+        });
+    } else {
+        // Docker: Prozess sauber beenden → Container wird per restart-policy neu gestartet
+        tokio::spawn(async {
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            println!("[updater] 🐳 Docker: Beende Prozess für Container-Restart...");
             std::process::exit(0);
-        }
-    });
+        });
+    }
 
     Ok(resp)
 }
@@ -347,12 +379,21 @@ async fn download_missing_chunks(
                     // Auto-Install in eigenem Task
                     tokio::spawn(async {
                         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                        let exe = std::env::current_exe().expect("current_exe");
-                        let args: Vec<String> = std::env::args().collect();
-                        #[cfg(unix)]
-                        {
-                            use std::os::unix::process::CommandExt;
-                            let _ = std::process::Command::new(&exe).args(&args[1..]).exec();
+                        if stone::updater::UpdateManager::is_docker() {
+                            println!("[updater] 🐳 Docker: Beende Prozess für Container-Restart...");
+                            std::process::exit(0);
+                        } else {
+                            let exe = std::env::current_exe().expect("current_exe");
+                            let args: Vec<String> = std::env::args().collect();
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::process::CommandExt;
+                                let _ = std::process::Command::new(&exe).args(&args[1..]).exec();
+                            }
+                            #[cfg(not(unix))]
+                            {
+                                std::process::exit(0);
+                            }
                         }
                     });
                 }

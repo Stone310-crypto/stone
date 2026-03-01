@@ -397,8 +397,21 @@ impl UpdateManager {
 
     // ─── Installation ─────────────────────────────────────────────────────
 
+    /// Prüft ob wir in einem Docker-Container laufen (STONE_DOCKER=1).
+    pub fn is_docker() -> bool {
+        std::env::var("STONE_DOCKER").as_deref() == Ok("1")
+    }
+
     /// Installiert das Update: tauscht das aktuelle Binary aus.
     /// Gibt den Pfad des neuen Binaries zurück.
+    ///
+    /// **Docker-Modus** (STONE_DOCKER=1):
+    ///   Das neue Binary wird nach `$STONE_DATA_DIR/updates/stone-setup` kopiert.
+    ///   Beim nächsten Container-Restart erkennt der Entrypoint das Update und
+    ///   installiert es automatisch.
+    ///
+    /// **Bare-Metal-Modus:**
+    ///   Das aktuelle Binary wird direkt ausgetauscht (Swap + Restart).
     pub fn install(&mut self) -> Result<PathBuf, String> {
         let manifest = self.manifest.as_ref().ok_or("Kein aktives Manifest")?;
 
@@ -416,6 +429,41 @@ impl UpdateManager {
         if !staged_path.exists() {
             return Err("Staged Binary nicht gefunden".into());
         }
+
+        // ── Docker-Modus: Binary ins Volume stagen ────────────────────────
+        if Self::is_docker() {
+            let data_dir = crate::blockchain::data_dir();
+            let update_dir = format!("{}/updates", data_dir);
+            let _ = fs::create_dir_all(&update_dir);
+            let target_path = PathBuf::from(&update_dir).join("stone-setup");
+
+            fs::copy(&staged_path, &target_path).map_err(|e| {
+                format!("Docker: Binary ins Volume kopieren: {e}")
+            })?;
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let perms = std::fs::Permissions::from_mode(0o755);
+                let _ = fs::set_permissions(&target_path, perms);
+            }
+
+            println!(
+                "[updater] 🐳 Docker-Update v{} gestaged → {}",
+                version,
+                target_path.display()
+            );
+            println!("[updater] 🐳 Container-Restart erforderlich für Installation.");
+
+            self.state = UpdateState::Idle;
+            self.manifest = None;
+            self.chunks.clear();
+            let _ = fs::remove_dir_all(self.update_dir(&version));
+
+            return Ok(target_path);
+        }
+
+        // ── Bare-Metal-Modus: Binary direkt tauschen ─────────────────────
 
         // Aktuelles Binary finden
         let current_exe = std::env::current_exe()
