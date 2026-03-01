@@ -452,14 +452,39 @@ impl MasterNodeState {
     ) -> Result<Block, String> {
         // PoA: Validator-Prüfung auf Node-Ebene (nicht User-Ebene)
         // Der Signer/User ist der Dokument-Owner — die Node ist der Validator.
+        //
+        // v0.3.0: Randomisierte Validator-Auswahl — pro Block wird deterministisch
+        // ein Validator ausgewählt via SHA256(prev_hash || block_index).
+        // Jeder Node ist registriert und aktiv, aber nur der ausgewählte darf
+        // den nächsten Block erstellen.
         {
             let vs = self.validator_set.read().unwrap();
-            if !vs.validators.is_empty() && !vs.is_active_validator(&self.node_id) {
-                return Err(format!(
-                    "PoA: Diese Node ('{}') ist kein aktiver Validator. \
-                     Bitte Node als Validator registrieren.",
-                    self.node_id
-                ));
+            if !vs.validators.is_empty() {
+                // Schritt 1: Ist diese Node überhaupt ein aktiver Validator?
+                if !vs.is_active_validator(&self.node_id) {
+                    return Err(format!(
+                        "PoA: Diese Node ('{}') ist kein aktiver Validator. \
+                         Bitte Node als Validator registrieren.",
+                        self.node_id
+                    ));
+                }
+                // Schritt 2: Randomisierte Auswahl — ist diese Node dran?
+                let chain = self.chain.lock().unwrap();
+                let next_index = chain.blocks.len() as u64;
+                let prev_hash = chain.blocks.last()
+                    .map(|b| b.hash.as_str())
+                    .unwrap_or("genesis");
+                if !vs.is_selected_validator(&self.node_id, prev_hash, next_index) {
+                    let selected = vs.select_validator(prev_hash, next_index)
+                        .map(|v| v.node_id.clone())
+                        .unwrap_or_else(|| "?".into());
+                    return Err(format!(
+                        "PoA: Diese Node ('{}') ist nicht der ausgewählte Validator für Block #{}. \
+                         Ausgewählt: '{}'.",
+                        self.node_id, next_index, selected
+                    ));
+                }
+                drop(chain);
             }
         }
 

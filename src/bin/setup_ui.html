@@ -156,6 +156,18 @@ textarea{resize:vertical;min-height:80px;font-family:monospace;font-size:13px}
 .btn-orange:hover{background:#e5a825}
 .btn-danger{background:var(--red);color:#fff}
 .btn-danger:hover{background:#ff6b63}
+
+/* ─── Network Metrics Panel ─── */
+.net-stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:14px}
+@media(max-width:700px){.net-stats-grid{grid-template-columns:repeat(2,1fr)}}
+@media(max-width:400px){.net-stats-grid{grid-template-columns:1fr}}
+.net-stat{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px;text-align:center}
+.net-stat .ns-val{font-size:18px;font-weight:700;margin-bottom:2px}
+.net-stat .ns-label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
+.net-stat .ns-val.in{color:var(--green)}
+.net-stat .ns-val.out{color:var(--accent)}
+.net-detail-row{display:flex;gap:20px;margin-top:14px;font-size:13px;color:var(--muted);flex-wrap:wrap}
+.net-detail-row span strong{color:var(--text)}
 </style>
 </head>
 <body>
@@ -309,7 +321,10 @@ textarea{resize:vertical;min-height:80px;font-family:monospace;font-size:13px}
     <div class="card" id="shard-health-card">
       <div style="display:flex;justify-content:space-between;align-items:center">
         <h2 style="margin:0">🧩 Erasure-Coding / Shards</h2>
-        <span class="shard-status-badge offline" id="shard-status-badge">offline</span>
+        <div style="display:flex;gap:8px;align-items:center">
+          <button id="shard-repair-btn" onclick="triggerShardRepair()" style="padding:4px 12px;font-size:12px;background:var(--accent);color:#fff;border:none;border-radius:6px;cursor:pointer;display:none" title="Fehlende Shards von Peers anfordern">🔧 Repair</button>
+          <span class="shard-status-badge offline" id="shard-status-badge">offline</span>
+        </div>
       </div>
       <div class="shard-stats-grid" id="shard-stats-grid">
         <div class="shard-stat">
@@ -334,6 +349,81 @@ textarea{resize:vertical;min-height:80px;font-family:monospace;font-size:13px}
       <div id="shard-doc-list" class="shard-doc-list"></div>
       <div id="shard-no-data" style="text-align:center;padding:20px 0;color:var(--muted);font-size:13px;display:none">
         Keine Erasure-Coding-Daten vorhanden. Dateien müssen erst mit EC-Sharding hochgeladen werden.
+      </div>
+      <div id="shard-repair-result" style="margin-top:10px;padding:10px;border-radius:8px;font-size:13px;display:none"></div>
+    </div>
+
+    <!-- ═══ Network Storage Panel ═══ -->
+    <div class="card" id="network-storage-panel">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <h2 style="margin:0">🌐 Netzwerk-Speicher</h2>
+        <span style="color:var(--muted);font-size:13px" id="ns-node-count">0 Nodes</span>
+      </div>
+      <div class="net-stats-grid">
+        <div class="net-stat">
+          <div class="ns-val" style="color:var(--accent)" id="ns-total-offered">0 GB</div>
+          <div class="ns-label">Gesamt angeboten</div>
+        </div>
+        <div class="net-stat">
+          <div class="ns-val" style="color:var(--orange)" id="ns-total-used">0 B</div>
+          <div class="ns-label">Gesamt belegt</div>
+        </div>
+        <div class="net-stat">
+          <div class="ns-val" style="color:var(--green)" id="ns-total-free">0 B</div>
+          <div class="ns-label">Gesamt frei</div>
+        </div>
+      </div>
+      <div id="ns-bar-container" style="margin-top:12px;background:rgba(255,255,255,.06);border-radius:6px;height:12px;overflow:hidden">
+        <div id="ns-bar-fill" style="height:100%;background:var(--accent);border-radius:6px;width:0%;transition:width .5s"></div>
+      </div>
+      <div id="ns-offline" style="text-align:center;padding:10px 0;color:var(--muted);font-size:13px;display:none">
+        Keine Storage-Daten von anderen Nodes empfangen.
+      </div>
+    </div>
+
+    <!-- ═══ Network Metrics Panel ═══ -->
+    <div class="card" id="network-panel">
+      <div style="display:flex;justify-content:space-between;align-items:center">
+        <h2 style="margin:0">📡 Netzwerk-Auslastung</h2>
+        <span style="color:var(--muted);font-size:13px" id="net-uptime">—</span>
+      </div>
+      <div class="net-stats-grid">
+        <div class="net-stat">
+          <div class="ns-val in" id="net-bytes-in">0 B</div>
+          <div class="ns-label">⬇ Empfangen</div>
+        </div>
+        <div class="net-stat">
+          <div class="ns-val out" id="net-bytes-out">0 B</div>
+          <div class="ns-label">⬆ Gesendet</div>
+        </div>
+        <div class="net-stat">
+          <div class="ns-val in" id="net-bw-in">0 B/s</div>
+          <div class="ns-label">⬇ Bandbreite</div>
+        </div>
+        <div class="net-stat">
+          <div class="ns-val out" id="net-bw-out">0 B/s</div>
+          <div class="ns-label">⬆ Bandbreite</div>
+        </div>
+      </div>
+      <div class="net-detail-row">
+        <span>Nachrichten ⬇: <strong id="net-msg-in">0</strong></span>
+        <span>Nachrichten ⬆: <strong id="net-msg-out">0</strong></span>
+        <span>Blöcke ⬇: <strong id="net-blk-in">0</strong></span>
+        <span>Blöcke ⬆: <strong id="net-blk-out">0</strong></span>
+      </div>
+      <div class="net-detail-row">
+        <span>TXs ⬇: <strong id="net-tx-in">0</strong></span>
+        <span>TXs ⬆: <strong id="net-tx-out">0</strong></span>
+        <span>Shard-Daten ⬇: <strong id="net-shard-in">0 B</strong></span>
+        <span>Shard-Daten ⬆: <strong id="net-shard-out">0 B</strong></span>
+      </div>
+      <div class="net-detail-row">
+        <span>Peers verbunden: <strong id="net-peers-connected">0</strong></span>
+        <span>Gossipsub-Mesh: <strong id="net-mesh-size">0</strong></span>
+        <span>Bekannte Peers: <strong id="net-known-peers">0</strong></span>
+      </div>
+      <div id="net-offline" style="text-align:center;padding:20px 0;color:var(--muted);font-size:13px;display:none">
+        P2P-Netzwerk nicht aktiv.
       </div>
     </div>
 
@@ -655,6 +745,10 @@ async function refreshDashboard() {
     else { data.seed_peers.forEach(p => { const li=document.createElement('li'); li.textContent=p; list.appendChild(li); }); }
     // Shard Health
     renderShardHealth(data.shard_health);
+    // Network Storage
+    renderNetworkStorage(data.network_storage);
+    // Network Metrics
+    renderNetworkMetrics(data.network_metrics);
     // Update Panel
     refreshUpdatePanel();
   } catch(e) { console.error(e); }
@@ -674,6 +768,13 @@ function renderShardHealth(sh) {
   badge.className = 'shard-status-badge ' + sh.status;
   const statusLabels = { healthy:'Healthy', degraded:'Degraded', critical:'Critical', no_ec_data:'Keine EC-Daten', offline:'Offline' };
   badge.textContent = statusLabels[sh.status] || sh.status;
+  // Repair button: nur anzeigen wenn degraded oder critical
+  const repairBtn = document.getElementById('shard-repair-btn');
+  if (sh.degraded_chunks > 0 || sh.critical_chunks > 0) {
+    repairBtn.style.display = 'inline-block';
+  } else {
+    repairBtn.style.display = 'none';
+  }
   // Stats
   document.getElementById('shard-healthy').textContent = sh.healthy_chunks;
   document.getElementById('shard-degraded').textContent = sh.degraded_chunks;
@@ -711,6 +812,84 @@ function renderShardHealth(sh) {
       docList.appendChild(row);
     });
   }
+}
+
+function renderNetworkMetrics(nm) {
+  const panel = document.getElementById('network-panel');
+  const offline = document.getElementById('net-offline');
+  if (!nm) {
+    // Alle Werte auf 0 und offline hint anzeigen
+    offline.style.display = 'block';
+    return;
+  }
+  offline.style.display = 'none';
+  document.getElementById('net-uptime').textContent = 'P2P-Uptime: ' + fmtUptime(nm.uptime_secs);
+  document.getElementById('net-bytes-in').textContent = humanBytes(nm.bytes_in);
+  document.getElementById('net-bytes-out').textContent = humanBytes(nm.bytes_out);
+  document.getElementById('net-bw-in').textContent = humanBytes(nm.avg_bytes_in_per_sec) + '/s';
+  document.getElementById('net-bw-out').textContent = humanBytes(nm.avg_bytes_out_per_sec) + '/s';
+  document.getElementById('net-msg-in').textContent = nm.messages_in;
+  document.getElementById('net-msg-out').textContent = nm.messages_out;
+  document.getElementById('net-blk-in').textContent = nm.blocks_received;
+  document.getElementById('net-blk-out').textContent = nm.blocks_sent;
+  document.getElementById('net-tx-in').textContent = nm.txs_received;
+  document.getElementById('net-tx-out').textContent = nm.txs_sent;
+  document.getElementById('net-shard-in').textContent = humanBytes(nm.shard_bytes_in);
+  document.getElementById('net-shard-out').textContent = humanBytes(nm.shard_bytes_out);
+  document.getElementById('net-peers-connected').textContent = nm.connected_peers;
+  document.getElementById('net-mesh-size').textContent = nm.gossipsub_mesh_size;
+  document.getElementById('net-known-peers').textContent = nm.total_known_peers;
+}
+
+function renderNetworkStorage(ns) {
+  const offline = document.getElementById('ns-offline');
+  if (!ns) {
+    offline.style.display = 'block';
+    return;
+  }
+  offline.style.display = 'none';
+  document.getElementById('ns-node-count').textContent = ns.reporting_nodes + ' Node' + (ns.reporting_nodes !== 1 ? 's' : '');
+  document.getElementById('ns-total-offered').textContent = ns.total_offered_human;
+  document.getElementById('ns-total-used').textContent = ns.total_used_human;
+  document.getElementById('ns-total-free').textContent = ns.total_free_human;
+  // Usage bar
+  const totalBytes = ns.total_offered_gb * 1024 * 1024 * 1024;
+  const pct = totalBytes > 0 ? Math.min((ns.total_used_bytes / totalBytes) * 100, 100) : 0;
+  document.getElementById('ns-bar-fill').style.width = pct.toFixed(1) + '%';
+}
+
+async function triggerShardRepair() {
+  const btn = document.getElementById('shard-repair-btn');
+  const result = document.getElementById('shard-repair-result');
+  btn.disabled = true;
+  btn.textContent = '⏳ Repair…';
+  result.style.display = 'none';
+  try {
+    const { data } = await api('/api/shards/repair', 'POST');
+    if (data.ok) {
+      result.style.background = 'rgba(63,185,80,.12)';
+      result.style.color = 'var(--green)';
+      let msg = '✅ Repair: ' + data.repaired + ' angefordert, ' + data.failed + ' fehlgeschlagen, ' + data.skipped + ' OK';
+      if (data.details && data.details.length > 0) {
+        msg += '<br><small style="color:var(--muted)">' + data.details.slice(0,5).join('<br>') + '</small>';
+      }
+      result.innerHTML = msg;
+    } else {
+      result.style.background = 'rgba(248,81,73,.12)';
+      result.style.color = 'var(--red)';
+      result.textContent = '❌ ' + (data.error || 'Unbekannter Fehler');
+    }
+    result.style.display = 'block';
+  } catch(e) {
+    result.style.background = 'rgba(248,81,73,.12)';
+    result.style.color = 'var(--red)';
+    result.textContent = '❌ Netzwerk-Fehler';
+    result.style.display = 'block';
+  }
+  btn.disabled = false;
+  btn.textContent = '🔧 Repair';
+  // Auto-refresh nach 3s
+  setTimeout(refreshDashboard, 3000);
 }
 
 // ── Send ──

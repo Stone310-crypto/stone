@@ -29,6 +29,7 @@ use ed25519_dalek::{
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use chrono::Utc;
+use sha2::{Sha256, Digest};
 
 // ─── Validator-Info ──────────────────────────────────────────────────────────
 
@@ -205,6 +206,83 @@ impl ValidatorSet {
             BlockVerifyResult::InvalidSignature
         }
     }
+
+    // ─── Randomisierte Validator-Auswahl (VRF-ähnlich) ──────────────────────
+    //
+    // Jeder Node kann Validator sein. Pro Block wird deterministisch einer
+    // ausgewählt: SHA256(prev_hash || block_index) mod active_count.
+    // Das ist vorhersehbar aber fair: Niemand kann beeinflussen wer dran ist,
+    // weil prev_hash kryptographisch nicht manipulierbar ist.
+
+    /// Wählt deterministisch einen aktiven Validator für einen bestimmten Block-Slot.
+    ///
+    /// Gibt `None` zurück wenn keine aktiven Validatoren vorhanden sind (PoA deaktiviert).
+    pub fn select_validator(&self, prev_hash: &str, block_index: u64) -> Option<&ValidatorInfo> {
+        let active: Vec<&ValidatorInfo> = self.validators.iter()
+            .filter(|v| v.active)
+            .collect();
+        if active.is_empty() {
+            return None;
+        }
+        // Deterministische Auswahl via SHA256
+        let mut hasher = Sha256::new();
+        hasher.update(prev_hash.as_bytes());
+        hasher.update(block_index.to_le_bytes());
+        let hash = hasher.finalize();
+        // Die letzten 8 Bytes als u64 interpretieren (Little Endian)
+        let seed = u64::from_le_bytes(hash[24..32].try_into().unwrap());
+        let idx = (seed % active.len() as u64) as usize;
+        Some(active[idx])
+    }
+
+    /// Prüft ob eine bestimmte Node-ID der ausgewählte Validator für diesen Slot ist.
+    ///
+    /// Gibt `true` zurück wenn:
+    /// - Keine Validatoren konfiguriert sind (PoA deaktiviert → jeder darf)
+    /// - Die Node-ID der ausgewählte Validator ist
+    pub fn is_selected_validator(
+        &self,
+        node_id: &str,
+        prev_hash: &str,
+        block_index: u64,
+    ) -> bool {
+        if self.validators.is_empty() {
+            return true; // PoA deaktiviert
+        }
+        match self.select_validator(prev_hash, block_index) {
+            Some(v) => v.node_id == node_id,
+            None => true, // Keine aktiven Validatoren
+        }
+    }
+
+    /// Block-Signatur + randomisierte Validator-Auswahl verifizieren.
+    ///
+    /// Erweiterte Version von `verify_block` die zusätzlich prüft ob der Signer
+    /// für diesen Block-Slot der ausgewählte Validator war (SHA256-basiert).
+    /// `prev_hash` ist der Hash des vorherigen Blocks (oder "genesis" für Block #0).
+    pub fn verify_block_with_selection(
+        &self,
+        block_hash: &str,
+        signer_node_id: &str,
+        signature_hex: &str,
+        prev_hash: &str,
+        block_index: u64,
+    ) -> BlockVerifyResult {
+        // Basis-Prüfung (Signatur + Validator-Status)
+        let basic = self.verify_block(block_hash, signer_node_id, signature_hex);
+        if !basic.is_acceptable() {
+            return basic;
+        }
+        // Bei NoValidatorsConfigured → keine weitere Prüfung
+        if basic == BlockVerifyResult::NoValidatorsConfigured {
+            return basic;
+        }
+        // Prüfe ob der Signer der ausgewählte Validator für diesen Slot war
+        if !self.is_selected_validator(signer_node_id, prev_hash, block_index) {
+            return BlockVerifyResult::NotSelectedValidator;
+        }
+        BlockVerifyResult::Valid
+    }
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -219,6 +297,8 @@ pub enum BlockVerifyResult {
     ValidatorInactive,
     /// Signatur mathematisch falsch
     InvalidSignature,
+    /// Signatur gültig, aber dieser Validator war nicht der ausgewählte für diesen Slot
+    NotSelectedValidator,
 }
 
 impl BlockVerifyResult {

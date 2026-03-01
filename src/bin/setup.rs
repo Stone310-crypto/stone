@@ -35,7 +35,7 @@ use stone::{
     auth::load_users,
     blockchain::{data_dir, NodeRole},
     master_node::MasterNodeState,
-    network::{start_network, NetworkEvent, NetworkHandle},
+    network::{start_network, NetworkEvent, NetworkHandle, StorageAnnouncement, TOPIC_STORAGE},
     shard::ShardStore,
     storage::ChunkStore,
 };
@@ -209,6 +209,10 @@ async fn main() {
         .route("/api/updates", get(api_update_status))
         .route("/api/updates/install", post(api_update_install))
         .route("/api/updates/config", post(api_update_config))
+        // Shard Repair
+        .route("/api/shards/repair", post(api_shard_repair))
+        // Network Storage
+        .route("/api/network/storage", get(api_network_storage))
         .fallback(forward_to_node_api)
         .with_state(state.clone());
 
@@ -401,6 +405,53 @@ async fn start_full_node(state: SetupState) {
                     scan_node.shard_registry.persist();
                     println!("[shard-scan] ✅ Registry aktualisiert: {updated} Shard-Einträge von {} Peers für {} Chunks", peers.len(), chunk_hashes.len());
                 }
+
+                // ── Auto-Repair nach Scan ─────────────────────────────────────
+                // Prüfe ob degradierte/kritische Chunks repariert werden können
+                let result = repair_degraded_shards(&scan_node, &scan_net).await;
+                if result.repaired > 0 || result.failed > 0 {
+                    println!(
+                        "[shard-repair] 🔧 Auto-Repair: {} angefordert, {} fehlgeschlagen",
+                        result.repaired, result.failed
+                    );
+                }
+            }
+        });
+    }
+
+    // ── Periodischer Storage-Broadcast ──────────────────────────────────────
+    // Alle 60 Sekunden: eigenen Speicher-Status per Gossipsub broadcasten
+    if let Some(ref net_handle) = network_handle {
+        let storage_net = net_handle.clone();
+        let storage_state = state.clone();
+        tokio::spawn(async move {
+            // Erster Broadcast nach 10s, dann alle 60 Sekunden
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                let cfg = storage_state.config.read().await;
+                let offered_gb = cfg.storage_offered_gb;
+                let data_path = cfg.data_dir.clone();
+                let node_name = cfg.node_name.clone();
+                drop(cfg);
+
+                let used = dir_size(std::path::Path::new(&data_path));
+                let total_bytes = offered_gb * 1024 * 1024 * 1024;
+                let free = total_bytes.saturating_sub(used);
+
+                let announcement = StorageAnnouncement {
+                    peer_id: storage_net.local_peer_id.clone(),
+                    offered_gb,
+                    used_bytes: used,
+                    free_bytes: free,
+                    timestamp: chrono::Utc::now().timestamp(),
+                    node_name,
+                };
+
+                if let Ok(json) = serde_json::to_vec(&announcement) {
+                    storage_net.publish_gossip(TOPIC_STORAGE, json).await;
+                }
             }
         });
     }
@@ -513,7 +564,17 @@ async fn handle_p2p_event(
             let poa_ok = {
                 let vs = node.validator_set.read().unwrap();
                 if vs.validators.is_empty() { None }
-                else { Some(vs.verify_block(&block.hash, &block.signer, &block.validator_signature).is_acceptable()) }
+                else {
+                    // v0.3.0: Prüfe auch ob der Signer der ausgewählte Validator war
+                    let prev_hash = {
+                        let chain = node.chain.lock().unwrap();
+                        chain.blocks.last().map(|b| b.hash.clone()).unwrap_or_else(|| "genesis".into())
+                    };
+                    Some(vs.verify_block_with_selection(
+                        &block.hash, &block.signer, &block.validator_signature,
+                        &prev_hash, block.index,
+                    ).is_acceptable())
+                }
             };
 
             // Block-Akzeptanz in einem eigenen Scope, damit der Lock vor dem await dropped wird
@@ -657,7 +718,7 @@ async fn handle_p2p_event(
 
                                     if !missing.is_empty() {
                                         let updater_clone = updater_ref.clone();
-                                        let node_clone = node.clone();
+                                        let _node_clone = node.clone();
                                         tokio::spawn(async move {
                                             let client = reqwest::Client::builder()
                                                 .danger_accept_invalid_certs(true)
@@ -745,8 +806,190 @@ async fn handle_p2p_event(
             }
         }
 
+        // ── Storage-Announcement (nur Logging, Tracking passiert in SwarmTask) ──
+        NetworkEvent::StorageAnnouncementReceived { announcement, from_peer } => {
+            println!(
+                "[storage] 💾 {} bietet {} GB an ({} belegt)",
+                &from_peer[..12.min(from_peer.len())],
+                announcement.offered_gb,
+                human_bytes(announcement.used_bytes)
+            );
+        }
+
         _ => {} // PeerConnected, PeerDisconnected, Listening etc.
     }
+}
+
+// ─── Shard-Repair ───────────────────────────────────────────────────────────
+
+/// Ergebnis einer Shard-Repair-Operation
+#[derive(Serialize, Clone)]
+struct ShardRepairResult {
+    repaired: u64,
+    failed: u64,
+    skipped: u64,
+    details: Vec<String>,
+}
+
+/// Repariert degradierte/kritische Shards indem fehlende Shards von Peers geholt werden.
+///
+/// Ablauf für jeden EC-Chunk:
+/// 1. Prüfe lokal vorhandene Shard-Indices
+/// 2. Ermittle fehlende Indices (sollten n = k+m sein, fehlen = n - lokal)
+/// 3. Suche in der ShardHolderRegistry nach Peers die den fehlenden Shard haben
+/// 4. Fordere den Shard per `request_shard` an → wird asynchron via Event empfangen
+async fn repair_degraded_shards(
+    node: &Arc<MasterNodeState>,
+    net: &NetworkHandle,
+) -> ShardRepairResult {
+    let shard_store = match ShardStore::new() {
+        Ok(s) => s,
+        Err(e) => {
+            return ShardRepairResult {
+                repaired: 0, failed: 0, skipped: 0,
+                details: vec![format!("ShardStore-Fehler: {e}")],
+            };
+        }
+    };
+
+    // Alle EC-Chunks aus der Blockchain sammeln
+    let ec_chunks: Vec<(String, u8, u8)> = {
+        let chain = node.chain.lock().unwrap();
+        let mut chunks = Vec::new();
+        for block in &chain.blocks {
+            for doc in &block.documents {
+                for chunk in &doc.chunks {
+                    if chunk.ec_k > 0 && !chunk.shards.is_empty() {
+                        chunks.push((chunk.hash.clone(), chunk.ec_k, chunk.ec_m));
+                    }
+                }
+            }
+        }
+        chunks
+    };
+
+    if ec_chunks.is_empty() {
+        return ShardRepairResult {
+            repaired: 0, failed: 0, skipped: 0,
+            details: vec!["Keine EC-Chunks in der Blockchain".into()],
+        };
+    }
+
+    let connected_peers = net.connected_peers().await;
+    if connected_peers.is_empty() {
+        return ShardRepairResult {
+            repaired: 0, failed: 0, skipped: 0,
+            details: vec!["Keine verbundenen Peers für Repair".into()],
+        };
+    }
+
+    let local_peer_id = net.local_peer_id.clone();
+    let mut repaired = 0u64;
+    let mut failed = 0u64;
+    let mut skipped = 0u64;
+    let mut details = Vec::new();
+
+    for (chunk_hash, ec_k, ec_m) in &ec_chunks {
+        let n = (*ec_k as usize) + (*ec_m as usize);
+        let local_indices = shard_store.local_shard_indices(chunk_hash);
+
+        // Welche Indices fehlen lokal?
+        let missing: Vec<u8> = (0..n as u8)
+            .filter(|i| !local_indices.contains(i))
+            .collect();
+
+        if missing.is_empty() {
+            skipped += 1;
+            continue; // Alle Shards lokal vorhanden
+        }
+
+        // Nur reparieren wenn wir degradiert oder kritisch sind
+        let available_count = node.shard_registry.available_shards_for_chunk(chunk_hash);
+        if available_count >= n {
+            skipped += 1;
+            continue; // Gesund, genug Shards im Netzwerk
+        }
+
+        for shard_idx in &missing {
+            // Suche einen Peer der diesen Shard hat
+            let holders = node.shard_registry.holders_for(chunk_hash, *shard_idx);
+            let remote_holder = holders.iter().find(|h| **h != local_peer_id);
+
+            if let Some(holder_id) = remote_holder {
+                if let Ok(peer_id) = holder_id.parse::<libp2p::PeerId>() {
+                    // Prüfe ob der Peer verbunden ist
+                    let is_connected = connected_peers.iter().any(|p| p.peer_id == *holder_id);
+                    if is_connected {
+                        println!(
+                            "[repair] 🔧 Requesting {}[{}] from {}",
+                            &chunk_hash[..8.min(chunk_hash.len())], shard_idx,
+                            &holder_id[..12.min(holder_id.len())]
+                        );
+                        net.request_shard(peer_id, chunk_hash.clone(), *shard_idx).await;
+                        repaired += 1;
+                        details.push(format!(
+                            "{}[{}] → angefordert von {}",
+                            &chunk_hash[..8.min(chunk_hash.len())], shard_idx,
+                            &holder_id[..12.min(holder_id.len())]
+                        ));
+                    } else {
+                        failed += 1;
+                        details.push(format!(
+                            "{}[{}] → Holder {} nicht verbunden",
+                            &chunk_hash[..8.min(chunk_hash.len())], shard_idx,
+                            &holder_id[..12.min(holder_id.len())]
+                        ));
+                    }
+                } else {
+                    failed += 1;
+                }
+            } else {
+                // Kein bekannter Holder → bei verbundenen Peers nachfragen
+                let mut found = false;
+                for peer in &connected_peers {
+                    if let Ok(pid) = peer.peer_id.parse::<libp2p::PeerId>() {
+                        let peer_shards = net.list_peer_shards(pid.clone(), chunk_hash.clone()).await;
+                        if peer_shards.contains(shard_idx) {
+                            println!(
+                                "[repair] 🔧 Found {}[{}] at {} (discovery)",
+                                &chunk_hash[..8.min(chunk_hash.len())], shard_idx,
+                                &peer.peer_id[..12.min(peer.peer_id.len())]
+                            );
+                            net.request_shard(pid, chunk_hash.clone(), *shard_idx).await;
+                            // Registry aktualisieren
+                            node.shard_registry.add_holder(chunk_hash, *shard_idx, &peer.peer_id);
+                            repaired += 1;
+                            found = true;
+                            details.push(format!(
+                                "{}[{}] → angefordert von {} (discovery)",
+                                &chunk_hash[..8.min(chunk_hash.len())], shard_idx,
+                                &peer.peer_id[..12.min(peer.peer_id.len())]
+                            ));
+                            break;
+                        }
+                    }
+                }
+                if !found {
+                    failed += 1;
+                    details.push(format!(
+                        "{}[{}] → kein Holder gefunden",
+                        &chunk_hash[..8.min(chunk_hash.len())], shard_idx
+                    ));
+                }
+            }
+        }
+    }
+
+    if repaired > 0 {
+        node.shard_registry.persist();
+    }
+
+    println!(
+        "[repair] ✅ Shard-Repair abgeschlossen: {} angefordert, {} fehlgeschlagen, {} übersprungen",
+        repaired, failed, skipped
+    );
+
+    ShardRepairResult { repaired, failed, skipped, details }
 }
 
 /// Löst eine libp2p PeerId in eine HTTP-URL auf.
@@ -979,6 +1222,105 @@ async fn api_update_config(
             })))
         }
     }
+}
+
+// ─── API: Shard Repair ──────────────────────────────────────────────────────
+
+async fn api_shard_repair(State(state): State<SetupState>) -> (StatusCode, Json<serde_json::Value>) {
+    let ns = state.node_state.read().await;
+    let net = state.network.read().await;
+    match (ns.as_ref(), net.as_ref()) {
+        (Some(ns), Some(net)) => {
+            let result = repair_degraded_shards(&ns.node, net).await;
+            (StatusCode::OK, Json(serde_json::json!({
+                "ok": true,
+                "repaired": result.repaired,
+                "failed": result.failed,
+                "skipped": result.skipped,
+                "details": result.details,
+            })))
+        }
+        _ => {
+            (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+                "ok": false,
+                "error": "Node oder P2P nicht gestartet"
+            })))
+        }
+    }
+}
+
+// ─── API: Network Storage ───────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct NetworkStorageResponse {
+    ok: bool,
+    /// Eigener angebotener Speicher in GB
+    local_offered_gb: u64,
+    /// Eigener belegter Speicher in Bytes
+    local_used_bytes: u64,
+    /// Netzwerk-Gesamt angebotener Speicher in GB (inkl. lokal)
+    total_offered_gb: u64,
+    /// Netzwerk-Gesamt belegter Speicher in Bytes (inkl. lokal)
+    total_used_bytes: u64,
+    /// Netzwerk-Gesamt freier Speicher in Bytes
+    total_free_bytes: u64,
+    /// Anzahl Nodes die Speicher melden
+    reporting_nodes: usize,
+    /// Details pro Node
+    nodes: Vec<StorageAnnouncement>,
+}
+
+async fn api_network_storage(State(state): State<SetupState>) -> Json<NetworkStorageResponse> {
+    let cfg = state.config.read().await;
+    let local_offered_gb = cfg.storage_offered_gb;
+    let local_used = dir_size(std::path::Path::new(&cfg.data_dir));
+    let local_total_bytes = local_offered_gb * 1024 * 1024 * 1024;
+    let local_free = local_total_bytes.saturating_sub(local_used);
+    drop(cfg);
+
+    let net = state.network.read().await;
+    let mut nodes: Vec<StorageAnnouncement> = Vec::new();
+    let mut total_offered_gb = local_offered_gb;
+    let mut total_used_bytes = local_used;
+    let mut total_free_bytes = local_free;
+
+    if let Some(ref handle) = *net {
+        if let Some(status) = handle.get_status().await {
+            for ann in &status.peer_storage {
+                // Eigenen Eintrag überspringen (kommt von uns selbst)
+                if ann.peer_id == handle.local_peer_id {
+                    continue;
+                }
+                total_offered_gb += ann.offered_gb;
+                total_used_bytes += ann.used_bytes;
+                total_free_bytes += ann.free_bytes;
+                nodes.push(ann.clone());
+            }
+        }
+    }
+
+    // Eigenen Node auch in die Liste aufnehmen
+    let local_peer_id = net.as_ref().map(|h| h.local_peer_id.clone()).unwrap_or_default();
+    let node_name = state.config.read().await.node_name.clone();
+    nodes.insert(0, StorageAnnouncement {
+        peer_id: local_peer_id,
+        offered_gb: local_offered_gb,
+        used_bytes: local_used,
+        free_bytes: local_free,
+        timestamp: chrono::Utc::now().timestamp(),
+        node_name,
+    });
+
+    Json(NetworkStorageResponse {
+        ok: true,
+        local_offered_gb,
+        local_used_bytes: local_used,
+        total_offered_gb,
+        total_used_bytes,
+        total_free_bytes,
+        reporting_nodes: nodes.len(),
+        nodes,
+    })
 }
 
 // ─── Fallback: /api/v1/* und /ws an Node-Router weiterleiten ────────────────
@@ -1261,6 +1603,46 @@ struct DashboardData {
     mempool_size: usize,
     // Shard-Health
     shard_health: ShardHealthInfo,
+    // Netzwerk-Metriken
+    network_metrics: Option<NetworkMetricsData>,
+    // Netzwerk-Speicher
+    network_storage: Option<NetworkStorageSummary>,
+}
+
+#[derive(Serialize)]
+struct NetworkMetricsData {
+    bytes_in: u64,
+    bytes_out: u64,
+    messages_in: u64,
+    messages_out: u64,
+    blocks_received: u64,
+    blocks_sent: u64,
+    txs_received: u64,
+    txs_sent: u64,
+    shard_bytes_in: u64,
+    shard_bytes_out: u64,
+    uptime_secs: u64,
+    avg_bytes_in_per_sec: f64,
+    avg_bytes_out_per_sec: f64,
+    connected_peers: usize,
+    gossipsub_mesh_size: usize,
+    total_known_peers: usize,
+}
+
+#[derive(Serialize)]
+struct NetworkStorageSummary {
+    /// Netzwerk-Gesamt angebotener Speicher in GB
+    total_offered_gb: u64,
+    /// Netzwerk-Gesamt belegter Speicher in Bytes
+    total_used_bytes: u64,
+    /// Netzwerk-Gesamt freier Speicher in Bytes
+    total_free_bytes: u64,
+    /// Anzahl Nodes die Speicher melden
+    reporting_nodes: usize,
+    /// Menschenlesbare Darstellung
+    total_offered_human: String,
+    total_used_human: String,
+    total_free_human: String,
 }
 
 #[derive(Serialize)]
@@ -1426,6 +1808,61 @@ async fn api_dashboard(State(state): State<SetupState>) -> Json<DashboardData> {
         }
     };
 
+    // ── Netzwerk-Metriken ──────────────────────────────────────────────
+    let (network_metrics, network_storage) = {
+        let net = state.network.read().await;
+        if let Some(ref handle) = *net {
+            if let Some(status) = handle.get_status().await {
+                let m = &status.metrics;
+                let nm = Some(NetworkMetricsData {
+                    bytes_in: m.bytes_in,
+                    bytes_out: m.bytes_out,
+                    messages_in: m.messages_in,
+                    messages_out: m.messages_out,
+                    blocks_received: m.blocks_received,
+                    blocks_sent: m.blocks_sent,
+                    txs_received: m.txs_received,
+                    txs_sent: m.txs_sent,
+                    shard_bytes_in: m.shard_bytes_in,
+                    shard_bytes_out: m.shard_bytes_out,
+                    uptime_secs: m.uptime_secs,
+                    avg_bytes_in_per_sec: m.avg_bytes_in_per_sec,
+                    avg_bytes_out_per_sec: m.avg_bytes_out_per_sec,
+                    connected_peers: status.connected_peers,
+                    gossipsub_mesh_size: status.gossipsub_mesh_size,
+                    total_known_peers: status.total_known_peers,
+                });
+
+                // Netzwerk-Speicher aggregieren
+                let mut t_offered = cfg.storage_offered_gb;
+                let mut t_used = used;
+                let local_total_bytes = cfg.storage_offered_gb * 1024 * 1024 * 1024;
+                let mut t_free = local_total_bytes.saturating_sub(used);
+                let mut count = 1usize; // wir selbst
+
+                for ann in &status.peer_storage {
+                    if ann.peer_id == handle.local_peer_id { continue; }
+                    t_offered += ann.offered_gb;
+                    t_used += ann.used_bytes;
+                    t_free += ann.free_bytes;
+                    count += 1;
+                }
+
+                let ns = Some(NetworkStorageSummary {
+                    total_offered_gb: t_offered,
+                    total_used_bytes: t_used,
+                    total_free_bytes: t_free,
+                    reporting_nodes: count,
+                    total_offered_human: format!("{} GB", t_offered),
+                    total_used_human: human_bytes(t_used),
+                    total_free_human: human_bytes(t_free),
+                });
+
+                (nm, ns)
+            } else { (None, None) }
+        } else { (None, None) }
+    };
+
     Json(DashboardData {
         ok: true,
         node_name: cfg.node_name.clone(),
@@ -1452,6 +1889,8 @@ async fn api_dashboard(State(state): State<SetupState>) -> Json<DashboardData> {
         p2p_peer_id,
         mempool_size,
         shard_health,
+        network_metrics,
+        network_storage,
     })
 }
 

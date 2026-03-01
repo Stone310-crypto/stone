@@ -94,6 +94,7 @@ const P2P_CONFIG_FILENAME: &str = "p2p_config.json";
 pub const TOPIC_BLOCKS: &str = "stone/blocks/v1";
 pub const TOPIC_PEERS: &str = "stone/peers/v1";
 pub const TOPIC_MEMPOOL: &str = "stone/mempool/v1";
+pub const TOPIC_STORAGE: &str = "stone/storage/v1";
 
 /// Standard-libp2p-Port des Stone-Netzwerks
 pub const DEFAULT_P2P_PORT: u16 = 7654;
@@ -360,6 +361,13 @@ pub enum NetworkEvent {
         manifest_json: Vec<u8>,
         from_peer: String,
     },
+
+    // ── Storage-Events ────────────────────────────────────────────────────
+    /// Ein Peer hat seinen Speicher-Status per Gossipsub gemeldet
+    StorageAnnouncementReceived {
+        announcement: StorageAnnouncement,
+        from_peer: String,
+    },
 }
 
 /// Befehle die von außen an den Swarm-Task gesendet werden.
@@ -434,6 +442,59 @@ pub struct NetworkStatus {
     pub gossipsub_mesh_size: usize,
     pub chain_block_count: u64,
     pub peers: Vec<PeerStatus>,
+    /// Netzwerk-Metriken (Traffic, Nachrichten, etc.)
+    pub metrics: NetworkMetrics,
+    /// Speicher-Ankündigungen aller bekannten Peers
+    pub peer_storage: Vec<StorageAnnouncement>,
+}
+
+/// Netzwerk-Nutzungsmetriken (kumulativ seit Start)
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct NetworkMetrics {
+    /// Empfangene Bytes (Gossipsub + Request/Response)
+    pub bytes_in: u64,
+    /// Gesendete Bytes (Gossipsub + Request/Response)
+    pub bytes_out: u64,
+    /// Empfangene Nachrichten (alle Typen)
+    pub messages_in: u64,
+    /// Gesendete Nachrichten (alle Typen)
+    pub messages_out: u64,
+    /// Empfangene Blöcke per Gossipsub
+    pub blocks_received: u64,
+    /// Gesendete Blöcke per Gossipsub
+    pub blocks_sent: u64,
+    /// Empfangene TXs per Gossipsub
+    pub txs_received: u64,
+    /// Gesendete TXs per Gossipsub
+    pub txs_sent: u64,
+    /// Shard-Daten empfangen (Bytes)
+    pub shard_bytes_in: u64,
+    /// Shard-Daten gesendet (Bytes)
+    pub shard_bytes_out: u64,
+    /// Node-Uptime in Sekunden (seit Swarm-Start)
+    pub uptime_secs: u64,
+    /// Durchschnitt: Bytes/Sek empfangen
+    pub avg_bytes_in_per_sec: f64,
+    /// Durchschnitt: Bytes/Sek gesendet
+    pub avg_bytes_out_per_sec: f64,
+}
+
+/// Speicher-Ankündigung: wird regelmäßig per Gossipsub gebroadcastet.
+/// Jeder Node meldet wie viel Speicher er bereitstellt / nutzt.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageAnnouncement {
+    /// PeerId des Absenders
+    pub peer_id: String,
+    /// Angebotener Speicher in GB (Konfiguration)
+    pub offered_gb: u64,
+    /// Belegter Speicher in Bytes
+    pub used_bytes: u64,
+    /// Freier Speicher in Bytes
+    pub free_bytes: u64,
+    /// Unix-Timestamp
+    pub timestamp: i64,
+    /// Node-Name (optional)
+    pub node_name: String,
 }
 
 /// Detaillierter Status eines einzelnen Peers
@@ -827,6 +888,18 @@ struct SwarmTask {
         request_response::OutboundRequestId,
         (String, tokio::sync::oneshot::Sender<Vec<u8>>),
     >,
+
+    // ─── Netzwerk-Metriken ──────────────────────────────────────────────────
+
+    /// Kumulative Traffic-Metriken
+    net_metrics: NetworkMetrics,
+    /// Zeitpunkt des Swarm-Starts (für Uptime-Berechnung)
+    started_at: Instant,
+
+    // ─── Peer-Storage-Tracking ──────────────────────────────────────────────
+
+    /// Speicher-Ankündigungen von Peers: PeerId-String → StorageAnnouncement
+    peer_storage: HashMap<String, StorageAnnouncement>,
 }
 
 /// Tracking für Fehlverhalten eines Peers
@@ -1270,6 +1343,11 @@ impl SwarmTask {
                 ..
             }) => {
                 let topic = message.topic.as_str().to_string();
+                let msg_len = message.data.len() as u64;
+
+                // Metriken: eingehende Gossipsub-Nachricht
+                self.net_metrics.bytes_in += msg_len;
+                self.net_metrics.messages_in += 1;
 
                 if topic == TOPIC_BLOCKS {
                     self.handle_gossip_block(message.data, propagation_source);
@@ -1283,6 +1361,18 @@ impl SwarmTask {
                         manifest_json: message.data,
                         from_peer: propagation_source.to_string(),
                     });
+                } else if topic == TOPIC_STORAGE {
+                    if let Ok(ann) = serde_json::from_slice::<StorageAnnouncement>(&message.data) {
+                        println!(
+                            "[p2p] 💾 Storage-Announcement von {} – {} GB angeboten, {} bytes belegt",
+                            &ann.peer_id[..12.min(ann.peer_id.len())], ann.offered_gb, ann.used_bytes
+                        );
+                        self.peer_storage.insert(ann.peer_id.clone(), ann.clone());
+                        let _ = self.event_tx.send(NetworkEvent::StorageAnnouncementReceived {
+                            announcement: ann,
+                            from_peer: propagation_source.to_string(),
+                        });
+                    }
                 } else {
                     let _ = message_id; // acknowledged
                 }
@@ -1493,7 +1583,11 @@ impl SwarmTask {
                             );
                         }
                         ShardRequest::StoreShard { chunk_hash, shard_index, shard_hash, data } => {
+                            let incoming_len = data.len() as u64;
                             println!("[p2p] 💾 Shard-Store: {chunk_hash}[{shard_index}] von {peer} ({} bytes)", data.len());
+                            self.net_metrics.bytes_in += incoming_len;
+                            self.net_metrics.messages_in += 1;
+                            self.net_metrics.shard_bytes_in += incoming_len;
                             match self.shard_store.write_shard(&chunk_hash, shard_index, &data) {
                                 Ok(written_hash) => {
                                     let ok = written_hash == shard_hash;
@@ -1547,7 +1641,11 @@ impl SwarmTask {
                     match response {
                         ShardResponse::ShardData { chunk_hash, shard_index, data } => {
                             if let Some(data) = data {
+                                let recv_len = data.len() as u64;
                                 println!("[p2p] ← Shard empfangen: {chunk_hash}[{shard_index}] ({} bytes) von {peer}", data.len());
+                                self.net_metrics.bytes_in += recv_len;
+                                self.net_metrics.messages_in += 1;
+                                self.net_metrics.shard_bytes_in += recv_len;
                                 let _ = self.event_tx.send(NetworkEvent::ShardReceived {
                                     chunk_hash,
                                     shard_index,
@@ -1818,6 +1916,7 @@ impl SwarmTask {
                     entry.blocks_received += 1;
                     entry.last_seen = chrono::Utc::now().timestamp();
                 }
+                self.net_metrics.blocks_received += 1;
 
                 let _ = self.event_tx.send(NetworkEvent::BlockReceived {
                     block: Box::new(block),
@@ -1869,6 +1968,8 @@ impl SwarmTask {
                 }
 
                 println!("[p2p] 💸 TX {} von {source} empfangen", &tx.tx_id[..12.min(tx.tx_id.len())]);
+
+                self.net_metrics.txs_received += 1;
 
                 let _ = self.event_tx.send(NetworkEvent::TxReceived {
                     tx: Box::new(tx),
@@ -1951,10 +2052,15 @@ impl SwarmTask {
 
                 match serde_json::to_vec(&*block) {
                     Ok(data) => {
+                        let data_len = data.len() as u64;
                         let topic = IdentTopic::new(TOPIC_BLOCKS);
                         match self.swarm.behaviour_mut().gossipsub.publish(topic, data) {
                             Ok(_) => {
                                 println!("[p2p] 📡 Block #{} gebroadcastet (hash={}...)", block.index, &hash[..8.min(hash.len())]);
+                                // Metriken
+                                self.net_metrics.bytes_out += data_len;
+                                self.net_metrics.messages_out += 1;
+                                self.net_metrics.blocks_sent += 1;
                                 // Chain-Count aktualisieren
                                 if block.index + 1 > self.local_chain_count {
                                     self.local_chain_count = block.index + 1;
@@ -1982,10 +2088,14 @@ impl SwarmTask {
 
                 match serde_json::to_vec(&*tx) {
                     Ok(data) => {
+                        let data_len = data.len() as u64;
                         let topic = IdentTopic::new(TOPIC_MEMPOOL);
                         match self.swarm.behaviour_mut().gossipsub.publish(topic, data) {
                             Ok(_) => {
                                 println!("[p2p] 💸 TX {tx_id} gebroadcastet");
+                                self.net_metrics.bytes_out += data_len;
+                                self.net_metrics.messages_out += 1;
+                                self.net_metrics.txs_sent += 1;
                             }
                             Err(gossipsub::PublishError::InsufficientPeers) => {
                                 // Kein Peer – kein Fehler
@@ -2092,6 +2202,14 @@ impl SwarmTask {
                 }).collect();
 
                 let connected = swarm_connected.len(); // direkt aus Swarm
+
+                // Metriken mit Uptime & Durchschnittswerten berechnen
+                let uptime = self.started_at.elapsed().as_secs().max(1);
+                let mut metrics = self.net_metrics.clone();
+                metrics.uptime_secs = uptime;
+                metrics.avg_bytes_in_per_sec = metrics.bytes_in as f64 / uptime as f64;
+                metrics.avg_bytes_out_per_sec = metrics.bytes_out as f64 / uptime as f64;
+
                 let _ = reply.send(NetworkStatus {
                     local_peer_id: self.swarm.local_peer_id().to_string(),
                     connected_peers: connected,
@@ -2099,6 +2217,8 @@ impl SwarmTask {
                     gossipsub_mesh_size: mesh_peers.len(),
                     chain_block_count: self.local_chain_count,
                     peers,
+                    metrics,
+                    peer_storage: self.peer_storage.values().cloned().collect(),
                 });
                 false
             }
@@ -2120,7 +2240,11 @@ impl SwarmTask {
             }
 
             NetworkCommand::StoreShard { peer_id, chunk_hash, shard_index, shard_hash, data } => {
+                let data_len = data.len() as u64;
                 println!("[p2p] → Shard senden: {chunk_hash}[{shard_index}] an {peer_id} ({} bytes)", data.len());
+                self.net_metrics.bytes_out += data_len;
+                self.net_metrics.messages_out += 1;
+                self.net_metrics.shard_bytes_out += data_len;
                 self.swarm.behaviour_mut().shard_exchange.send_request(
                     &peer_id,
                     ShardRequest::StoreShard { chunk_hash, shard_index, shard_hash, data },
@@ -2139,9 +2263,12 @@ impl SwarmTask {
             }
 
             NetworkCommand::PublishGossip { topic, data } => {
+                let data_len = data.len() as u64;
                 match self.swarm.behaviour_mut().gossipsub.publish(topic.clone(), data) {
                     Ok(_) => {
                         println!("[p2p] 📡 Gossip auf Topic {topic} gesendet");
+                        self.net_metrics.bytes_out += data_len;
+                        self.net_metrics.messages_out += 1;
                     }
                     Err(gossipsub::PublishError::InsufficientPeers) => {
                         println!("[p2p] Gossip {topic} – keine Peers, übersprungen");
@@ -2170,7 +2297,7 @@ struct SyncHandshake {
 // ─── Gossipsub: Topics abonnieren ─────────────────────────────────────────────
 
 fn subscribe_all_topics(gossipsub: &mut gossipsub::Behaviour) -> Result<(), String> {
-    for topic in [TOPIC_BLOCKS, TOPIC_PEERS, TOPIC_SYNC_HANDSHAKE, TOPIC_MEMPOOL, crate::updater::TOPIC_UPDATES] {
+    for topic in [TOPIC_BLOCKS, TOPIC_PEERS, TOPIC_SYNC_HANDSHAKE, TOPIC_MEMPOOL, crate::updater::TOPIC_UPDATES, TOPIC_STORAGE] {
         gossipsub.subscribe(&IdentTopic::new(topic))
             .map_err(|e| format!("Subscribe '{topic}': {e}"))?;
     }
@@ -2274,6 +2401,11 @@ impl NetworkHandle {
         self.cmd_tx.send(NetworkCommand::GetStatus(tx)).await.ok()?;
         tokio::time::timeout(std::time::Duration::from_secs(3), rx)
             .await.ok()?.ok()
+    }
+
+    /// Gibt nur die Netzwerk-Metriken zurück.
+    pub async fn get_metrics(&self) -> Option<NetworkMetrics> {
+        self.get_status().await.map(|s| s.metrics)
     }
 
     /// Beendet den Swarm-Task.
@@ -2397,6 +2529,9 @@ pub async fn start_network(
         peer_penalties: HashMap::new(),
         shard_store: crate::shard::ShardStore::new().expect("ShardStore erstellen"),
         pending_shard_lists: HashMap::new(),
+        net_metrics: NetworkMetrics::default(),
+        started_at: Instant::now(),
+        peer_storage: HashMap::new(),
     };
 
     tokio::spawn(task.run());

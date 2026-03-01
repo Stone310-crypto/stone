@@ -164,10 +164,17 @@ async fn main() {
                                         if vs.validators.is_empty() {
                                             None
                                         } else {
-                                            let result = vs.verify_block(
+                                            // v0.3.0: Prüfe auch ob der Signer der ausgewählte Validator war
+                                            let prev_hash = {
+                                                let chain = node_bg.chain.lock().unwrap();
+                                                chain.blocks.last().map(|b| b.hash.clone()).unwrap_or_else(|| "genesis".into())
+                                            };
+                                            let result = vs.verify_block_with_selection(
                                                 &block.hash,
                                                 &block.signer,
                                                 &block.validator_signature,
+                                                &prev_hash,
+                                                block.index,
                                             );
                                             Some(result.is_acceptable())
                                         }
