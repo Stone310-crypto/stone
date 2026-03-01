@@ -131,6 +131,10 @@ pub struct UpdateConfig {
     pub auto_install: bool,
     /// Trusted Public Keys (hex)
     pub trusted_keys: Vec<String>,
+    /// Geplante Auto-Update-Stunde (0-23, None = deaktiviert)
+    /// z.B. Some(3) = jeden Tag um 03:00 Uhr automatisch installieren
+    #[serde(default)]
+    pub auto_update_hour: Option<u8>,
 }
 
 impl Default for UpdateConfig {
@@ -139,6 +143,7 @@ impl Default for UpdateConfig {
             auto_download: true,
             auto_install: false,
             trusted_keys: Vec::new(),
+            auto_update_hour: None,
         }
     }
 }
@@ -567,6 +572,15 @@ impl UpdateManager {
         // 4. ENV: STONE_AUTO_UPDATE=1
         if std::env::var("STONE_AUTO_UPDATE").as_deref() == Ok("1") {
             config.auto_install = true;
+        }
+
+        // 5. ENV: STONE_AUTO_UPDATE_HOUR=3  (0-23)
+        if let Ok(hour_str) = std::env::var("STONE_AUTO_UPDATE_HOUR") {
+            if let Ok(hour) = hour_str.trim().parse::<u8>() {
+                if hour < 24 {
+                    config.auto_update_hour = Some(hour);
+                }
+            }
         }
 
         config

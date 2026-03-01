@@ -1,0 +1,24 @@
+[Unit]
+Description=Stone Node (Unified Setup + Full Node)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/stone-node
+EnvironmentFile=/opt/stone-node/.env
+ExecStart=/opt/stone-node/target/release/stone-setup
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=stone-node
+LimitNOFILE=65535
+
+# Graceful shutdown
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

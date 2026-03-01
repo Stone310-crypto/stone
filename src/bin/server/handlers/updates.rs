@@ -42,6 +42,7 @@ pub async fn handle_update_status(
             "percent": progress.percent,
             "auto_download": config.auto_download,
             "auto_install": config.auto_install,
+            "auto_update_hour": config.auto_update_hour,
             "trusted_keys_count": config.trusted_keys.len(),
         })),
     )
@@ -395,6 +396,14 @@ pub async fn handle_update_config(
             println!("[updater] - Trusted Key entfernt: {}…", &key[..16.min(key.len())]);
         }
     }
+    if let Some(ref hour_opt) = payload.auto_update_hour {
+        updater.config.auto_update_hour = hour_opt.filter(|&h| h < 24);
+        if let Some(h) = updater.config.auto_update_hour {
+            println!("[updater] ⏰ Auto-Update-Stunde: {h:02}:00");
+        } else {
+            println!("[updater] ⏰ Auto-Update-Zeitplan deaktiviert");
+        }
+    }
 
     updater.save_config().map_err(|e| {
         (
@@ -411,6 +420,7 @@ pub async fn handle_update_config(
             "config": {
                 "auto_download": updater.config.auto_download,
                 "auto_install": updater.config.auto_install,
+                "auto_update_hour": updater.config.auto_update_hour,
                 "trusted_keys_count": updater.config.trusted_keys.len(),
             }
         })),
@@ -423,4 +433,6 @@ pub struct UpdateConfigPayload {
     pub auto_install: Option<bool>,
     pub add_trusted_keys: Option<Vec<String>>,
     pub remove_trusted_keys: Option<Vec<String>>,
+    #[serde(default)]
+    pub auto_update_hour: Option<Option<u8>>,
 }

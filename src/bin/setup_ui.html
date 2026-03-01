@@ -128,6 +128,34 @@ textarea{resize:vertical;min-height:80px;font-family:monospace;font-size:13px}
 .shard-doc .sd-dot.critical{background:var(--red)}
 .shard-doc .sd-title{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .shard-doc .sd-meta{color:var(--muted);font-size:11px;white-space:nowrap}
+
+/* ─── Update Panel ─── */
+.update-card{position:relative;overflow:hidden}
+.update-card .update-badge{position:absolute;top:16px;right:16px;padding:4px 12px;border-radius:20px;font-size:12px;font-weight:600;letter-spacing:.5px}
+.update-badge.up-to-date{background:rgba(63,185,80,.12);color:var(--green)}
+.update-badge.available{background:rgba(210,153,34,.15);color:var(--orange);animation:pulse 2s infinite}
+.update-badge.downloading{background:rgba(88,166,255,.12);color:var(--accent)}
+.update-badge.ready{background:rgba(63,185,80,.15);color:var(--green);animation:pulse 2s infinite}
+.update-badge.installing{background:rgba(210,153,34,.15);color:var(--orange)}
+.update-badge.failed{background:rgba(248,81,73,.12);color:var(--red)}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.6}}
+.update-info{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:16px}
+@media(max-width:600px){.update-info{grid-template-columns:1fr}}
+.update-info-item{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px}
+.update-info-item .ui-label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
+.update-info-item .ui-val{font-size:16px;font-weight:600;margin-top:4px}
+.update-progress{margin-top:16px}
+.update-progress-bar{background:var(--border);border-radius:6px;height:8px;overflow:hidden;margin-top:8px}
+.update-progress-fill{background:var(--accent);height:100%;border-radius:6px;transition:width .5s}
+.update-changelog{margin-top:14px;padding:14px;background:var(--bg);border:1px solid var(--border);border-radius:8px;font-size:13px;color:var(--muted);line-height:1.6}
+.update-actions{display:flex;gap:10px;margin-top:16px;flex-wrap:wrap;align-items:center}
+.update-schedule{display:flex;align-items:center;gap:8px;margin-left:auto;font-size:13px}
+.update-schedule select{background:var(--input-bg);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:6px 10px;font-size:13px}
+.update-schedule label{margin:0;color:var(--muted);font-size:13px}
+.btn-orange{background:var(--orange);color:#fff}
+.btn-orange:hover{background:#e5a825}
+.btn-danger{background:var(--red);color:#fff}
+.btn-danger:hover{background:#ff6b63}
 </style>
 </head>
 <body>
@@ -306,6 +334,74 @@ textarea{resize:vertical;min-height:80px;font-family:monospace;font-size:13px}
       <div id="shard-doc-list" class="shard-doc-list"></div>
       <div id="shard-no-data" style="text-align:center;padding:20px 0;color:var(--muted);font-size:13px;display:none">
         Keine Erasure-Coding-Daten vorhanden. Dateien müssen erst mit EC-Sharding hochgeladen werden.
+      </div>
+    </div>
+
+    <!-- ═══ OTA Update Panel ═══ -->
+    <div class="card update-card" id="update-panel">
+      <div style="display:flex;align-items:center;gap:12px">
+        <h2 style="margin:0">🔄 Software-Update</h2>
+        <span class="update-badge up-to-date" id="update-badge">Aktuell</span>
+      </div>
+
+      <div class="update-info">
+        <div class="update-info-item">
+          <div class="ui-label">Aktuelle Version</div>
+          <div class="ui-val" id="upd-current-version">—</div>
+        </div>
+        <div class="update-info-item" id="upd-new-version-box" style="display:none">
+          <div class="ui-label">Verfügbare Version</div>
+          <div class="ui-val" style="color:var(--green)" id="upd-new-version">—</div>
+        </div>
+        <div class="update-info-item" id="upd-size-box" style="display:none">
+          <div class="ui-label">Größe</div>
+          <div class="ui-val" id="upd-size">—</div>
+        </div>
+        <div class="update-info-item" id="upd-published-box" style="display:none">
+          <div class="ui-label">Veröffentlicht</div>
+          <div class="ui-val" id="upd-published">—</div>
+        </div>
+      </div>
+
+      <!-- Download-Fortschritt -->
+      <div class="update-progress" id="upd-progress-section" style="display:none">
+        <div style="display:flex;justify-content:space-between;font-size:13px;color:var(--muted)">
+          <span>Download-Fortschritt</span>
+          <span id="upd-progress-text">0%</span>
+        </div>
+        <div class="update-progress-bar">
+          <div class="update-progress-fill" id="upd-progress-bar" style="width:0%"></div>
+        </div>
+        <div style="font-size:12px;color:var(--muted);margin-top:4px" id="upd-chunks-text"></div>
+      </div>
+
+      <!-- Changelog -->
+      <div class="update-changelog" id="upd-changelog-box" style="display:none">
+        <strong>📝 Changelog:</strong><br>
+        <span id="upd-changelog"></span>
+      </div>
+
+      <!-- Actions -->
+      <div class="update-actions">
+        <button class="btn btn-green btn-sm" id="upd-install-btn" style="display:none" onclick="doInstallUpdate()">
+          ⬇️ Update installieren
+        </button>
+        <span id="upd-install-status" style="font-size:13px;color:var(--muted)"></span>
+
+        <!-- Auto-Update Zeitplan -->
+        <div class="update-schedule">
+          <label>Auto-Update:</label>
+          <select id="upd-schedule" onchange="saveUpdateSchedule()">
+            <option value="-1">Deaktiviert</option>
+            <option value="0">00:00 Uhr</option>
+            <option value="1">01:00 Uhr</option>
+            <option value="2">02:00 Uhr</option>
+            <option value="3">03:00 Uhr</option>
+            <option value="4">04:00 Uhr</option>
+            <option value="5">05:00 Uhr</option>
+            <option value="6">06:00 Uhr</option>
+          </select>
+        </div>
       </div>
     </div>
 
@@ -559,6 +655,8 @@ async function refreshDashboard() {
     else { data.seed_peers.forEach(p => { const li=document.createElement('li'); li.textContent=p; list.appendChild(li); }); }
     // Shard Health
     renderShardHealth(data.shard_health);
+    // Update Panel
+    refreshUpdatePanel();
   } catch(e) { console.error(e); }
 }
 
@@ -669,6 +767,210 @@ function fmtUptime(s) {
   if (d > 0) return d+'d '+h+'h '+m+'m';
   if (h > 0) return h+'h '+m+'m';
   return m+'m '+(s%60)+'s';
+}
+
+// ── OTA Update Panel ──
+async function refreshUpdatePanel() {
+  try {
+    // Primär: setup.rs eigene Endpoints; Fallback: stone-master /api/v1/updates/status
+    let data;
+    const resp1 = await api('/api/updates', 'GET');
+    if (resp1.status === 200 && resp1.data.current_version) {
+      data = resp1.data;
+    } else {
+      const resp2 = await api('/api/v1/updates/status', 'GET');
+      if (resp2.status !== 200) return;
+      // Daten vom stone-master in dasselbe Format bringen
+      const d = resp2.data;
+      data = {
+        current_version: d.current_version || '?',
+        update_available: d.state !== 'Idle' && d.manifest !== null,
+        update_version: d.manifest ? d.manifest.version : null,
+        update_changelog: d.manifest ? (d.manifest.changelog || null) : null,
+        update_size: d.manifest ? d.manifest.binary_size : null,
+        update_published_at: d.manifest ? d.manifest.published_at : null,
+        download_state: d.state || 'Idle',
+        download_percent: d.percent || 0,
+        chunks_total: d.manifest ? d.manifest.chunk_hashes.length : 0,
+        chunks_downloaded: d.chunks_downloaded || 0,
+        can_install: d.state === 'Ready',
+        auto_download: d.auto_download,
+        auto_install: d.auto_install,
+        auto_update_hour: d.auto_update_hour || null,
+        trusted_keys_count: d.trusted_keys_count || 0
+      };
+    }
+    const badge = document.getElementById('update-badge');
+    const currentV = document.getElementById('upd-current-version');
+    const newVBox = document.getElementById('upd-new-version-box');
+    const newV = document.getElementById('upd-new-version');
+    const sizeBox = document.getElementById('upd-size-box');
+    const sizeEl = document.getElementById('upd-size');
+    const pubBox = document.getElementById('upd-published-box');
+    const pubEl = document.getElementById('upd-published');
+    const progressSection = document.getElementById('upd-progress-section');
+    const progressBar = document.getElementById('upd-progress-bar');
+    const progressText = document.getElementById('upd-progress-text');
+    const chunksText = document.getElementById('upd-chunks-text');
+    const changelogBox = document.getElementById('upd-changelog-box');
+    const changelogEl = document.getElementById('upd-changelog');
+    const installBtn = document.getElementById('upd-install-btn');
+    const installStatus = document.getElementById('upd-install-status');
+    const scheduleSelect = document.getElementById('upd-schedule');
+
+    currentV.textContent = 'v' + data.current_version;
+
+    // Schedule Dropdown synchronisieren
+    const schedVal = data.auto_update_hour !== null && data.auto_update_hour !== undefined
+      ? data.auto_update_hour.toString() : '-1';
+    if (scheduleSelect.value !== schedVal) scheduleSelect.value = schedVal;
+
+    if (!data.update_available) {
+      // Kein Update verfügbar
+      badge.className = 'update-badge up-to-date';
+      badge.textContent = '✅ Aktuell';
+      newVBox.style.display = 'none';
+      sizeBox.style.display = 'none';
+      pubBox.style.display = 'none';
+      progressSection.style.display = 'none';
+      changelogBox.style.display = 'none';
+      installBtn.style.display = 'none';
+      installStatus.textContent = '';
+      return;
+    }
+
+    // Update verfügbar!
+    newVBox.style.display = '';
+    newV.textContent = 'v' + data.update_version;
+
+    if (data.update_size) {
+      sizeBox.style.display = '';
+      sizeEl.textContent = humanBytes(data.update_size);
+    }
+
+    if (data.update_published_at) {
+      pubBox.style.display = '';
+      const d = new Date(data.update_published_at);
+      pubEl.textContent = d.toLocaleDateString('de-DE') + ' ' + d.toLocaleTimeString('de-DE', {hour:'2-digit',minute:'2-digit'});
+    }
+
+    if (data.update_changelog) {
+      changelogBox.style.display = '';
+      changelogEl.textContent = data.update_changelog;
+    } else {
+      changelogBox.style.display = 'none';
+    }
+
+    // Fortschritt
+    const state = data.download_state;
+    if (state === 'Downloading' || (data.chunks_total > 0 && data.download_percent < 100)) {
+      badge.className = 'update-badge downloading';
+      badge.textContent = '⬇️ Download ' + data.download_percent + '%';
+      progressSection.style.display = '';
+      progressBar.style.width = data.download_percent + '%';
+      progressText.textContent = data.download_percent + '%';
+      chunksText.textContent = data.chunks_downloaded + ' / ' + data.chunks_total + ' Chunks';
+      installBtn.style.display = 'none';
+    } else if (state === 'Ready' || data.can_install) {
+      badge.className = 'update-badge ready';
+      badge.textContent = '🟢 Bereit';
+      progressSection.style.display = '';
+      progressBar.style.width = '100%';
+      progressText.textContent = '100%';
+      chunksText.textContent = data.chunks_total + ' / ' + data.chunks_total + ' Chunks';
+      installBtn.style.display = '';
+      installBtn.disabled = false;
+      installBtn.textContent = '⬇️ Update v' + data.update_version + ' installieren';
+      if (data.auto_update_hour !== null && data.auto_update_hour !== undefined) {
+        installStatus.textContent = '⏰ Auto-Update um ' + String(data.auto_update_hour).padStart(2,'0') + ':00 Uhr geplant';
+      } else {
+        installStatus.textContent = '';
+      }
+    } else if (state === 'Installing') {
+      badge.className = 'update-badge installing';
+      badge.textContent = '🔄 Installiert...';
+      installBtn.style.display = 'none';
+      installStatus.textContent = 'Update wird installiert, Node startet gleich neu...';
+      installStatus.style.color = 'var(--orange)';
+    } else if (state.startsWith('Failed')) {
+      badge.className = 'update-badge failed';
+      badge.textContent = '❌ Fehlgeschlagen';
+      installBtn.style.display = 'none';
+      installStatus.textContent = state;
+      installStatus.style.color = 'var(--red)';
+    } else {
+      // Available, noch am Downloaden
+      badge.className = 'update-badge available';
+      badge.textContent = '🆕 Update verfügbar';
+      progressSection.style.display = data.chunks_total > 0 ? '' : 'none';
+      if (data.chunks_total > 0) {
+        progressBar.style.width = data.download_percent + '%';
+        progressText.textContent = data.download_percent + '%';
+        chunksText.textContent = data.chunks_downloaded + ' / ' + data.chunks_total + ' Chunks';
+      }
+      installBtn.style.display = 'none';
+    }
+  } catch(e) { console.error('Update-Status:', e); }
+}
+
+async function doInstallUpdate() {
+  const btn = document.getElementById('upd-install-btn');
+  const status = document.getElementById('upd-install-status');
+  if (!confirm('Update jetzt installieren? Der Node wird kurz neu gestartet.')) return;
+  btn.disabled = true;
+  btn.textContent = '⏳ Installiere...';
+  status.textContent = 'Installation läuft...';
+  status.style.color = 'var(--orange)';
+  try {
+    // Primär: setup.rs; Fallback: stone-master
+    let data;
+    const resp = await api('/api/updates/install', 'POST');
+    if (resp.status === 404) {
+      const resp2 = await api('/api/v1/updates/install', 'POST');
+      data = resp2.data;
+    } else {
+      data = resp.data;
+    }
+    if (data.ok) {
+      status.textContent = '✅ ' + data.message;
+      status.style.color = 'var(--green)';
+      btn.style.display = 'none';
+      // Warte auf Neustart, dann Seite neu laden
+      setTimeout(() => {
+        status.textContent = '🔄 Node startet neu... Seite wird neu geladen.';
+        setTimeout(() => location.reload(), 5000);
+      }, 3000);
+    } else {
+      status.textContent = '❌ ' + (data.error || 'Unbekannter Fehler');
+      status.style.color = 'var(--red)';
+      btn.disabled = false;
+      btn.textContent = '⬇️ Update installieren';
+    }
+  } catch(e) {
+    // Verbindung verloren = Node startet bereits neu
+    status.textContent = '🔄 Node startet neu...';
+    status.style.color = 'var(--green)';
+    setTimeout(() => location.reload(), 8000);
+  }
+}
+
+async function saveUpdateSchedule() {
+  const val = parseInt(document.getElementById('upd-schedule').value);
+  const hour = val >= 0 ? val : null;
+  try {
+    let resp = await api('/api/updates/config', 'POST', { auto_update_hour: hour });
+    if (resp.status === 404) {
+      resp = await api('/api/v1/updates/config', 'POST', { auto_update_hour: hour });
+    }
+    const status = document.getElementById('upd-install-status');
+    if (hour !== null) {
+      status.textContent = '⏰ Auto-Update auf ' + String(hour).padStart(2,'0') + ':00 Uhr gesetzt';
+    } else {
+      status.textContent = 'Auto-Update deaktiviert';
+    }
+    status.style.color = 'var(--muted)';
+    setTimeout(() => { if (status.textContent.includes('Auto-Update')) status.textContent = ''; }, 3000);
+  } catch(e) { console.error('Update-Config:', e); }
 }
 
 // Auto-refresh

@@ -27,6 +27,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use chrono::Timelike;
 use tokio::sync::RwLock;
 use tower::ServiceExt;
 
@@ -204,6 +205,10 @@ async fn main() {
         .route("/api/settings", post(api_save_settings))
         .route("/api/send", post(api_send))
         .route("/api/reward-preview", post(api_reward_preview))
+        // OTA Update Dashboard-Endpoints
+        .route("/api/updates", get(api_update_status))
+        .route("/api/updates/install", post(api_update_install))
+        .route("/api/updates/config", post(api_update_config))
         .fallback(forward_to_node_api)
         .with_state(state.clone());
 
@@ -395,6 +400,69 @@ async fn start_full_node(state: SetupState) {
                 if updated > 0 {
                     scan_node.shard_registry.persist();
                     println!("[shard-scan] ✅ Registry aktualisiert: {updated} Shard-Einträge von {} Peers für {} Chunks", peers.len(), chunk_hashes.len());
+                }
+            }
+        });
+    }
+
+    // ── Auto-Update Scheduler ───────────────────────────────────────────────
+    // Prüft jede Minute ob ein Update bereit ist und ob die konfigurierte
+    // Stunde erreicht ist → automatische Installation + Neustart
+    {
+        let sched_updater = updater.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            let mut last_install_date = String::new(); // Verhindert doppelte Installation am selben Tag
+            loop {
+                interval.tick().await;
+                let (should_install, version) = {
+                    let um = sched_updater.read().unwrap();
+                    let hour = match um.config.auto_update_hour {
+                        Some(h) => h,
+                        None => continue,
+                    };
+                    let now = chrono::Local::now();
+                    let today = now.format("%Y-%m-%d").to_string();
+                    if today == last_install_date {
+                        continue; // Schon heute installiert/versucht
+                    }
+                    let current_hour = now.hour() as u8;
+                    let is_ready = matches!(um.state, stone::updater::UpdateState::Ready);
+                    let version = um.manifest.as_ref().map(|m| m.version.clone()).unwrap_or_default();
+                    (current_hour == hour && is_ready, version)
+                };
+                if should_install {
+                    println!("[updater] ⏰ Geplantes Auto-Update: v{version} wird installiert...");
+                    let now = chrono::Local::now();
+                    last_install_date = now.format("%Y-%m-%d").to_string();
+                    let install_result = {
+                        let mut um = sched_updater.write().unwrap();
+                        um.install()
+                    };
+                    match install_result {
+                        Ok(_path) => {
+                            println!("[updater] ✅ Auto-Update installiert → Neustart in 5 Sekunden");
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::process::CommandExt;
+                                let exe = std::env::current_exe().unwrap();
+                                let args: Vec<String> = std::env::args().collect();
+                                let mut cmd = std::process::Command::new(&exe);
+                                cmd.args(&args[1..]);
+                                let err = cmd.exec();
+                                eprintln!("[updater] exec fehlgeschlagen: {err}");
+                                std::process::exit(1);
+                            }
+                            #[cfg(not(unix))]
+                            {
+                                std::process::exit(0);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[updater] ❌ Auto-Update fehlgeschlagen: {e}");
+                        }
+                    }
                 }
             }
         });
@@ -723,6 +791,194 @@ async fn resolve_peer_url(
     }
 
     None
+}
+
+// ─── API: Update-Status (Dashboard) ─────────────────────────────────────────
+
+#[derive(Serialize)]
+struct UpdateStatusResponse {
+    current_version: String,
+    update_available: bool,
+    update_version: Option<String>,
+    update_changelog: Option<String>,
+    update_size: Option<u64>,
+    update_published_at: Option<String>,
+    download_state: String,
+    download_percent: u8,
+    chunks_total: usize,
+    chunks_downloaded: usize,
+    can_install: bool,
+    auto_download: bool,
+    auto_install: bool,
+    auto_update_hour: Option<u8>,
+    trusted_keys_count: usize,
+}
+
+async fn api_update_status(State(state): State<SetupState>) -> Json<UpdateStatusResponse> {
+    let ns = state.node_state.read().await;
+    if let Some(ref ns) = *ns {
+        let um = ns.updater.read().unwrap();
+        let progress = um.progress();
+        let manifest = progress.manifest.as_ref();
+        let is_available = manifest.is_some();
+        let can_install = matches!(um.state, stone::updater::UpdateState::Ready);
+
+        Json(UpdateStatusResponse {
+            current_version: stone::updater::CURRENT_VERSION.to_string(),
+            update_available: is_available,
+            update_version: manifest.map(|m| m.version.clone()),
+            update_changelog: manifest.map(|m| {
+                if m.changelog.is_empty() { None } else { Some(m.changelog.clone()) }
+            }).flatten(),
+            update_size: manifest.map(|m| m.binary_size),
+            update_published_at: manifest.map(|m| m.published_at.to_rfc3339()),
+            download_state: format!("{:?}", um.state),
+            download_percent: progress.percent,
+            chunks_total: progress.chunks_total,
+            chunks_downloaded: progress.chunks_downloaded,
+            can_install,
+            auto_download: um.config.auto_download,
+            auto_install: um.config.auto_install,
+            auto_update_hour: um.config.auto_update_hour,
+            trusted_keys_count: um.config.trusted_keys.len(),
+        })
+    } else {
+        Json(UpdateStatusResponse {
+            current_version: stone::updater::CURRENT_VERSION.to_string(),
+            update_available: false,
+            update_version: None,
+            update_changelog: None,
+            update_size: None,
+            update_published_at: None,
+            download_state: "NodeOffline".to_string(),
+            download_percent: 0,
+            chunks_total: 0,
+            chunks_downloaded: 0,
+            can_install: false,
+            auto_download: true,
+            auto_install: false,
+            auto_update_hour: None,
+            trusted_keys_count: 0,
+        })
+    }
+}
+
+// ─── API: Update installieren ───────────────────────────────────────────────
+
+async fn api_update_install(State(state): State<SetupState>) -> (StatusCode, Json<serde_json::Value>) {
+    let ns = state.node_state.read().await;
+    match ns.as_ref() {
+        Some(ns) => {
+            // Erst verifizieren
+            {
+                let mut um = ns.updater.write().unwrap();
+                if um.manifest.is_none() {
+                    return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                        "ok": false, "error": "Kein Update verfügbar"
+                    })));
+                }
+                if let Err(e) = um.verify_and_prepare() {
+                    // Wenn schon Ready, ist das OK
+                    if !matches!(um.state, stone::updater::UpdateState::Ready) {
+                        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                            "ok": false, "error": format!("Verifizierung fehlgeschlagen: {e}")
+                        })));
+                    }
+                }
+            }
+            // Installieren
+            {
+                let mut um = ns.updater.write().unwrap();
+                // Version vor install() holen, weil install() manifest auf None setzt
+                let version = um.manifest.as_ref()
+                    .map(|m| m.version.clone())
+                    .unwrap_or_else(|| "?".into());
+                match um.install() {
+                    Ok(_path) => {
+                        // Neustart nach 2 Sekunden
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                            println!("[updater] 🔄 Neustart nach Update...");
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::process::CommandExt;
+                                let exe = std::env::current_exe().unwrap();
+                                let args: Vec<String> = std::env::args().collect();
+                                let mut cmd = std::process::Command::new(&exe);
+                                cmd.args(&args[1..]);
+                                let err = cmd.exec();
+                                eprintln!("[updater] exec fehlgeschlagen: {err}");
+                                std::process::exit(1);
+                            }
+                            #[cfg(not(unix))]
+                            {
+                                std::process::exit(0);
+                            }
+                        });
+                        (StatusCode::OK, Json(serde_json::json!({
+                            "ok": true,
+                            "message": format!("Update v{version} installiert! Node startet in 2 Sekunden neu...")
+                        })))
+                    }
+                    Err(e) => {
+                        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                            "ok": false, "error": format!("Installation fehlgeschlagen: {e}")
+                        })))
+                    }
+                }
+            }
+        }
+        None => {
+            (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+                "ok": false, "error": "Node noch nicht gestartet"
+            })))
+        }
+    }
+}
+
+// ─── API: Update-Config ändern ──────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct UpdateConfigReq {
+    #[serde(default)]
+    auto_download: Option<bool>,
+    #[serde(default)]
+    auto_install: Option<bool>,
+    #[serde(default)]
+    auto_update_hour: Option<Option<u8>>,  // Some(Some(3)) = 03:00, Some(None) = deaktiviert
+}
+
+async fn api_update_config(
+    State(state): State<SetupState>,
+    Json(body): Json<UpdateConfigReq>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let ns = state.node_state.read().await;
+    match ns.as_ref() {
+        Some(ns) => {
+            let mut um = ns.updater.write().unwrap();
+            if let Some(ad) = body.auto_download {
+                um.config.auto_download = ad;
+            }
+            if let Some(ai) = body.auto_install {
+                um.config.auto_install = ai;
+            }
+            if let Some(hour) = body.auto_update_hour {
+                um.config.auto_update_hour = hour.filter(|&h| h < 24);
+            }
+            let _ = um.save_config();
+            (StatusCode::OK, Json(serde_json::json!({
+                "ok": true,
+                "auto_download": um.config.auto_download,
+                "auto_install": um.config.auto_install,
+                "auto_update_hour": um.config.auto_update_hour
+            })))
+        }
+        None => {
+            (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+                "ok": false, "error": "Node noch nicht gestartet"
+            })))
+        }
+    }
 }
 
 // ─── Fallback: /api/v1/* und /ws an Node-Router weiterleiten ────────────────

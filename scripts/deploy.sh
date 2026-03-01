@@ -156,6 +156,14 @@ REMOTE_SCRIPT
 
     # Service neustarten
     if [ -n "$service" ]; then
+        # Service-File aktualisieren (falls vorhanden)
+        local service_src="$PROJECT_DIR/configs/stone-node.service"
+        if [ -f "$service_src" ]; then
+            echo -e "${BLUE}[deploy]${NC}   📄 Service-File aktualisieren..."
+            scp -P "$port" -q "$service_src" "$user@$host:/etc/systemd/system/$service.service"
+            ssh -p "$port" "$user@$host" "systemctl daemon-reload"
+        fi
+
         echo -e "${BLUE}[deploy]${NC}   🔄 Restarting $service ..."
         ssh -p "$port" "$user@$host" bash -s <<REMOTE_SCRIPT
             set -e
