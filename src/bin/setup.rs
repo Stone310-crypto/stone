@@ -291,6 +291,20 @@ async fn start_full_node(state: SetupState) {
 
     let users = load_users();
 
+    // On-Chain Account-Registry: Merge Chain-registrierte Accounts mit lokalen Users
+    {
+        let ledger = node.token_ledger.read().unwrap();
+        if ledger.registered_account_count() > 0 {
+            let mut local = users.lock().unwrap();
+            let merged = stone::auth::rebuild_users_from_ledger(&ledger, &local);
+            let chain_count = ledger.registered_account_count();
+            *local = merged;
+            stone::auth::save_users(&local);
+            println!("[node] 📋 Users aus Chain-Registry: {} Chain + {} gesamt",
+                chain_count, local.len());
+        }
+    }
+
     // Hintergrund-Tasks
     MasterNodeState::start_heartbeat(node.clone(), HEARTBEAT_INTERVAL);
     spawn_auto_sync_task(node.clone(), api_key.clone(), users.clone());
@@ -816,7 +830,38 @@ async fn handle_p2p_event(
             );
         }
 
-        _ => {} // PeerConnected, PeerDisconnected, Listening etc.
+        // ── Neuer Peer verbunden → Shard-Rebalancing ─────────────────────
+        NetworkEvent::PeerConnected { peer_id, .. } => {
+            println!("[node] 🔗 Peer verbunden: {}", &peer_id[..12.min(peer_id.len())]);
+
+            // Rebalancing nach kurzer Wartezeit starten (damit Peer-Liste stabil ist)
+            let node_rb = node.clone();
+            let handle_rb = handle.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+                let local_peer_id = handle_rb.local_peer_id.clone();
+                let shard_store = match stone::shard::ShardStore::new() {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("[rebalance] ShardStore-Fehler: {e}");
+                        return;
+                    }
+                };
+                let (migrated, failed) = stone::storage::rebalance_shards(
+                    &shard_store,
+                    &node_rb.shard_registry,
+                    &handle_rb,
+                    &local_peer_id,
+                ).await;
+                if migrated > 0 || failed > 0 {
+                    println!("[node] 📦 Rebalancing abgeschlossen: {} migriert, {} fehlgeschlagen",
+                        migrated, failed);
+                }
+            });
+        }
+
+        _ => {} // PeerDisconnected, Listening etc.
     }
 }
 
@@ -2049,7 +2094,6 @@ STONE_API_KEY={}
 STONE_P2P_LISTEN=/ip4/0.0.0.0/tcp/{}
 STONE_P2P_PORT={}
 {}
-STONE_P2P_PSK_DISABLED=1
 STONE_NODE_WALLET={}
 STONE_STORAGE_GB={}
 STONE_PUBLIC_IP={}

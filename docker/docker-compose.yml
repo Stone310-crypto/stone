@@ -1,0 +1,99 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Stone Network – Docker Compose
+#
+# Standard:  1 Node  →  docker-compose -f docker/docker-compose.yml up --build
+# Cluster:   3 Nodes →  docker-compose -f docker/docker-compose.yml --profile cluster up --build
+#
+# Dashboard: http://localhost:8080
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── Haupt-Node (startet immer) ─────────────────────────────────────────────
+  node:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: stone-node
+    hostname: stone-node
+    ports:
+      - "8080:8080"
+      - "4001:4001"
+    environment:
+      STONE_NODE_NAME: "stone-node"
+      STONE_PASSWORD: "TestPasswort1!"
+      STONE_STORAGE_GB: "50"
+      STONE_HTTP_PORT: "8080"
+      STONE_P2P_PORT: "4001"
+    volumes:
+      - node_data:/opt/stone-node/stone_data
+    networks:
+      - stonenet
+    restart: unless-stopped
+
+  # ── Node 2 (nur mit --profile cluster) ─────────────────────────────────────
+  node2:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: stone-node2
+    hostname: stone-node2
+    profiles:
+      - cluster
+    ports:
+      - "8082:8080"
+      - "4012:4001"
+    environment:
+      STONE_NODE_NAME: "stone-node-2"
+      STONE_PASSWORD: "TestPasswort2!"
+      STONE_STORAGE_GB: "30"
+      STONE_HTTP_PORT: "8080"
+      STONE_P2P_PORT: "4001"
+      STONE_NO_SEED: "1"
+      STONE_SEED_PEERS: "/dns4/stone-node/tcp/4001"
+    volumes:
+      - node2_data:/opt/stone-node/stone_data
+    networks:
+      - stonenet
+    depends_on:
+      node:
+        condition: service_started
+    restart: unless-stopped
+
+  # ── Node 3 (nur mit --profile cluster) ─────────────────────────────────────
+  node3:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: stone-node3
+    hostname: stone-node3
+    profiles:
+      - cluster
+    ports:
+      - "8083:8080"
+      - "4013:4001"
+    environment:
+      STONE_NODE_NAME: "stone-node-3"
+      STONE_PASSWORD: "TestPasswort3!"
+      STONE_STORAGE_GB: "20"
+      STONE_HTTP_PORT: "8080"
+      STONE_P2P_PORT: "4001"
+      STONE_NO_SEED: "1"
+      STONE_SEED_PEERS: "/dns4/stone-node/tcp/4001"
+    volumes:
+      - node3_data:/opt/stone-node/stone_data
+    networks:
+      - stonenet
+    depends_on:
+      node:
+        condition: service_started
+    restart: unless-stopped
+
+volumes:
+  node_data:
+  node2_data:
+  node3_data:
+
+networks:
+  stonenet:
+    driver: bridge

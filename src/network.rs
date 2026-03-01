@@ -54,10 +54,9 @@
 //! | `stone/mempool/v1` | Token-TXs (Mempool-Broadcast)        |
 
 use crate::blockchain::Block;
-use crate::psk::load_pnet_key;
 use futures_util::StreamExt;
 use libp2p::{
-    Multiaddr, PeerId, Swarm, SwarmBuilder, Transport as _,
+    Multiaddr, PeerId, Swarm, SwarmBuilder,
     autonat,
     dcutr,
     gossipsub::{self, IdentTopic, MessageAuthenticity},
@@ -65,7 +64,6 @@ use libp2p::{
     kad::{self, store::MemoryStore},
     mdns,
     noise,
-    pnet,
     relay,
     request_response::{self, ProtocolSupport},
     swarm::SwarmEvent,
@@ -749,85 +747,37 @@ pub fn build_swarm(
     // DCUtR baut auf dem Relay auf: nach einer Relay-Verbindung wird
     // automatisch versucht eine direkte Verbindung herzustellen (Hole-Punching).
 
-    let pnet_key = load_pnet_key();
-
-    let swarm = if let Some(psk) = pnet_key {
-        // PSK aktiv: pnet-Layer vor Noise einschalten
-        // HINWEIS: Mit PSK ist Relay-Transport nicht kompatibel (pnet erwartet
-        // direkte TCP-Verbindung). Relay wird übersprungen.
-        let pnet_config = pnet::PnetConfig::new(psk);
-        println!("[p2p] ⚠ PSK aktiv – Relay/DCUtR/UPnP deaktiviert (nur direkte Verbindungen)");
-        // Dummy relay_client + dcutr für das Behaviour-Struct
-        SwarmBuilder::with_existing_identity(keypair)
-            .with_tokio()
-            .with_other_transport(|key| {
-                let noise_config = noise::Config::new(key)?;
-                let base = tcp::tokio::Transport::new(tcp::Config::default().nodelay(true));
-                let transport = base
-                    .and_then(move |socket, _endpoint| pnet_config.handshake(socket))
-                    .upgrade(libp2p::core::upgrade::Version::V1)
-                    .authenticate(noise_config)
-                    .multiplex(yamux::Config::default())
-                    .boxed();
-                Ok(transport)
-            })?
-            .with_relay_client(noise::Config::new, yamux::Config::default)?
-            .with_behaviour(|key, relay_client| {
-                let dcutr = dcutr::Behaviour::new(key.public().to_peer_id());
-                StoneBehaviour {
-                    identify: identify,
-                    kad: kad,
-                    mdns: mdns,
-                    gossipsub: gossipsub,
-                    block_exchange: block_exchange,
-                    shard_exchange: shard_exchange,
-                    relay_client,
-                    relay_server,
-                    dcutr,
-                    autonat,
-                    upnp,
-                }
-            })?
-            .with_swarm_config(|cfg| {
-                cfg.with_idle_connection_timeout(Duration::from_secs(
-                    config.connection_timeout_secs * 2,
-                ))
-            })
-            .build()
-    } else {
-        // Ohne PSK: voller NAT-Traversal Stack
-        //   TCP + Noise + Yamux + Relay-Client + DCUtR
-        SwarmBuilder::with_existing_identity(keypair)
-            .with_tokio()
-            .with_tcp(
-                tcp::Config::default().nodelay(true),
-                noise::Config::new,
-                yamux::Config::default,
-            )?
-            .with_relay_client(noise::Config::new, yamux::Config::default)?
-            .with_behaviour(|key, relay_client| {
-                let dcutr = dcutr::Behaviour::new(key.public().to_peer_id());
-                StoneBehaviour {
-                    identify: identify,
-                    kad: kad,
-                    mdns: mdns,
-                    gossipsub: gossipsub,
-                    block_exchange: block_exchange,
-                    shard_exchange: shard_exchange,
-                    relay_client,
-                    relay_server,
-                    dcutr,
-                    autonat,
-                    upnp,
-                }
-            })?
-            .with_swarm_config(|cfg| {
-                cfg.with_idle_connection_timeout(Duration::from_secs(
-                    config.connection_timeout_secs * 2,
-                ))
-            })
-            .build()
-    };
+    // Voller NAT-Traversal Stack: TCP + Noise + Yamux + Relay-Client + DCUtR
+    let swarm = SwarmBuilder::with_existing_identity(keypair)
+        .with_tokio()
+        .with_tcp(
+            tcp::Config::default().nodelay(true),
+            noise::Config::new,
+            yamux::Config::default,
+        )?
+        .with_relay_client(noise::Config::new, yamux::Config::default)?
+        .with_behaviour(|key, relay_client| {
+            let dcutr = dcutr::Behaviour::new(key.public().to_peer_id());
+            StoneBehaviour {
+                identify: identify,
+                kad: kad,
+                mdns: mdns,
+                gossipsub: gossipsub,
+                block_exchange: block_exchange,
+                shard_exchange: shard_exchange,
+                relay_client,
+                relay_server,
+                dcutr,
+                autonat,
+                upnp,
+            }
+        })?
+        .with_swarm_config(|cfg| {
+            cfg.with_idle_connection_timeout(Duration::from_secs(
+                config.connection_timeout_secs * 2,
+            ))
+        })
+        .build();
 
     Ok(swarm)
 }
@@ -1122,7 +1072,7 @@ impl SwarmTask {
 
     async fn handle_swarm_event(&mut self, event: SwarmEvent<StoneBehaviourEvent>) {
         match event {
-            SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
+            SwarmEvent::ConnectionEstablished { peer_id, endpoint, num_established, .. } => {
                 // Gebannte Peers sofort trennen
                 if self.is_peer_banned(&peer_id) {
                     eprintln!("[p2p] 🔨 Verbindung von gebantem Peer {peer_id} getrennt");
@@ -1132,7 +1082,10 @@ impl SwarmTask {
 
                 let addr = endpoint.get_remote_address().to_string();
                 let now = chrono::Utc::now().timestamp();
-                println!("[p2p] ✓ Verbunden: {peer_id} @ {addr}");
+                // Nur loggen wenn es die erste Verbindung zu diesem Peer ist
+                if num_established.get() == 1 {
+                    println!("[p2p] ✓ Verbunden: {peer_id} @ {addr}");
+                }
 
                 let entry = self.peers.entry(peer_id).or_insert_with(|| PeerInfo {
                     peer_id: peer_id.to_string(),
@@ -1148,27 +1101,33 @@ impl SwarmTask {
                     entry.addresses.push(addr.clone());
                 }
 
-                let _ = self.event_tx.send(NetworkEvent::PeerConnected {
-                    peer_id: peer_id.to_string(),
-                    addr,
-                });
+                // Events + Sync nur bei erster Verbindung
+                if num_established.get() == 1 {
+                    let _ = self.event_tx.send(NetworkEvent::PeerConnected {
+                        peer_id: peer_id.to_string(),
+                        addr,
+                    });
 
-                // Chain-Sync anstoßen: Handshake-Nachricht via Gossipsub senden
-                if self.config.auto_sync_on_connect {
-                    self.send_sync_handshake();
+                    // Chain-Sync anstoßen: Handshake-Nachricht via Gossipsub senden
+                    if self.config.auto_sync_on_connect {
+                        self.send_sync_handshake();
+                    }
                 }
             }
 
-            SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
+            SwarmEvent::ConnectionClosed { peer_id, num_established, cause, .. } => {
                 let reason = cause.map(|e| e.to_string()).unwrap_or_default();
-                println!("[p2p] ✗ Getrennt: {peer_id} ({reason})");
+                // Nur loggen wenn es die letzte Verbindung zu diesem Peer war
+                if num_established == 0 {
+                    println!("[p2p] ✗ Getrennt: {peer_id} ({reason})");
 
-                if let Some(info) = self.peers.get_mut(&peer_id) {
-                    info.connected = false;
+                    if let Some(info) = self.peers.get_mut(&peer_id) {
+                        info.connected = false;
+                    }
+                    let _ = self.event_tx.send(NetworkEvent::PeerDisconnected {
+                        peer_id: peer_id.to_string(),
+                    });
                 }
-                let _ = self.event_tx.send(NetworkEvent::PeerDisconnected {
-                    peer_id: peer_id.to_string(),
-                });
             }
 
             SwarmEvent::NewListenAddr { address, .. } => {

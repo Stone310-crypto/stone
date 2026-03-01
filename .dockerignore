@@ -1,0 +1,32 @@
+# Build-Artefakte nicht in den Docker-Context senden
+target/
+
+# Docker-Unterverzeichnis: nur README ausschließen (entrypoint.sh wird gebraucht)
+docker/README.md
+
+# Datenverzeichnisse
+stone_data/
+stone_block_2/
+
+# Lokale Konfigurationen
+node_config.json
+.env
+*.key
+*.crt
+admin/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+*.swp
+
+# Git
+.git/
+.gitignore
+
+# Tests & Scripts die nicht gebraucht werden
+tests/
+scripts/
+configs/
+web/

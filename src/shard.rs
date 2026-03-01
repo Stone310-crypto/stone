@@ -749,4 +749,79 @@ impl ShardHolderRegistry {
             }
         }
     }
+
+    /// Berechnet Shard-Migrationen die nötig sind um die Verteilung auszugleichen.
+    ///
+    /// Strategie:
+    /// - Für jeden Chunk: Prüfe ob der neue Peer (`new_peer`) laut `assign_shards_to_peers`
+    ///   einen Shard halten sollte, ihn aber noch nicht hat.
+    /// - Gibt eine Liste von (chunk_hash, shard_index, source_peer, target_peer) zurück.
+    ///
+    /// `connected_peers` muss die vollständige Liste ALLER verbundenen Peers enthalten
+    /// (inkl. dem neuen).
+    pub fn compute_rebalance(
+        &self,
+        connected_peers: &[String],
+        local_peer_id: &str,
+    ) -> Vec<RebalanceAction> {
+        if connected_peers.is_empty() {
+            return Vec::new();
+        }
+
+        let map = self.entries.read().unwrap();
+        let mut actions = Vec::new();
+
+        for (chunk_hash, shard_map) in map.iter() {
+            // Bestimme k+m aus den vorhandenen Shard-Indizes
+            let max_idx = shard_map.keys().max().copied().unwrap_or(0);
+            let total_shards = (max_idx + 1) as u8;
+            if total_shards < 2 { continue; }
+
+            // Berechne ideale Zuweisung mit aktuellem Peer-Set
+            let ideal = assign_shards_to_peers(
+                chunk_hash,
+                connected_peers,
+                total_shards, // k+m als total
+                0,            // m=0 da wir total_shards schon als k+m haben
+            );
+
+            for (shard_idx, ideal_peer) in &ideal {
+                if ideal_peer.is_empty() { continue; }
+
+                let current_holders = shard_map
+                    .get(shard_idx)
+                    .cloned()
+                    .unwrap_or_default();
+
+                // Soll-Peer hat den Shard schon? → nichts zu tun
+                if current_holders.contains(ideal_peer) {
+                    continue;
+                }
+
+                // Finde einen Source-Peer der den Shard hat
+                let source = current_holders.iter()
+                    .find(|h| connected_peers.contains(h) || *h == local_peer_id)
+                    .cloned()
+                    .unwrap_or_else(|| local_peer_id.to_string());
+
+                actions.push(RebalanceAction {
+                    chunk_hash: chunk_hash.clone(),
+                    shard_index: *shard_idx,
+                    source_peer: source,
+                    target_peer: ideal_peer.clone(),
+                });
+            }
+        }
+
+        actions
+    }
+}
+
+/// Beschreibt eine einzelne Shard-Migration.
+#[derive(Debug, Clone)]
+pub struct RebalanceAction {
+    pub chunk_hash: String,
+    pub shard_index: u8,
+    pub source_peer: String,
+    pub target_peer: String,
 }

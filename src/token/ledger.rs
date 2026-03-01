@@ -131,6 +131,15 @@ pub struct TokenLedger {
     key_rotations: HashMap<String, String>,
     /// Reverse-Lookup: neuer Key → alter Key (für History-Traversal)
     key_rotation_history: HashMap<String, Vec<String>>,
+
+    // ── On-Chain Account Registry ─────────────────────────────────────────
+    /// Wallet-Adresse → registrierter Account-Name.
+    /// Wird aus AccountRegister-TXs aufgebaut und ist die einzige
+    /// autoritative Quelle für Account-Zuordnungen.
+    account_names: HashMap<String, String>,
+    /// Wallet-Adresse → API-Key-Hash (SHA-256 der Phrase).
+    /// Dient als Authentifizierungsbeweis, wird aus AccountRegister-TX memo gelesen.
+    account_api_keys: HashMap<String, String>,
 }
 
 impl TokenLedger {
@@ -144,6 +153,8 @@ impl TokenLedger {
             processed_txs: std::collections::HashSet::new(),
             key_rotations: HashMap::new(),
             key_rotation_history: HashMap::new(),
+            account_names: HashMap::new(),
+            account_api_keys: HashMap::new(),
         }
     }
 
@@ -185,6 +196,40 @@ impl TokenLedger {
     /// Anzahl der Accounts mit positivem Guthaben.
     pub fn account_count(&self) -> usize {
         self.balances.values().filter(|b| **b > Decimal::ZERO).count()
+    }
+
+    // ── On-Chain Account-Registry Abfragen ────────────────────────────────
+
+    /// Gibt den registrierten Account-Namen für eine Wallet-Adresse zurück.
+    pub fn account_name(&self, wallet_address: &str) -> Option<&str> {
+        self.account_names.get(wallet_address).map(|s| s.as_str())
+    }
+
+    /// Gibt den API-Key-Hash für eine Wallet-Adresse zurück.
+    pub fn account_api_key_hash(&self, wallet_address: &str) -> Option<&str> {
+        self.account_api_keys.get(wallet_address).map(|s| s.as_str())
+    }
+
+    /// Alle registrierten Accounts (Wallet → Name).
+    pub fn all_registered_accounts(&self) -> &HashMap<String, String> {
+        &self.account_names
+    }
+
+    /// Sucht einen Account nach API-Key-Hash.
+    /// Gibt (wallet_address, name) zurück.
+    pub fn find_account_by_api_key(&self, api_key_hash: &str) -> Option<(String, String)> {
+        for (wallet, hash) in &self.account_api_keys {
+            if hash == api_key_hash {
+                let name = self.account_names.get(wallet).cloned().unwrap_or_default();
+                return Some((wallet.clone(), name));
+            }
+        }
+        None
+    }
+
+    /// Anzahl der in der Chain registrierten Accounts.
+    pub fn registered_account_count(&self) -> usize {
+        self.account_names.len()
     }
 
     // ── Schreiboperationen ────────────────────────────────────────────────
@@ -395,7 +440,9 @@ impl TokenLedger {
         }
 
         // 3. Nonce-Prüfung (nur für Nutzer-Transaktionen)
-        if tx.tx_type == TxType::Transfer || tx.tx_type == TxType::Burn || tx.tx_type == TxType::RotateKey {
+        if tx.tx_type == TxType::Transfer || tx.tx_type == TxType::Burn || tx.tx_type == TxType::RotateKey
+            || tx.tx_type == TxType::AccountRegister || tx.tx_type == TxType::AccountUpdate
+        {
             // Prüfen ob der Key durch Rotation invalidiert wurde
             if let Some(active) = self.resolve_active_key(&tx.from) {
                 return Err(LedgerError::KeyRevoked {
@@ -432,6 +479,45 @@ impl TokenLedger {
                 // from = alter Key, to = neuer Key
                 self.rotate_key(&tx.from, &tx.to)?;
                 // Nonce wird am alten Key NICHT mehr erhöht – Account ist ab jetzt inaktiv
+            }
+            TxType::AccountRegister => {
+                // from == to == wallet_address, memo = JSON mit name + api_key_hash
+                if self.account_names.contains_key(&tx.from) {
+                    return Err(LedgerError::TxValidation(TxError::Replay(
+                        format!("Account {} bereits registriert", &tx.from[..12.min(tx.from.len())])
+                    )));
+                }
+                // Memo parsen: {"name":"…","api_key_hash":"…"}
+                if let Ok(memo) = serde_json::from_str::<serde_json::Value>(&tx.memo) {
+                    let name = memo.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    let api_key_hash = memo.get("api_key_hash").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                    if !name.is_empty() {
+                        self.account_names.insert(tx.from.clone(), name);
+                    }
+                    if !api_key_hash.is_empty() {
+                        self.account_api_keys.insert(tx.from.clone(), api_key_hash);
+                    }
+                }
+                // Nonce erhöhen
+                *self.nonces.entry(tx.from.clone()).or_insert(0) += 1;
+            }
+            TxType::AccountUpdate => {
+                // Account muss existieren
+                if !self.account_names.contains_key(&tx.from) {
+                    return Err(LedgerError::TxValidation(TxError::MissingField(
+                        format!("Account {} nicht registriert", &tx.from[..12.min(tx.from.len())])
+                    )));
+                }
+                // Memo parsen und Felder aktualisieren
+                if let Ok(memo) = serde_json::from_str::<serde_json::Value>(&tx.memo) {
+                    if let Some(name) = memo.get("name").and_then(|v| v.as_str()) {
+                        if !name.is_empty() {
+                            self.account_names.insert(tx.from.clone(), name.to_string());
+                        }
+                    }
+                }
+                // Nonce erhöhen
+                *self.nonces.entry(tx.from.clone()).or_insert(0) += 1;
             }
         }
 
@@ -514,8 +600,22 @@ impl TokenLedger {
                 .map_err(|e| LedgerError::Persistence(format!("put keyrot: {e}")))?;
         }
 
-        println!("[token] 💾 Ledger persistiert: {} Accounts, {} Key-Rotations, Supply: {}",
-            self.account_count(), self.key_rotations.len(), self.total_supply);
+        // Account-Registry: name
+        for (wallet, name) in &self.account_names {
+            let key = format!("acct_name/{}", wallet);
+            db.put(key.as_bytes(), name.as_bytes())
+                .map_err(|e| LedgerError::Persistence(format!("put acct_name: {e}")))?;
+        }
+
+        // Account-Registry: api_key_hash
+        for (wallet, hash) in &self.account_api_keys {
+            let key = format!("acct_key/{}", wallet);
+            db.put(key.as_bytes(), hash.as_bytes())
+                .map_err(|e| LedgerError::Persistence(format!("put acct_key: {e}")))?;
+        }
+
+        println!("[token] 💾 Ledger persistiert: {} Accounts, {} Registrierte, {} Key-Rotations, Supply: {}",
+            self.account_count(), self.registered_account_count(), self.key_rotations.len(), self.total_supply);
         Ok(())
     }
 
@@ -593,9 +693,42 @@ impl TokenLedger {
             }
         }
 
+        // Account-Registry: Namen laden
+        let iter = db.prefix_iterator(b"acct_name/");
+        for item in iter {
+            if let Ok((key, value)) = item {
+                let key_str = String::from_utf8_lossy(&key);
+                if !key_str.starts_with("acct_name/") {
+                    break;
+                }
+                let wallet = key_str.strip_prefix("acct_name/").unwrap_or("").to_string();
+                let name = String::from_utf8_lossy(&value).to_string();
+                if !wallet.is_empty() && !name.is_empty() {
+                    ledger.account_names.insert(wallet, name);
+                }
+            }
+        }
+
+        // Account-Registry: API-Key-Hashes laden
+        let iter = db.prefix_iterator(b"acct_key/");
+        for item in iter {
+            if let Ok((key, value)) = item {
+                let key_str = String::from_utf8_lossy(&key);
+                if !key_str.starts_with("acct_key/") {
+                    break;
+                }
+                let wallet = key_str.strip_prefix("acct_key/").unwrap_or("").to_string();
+                let hash = String::from_utf8_lossy(&value).to_string();
+                if !wallet.is_empty() && !hash.is_empty() {
+                    ledger.account_api_keys.insert(wallet, hash);
+                }
+            }
+        }
+
         println!(
-            "[token] 📂 Ledger geladen: {} Accounts, {} Key-Rotations, Supply: {}",
+            "[token] 📂 Ledger geladen: {} Accounts, {} Registrierte, {} Key-Rotations, Supply: {}",
             ledger.account_count(),
+            ledger.registered_account_count(),
             ledger.key_rotations.len(),
             ledger.total_supply
         );
@@ -613,10 +746,11 @@ impl TokenLedger {
                 ledger.apply_block_txs(&block.transactions, block.index);
             }
         }
-        if ledger.total_supply > Decimal::ZERO {
+        if ledger.total_supply > Decimal::ZERO || ledger.registered_account_count() > 0 {
             println!(
-                "[token] 🔄 Ledger aus Chain rekonstruiert: {} Accounts, Supply: {}",
+                "[token] 🔄 Ledger aus Chain rekonstruiert: {} Accounts, {} Registrierte, Supply: {}",
                 ledger.account_count(),
+                ledger.registered_account_count(),
                 ledger.total_supply
             );
             if let Err(e) = ledger.persist() {

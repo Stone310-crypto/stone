@@ -97,6 +97,20 @@ async fn main() {
 
     let users = load_users();
 
+    // On-Chain Account-Registry: Merge Chain-registrierte Accounts mit lokalen Users
+    {
+        let ledger = node.token_ledger.read().unwrap();
+        if ledger.registered_account_count() > 0 {
+            let mut local = users.lock().unwrap();
+            let merged = stone::auth::rebuild_users_from_ledger(&ledger, &local);
+            let chain_count = ledger.registered_account_count();
+            *local = merged;
+            stone::auth::save_users(&local);
+            println!("[master] 📋 Users aus Chain-Registry geladen: {} Chain + {} lokal = {} gesamt",
+                chain_count, local.len() - chain_count, local.len());
+        }
+    }
+
     // Hintergrund-Tasks starten
     MasterNodeState::start_heartbeat(node.clone(), HEARTBEAT_INTERVAL);
     spawn_auto_sync_task(node.clone(), api_key.clone(), users.clone());
@@ -379,7 +393,35 @@ async fn main() {
                                     }
                                 }
 
-                                _ => {} // PeerConnected, Listening etc.
+                                // ── Neuer Peer → Shard-Rebalancing ──────────
+                                NetworkEvent::PeerConnected { peer_id, .. } => {
+                                    println!("[master] 🔗 Peer verbunden: {}", &peer_id[..12.min(peer_id.len())]);
+                                    let node_rb = node_bg.clone();
+                                    let handle_rb = handle_bg.clone();
+                                    tokio::spawn(async move {
+                                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                        let local_peer_id = handle_rb.local_peer_id.clone();
+                                        let shard_store = match stone::shard::ShardStore::new() {
+                                            Ok(s) => s,
+                                            Err(e) => {
+                                                eprintln!("[rebalance] ShardStore-Fehler: {e}");
+                                                return;
+                                            }
+                                        };
+                                        let (migrated, failed) = stone::storage::rebalance_shards(
+                                            &shard_store,
+                                            &node_rb.shard_registry,
+                                            &handle_rb,
+                                            &local_peer_id,
+                                        ).await;
+                                        if migrated > 0 || failed > 0 {
+                                            println!("[master] 📦 Rebalancing: {} migriert, {} fehlgeschlagen",
+                                                migrated, failed);
+                                        }
+                                    });
+                                }
+
+                                _ => {} // PeerDisconnected, Listening etc.
                                 }
                             }
                         });

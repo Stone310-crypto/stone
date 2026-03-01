@@ -45,16 +45,26 @@ pub enum TxType {
     Burn,
     /// Ed25519 Key-Rotation: `from` = alter Key, `to` = neuer Key
     RotateKey,
+    /// Account-Registrierung in der Chain.
+    /// `from` = wallet_address (public key hex), `to` = wallet_address (gleich),
+    /// `memo` = JSON: `{"name":"…","api_key_hash":"…"}`, amount = 0
+    AccountRegister,
+    /// Account-Update (z.B. Name ändern).
+    /// `from` = wallet_address, `to` = wallet_address,
+    /// `memo` = JSON mit geänderten Feldern, amount = 0
+    AccountUpdate,
 }
 
 impl std::fmt::Display for TxType {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            TxType::Transfer  => write!(f, "transfer"),
-            TxType::Mint      => write!(f, "mint"),
-            TxType::Reward    => write!(f, "reward"),
-            TxType::Burn      => write!(f, "burn"),
-            TxType::RotateKey => write!(f, "rotate_key"),
+            TxType::Transfer        => write!(f, "transfer"),
+            TxType::Mint            => write!(f, "mint"),
+            TxType::Reward          => write!(f, "reward"),
+            TxType::Burn            => write!(f, "burn"),
+            TxType::RotateKey       => write!(f, "rotate_key"),
+            TxType::AccountRegister => write!(f, "account_register"),
+            TxType::AccountUpdate   => write!(f, "account_update"),
         }
     }
 }
@@ -199,10 +209,10 @@ pub fn create_signed_tx(
     memo: String,
 ) -> Result<TokenTx, TxError> {
     // Validierung
-    if tx_type == TxType::RotateKey {
-        // Key-Rotation: amount muss 0 sein, fee >= 0
+    if tx_type == TxType::RotateKey || tx_type == TxType::AccountRegister || tx_type == TxType::AccountUpdate {
+        // Diese TX-Typen: amount muss 0 sein, fee >= 0
         if amount != Decimal::ZERO {
-            return Err(TxError::InvalidAmount("RotateKey: Betrag muss 0 sein".into()));
+            return Err(TxError::InvalidAmount(format!("{tx_type}: Betrag muss 0 sein")));
         }
     } else if amount <= Decimal::ZERO {
         return Err(TxError::InvalidAmount("Betrag muss positiv sein".into()));
@@ -304,10 +314,10 @@ pub fn validate_tx(tx: &TokenTx) -> Result<(), TxError> {
     if tx.to.is_empty() {
         return Err(TxError::MissingField("to".into()));
     }
-    // RotateKey: amount == 0 erlaubt; sonst muss amount > 0
-    if tx.tx_type == TxType::RotateKey {
+    // RotateKey/AccountRegister/AccountUpdate: amount == 0 erlaubt; sonst muss amount > 0
+    if tx.tx_type == TxType::RotateKey || tx.tx_type == TxType::AccountRegister || tx.tx_type == TxType::AccountUpdate {
         if tx.amount != Decimal::ZERO {
-            return Err(TxError::InvalidAmount("RotateKey: Betrag muss 0 sein".into()));
+            return Err(TxError::InvalidAmount(format!("{}: Betrag muss 0 sein", tx.tx_type)));
         }
     } else if tx.amount <= Decimal::ZERO {
         return Err(TxError::InvalidAmount("Betrag muss positiv sein".into()));

@@ -987,6 +987,95 @@ async fn fetch_missing_shards_for_chunk(
     fetched
 }
 
+// ─── Shard-Rebalancing (async) ────────────────────────────────────────────────
+
+/// Führt Shard-Rebalancing aus: Sendet Shards an neue Peers die laut
+/// `assign_shards_to_peers` einen Shard halten sollten.
+///
+/// Wird aufgerufen wenn ein neuer Peer dem Netzwerk beitritt.
+/// Nur Shards die lokal verfügbar sind werden migriert (kein Chain-of-Forwarding).
+pub async fn rebalance_shards(
+    shard_store: &ShardStore,
+    registry: &shard::ShardHolderRegistry,
+    network: &crate::network::NetworkHandle,
+    local_peer_id: &str,
+) -> (u64, u64) {
+    let peers = network.connected_peers().await;
+    if peers.is_empty() {
+        return (0, 0);
+    }
+
+    let peer_ids: Vec<String> = peers.iter().map(|p| p.peer_id.clone()).collect();
+    let actions = registry.compute_rebalance(&peer_ids, local_peer_id);
+
+    if actions.is_empty() {
+        println!("[rebalance] ✅ Shards sind bereits optimal verteilt");
+        return (0, 0);
+    }
+
+    println!("[rebalance] 🔄 {} Shard-Migrationen geplant", actions.len());
+
+    let mut migrated = 0u64;
+    let mut failed = 0u64;
+
+    for action in &actions {
+        // Nur lokal verfügbare Shards migrieren
+        if action.source_peer != local_peer_id {
+            continue;
+        }
+
+        let shard_data = match shard_store.read_shard(&action.chunk_hash, action.shard_index) {
+            Ok(data) => data,
+            Err(_) => {
+                failed += 1;
+                continue;
+            }
+        };
+
+        let hash = shard::shard_hash(&shard_data);
+
+        let peer_id: libp2p::PeerId = match action.target_peer.parse() {
+            Ok(id) => id,
+            Err(_) => {
+                failed += 1;
+                continue;
+            }
+        };
+
+        println!(
+            "[rebalance] → Shard {}[{}] ({} bytes) → {}",
+            &action.chunk_hash[..8.min(action.chunk_hash.len())],
+            action.shard_index,
+            shard_data.len(),
+            &action.target_peer[..8.min(action.target_peer.len())]
+        );
+
+        network
+            .store_shard_on_peer(
+                peer_id,
+                action.chunk_hash.clone(),
+                action.shard_index,
+                hash,
+                shard_data,
+            )
+            .await;
+
+        // Holder registrieren (wird durch ShardStored-Event bestätigt)
+        registry.add_holder(&action.chunk_hash, action.shard_index, &action.target_peer);
+        migrated += 1;
+    }
+
+    if migrated > 0 {
+        registry.persist();
+        println!(
+            "[rebalance] ✅ {} Shards migriert, {} fehlgeschlagen",
+            migrated, failed
+        );
+    }
+
+    (migrated, failed)
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

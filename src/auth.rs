@@ -130,6 +130,69 @@ pub fn resolve_phrase(phrase: &str) -> Option<String> {
     Some(hash_phrase(phrase))
 }
 
+/// Rekonstruiert die User-Liste aus dem On-Chain Account-Registry des Ledgers.
+///
+/// Der Ledger enthält alle AccountRegister-TXs mit name + api_key_hash + wallet_address.
+/// Diese Funktion baut daraus die `Vec<User>` auf und mergt sie mit eventuell
+/// vorhandenen lokalen Usern (Fallback für Alt-Accounts vor Chain-Registrierung).
+///
+/// Reihenfolge: Chain hat Vorrang. Lokale User ohne Chain-Eintrag bleiben erhalten
+/// (Rückwärtskompatibilität), werden aber beim nächsten Login migriert.
+pub fn rebuild_users_from_ledger(
+    ledger: &crate::token::TokenLedger,
+    existing_users: &[User],
+) -> Vec<User> {
+    let chain_accounts = ledger.all_registered_accounts();
+    let mut users: Vec<User> = Vec::with_capacity(chain_accounts.len() + existing_users.len());
+
+    // 1. Alle Chain-registrierten Accounts übernehmen
+    let mut chain_wallets: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut chain_api_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut idx = 0usize;
+
+    for (wallet, name) in chain_accounts {
+        idx += 1;
+        let api_key_hash = ledger.account_api_key_hash(wallet).unwrap_or("").to_string();
+
+        // ID: Versuche aus bestehenden Usern zu übernehmen, sonst generieren
+        let existing_id = existing_users.iter()
+            .find(|u| u.wallet_address == *wallet || u.api_key == api_key_hash)
+            .map(|u| u.id.clone());
+        let id = existing_id.unwrap_or_else(|| format!("user-{}", idx));
+
+        // Quota: aus bestehendem User übernehmen oder Default
+        let quota = existing_users.iter()
+            .find(|u| u.wallet_address == *wallet || u.api_key == api_key_hash)
+            .map(|u| u.quota_bytes)
+            .unwrap_or_else(default_quota_bytes);
+
+        chain_wallets.insert(wallet.clone());
+        if !api_key_hash.is_empty() {
+            chain_api_keys.insert(api_key_hash.clone());
+        }
+
+        users.push(User {
+            id,
+            name: name.clone(),
+            api_key: api_key_hash.clone(),
+            phrase_hash: api_key_hash,
+            quota_bytes: quota,
+            wallet_address: wallet.clone(),
+        });
+    }
+
+    // 2. Lokale User OHNE Chain-Eintrag beibehalten (Legacy-Kompatibilität)
+    for u in existing_users {
+        let already_in_chain = (!u.wallet_address.is_empty() && chain_wallets.contains(&u.wallet_address))
+            || (!u.api_key.is_empty() && chain_api_keys.contains(&u.api_key));
+        if !already_in_chain {
+            users.push(u.clone());
+        }
+    }
+
+    users
+}
+
 // ─── Lokale Token-Generierung (kein Auth-Server nötig) ───────────────────────
 
 /// Claims für einen lokal generierten HMAC-Token.

@@ -47,6 +47,57 @@ pub async fn handle_signup(
         (id, user, phrase)
     };
 
+    // ── AccountRegister TX in die Chain schreiben ─────────────────────────
+    // Damit ist der Account manipulationssicher in der Blockchain verankert.
+    if !new_user.wallet_address.is_empty() {
+        let wallet = new_user.wallet_address.clone();
+        let name = new_user.name.clone();
+        let api_key_hash = new_user.api_key.clone();
+        let node = state.node.clone();
+
+        // Signing Key aus der Phrase ableiten (gleiche Logik wie wallet)
+        if let Ok(mnemonic) = bip39::Mnemonic::parse_in(bip39::Language::English, &phrase) {
+            let entropy = mnemonic.to_entropy();
+            let key_bytes: [u8; 32] = if entropy.len() == 32 {
+                entropy.try_into().unwrap()
+            } else {
+                use sha2::{Digest, Sha256};
+                let hash: [u8; 32] = Sha256::digest(&entropy).into();
+                hash
+            };
+            let signing_key = ed25519_dalek::SigningKey::from_bytes(&key_bytes);
+
+            let nonce = {
+                let ledger = node.token_ledger.read().unwrap();
+                ledger.nonce(&wallet)
+            };
+
+            let memo = serde_json::json!({
+                "name": name,
+                "api_key_hash": api_key_hash,
+            }).to_string();
+
+            if let Ok(tx) = stone::token::create_signed_tx(
+                &signing_key,
+                stone::token::TxType::AccountRegister,
+                wallet.clone(),
+                wallet.clone(),
+                rust_decimal::Decimal::ZERO,
+                rust_decimal::Decimal::ZERO,
+                nonce,
+                memo,
+            ) {
+                // Direkt in den nächsten Block aufnehmen (via Mempool)
+                if let Err(e) = node.mempool.add_tx(tx.clone(), None) {
+                    eprintln!("[auth] AccountRegister TX → Mempool fehlgeschlagen: {e}");
+                } else {
+                    println!("[auth] 📝 AccountRegister TX für '{}' erstellt: {}",
+                        name, &tx.tx_id[..12]);
+                }
+            }
+        }
+    }
+
     let peers = state.node.get_peers();
     let api_key = state.api_key.clone();
     let push_user = new_user.clone();
