@@ -8,6 +8,7 @@ use std::{
 use stone::{
     auth::User,
     blockchain::{ChunkRef, data_dir, CHUNK_SIZE, Document},
+    chat::ChatIndex,
     master_node::{MasterNodeState, PeerInfo, TrustEntry, TrustVote},
     network::NetworkHandle,
     organization::Organization,
@@ -41,6 +42,8 @@ pub struct AppState {
     pub updater: Arc<RwLock<UpdateManager>>,
     /// Organisationen
     pub orgs: Arc<Mutex<Vec<Organization>>>,
+    /// Globaler Chat-Index
+    pub chat_index: Arc<Mutex<ChatIndex>>,
 }
 
 // ─── API-Key laden ────────────────────────────────────────────────────────────

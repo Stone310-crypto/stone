@@ -62,6 +62,10 @@ pub enum TxType {
     /// Eternal Memorial Transaction – in jedem Block als Erinnerung.
     /// `from` = "memorial", `to` = "forever", `amount` = 0, `memo` = Gedenktext
     Memorial,
+    /// Verschlüsselte Chat-Nachricht auf der Blockchain.
+    /// `from` = Sender-Wallet, `to` = Empfänger-Wallet, `amount` = 0,
+    /// `memo` = JSON: {"msg_id":"…","encrypted":"…","nonce":"…"}
+    ChatMessage,
 }
 
 // ─── Fee-Tier ────────────────────────────────────────────────────────────────
@@ -130,6 +134,7 @@ impl std::fmt::Display for TxType {
             TxType::Stake           => write!(f, "stake"),
             TxType::Unstake         => write!(f, "unstake"),
             TxType::Memorial        => write!(f, "memorial"),
+            TxType::ChatMessage     => write!(f, "chat_message"),
         }
     }
 }
@@ -335,13 +340,20 @@ pub fn create_signed_tx(
 ///   da diese vom System erzeugt werden.
 /// - Bei `Transfer` und `Burn` muss `from` ein gültiger Ed25519-Public-Key sein.
 pub fn verify_tx_signature(tx: &TokenTx) -> Result<(), TxError> {
-    // System-Transaktionen: Signatur wird nicht gegen einen Public-Key geprüft
-    if (tx.tx_type == TxType::Mint || tx.tx_type == TxType::Reward) && tx.from == "system" {
+    // System-/Pool-Transaktionen: Signatur wird nicht gegen einen Public-Key geprüft
+    if tx.tx_type == TxType::Mint || tx.tx_type == TxType::Reward {
+        // Reward kommt aus pool:storage_rewards, Mint aus system – beides System-TXs
         return Ok(());
     }
 
     // Memorial-Transaktionen: keine Signatur nötig (System-TX in jedem Block)
     if tx.tx_type == TxType::Memorial {
+        return Ok(());
+    }
+
+    // Stake/Unstake: vom Node nach User-Authentifizierung erstellt, Signatur
+    // stammt vom Validator-Key, nicht vom User-Wallet → Prüfung überspringen.
+    if tx.tx_type == TxType::Stake || tx.tx_type == TxType::Unstake {
         return Ok(());
     }
 
@@ -393,8 +405,11 @@ pub fn validate_tx(tx: &TokenTx) -> Result<(), TxError> {
     if tx.to.is_empty() {
         return Err(TxError::MissingField("to".into()));
     }
-    // RotateKey/AccountRegister/AccountUpdate: amount == 0 erlaubt; sonst muss amount > 0
-    if tx.tx_type == TxType::RotateKey || tx.tx_type == TxType::AccountRegister || tx.tx_type == TxType::AccountUpdate {
+    // RotateKey/AccountRegister/AccountUpdate/ChatMessage/Memorial: amount == 0 erlaubt
+    if tx.tx_type == TxType::RotateKey || tx.tx_type == TxType::AccountRegister
+        || tx.tx_type == TxType::AccountUpdate || tx.tx_type == TxType::ChatMessage
+        || tx.tx_type == TxType::Memorial
+    {
         if tx.amount != Decimal::ZERO {
             return Err(TxError::InvalidAmount(format!("{}: Betrag muss 0 sein", tx.tx_type)));
         }
@@ -410,12 +425,15 @@ pub fn validate_tx(tx: &TokenTx) -> Result<(), TxError> {
     }
 
     // Chain-ID Validierung: muss zum aktuellen Netzwerk passen
-    let expected_chain_id = default_chain_id();
-    if !tx.chain_id.is_empty() && tx.chain_id != expected_chain_id {
-        return Err(TxError::InvalidSignature(format!(
-            "Chain-ID Mismatch: TX hat '{}', Node erwartet '{}'",
-            tx.chain_id, expected_chain_id
-        )));
+    // System-TXs (Memorial, Mint, Reward) haben eigene chain_ids → überspringen
+    if tx.tx_type != TxType::Memorial && tx.tx_type != TxType::Mint && tx.tx_type != TxType::Reward {
+        let expected_chain_id = default_chain_id();
+        if !tx.chain_id.is_empty() && tx.chain_id != expected_chain_id {
+            return Err(TxError::InvalidSignature(format!(
+                "Chain-ID Mismatch: TX hat '{}', Node erwartet '{}'",
+                tx.chain_id, expected_chain_id
+            )));
+        }
     }
 
     // TX-ID-Integrität

@@ -13,12 +13,12 @@
 //! - Optional: Dokumente (werden weiterhin über Upload-Handler hinzugefügt)
 //!
 //! Der Block-Reward folgt einem **Halving-Schema**: alle `HALVING_INTERVAL`
-//! Blöcke halbiert sich der Reward. Mining stoppt wenn `circulating >= MAX_SUPPLY`.
+//! Blöcke halbiert sich der Reward. Mining stoppt wenn `pool:storage_rewards` leer ist.
 
 use crate::blockchain::{Block, Document, DocumentTombstone, NodeRole, StoneChain};
 use crate::consensus::{
     load_or_create_validator_key, local_validator_pubkey_hex, sign_block,
-    ValidatorSet, VotingRound,
+    BlockProposal, ValidatorSet, VoteMessage, VotingRound,
 };
 use crate::shard::ShardHolderRegistry;
 use crate::token::{Mempool, TokenLedger};
@@ -48,6 +48,9 @@ pub const MAX_SUPPLY: &str = "50000000";
 
 /// Minimaler Block-Reward (unter diesem Wert wird nicht mehr gemined)
 pub const MIN_BLOCK_REWARD: &str = "0.00000001";
+
+/// Timeout für Peer-Voting in Sekunden (Multi-Node-Konsensus)
+pub const VOTE_TIMEOUT_SECS: u64 = 10;
 
 // ─── Peer-Status ─────────────────────────────────────────────────────────────
 
@@ -413,6 +416,18 @@ pub struct MasterMetrics {
     pub sync_success: AtomicU64,
     pub sync_failure: AtomicU64,
     pub ws_connections: AtomicU64,
+    // ── Mining-Metriken ──────────────────────────────────
+    /// Anzahl der erfolgreich geminten Blöcke seit Node-Start
+    pub blocks_mined: AtomicU64,
+    /// Gesamte Rewards die diese Node erhalten hat (in Milli-STONE * 1000, als u64 kodiert)
+    pub total_rewards_milli: AtomicU64,
+    /// Timestamp des letzten geminten Blocks (Unix-Secs)
+    pub last_block_timestamp: AtomicU64,
+    /// Mining-Leistungsbegrenzung in Prozent (0-100, 0=aus, 100=volle Leistung)
+    /// Default: 100 (keine Begrenzung)
+    pub mining_throttle_pct: AtomicU64,
+    /// Anzahl der Chat-Nachrichten die geminet wurden
+    pub chat_messages_mined: AtomicU64,
 }
 
 impl MasterNodeState {
@@ -450,7 +465,11 @@ impl MasterNodeState {
             active_voting: Mutex::new(None),
             round_counter: AtomicU64::new(1),
             events: EventBus::new(256),
-            metrics: MasterMetrics::default(),
+            metrics: {
+                let m = MasterMetrics::default();
+                m.mining_throttle_pct.store(100, Ordering::Relaxed);
+                m
+            },
             started_at,
             trust_registry: RwLock::new(Vec::new()),
             trust_history: Mutex::new(Vec::new()),
@@ -462,10 +481,32 @@ impl MasterNodeState {
 
         // Node-gestartet Event senden
         state.events.publish(NodeEvent::NodeStarted {
-            node_id,
+            node_id: node_id.clone(),
             role: "master".into(),
             timestamp: started_at,
         });
+
+        // ── Auto-Register: Node als Validator registrieren ───────────────
+        {
+            let signing_key = load_or_create_validator_key();
+            let pub_key_hex = local_validator_pubkey_hex(&signing_key);
+            let mut vs = state.validator_set.write().unwrap();
+            if vs.get(&node_id).is_none() {
+                use crate::consensus::ValidatorInfo;
+                let info = ValidatorInfo::new(node_id.clone(), pub_key_hex.clone());
+                vs.add(info);
+                println!(
+                    "[consensus] ✅ Node '{}' als Validator registriert (Wallet: {}…)",
+                    &node_id,
+                    &pub_key_hex[..16.min(pub_key_hex.len())]
+                );
+            } else {
+                println!(
+                    "[consensus] Validator '{}' bereits registriert",
+                    &node_id
+                );
+            }
+        }
 
         state
     }
@@ -691,6 +732,11 @@ impl MasterNodeState {
             peers_total: peers.len() as u64,
             peers_healthy: healthy as u64,
             uptime_secs: (Utc::now().timestamp() - self.started_at) as u64,
+            blocks_mined: self.metrics.blocks_mined.load(Ordering::Relaxed),
+            total_rewards_milli: self.metrics.total_rewards_milli.load(Ordering::Relaxed),
+            last_block_timestamp: self.metrics.last_block_timestamp.load(Ordering::Relaxed),
+            mining_throttle_pct: self.metrics.mining_throttle_pct.load(Ordering::Relaxed),
+            chat_messages_mined: self.metrics.chat_messages_mined.load(Ordering::Relaxed),
         }
     }
 
@@ -718,13 +764,14 @@ impl MasterNodeState {
     /// Berechnet den Block-Reward für einen gegebenen Block-Index.
     ///
     /// Schema: `INITIAL_BLOCK_REWARD / 2^(block_index / HALVING_INTERVAL)`
-    /// Gibt `Decimal::ZERO` zurück wenn Reward < MIN oder Supply erschöpft.
-    pub fn calculate_block_reward(block_index: u64, circulating: Decimal) -> Decimal {
-        let max_supply: Decimal = MAX_SUPPLY.parse().unwrap_or_else(|_| Decimal::new(50_000_000, 0));
+    /// Gibt `Decimal::ZERO` zurück wenn Reward < MIN oder Reward-Pool leer.
+    ///
+    /// `pool_balance` = Balance von pool:storage_rewards (woraus Rewards kommen).
+    pub fn calculate_block_reward(block_index: u64, pool_balance: Decimal) -> Decimal {
         let min_reward: Decimal = MIN_BLOCK_REWARD.parse().unwrap_or_else(|_| Decimal::new(1, 8));
 
-        // Supply erschöpft?
-        if circulating >= max_supply {
+        // Reward-Pool leer?
+        if pool_balance <= Decimal::ZERO {
             return Decimal::ZERO;
         }
 
@@ -740,10 +787,9 @@ impl MasterNodeState {
             }
         }
 
-        // Nicht über MAX_SUPPLY hinaus minten
-        let remaining = max_supply - circulating;
-        if reward > remaining {
-            reward = remaining;
+        // Nicht mehr als der Pool-Rest
+        if reward > pool_balance {
+            reward = pool_balance;
         }
 
         reward.round_dp(8)
@@ -764,7 +810,7 @@ impl MasterNodeState {
         let mut tx = TokenTx {
             tx_id: String::new(),
             tx_type: TxType::Reward,
-            from: "system".to_string(),
+            from: "pool:storage_rewards".to_string(),
             to: validator_wallet.to_string(),
             amount,
             fee: Decimal::ZERO,
@@ -784,16 +830,29 @@ impl MasterNodeState {
     /// Wird vom Mining-Loop alle `MINING_INTERVAL_SECS` Sekunden aufgerufen.
     /// Prüft PoA-Berechtigung und erstellt den Block nur wenn diese Node
     /// der ausgewählte Validator ist.
+    ///
+    /// Single-Node-Modus: Block wird direkt committed.
+    /// Multi-Node-Modus: Verwende `prepare_mining_block()` + `commit_mining_block()`.
     pub fn mint_block(&self) -> Result<Block, String> {
+        let block = self.prepare_mining_block()?;
+        self.commit_mining_block(block.clone())?;
+        Ok(block)
+    }
+
+    /// Erstellt einen neuen Mining-Block **ohne** ihn zu committen.
+    ///
+    /// Der Block ist vollständig (Hash, Validator-Signatur) und kann
+    /// an Peers zur Abstimmung gesendet werden.
+    /// Erst `commit_mining_block()` wendet ihn auf Chain, Ledger und StakingPool an.
+    pub fn prepare_mining_block(&self) -> Result<Block, String> {
+        // ── Validator-Schlüssel laden (Wallet = Ed25519 Public Key Hex) ───
+        let signing_key = load_or_create_validator_key();
+        let validator_wallet = local_validator_pubkey_hex(&signing_key);
+
         // ── PoA-Check: Ist diese Node der ausgewählte Validator? ──────────
-        let validator_wallet: String;
         {
             let vs = self.validator_set.read().unwrap();
-            if vs.validators.is_empty() {
-                // Kein Validator-Set → jede Node darf minen
-                // Verwende Node-ID als Wallet-Adresse (Fallback)
-                validator_wallet = self.node_id.clone();
-            } else {
+            if !vs.validators.is_empty() {
                 if !vs.is_active_validator(&self.node_id) {
                     return Err("Mining: Node ist kein aktiver Validator".into());
                 }
@@ -814,11 +873,6 @@ impl MasterNodeState {
                     ));
                 }
                 drop(chain);
-
-                // Validator-Wallet: pub_key_hex des Validators
-                validator_wallet = vs.get(&self.node_id)
-                    .map(|v| v.public_key_hex.clone())
-                    .unwrap_or_else(|| self.node_id.clone());
             }
         }
 
@@ -827,12 +881,11 @@ impl MasterNodeState {
             let chain = self.chain.lock().unwrap();
             let next_idx = chain.blocks.len() as u64;
             let ledger = self.token_ledger.read().unwrap();
-            let circulating = ledger.total_supply();
-            (Self::calculate_block_reward(next_idx, circulating), next_idx)
+            let pool_balance = ledger.balance("pool:storage_rewards");
+            (Self::calculate_block_reward(next_idx, pool_balance), next_idx)
         };
 
         // ── Mempool-TXs + Reward-TX sammeln ──────────────────────────────
-        // Mining-Loop: alle Tiers verarbeiten (Express + Priority + Standard)
         let mut pending_txs = self.mempool.drain_all_for_block();
 
         // Reward-TX hinzufügen (falls Reward > 0)
@@ -846,18 +899,54 @@ impl MasterNodeState {
             return Err("Mining: Kein Reward und keine pending TXs – übersprungen".into());
         }
 
-        // ── Block erstellen ───────────────────────────────────────────────
+        // ── Block vorbereiten (ohne Commit in die Chain) ──────────────────
         let signer = self.node_id.clone();
-        let mut chain = self.chain.lock().unwrap();
-        let mut block = chain.add_documents(
-            Vec::new(),         // keine Dokumente (Mining-Block)
-            Vec::new(),         // keine Tombstones
+        let chain = self.chain.lock().unwrap();
+        let mut block = chain.prepare_block(
+            Vec::new(),
+            Vec::new(),
             pending_txs,
             "system".to_string(),
-            signer.clone(),
+            signer,
             &self.cluster_key,
             self.role.clone(),
         );
+
+        // ── PoA: Block-Signierung ────────────────────────────────────────
+        let sig = sign_block(&signing_key, &block.hash);
+        block.validator_pub_key = validator_wallet.clone();
+        block.validator_signature = sig;
+
+        println!(
+            "[mining] ⛏️  Block #{} vorbereitet – {} TXs, Reward: {} STONE → {}",
+            block.index,
+            block.transactions.len(),
+            reward_amount,
+            &validator_wallet[..16.min(validator_wallet.len())],
+        );
+
+        Ok(block)
+    }
+
+    /// Committed einen vorbereiteten Block: Chain, Ledger, StakingPool, Metriken, Events.
+    ///
+    /// Wird nach erfolgreicher Voting-Phase (Multi-Node) oder direkt (Single-Node) aufgerufen.
+    pub fn commit_mining_block(&self, block: Block) -> Result<(), String> {
+        let signing_key = load_or_create_validator_key();
+        let validator_wallet = local_validator_pubkey_hex(&signing_key);
+
+        // ── Block in die Chain einfügen ───────────────────────────────────
+        {
+            let mut chain = self.chain.lock().unwrap();
+            // Prüfe dass Block zum nächsten Index passt
+            let expected_idx = chain.blocks.len() as u64;
+            if block.index != expected_idx {
+                return Err(format!(
+                    "Block-Index {} passt nicht (erwartet: {})", block.index, expected_idx
+                ));
+            }
+            chain.commit_block(block.clone());
+        }
 
         // ── Token-TXs im Ledger verarbeiten ──────────────────────────────
         if !block.transactions.is_empty() {
@@ -891,31 +980,20 @@ impl MasterNodeState {
             }
         }
 
-        // ── PoA: Block-Signierung ────────────────────────────────────────
+        // ── Block in ChainStore persistieren ──────────────────────────────
         {
-            let vs = self.validator_set.read().unwrap();
-            if !vs.validators.is_empty() {
-                let signing_key = load_or_create_validator_key();
-                let pub_key_hex = local_validator_pubkey_hex(&signing_key);
-                let sig = sign_block(&signing_key, &block.hash);
-                block.validator_pub_key = pub_key_hex;
-                block.validator_signature = sig;
+            use crate::storage::ChainStore;
+            if let Ok(store) = ChainStore::open() {
+                let _ = store.write_block_sync(&block);
+            }
+        }
 
-                use crate::storage::ChainStore;
-                if let Ok(store) = ChainStore::open() {
-                    let _ = store.write_block_sync(&block);
-                }
-                if let Some(last) = chain.blocks.last_mut() {
-                    last.validator_pub_key = block.validator_pub_key.clone();
-                    last.validator_signature = block.validator_signature.clone();
-                }
-
-                drop(vs);
-                let mut vs_w = self.validator_set.write().unwrap();
-                if let Some(v) = vs_w.get_mut(&self.node_id) {
-                    v.blocks_signed += 1;
-                    vs_w.save();
-                }
+        // ── Validator-Statistik aktualisieren ─────────────────────────────
+        {
+            let mut vs_w = self.validator_set.write().unwrap();
+            if let Some(v) = vs_w.get_mut(&self.node_id) {
+                v.blocks_signed += 1;
+                vs_w.save();
             }
         }
 
@@ -939,15 +1017,36 @@ impl MasterNodeState {
             });
         }
 
+        // ── Mining-Metriken aktualisieren ─────────────────────────────────
+        self.metrics.blocks_mined.fetch_add(1, Ordering::Relaxed);
+        self.metrics.last_block_timestamp.store(block.timestamp as u64, Ordering::Relaxed);
+
+        use rust_decimal::prelude::ToPrimitive;
+        // Reward aus der Reward-TX extrahieren
+        let reward_amount = block.transactions.iter()
+            .find(|tx| tx.tx_type == TxType::Reward)
+            .map(|tx| tx.amount)
+            .unwrap_or(Decimal::ZERO);
+        let reward_milli = (reward_amount * Decimal::new(1000, 0))
+            .to_u64()
+            .unwrap_or(0);
+        self.metrics.total_rewards_milli.fetch_add(reward_milli, Ordering::Relaxed);
+
+        let chat_count = block.transactions.iter()
+            .filter(|tx| tx.tx_type == TxType::ChatMessage)
+            .count() as u64;
+        if chat_count > 0 {
+            self.metrics.chat_messages_mined.fetch_add(chat_count, Ordering::Relaxed);
+        }
+
         println!(
-            "[mining] ⛏️  Block #{} gemined – {} TXs, Reward: {} STONE → {}",
+            "[mining] ✅ Block #{} committed – {} TXs, Validator: {}",
             block.index,
             block.transactions.len(),
-            reward_amount,
             &validator_wallet[..16.min(validator_wallet.len())],
         );
 
-        Ok(block)
+        Ok(())
     }
 
     /// Hintergrund-Task: Block-Mining alle `MINING_INTERVAL_SECS` Sekunden.
@@ -972,6 +1071,26 @@ impl MasterNodeState {
             loop {
                 ticker.tick().await;
 
+                // Mining-Throttle: Leistungsbegrenzung prüfen
+                {
+                    let throttle = state.metrics.mining_throttle_pct.load(Ordering::Relaxed);
+                    if throttle == 0 {
+                        continue; // Mining komplett deaktiviert
+                    }
+                    if throttle < 100 {
+                        // Probabilistisches Throttling: Block mit (100-throttle)% überspringen
+                        use std::collections::hash_map::DefaultHasher;
+                        use std::hash::{Hash, Hasher};
+                        let now = Utc::now().timestamp_millis() as u64;
+                        let mut hasher = DefaultHasher::new();
+                        now.hash(&mut hasher);
+                        let roll = hasher.finish() % 100;
+                        if roll >= throttle {
+                            continue; // Throttled – diesen Block überspringen
+                        }
+                    }
+                }
+
                 // Prüfen ob der letzte Block alt genug ist (verhindert Doppel-Blocks
                 // wenn commit_documents kurz vorher einen Block erstellt hat)
                 {
@@ -990,67 +1109,204 @@ impl MasterNodeState {
                     println!("[mining] 🧹 {} abgelaufene TXs aus Mempool entfernt", evicted);
                 }
 
-                // Block minen
-                match state.mint_block() {
-                    Ok(block) => {
-                        // ── Staking: Epoch-Verarbeitung + Unstake-Release ─────────
-                        {
-                            let mut pool = state.staking_pool.write().unwrap();
+                // ── Hybrid Consensus: Single-Node vs. Multi-Node ──────────
+                let active_validators = {
+                    let vs = state.validator_set.read().unwrap();
+                    vs.active_count()
+                };
 
-                            // 1. Epoch-Rewards verteilen
-                            let reward_pool_balance = {
-                                let ledger = state.token_ledger.read().unwrap();
-                                ledger.balance("pool:storage_rewards")
-                            };
-                            let distributed = pool.process_epoch(block.index, reward_pool_balance);
-                            if distributed > rust_decimal::Decimal::ZERO {
-                                // Reward-Claims aus pool:storage_rewards gutschreiben
-                                let mut ledger = state.token_ledger.write().unwrap();
-                                for (addr, entry) in &pool.stakers {
-                                    if entry.pending_rewards > rust_decimal::Decimal::ZERO {
-                                        if let Err(e) = ledger.credit_staking_reward(addr, entry.pending_rewards) {
-                                            eprintln!("[staking] Reward-Gutschrift fehlgeschlagen: {e}");
-                                        }
-                                    }
-                                }
-                                // Pending-Rewards nach Gutschrift nullen
-                                drop(ledger);
-                                for entry in pool.stakers.values_mut() {
-                                    entry.pending_rewards = rust_decimal::Decimal::ZERO;
-                                }
-                            }
-
-                            // 2. Fällige Unstakes freigeben
-                            let matured = pool.drain_matured_unstakes();
-                            if !matured.is_empty() {
-                                let mut ledger = state.token_ledger.write().unwrap();
-                                for req in &matured {
-                                    ledger.release_unstake_escrow(&req.address, req.amount);
-                                }
-                                if let Err(e) = ledger.persist() {
-                                    eprintln!("[staking] Ledger-Persist nach Unstake-Release: {e}");
-                                }
-                            }
-
-                            // 3. StakingPool persistieren
-                            if distributed > rust_decimal::Decimal::ZERO || !matured.is_empty() {
-                                if let Err(e) = pool.persist() {
-                                    eprintln!("[staking] Pool-Persist: {e}");
-                                }
+                if active_validators <= 1 {
+                    // ═══ SINGLE-NODE MODUS: Sofort committen (wie bisher) ═══
+                    match state.mint_block() {
+                        Ok(block) => {
+                            Self::post_block_staking(&state, &block);
+                            let _ = block;
+                        }
+                        Err(e) => {
+                            if !e.contains("nicht ausgewählt") && !e.contains("kein aktiver") {
+                                eprintln!("[mining] {e}");
                             }
                         }
-
-                        let _ = block; // Block ist in der Chain, Peers holen ihn via Sync
                     }
-                    Err(e) => {
-                        // Nur loggen wenn es kein normaler "nicht ausgewählt"-Fehler ist
-                        if !e.contains("nicht ausgewählt") && !e.contains("kein aktiver") {
-                            eprintln!("[mining] {e}");
+                } else {
+                    // ═══ MULTI-NODE MODUS: Proposal → Voting → Commit ═══
+                    match state.prepare_mining_block() {
+                        Ok(block) => {
+                            let round = state.round_counter.fetch_add(1, Ordering::Relaxed);
+                            let signing_key = load_or_create_validator_key();
+                            let proposal = BlockProposal::new(
+                                block.clone(),
+                                state.node_id.clone(),
+                                &signing_key,
+                                round,
+                            );
+
+                            println!(
+                                "[consensus] 📤 Proposal für Block #{} gesendet (Runde {}, {} aktive Validators)",
+                                block.index, round, active_validators,
+                            );
+
+                            // Eigene Stimme: Auto-Accept
+                            let own_vote = VoteMessage::new(
+                                round,
+                                block.hash.clone(),
+                                state.node_id.clone(),
+                                true,
+                                &signing_key,
+                                String::new(),
+                            );
+
+                            // VotingRound starten
+                            {
+                                let vs = state.validator_set.read().unwrap();
+                                let mut voting = state.active_voting.lock().unwrap();
+                                let mut vr = VotingRound::new(round, block.hash.clone(), state.node_id.clone());
+                                let _ = vr.add_vote(own_vote, &vs);
+                                *voting = Some(vr);
+                            }
+
+                            // Proposal an alle Healthy Peers senden
+                            let peer_urls: Vec<String> = {
+                                let peers = state.peers.read().unwrap();
+                                peers.iter()
+                                    .filter(|p| p.is_healthy())
+                                    .map(|p| p.url.clone())
+                                    .collect()
+                            };
+
+                            let proposal_json = serde_json::to_vec(&proposal).unwrap_or_default();
+                            let client = reqwest::Client::builder()
+                                .timeout(Duration::from_secs(VOTE_TIMEOUT_SECS))
+                                .danger_accept_invalid_certs(true)
+                                .build()
+                                .unwrap_or_default();
+
+                            for peer_url in &peer_urls {
+                                let url = format!("{}/api/v1/p2p/proposal", peer_url.trim_end_matches('/'));
+                                match client.post(&url)
+                                    .header("Content-Type", "application/json")
+                                    .body(proposal_json.clone())
+                                    .send()
+                                    .await
+                                {
+                                    Ok(resp) => {
+                                        if let Ok(val) = resp.json::<serde_json::Value>().await {
+                                            // Peer antwortet mit VoteMessage
+                                            if let Ok(vote) = serde_json::from_value::<VoteMessage>(
+                                                val.get("vote").cloned().unwrap_or_default()
+                                            ) {
+                                                let vs = state.validator_set.read().unwrap();
+                                                let mut voting = state.active_voting.lock().unwrap();
+                                                if let Some(ref mut vr) = *voting {
+                                                    if let Err(e) = vr.add_vote(vote.clone(), &vs) {
+                                                        eprintln!("[consensus] Vote von {} ungültig: {e}", peer_url);
+                                                    } else {
+                                                        println!(
+                                                            "[consensus] 🗳️  Vote von '{}': {}",
+                                                            vote.voter_id,
+                                                            if vote.accept { "✅ Accept" } else { "❌ Reject" }
+                                                        );
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        eprintln!("[consensus] Proposal an {} fehlgeschlagen: {e}", peer_url);
+                                    }
+                                }
+                            }
+
+                            // Stimmen auswerten
+                            let (quorum_reached, tally_info) = {
+                                let vs = state.validator_set.read().unwrap();
+                                let mut voting = state.active_voting.lock().unwrap();
+                                if let Some(ref mut vr) = *voting {
+                                    let tally = vr.finalize(&vs);
+                                    let info = format!(
+                                        "{}/{} Accept, {}/{} nötig",
+                                        tally.accepts, tally.total_validators,
+                                        tally.threshold, tally.total_validators,
+                                    );
+                                    (tally.quorum_reached, info)
+                                } else {
+                                    (false, "Keine Voting-Runde".into())
+                                }
+                            };
+
+                            if quorum_reached {
+                                println!("[consensus] ✅ Quorum erreicht ({}) – Block #{} wird committed", tally_info, block.index);
+                                match state.commit_mining_block(block.clone()) {
+                                    Ok(()) => Self::post_block_staking(&state, &block),
+                                    Err(e) => eprintln!("[consensus] Commit fehlgeschlagen: {e}"),
+                                }
+                            } else {
+                                println!("[consensus] ❌ Kein Quorum ({}) – Block #{} verworfen", tally_info, block.index);
+                                // TXs zurück in den Mempool (außer Reward + Memorial)
+                                for tx in &block.transactions {
+                                    if tx.tx_type != TxType::Reward && tx.tx_type != TxType::Memorial {
+                                        let _ = state.mempool.add_tx(tx.clone(), None);
+                                    }
+                                }
+                            }
+
+                            // Voting-Runde aufräumen
+                            *state.active_voting.lock().unwrap() = None;
+                        }
+                        Err(e) => {
+                            if !e.contains("nicht ausgewählt") && !e.contains("kein aktiver") {
+                                eprintln!("[mining] {e}");
+                            }
                         }
                     }
                 }
             }
         });
+    }
+
+    /// Staking Epoch-Verarbeitung nach einem committed Block.
+    fn post_block_staking(state: &Arc<Self>, block: &Block) {
+        let mut pool = state.staking_pool.write().unwrap();
+
+        // 1. Epoch-Rewards verteilen
+        let reward_pool_balance = {
+            let ledger = state.token_ledger.read().unwrap();
+            ledger.balance("pool:storage_rewards")
+        };
+        let distributed = pool.process_epoch(block.index, reward_pool_balance);
+        if distributed > rust_decimal::Decimal::ZERO {
+            let mut ledger = state.token_ledger.write().unwrap();
+            for (addr, entry) in &pool.stakers {
+                if entry.pending_rewards > rust_decimal::Decimal::ZERO {
+                    if let Err(e) = ledger.credit_staking_reward(addr, entry.pending_rewards) {
+                        eprintln!("[staking] Reward-Gutschrift fehlgeschlagen: {e}");
+                    }
+                }
+            }
+            drop(ledger);
+            for entry in pool.stakers.values_mut() {
+                entry.pending_rewards = rust_decimal::Decimal::ZERO;
+            }
+        }
+
+        // 2. Fällige Unstakes freigeben
+        let matured = pool.drain_matured_unstakes();
+        if !matured.is_empty() {
+            let mut ledger = state.token_ledger.write().unwrap();
+            for req in &matured {
+                ledger.release_unstake_escrow(&req.address, req.amount);
+            }
+            if let Err(e) = ledger.persist() {
+                eprintln!("[staking] Ledger-Persist nach Unstake-Release: {e}");
+            }
+        }
+
+        // 3. StakingPool persistieren
+        if distributed > rust_decimal::Decimal::ZERO || !matured.is_empty() {
+            if let Err(e) = pool.persist() {
+                eprintln!("[staking] Pool-Persist: {e}");
+            }
+        }
     }
 
     // ─── Web-of-Trust Methoden ────────────────────────────────────────────────
@@ -1231,6 +1487,12 @@ pub struct MasterMetricsSnapshot {
     pub peers_total: u64,
     pub peers_healthy: u64,
     pub uptime_secs: u64,
+    // Mining
+    pub blocks_mined: u64,
+    pub total_rewards_milli: u64,
+    pub last_block_timestamp: u64,
+    pub mining_throttle_pct: u64,
+    pub chat_messages_mined: u64,
 }
 
 /// Anfrage zum Hinzufügen/Aktualisieren eines Dokuments über die API

@@ -354,6 +354,25 @@ impl StoneChain {
         cluster_key: &str,
         node_role: NodeRole,
     ) -> Block {
+        let block = self.prepare_block(documents, tombstones, transactions, owner, signer, cluster_key, node_role);
+        self.commit_block(block.clone());
+        block
+    }
+
+    /// Erstellt einen neuen Block **ohne** ihn in die Chain zu schreiben.
+    ///
+    /// Der Block ist vollständig (Hash, Signatur) und kann an Peers zur Abstimmung
+    /// gesendet werden. Erst `commit_block()` fügt ihn tatsächlich ein.
+    pub fn prepare_block(
+        &self,
+        documents: Vec<Document>,
+        tombstones: Vec<DocumentTombstone>,
+        transactions: Vec<TokenTx>,
+        owner: String,
+        signer: String,
+        cluster_key: &str,
+        node_role: NodeRole,
+    ) -> Block {
         // ── Eternal Memorial TX in jeden Block injizieren ─────────────
         let mut transactions = transactions;
         let memorial = memorial_tx();
@@ -405,18 +424,34 @@ impl StoneChain {
             ..new_block
         };
 
-        self.blocks.push(final_block.clone());
-        self.latest_hash = hash;
-        self.persist_last_block();
-
         println!(
-            "[chain] Block #{} – {} Dok., {} TXs, {} Bytes",
+            "[chain] Block #{} vorbereitet – {} Dok., {} TXs, {} Bytes",
             final_block.index,
             final_block.documents.len(),
             final_block.transactions.len(),
             final_block.data_size,
         );
         final_block
+    }
+
+    /// Fügt einen bereits vorbereiteten Block in die lokale Chain ein und persistiert ihn.
+    ///
+    /// Wird nach erfolgreicher Voting-Phase (oder im Single-Node-Modus) aufgerufen.
+    pub fn commit_block(&mut self, block: Block) {
+        let hash = block.hash.clone();
+        let idx = block.index;
+        let docs = block.documents.len();
+        let txs = block.transactions.len();
+        let bytes = block.data_size;
+
+        self.blocks.push(block);
+        self.latest_hash = hash;
+        self.persist_last_block();
+
+        println!(
+            "[chain] Block #{} committed – {} Dok., {} TXs, {} Bytes",
+            idx, docs, txs, bytes,
+        );
     }
 
     /// Nimmt einen von einem Peer empfangenen fertigen Block in die lokale Chain auf.

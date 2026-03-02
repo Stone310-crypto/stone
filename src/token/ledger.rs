@@ -432,17 +432,17 @@ impl TokenLedger {
         // 1. Strukturelle Validierung
         validate_tx(tx)?;
 
-        // 2. Duplikat-Prüfung
-        if self.processed_txs.contains(&tx.tx_id) {
+        // 2. Duplikat-Prüfung (Memorial-TXs sind in jedem Block identisch → überspringen)
+        if tx.tx_type != TxType::Memorial && self.processed_txs.contains(&tx.tx_id) {
             return Err(LedgerError::TxValidation(TxError::Replay(
                 format!("TX {} bereits verarbeitet", &tx.tx_id[..12])
             )));
         }
 
-        // 3. Nonce-Prüfung (nur für Nutzer-Transaktionen)
+        // 3. Nonce-Prüfung (nur für echte Nutzer-Transaktionen)
+        //    Stake/Unstake werden vom Node erstellt (nicht vom User signiert) → Nonce überspringen.
         if tx.tx_type == TxType::Transfer || tx.tx_type == TxType::Burn || tx.tx_type == TxType::RotateKey
             || tx.tx_type == TxType::AccountRegister || tx.tx_type == TxType::AccountUpdate
-            || tx.tx_type == TxType::Stake || tx.tx_type == TxType::Unstake
         {
             // Prüfen ob der Key durch Rotation invalidiert wurde
             if let Some(active) = self.resolve_active_key(&tx.from) {
@@ -463,8 +463,27 @@ impl TokenLedger {
 
         // 4+5. Ausführen
         match tx.tx_type {
-            TxType::Mint | TxType::Reward => {
+            TxType::Mint => {
                 self.mint(&tx.to, tx.amount)?;
+            }
+            TxType::Reward => {
+                // Block-Rewards werden aus pool:storage_rewards transferiert (nicht neu geminted)
+                let pool_addr = "pool:storage_rewards";
+                let pool_balance = self.balance(pool_addr);
+                if pool_balance < tx.amount {
+                    return Err(LedgerError::InsufficientBalance {
+                        account: pool_addr.to_string(),
+                        available: pool_balance,
+                        required: tx.amount,
+                    });
+                }
+                *self.balances.entry(pool_addr.to_string()).or_insert(Decimal::ZERO) -= tx.amount;
+                *self.balances.entry(tx.to.clone()).or_insert(Decimal::ZERO) += tx.amount;
+                // total_supply bleibt gleich – es werden keine neuen Token erzeugt
+                println!(
+                    "[token] ⛏️  Reward: {} STONE pool:storage_rewards → {}",
+                    tx.amount, &tx.to[..16.min(tx.to.len())]
+                );
             }
             TxType::Transfer => {
                 self.transfer(&tx.from, &tx.to, tx.amount, tx.fee)?;
@@ -569,6 +588,11 @@ impl TokenLedger {
             }
             TxType::Memorial => {
                 // Eternal Memorial TX – keine Balance-Änderung, nur Präsenz im Block
+            }
+            TxType::ChatMessage => {
+                // Verschlüsselte Chat-Nachricht – keine Balance-Änderung.
+                // Die Nachricht wird durch die Aufnahme in den Block validiert.
+                *self.nonces.entry(tx.from.clone()).or_insert(0) += 1;
             }
         }
 

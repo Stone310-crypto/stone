@@ -19,6 +19,14 @@ use super::handlers::{
         handle_patch_document, handle_search_documents, handle_transfer_document,
         handle_upload_document,
     },
+    mining::{
+        handle_mining_status, handle_mining_throttle, handle_mining_withdraw,
+        handle_mining_stake, handle_mining_unstake,
+    },
+    chat::{
+        handle_chat_conversations, handle_chat_messages, handle_chat_pending,
+        handle_chat_resolve, handle_chat_send,
+    },
     orgs::{
         handle_accept_invite, handle_create_channel, handle_create_org,
         handle_decline_invite, handle_get_chat, handle_get_org, handle_invite,
@@ -27,7 +35,7 @@ use super::handlers::{
     },
     p2p::{
         handle_p2p_config, handle_p2p_dial, handle_p2p_info, handle_p2p_peers,
-        handle_p2p_ping, handle_p2p_status,
+        handle_p2p_ping, handle_p2p_proposal, handle_p2p_status,
     },
     peers::{handle_add_peer, handle_list_peers, handle_remove_peer, handle_sync},
     poa::{
@@ -126,6 +134,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/p2p/dial", post(handle_p2p_dial))
         .route("/api/v1/p2p/info", get(handle_p2p_info))
         .route("/api/v1/p2p/config", get(handle_p2p_config))
+        // P2P Consensus Voting
+        .route("/api/v1/p2p/proposal", post(handle_p2p_proposal))
         // Nutzer (Admin)
         .route("/api/v1/users", get(handle_list_users))
         .route("/api/v1/users/:user_id", delete(handle_delete_user))
@@ -207,6 +217,18 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/orgs/:org_id/channels", post(handle_create_channel))
         .route("/api/v1/orgs/:org_id/chat", post(handle_send_message))
         .route("/api/v1/orgs/:org_id/chat/:channel_id", get(handle_get_chat))
+        // ─── Globaler Chat ───────────────────────────────────────────────────
+        .route("/api/v1/chat/send", post(handle_chat_send))
+        .route("/api/v1/chat/conversations", get(handle_chat_conversations))
+        .route("/api/v1/chat/messages/:peer_wallet", get(handle_chat_messages))
+        .route("/api/v1/chat/pending", get(handle_chat_pending))
+        .route("/api/v1/chat/resolve/:identifier", get(handle_chat_resolve))
+        // ─── Mining Dashboard ───────────────────────────────────────────────
+        .route("/api/v1/mining/status", get(handle_mining_status))
+        .route("/api/v1/mining/throttle", post(handle_mining_throttle))
+        .route("/api/v1/mining/withdraw", post(handle_mining_withdraw))
+        .route("/api/v1/mining/stake", post(handle_mining_stake))
+        .route("/api/v1/mining/unstake", post(handle_mining_unstake))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
         .layer(build_cors())
         .with_state(state)

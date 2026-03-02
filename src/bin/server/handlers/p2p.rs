@@ -6,6 +6,9 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde_json::json;
+use stone::consensus::{
+    BlockProposal, VoteMessage, load_or_create_validator_key,
+};
 
 use super::super::auth_middleware::require_admin;
 use super::super::state::AppState;
@@ -173,4 +176,157 @@ pub async fn handle_p2p_ping(
             "error":      result.error,
         })),
     ))
+}
+
+/// POST /api/v1/p2p/proposal
+///
+/// Empfängt einen Block-Proposal von einem Peer-Validator.
+/// Validiert den Proposal und gibt eine signierte VoteMessage zurück.
+pub async fn handle_p2p_proposal(
+    State(state): State<AppState>,
+    axum::Json(proposal): axum::Json<BlockProposal>,
+) -> impl IntoResponse {
+    // 1. Validator-Set laden
+    let vs = state.node.validator_set.read().unwrap().clone();
+
+    // 2. Proposer-Signatur prüfen
+    if !proposal.verify_proposer(&vs) {
+        let signing_key = load_or_create_validator_key();
+        let vote = VoteMessage::new(
+            proposal.round,
+            proposal.block.hash.clone(),
+            state.node.node_id.clone(),
+            false,
+            &signing_key,
+            "Ungültige Proposer-Signatur".into(),
+        );
+        return (StatusCode::OK, axum::Json(json!({
+            "ok": false,
+            "error": "Ungültige Proposer-Signatur",
+            "vote": vote,
+        })));
+    }
+
+    // 3. Prüfen ob der Proposer der ausgewählte Validator für diesen Slot ist
+    let (prev_hash, expected_index) = {
+        let chain = state.node.chain.lock().unwrap();
+        let ph = chain.blocks.last()
+            .map(|b| b.hash.clone())
+            .unwrap_or_else(|| "genesis".to_string());
+        let idx = chain.blocks.len() as u64;
+        (ph, idx)
+    };
+
+    // Block-Index muss zum lokalen Chain-Stand passen
+    if proposal.block.index != expected_index {
+        let signing_key = load_or_create_validator_key();
+        let vote = VoteMessage::new(
+            proposal.round,
+            proposal.block.hash.clone(),
+            state.node.node_id.clone(),
+            false,
+            &signing_key,
+            format!("Block-Index {} erwartet, {} empfangen", expected_index, proposal.block.index),
+        );
+        return (StatusCode::OK, axum::Json(json!({
+            "ok": false,
+            "error": format!("Block-Index Mismatch: erwartet {}, empfangen {}", expected_index, proposal.block.index),
+            "vote": vote,
+        })));
+    }
+
+    // previous_hash muss mit letztem lokalen Block übereinstimmen
+    if proposal.block.previous_hash != prev_hash {
+        let signing_key = load_or_create_validator_key();
+        let vote = VoteMessage::new(
+            proposal.round,
+            proposal.block.hash.clone(),
+            state.node.node_id.clone(),
+            false,
+            &signing_key,
+            "previous_hash stimmt nicht mit lokaler Chain überein".into(),
+        );
+        return (StatusCode::OK, axum::Json(json!({
+            "ok": false,
+            "error": "previous_hash Mismatch",
+            "vote": vote,
+        })));
+    }
+
+    // Validator-Auswahl prüfen (SHA256-Rotation)
+    if !vs.is_selected_validator(&proposal.proposer_id, &prev_hash, proposal.block.index) {
+        let signing_key = load_or_create_validator_key();
+        let vote = VoteMessage::new(
+            proposal.round,
+            proposal.block.hash.clone(),
+            state.node.node_id.clone(),
+            false,
+            &signing_key,
+            format!("Validator '{}' ist nicht der ausgewählte für Block #{}", proposal.proposer_id, proposal.block.index),
+        );
+        return (StatusCode::OK, axum::Json(json!({
+            "ok": false,
+            "error": "Nicht der ausgewählte Validator für diesen Slot",
+            "vote": vote,
+        })));
+    }
+
+    // 4. Block-Hash verifizieren (Integrität)
+    let recalculated = stone::blockchain::calculate_hash(&proposal.block);
+    if recalculated != proposal.block.hash {
+        let signing_key = load_or_create_validator_key();
+        let vote = VoteMessage::new(
+            proposal.round,
+            proposal.block.hash.clone(),
+            state.node.node_id.clone(),
+            false,
+            &signing_key,
+            "Block-Hash stimmt nicht mit Inhalt überein".into(),
+        );
+        return (StatusCode::OK, axum::Json(json!({
+            "ok": false,
+            "error": "Block-Hash Integritätsfehler",
+            "vote": vote,
+        })));
+    }
+
+    // 5. Alles OK → Accept-Vote erstellen
+    let signing_key = load_or_create_validator_key();
+    let vote = VoteMessage::new(
+        proposal.round,
+        proposal.block.hash.clone(),
+        state.node.node_id.clone(),
+        true,
+        &signing_key,
+        String::new(),
+    );
+
+    println!(
+        "[consensus] 🗳️  Vote für Block #{} von '{}': ✅ Accept",
+        proposal.block.index, proposal.proposer_id,
+    );
+
+    // 6. Auto-Registrierung: Proposer als Validator hinzufügen falls unbekannt
+    {
+        let mut vs_w = state.node.validator_set.write().unwrap();
+        if vs_w.get(&proposal.proposer_id).is_none() {
+            let pub_key_hex = proposal.block.validator_pub_key.clone();
+            let mut vi = stone::consensus::ValidatorInfo::new(
+                proposal.proposer_id.clone(),
+                pub_key_hex,
+            );
+            vi.name = format!("Auto-discovered (Block #{})", proposal.block.index);
+            vi.active = true;
+            vs_w.add(vi);
+            println!(
+                "[consensus] 🔗 Peer '{}' automatisch als Validator registriert",
+                proposal.proposer_id,
+            );
+        }
+    }
+
+    (StatusCode::OK, axum::Json(json!({
+        "ok": true,
+        "vote": vote,
+    })))
 }

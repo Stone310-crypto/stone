@@ -476,6 +476,9 @@ textarea{resize:vertical;min-height:80px;font-family:monospace;font-size:13px}
         <button class="btn btn-green btn-sm" id="upd-install-btn" style="display:none" onclick="doInstallUpdate()">
           ⬇️ Update installieren
         </button>
+        <button class="btn btn-green btn-sm" id="upd-download-install-btn" style="display:none" onclick="doDownloadAndInstall()">
+          🚀 Jetzt installieren
+        </button>
         <span id="upd-install-status" style="font-size:13px;color:var(--muted)"></span>
 
         <!-- Auto-Update Zeitplan -->
@@ -994,6 +997,7 @@ async function refreshUpdatePanel() {
     const changelogBox = document.getElementById('upd-changelog-box');
     const changelogEl = document.getElementById('upd-changelog');
     const installBtn = document.getElementById('upd-install-btn');
+    const dlInstBtn = document.getElementById('upd-download-install-btn');
     const installStatus = document.getElementById('upd-install-status');
     const scheduleSelect = document.getElementById('upd-schedule');
 
@@ -1014,6 +1018,7 @@ async function refreshUpdatePanel() {
       progressSection.style.display = 'none';
       changelogBox.style.display = 'none';
       installBtn.style.display = 'none';
+      dlInstBtn.style.display = 'none';
       installStatus.textContent = '';
       return;
     }
@@ -1050,6 +1055,7 @@ async function refreshUpdatePanel() {
       progressText.textContent = data.download_percent + '%';
       chunksText.textContent = data.chunks_downloaded + ' / ' + data.chunks_total + ' Chunks';
       installBtn.style.display = 'none';
+      dlInstBtn.style.display = 'none';
     } else if (state === 'Ready' || data.can_install) {
       badge.className = 'update-badge ready';
       badge.textContent = '🟢 Bereit';
@@ -1060,6 +1066,7 @@ async function refreshUpdatePanel() {
       installBtn.style.display = '';
       installBtn.disabled = false;
       installBtn.textContent = '⬇️ Update v' + data.update_version + ' installieren';
+      dlInstBtn.style.display = 'none';
       if (data.auto_update_hour !== null && data.auto_update_hour !== undefined) {
         installStatus.textContent = '⏰ Auto-Update um ' + String(data.auto_update_hour).padStart(2,'0') + ':00 Uhr geplant';
       } else {
@@ -1069,12 +1076,14 @@ async function refreshUpdatePanel() {
       badge.className = 'update-badge installing';
       badge.textContent = '🔄 Installiert...';
       installBtn.style.display = 'none';
+      dlInstBtn.style.display = 'none';
       installStatus.textContent = 'Update wird installiert, Node startet gleich neu...';
       installStatus.style.color = 'var(--orange)';
     } else if (state.startsWith('Failed')) {
       badge.className = 'update-badge failed';
       badge.textContent = '❌ Fehlgeschlagen';
       installBtn.style.display = 'none';
+      dlInstBtn.style.display = 'none';
       installStatus.textContent = state;
       installStatus.style.color = 'var(--red)';
     } else {
@@ -1088,8 +1097,91 @@ async function refreshUpdatePanel() {
         chunksText.textContent = data.chunks_downloaded + ' / ' + data.chunks_total + ' Chunks';
       }
       installBtn.style.display = 'none';
+      // "Jetzt installieren" Button anzeigen (Download + Install in einem Schritt)
+      dlInstBtn.style.display = '';
+      dlInstBtn.disabled = false;
+      dlInstBtn.textContent = '🚀 Jetzt installieren';
     }
   } catch(e) { console.error('Update-Status:', e); }
+}
+
+async function doDownloadAndInstall() {
+  const btn = document.getElementById('upd-download-install-btn');
+  const status = document.getElementById('upd-install-status');
+  if (!confirm('Update jetzt herunterladen und installieren? Der Node wird anschließend neu gestartet.')) return;
+  btn.disabled = true;
+  btn.textContent = '⏳ Download läuft...';
+  status.textContent = 'Update wird heruntergeladen...';
+  status.style.color = 'var(--accent)';
+  try {
+    // 1. Download starten
+    let dlResp = await api('/api/updates/download', 'POST');
+    if (dlResp.status === 404) {
+      dlResp = await api('/api/v1/updates/download', 'POST');
+    }
+    // 2. Warten bis Download fertig (polling)
+    let ready = false;
+    for (let i = 0; i < 120; i++) {
+      await new Promise(r => setTimeout(r, 2000));
+      let sResp = await api('/api/updates', 'GET');
+      let sData;
+      if (sResp.status === 200 && sResp.data.current_version) {
+        sData = sResp.data;
+      } else {
+        const sResp2 = await api('/api/v1/updates/status', 'GET');
+        if (sResp2.status !== 200) continue;
+        const d = sResp2.data;
+        sData = { download_state: d.state || 'Idle', can_install: d.state === 'Ready',
+                  download_percent: d.percent || 0, chunks_downloaded: d.chunks_downloaded || 0,
+                  chunks_total: d.manifest ? d.manifest.chunk_hashes.length : 0 };
+      }
+      btn.textContent = '⏳ Download ' + (sData.download_percent || 0) + '%';
+      status.textContent = (sData.chunks_downloaded||0) + ' / ' + (sData.chunks_total||'?') + ' Chunks heruntergeladen...';
+      if (sData.can_install || sData.download_state === 'Ready') { ready = true; break; }
+      if (sData.download_state && sData.download_state.startsWith('Failed')) {
+        status.textContent = '❌ Download fehlgeschlagen: ' + sData.download_state;
+        status.style.color = 'var(--red)';
+        btn.disabled = false;
+        btn.textContent = '🚀 Jetzt installieren';
+        return;
+      }
+    }
+    if (!ready) {
+      status.textContent = '❌ Download-Timeout – bitte erneut versuchen';
+      status.style.color = 'var(--red)';
+      btn.disabled = false;
+      btn.textContent = '🚀 Jetzt installieren';
+      return;
+    }
+    // 3. Installation starten
+    btn.textContent = '⏳ Installiere...';
+    status.textContent = 'Installation läuft...';
+    status.style.color = 'var(--orange)';
+    let iResp = await api('/api/updates/install', 'POST');
+    if (iResp.status === 404) {
+      iResp = await api('/api/v1/updates/install', 'POST');
+    }
+    if (iResp.data && iResp.data.ok) {
+      status.textContent = '✅ ' + iResp.data.message;
+      status.style.color = 'var(--green)';
+      btn.style.display = 'none';
+      setTimeout(() => {
+        status.textContent = '🔄 Node startet neu... Seite wird neu geladen.';
+        setTimeout(() => location.reload(), 5000);
+      }, 3000);
+    } else {
+      status.textContent = '❌ ' + (iResp.data?.error || 'Installationsfehler');
+      status.style.color = 'var(--red)';
+      btn.disabled = false;
+      btn.textContent = '🚀 Jetzt installieren';
+    }
+  } catch(e) {
+    // Verbindung verloren = Node startet bereits neu
+    status.textContent = '🔄 Node startet neu...';
+    status.style.color = 'var(--green)';
+    btn.style.display = 'none';
+    setTimeout(() => location.reload(), 8000);
+  }
 }
 
 async function doInstallUpdate() {

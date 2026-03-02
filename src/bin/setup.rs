@@ -551,6 +551,18 @@ async fn start_full_node(state: SetupState) {
         rate_limits,
         updater: updater.clone(),
         orgs: Arc::new(std::sync::Mutex::new(stone::organization::load_orgs())),
+        chat_index: {
+            let mut idx = stone::chat::load_chat_index();
+            let chain = node.chain.lock().unwrap();
+            if chain.blocks.len() as u64 > idx.last_indexed_block {
+                let new_blocks: Vec<_> = chain.blocks.iter()
+                    .skip(idx.last_indexed_block as usize)
+                    .collect();
+                idx.index_new_blocks(&new_blocks);
+                let _ = stone::chat::save_chat_index(&idx);
+            }
+            Arc::new(std::sync::Mutex::new(idx))
+        },
     };
 
     *state.node_state.write().await = Some(node_app_state);

@@ -11,13 +11,13 @@
 //! | Lock-Periode        | 7 Tage (Unstake-Wartezeit)  |
 //! | Reward-Quelle       | pool:storage_rewards (60%)  |
 //! | Epoch-Länge         | 720 Blöcke (~6h bei 30s)    |
-//! | Staking-APY         | ~8-12% (dynamisch)          |
-//! | Reward pro Epoch    | 0.1% des Pool-Guthabens     |
+//! | Staking-APY         | 9% (fest)                   |
+//! | Rewards pro Epoch   | total_staked × APY / epochs_per_year |
 //!
 //! ## Flow
 //!
 //! 1. **Stake**: Nutzer sendet TX (Stake, amount) → Balance wird in StakingPool verbucht
-//! 2. **Epoch-Tick**: Alle 720 Blöcke werden Rewards anteilig verteilt
+//! 2. **Epoch-Tick**: Alle 720 Blöcke werden 9% APY anteilig verteilt
 //! 3. **Unstake**: Nutzer sendet TX (Unstake, amount) → 7-Tage-Lock startet
 //! 4. **Withdraw**: Nach Lock-Periode wird der Betrag in die Wallet zurückgebucht
 
@@ -37,8 +37,11 @@ pub const UNSTAKE_LOCK_SECS: i64 = 7 * 24 * 3600;
 /// Epoch-Länge in Blöcken (bei 30s Mining-Intervall ≈ 6 Stunden)
 pub const EPOCH_LENGTH: u64 = 720;
 
-/// Reward-Rate pro Epoch: 0.1% des Storage-Rewards-Pools
-pub const EPOCH_REWARD_RATE: &str = "0.001";
+/// Jährliche Staking-Rendite (APY) als Dezimal: 9% = 0.09
+pub const STAKING_APY: &str = "0.09";
+
+/// Anzahl Epochen pro Jahr: 365.25 * 24 * 3600 / (EPOCH_LENGTH * 30s) ≈ 1461
+pub const EPOCHS_PER_YEAR: u64 = 1461;
 
 /// Staking-Pool-Adresse (virtueller Account)
 pub const STAKING_POOL_ADDRESS: &str = "pool:staking";
@@ -275,12 +278,28 @@ impl StakingPool {
             return Decimal::ZERO;
         }
 
-        let rate: Decimal = EPOCH_REWARD_RATE.parse().unwrap();
-        let epoch_reward = (reward_pool_balance * rate).round_dp(8);
+        // Feste 9% APY: epoch_reward = total_staked × APY / epochs_per_year
+        let apy: Decimal = STAKING_APY.parse().unwrap();
+        let epochs_year = Decimal::new(EPOCHS_PER_YEAR as i64, 0);
+        let epoch_reward = (self.total_staked * apy / epochs_year).round_dp(8);
 
         if epoch_reward <= Decimal::ZERO {
             self.last_epoch_block = current_block;
             self.current_epoch += 1;
+            return Decimal::ZERO;
+        }
+
+        // Sicherstellen dass nicht mehr verteilt wird als im Reward-Pool vorhanden
+        let capped_reward = if epoch_reward > reward_pool_balance {
+            reward_pool_balance
+        } else {
+            epoch_reward
+        };
+
+        if capped_reward <= Decimal::ZERO {
+            self.last_epoch_block = current_block;
+            self.current_epoch += 1;
+            println!("[staking] ⚠️  Epoch #{}: Reward-Pool erschöpft", self.current_epoch);
             return Decimal::ZERO;
         }
 
@@ -292,7 +311,7 @@ impl StakingPool {
             if let Some(entry) = self.stakers.get_mut(addr) {
                 // Anteil = staked_amount / total_staked
                 let share = entry.staked_amount / self.total_staked;
-                let reward = (epoch_reward * share).round_dp(8);
+                let reward = (capped_reward * share).round_dp(8);
 
                 if reward > Decimal::ZERO {
                     entry.pending_rewards += reward;
@@ -308,7 +327,7 @@ impl StakingPool {
         self.last_epoch_block = current_block;
 
         println!(
-            "[staking] 💰 Epoch #{}: {} STONE Rewards an {} Staker verteilt (Pool-Balance: {})",
+            "[staking] 💰 Epoch #{}: {} STONE Rewards an {} Staker (9% APY, Pool: {})",
             self.current_epoch, total_distributed, stakers.len(), reward_pool_balance,
         );
 
@@ -343,17 +362,8 @@ impl StakingPool {
 
     /// Pool-Info für die API.
     pub fn pool_info(&self, reward_pool_balance: Decimal) -> StakingPoolInfo {
-        let rate: Decimal = EPOCH_REWARD_RATE.parse().unwrap();
-        // Geschätzte APY: (epoch_reward_rate * epochs_per_year) * 100
-        // Epochs pro Jahr: ~365.25 * 24 * 3600 / (EPOCH_LENGTH * 30) ≈ 1461
-        let epochs_per_year = Decimal::new(365 * 24 * 3600, 0)
-            / (Decimal::new(EPOCH_LENGTH as i64, 0) * Decimal::new(30, 0));
-        let apy = if self.total_staked > Decimal::ZERO {
-            let annual_reward = reward_pool_balance * rate * epochs_per_year;
-            (annual_reward / self.total_staked * Decimal::new(100, 0)).round_dp(2)
-        } else {
-            Decimal::ZERO
-        };
+        // Feste 9% APY
+        let apy: Decimal = STAKING_APY.parse::<Decimal>().unwrap() * Decimal::new(100, 0);
 
         StakingPoolInfo {
             total_staked: self.total_staked,

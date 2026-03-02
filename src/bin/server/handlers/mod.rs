@@ -2,8 +2,10 @@
 
 pub mod auth;
 pub mod blocks;
+pub mod chat;
 pub mod chunks;
 pub mod documents;
+pub mod mining;
 pub mod orgs;
 pub mod p2p;
 pub mod peers;

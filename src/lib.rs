@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod blockchain;
+pub mod chat;
 pub mod consensus;
 pub mod crypto;
 pub mod master_node;
