@@ -19,6 +19,12 @@ use super::handlers::{
         handle_patch_document, handle_search_documents, handle_transfer_document,
         handle_upload_document,
     },
+    orgs::{
+        handle_accept_invite, handle_create_channel, handle_create_org,
+        handle_decline_invite, handle_get_chat, handle_get_org, handle_invite,
+        handle_leave_org, handle_list_orgs, handle_my_invites,
+        handle_remove_member, handle_send_message, handle_set_role,
+    },
     p2p::{
         handle_p2p_config, handle_p2p_dial, handle_p2p_info, handle_p2p_peers,
         handle_p2p_ping, handle_p2p_status,
@@ -188,6 +194,19 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/updates/install", post(handle_update_install))
         .route("/api/v1/updates/download", post(handle_update_download))
         .route("/api/v1/updates/config", post(handle_update_config))
+        // ─── Organisationen ──────────────────────────────────────────────────
+        .route("/api/v1/orgs", get(handle_list_orgs).post(handle_create_org))
+        .route("/api/v1/orgs/invites", get(handle_my_invites))
+        .route("/api/v1/orgs/invites/:invite_id/accept", post(handle_accept_invite))
+        .route("/api/v1/orgs/invites/:invite_id/decline", post(handle_decline_invite))
+        .route("/api/v1/orgs/:org_id", get(handle_get_org))
+        .route("/api/v1/orgs/:org_id/invite", post(handle_invite))
+        .route("/api/v1/orgs/:org_id/leave", post(handle_leave_org))
+        .route("/api/v1/orgs/:org_id/members/remove", post(handle_remove_member))
+        .route("/api/v1/orgs/:org_id/members/role", post(handle_set_role))
+        .route("/api/v1/orgs/:org_id/channels", post(handle_create_channel))
+        .route("/api/v1/orgs/:org_id/chat", post(handle_send_message))
+        .route("/api/v1/orgs/:org_id/chat/:channel_id", get(handle_get_chat))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
         .layer(build_cors())
         .with_state(state)

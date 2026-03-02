@@ -26,7 +26,18 @@ pub struct User {
     /// Wird automatisch bei der Registrierung aus der Mnemonic abgeleitet.
     #[serde(default)]
     pub wallet_address: String,
+    /// Account-Typ: "private" (Standard) oder "organization"
+    #[serde(default = "default_account_type")]
+    pub account_type: String,
+    /// Organisation-ID, der dieser User angehört (leer = keine)
+    #[serde(default)]
+    pub org_id: String,
+    /// Rolle innerhalb der Organisation (leer, "owner", "admin", "member", "viewer")
+    #[serde(default)]
+    pub org_role: String,
 }
+
+pub fn default_account_type() -> String { "private".to_string() }
 
 pub fn default_quota_bytes() -> u64 {
     5 * 1024 * 1024 * 1024
@@ -88,6 +99,9 @@ pub fn create_user_with_phrase(name: &str) -> (User, String) {
         phrase_hash: api_key.clone(),
         quota_bytes: default_quota_bytes(),
         wallet_address,
+        account_type: default_account_type(),
+        org_id: String::new(),
+        org_role: String::new(),
     };
     (user, phrase_str)
 }
@@ -158,7 +172,9 @@ pub fn rebuild_users_from_ledger(
         let existing_id = existing_users.iter()
             .find(|u| u.wallet_address == *wallet || u.api_key == api_key_hash)
             .map(|u| u.id.clone());
-        let id = existing_id.unwrap_or_else(|| format!("user-{}", idx));
+        let id = existing_id.unwrap_or_else(|| {
+            format!("u-{}", uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("0000"))
+        });
 
         // Quota: aus bestehendem User übernehmen oder Default
         let quota = existing_users.iter()
@@ -178,6 +194,9 @@ pub fn rebuild_users_from_ledger(
             phrase_hash: api_key_hash,
             quota_bytes: quota,
             wallet_address: wallet.clone(),
+            account_type: default_account_type(),
+            org_id: String::new(),
+            org_role: String::new(),
         });
     }
 

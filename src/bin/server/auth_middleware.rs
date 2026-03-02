@@ -30,6 +30,9 @@ pub fn resolve_user_by_key(
             phrase_hash: String::new(),
             quota_bytes: u64::MAX,
             wallet_address: String::new(),
+            account_type: "private".into(),
+            org_id: String::new(),
+            org_role: String::new(),
         });
     }
     users

@@ -105,6 +105,9 @@ reed-solomon-erasure = "6.0"
 # Token-Economy (StoneCoin) – Dezimalgenau bis 8 Nachkommastellen
 rust_decimal = { version = "1.36", features = ["serde-with-str"] }
 
+# UUID für User-IDs und Organisations-IDs
+uuid = { version = "1.0", features = ["v4", "serde"] }
+
 # ─── Setup-Wizard ────────────────────────────────────────────────────────────
 dialoguer   = { version = "0.11", features = ["fuzzy-select"] }
 indicatif   = "0.17"

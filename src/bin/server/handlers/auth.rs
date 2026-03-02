@@ -39,7 +39,7 @@ pub async fn handle_signup(
     }
     let (id, new_user, phrase) = {
         let mut users = state.users.lock().unwrap();
-        let id = format!("user-{}", users.len() + 1);
+        let id = format!("u-{}", uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("0000"));
         let (mut user, phrase) = create_user_with_phrase(req.name.trim());
         user.id = id.clone();
         users.push(user.clone());

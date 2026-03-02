@@ -462,6 +462,7 @@ async fn main() {
             um.load_persisted_update();
             um
         })),
+        orgs: Arc::new(std::sync::Mutex::new(stone::organization::load_orgs())),
     };
 
     let router = build_router(state);

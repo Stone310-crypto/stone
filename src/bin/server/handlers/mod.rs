@@ -4,6 +4,7 @@ pub mod auth;
 pub mod blocks;
 pub mod chunks;
 pub mod documents;
+pub mod orgs;
 pub mod p2p;
 pub mod peers;
 pub mod poa;

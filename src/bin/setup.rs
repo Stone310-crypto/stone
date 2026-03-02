@@ -550,6 +550,7 @@ async fn start_full_node(state: SetupState) {
         network: network_handle,
         rate_limits,
         updater: updater.clone(),
+        orgs: Arc::new(std::sync::Mutex::new(stone::organization::load_orgs())),
     };
 
     *state.node_state.write().await = Some(node_app_state);

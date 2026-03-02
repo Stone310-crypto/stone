@@ -10,6 +10,7 @@ use stone::{
     blockchain::{ChunkRef, data_dir, CHUNK_SIZE, Document},
     master_node::{MasterNodeState, PeerInfo, TrustEntry, TrustVote},
     network::NetworkHandle,
+    organization::Organization,
     storage::{ChunkStore, StoneStore},
     updater::UpdateManager,
 };
@@ -38,6 +39,8 @@ pub struct AppState {
     pub rate_limits: Arc<RateLimits>,
     /// OTA Update Manager
     pub updater: Arc<RwLock<UpdateManager>>,
+    /// Organisationen
+    pub orgs: Arc<Mutex<Vec<Organization>>>,
 }
 
 // ─── API-Key laden ────────────────────────────────────────────────────────────
