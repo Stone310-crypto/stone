@@ -18,7 +18,8 @@
 use crate::blockchain::{Block, Document, DocumentTombstone, NodeRole, StoneChain};
 use crate::consensus::{
     load_or_create_validator_key, local_validator_pubkey_hex, sign_block,
-    BlockProposal, ValidatorSet, VoteMessage, VotingRound,
+    BlockProposal, CheckpointStore, PreCommitRequest, SlashingStore, ValidatorSet,
+    VoteMessage, VotePhase, VotingRound,
 };
 use crate::shard::ShardHolderRegistry;
 use crate::token::{Mempool, TokenLedger};
@@ -337,6 +338,14 @@ pub enum NodeEvent {
         tx_type: String,
         block_index: u64,
     },
+    // ─── Slashing Events ──────────────────────────────────────────────────────
+    /// Validator wurde bestraft
+    ValidatorSlashed {
+        validator_id: String,
+        offense: String,
+        slashed_amount: String,
+        timestamp: i64,
+    },
 }
 
 // ─── Event-Bus ───────────────────────────────────────────────────────────────
@@ -405,6 +414,10 @@ pub struct MasterNodeState {
     pub staking_pool: RwLock<crate::token::StakingPool>,
     /// Shard-Holder-Registry: Wer hält welchen Shard?
     pub shard_registry: ShardHolderRegistry,
+    /// Finality Checkpoints (unwiderrufliche Chain-Punkte)
+    pub checkpoint_store: RwLock<CheckpointStore>,
+    /// Slashing-Store (Strafen, Jail-Status, Downtime-Tracker)
+    pub slashing_store: RwLock<SlashingStore>,
 }
 
 #[derive(Default)]
@@ -477,6 +490,8 @@ impl MasterNodeState {
             mempool: Mempool::new(),
             staking_pool: RwLock::new(staking_pool),
             shard_registry: ShardHolderRegistry::new(),
+            checkpoint_store: RwLock::new(CheckpointStore::load()),
+            slashing_store: RwLock::new(SlashingStore::load()),
         });
 
         // Node-gestartet Event senden
@@ -511,6 +526,39 @@ impl MasterNodeState {
         state
     }
 
+    /// Baut die drei Maps die für stake-gewichtete Validator-Auswahl benötigt werden:
+    /// 1. `stakes`: wallet_address → gestakter Betrag
+    /// 2. `jailed`: Set von Validator-IDs die gejailed sind
+    /// 3. `wallet_map`: node_id → wallet_address (soweit bekannt)
+    pub fn build_selection_context(&self) -> (
+        HashMap<String, rust_decimal::Decimal>,
+        std::collections::HashSet<String>,
+        HashMap<String, String>,
+    ) {
+        // Stakes aus StakingPool
+        let stakes: HashMap<String, rust_decimal::Decimal> = {
+            let pool = self.staking_pool.read().unwrap();
+            pool.stakers.iter()
+                .map(|(addr, entry)| (addr.clone(), entry.staked_amount))
+                .collect()
+        };
+
+        // Jailed aus SlashingStore
+        let jailed: std::collections::HashSet<String> = {
+            let ss = self.slashing_store.read().unwrap();
+            ss.jailed.keys().cloned().collect()
+        };
+
+        // Wallet-Map: Momentan kennen wir nur unsere eigene Wallet
+        // In Zukunft wird hier die Trust-Registry/P2P-Handshake-Info genutzt
+        let mut wallet_map = HashMap::new();
+        if let Ok(wallet) = std::env::var("STONE_NODE_WALLET") {
+            wallet_map.insert(self.node_id.clone(), wallet);
+        }
+
+        (stakes, jailed, wallet_map)
+    }
+
     /// Dokumente zur Blockchain hinzufügen und Event publizieren.
     ///
     /// PoA prüft die **Node-ID** (`self.node_id`), nicht den User/Signer.
@@ -529,10 +577,9 @@ impl MasterNodeState {
         // PoA: Validator-Prüfung auf Node-Ebene (nicht User-Ebene)
         // Der Signer/User ist der Dokument-Owner — die Node ist der Validator.
         //
-        // v0.3.0: Randomisierte Validator-Auswahl — pro Block wird deterministisch
-        // ein Validator ausgewählt via SHA256(prev_hash || block_index).
-        // Jeder Node ist registriert und aktiv, aber nur der ausgewählte darf
-        // den nächsten Block erstellen.
+        // v0.5.0: Stake-gewichtete Validator-Rotation
+        // Validatoren mit mehr Stake haben proportional höhere Chance,
+        // gejailte Validatoren werden übersprungen.
         {
             let vs = self.validator_set.read().unwrap();
             if !vs.validators.is_empty() {
@@ -544,14 +591,15 @@ impl MasterNodeState {
                         self.node_id
                     ));
                 }
-                // Schritt 2: Randomisierte Auswahl — ist diese Node dran?
+                // Schritt 2: Stake-gewichtete Auswahl — ist diese Node dran?
+                let (stakes, jailed, wallet_map) = self.build_selection_context();
                 let chain = self.chain.lock().unwrap();
                 let next_index = chain.blocks.len() as u64;
                 let prev_hash = chain.blocks.last()
                     .map(|b| b.hash.as_str())
                     .unwrap_or("genesis");
-                if !vs.is_selected_validator(&self.node_id, prev_hash, next_index) {
-                    let selected = vs.select_validator(prev_hash, next_index)
+                if !vs.is_selected_validator_weighted(&self.node_id, prev_hash, next_index, &stakes, &jailed, &wallet_map) {
+                    let selected = vs.select_validator_weighted(prev_hash, next_index, &stakes, &jailed, &wallet_map)
                         .map(|v| v.node_id.clone())
                         .unwrap_or_else(|| "?".into());
                     return Err(format!(
@@ -857,14 +905,15 @@ impl MasterNodeState {
                     return Err("Mining: Node ist kein aktiver Validator".into());
                 }
 
+                let (stakes, jailed, wallet_map) = self.build_selection_context();
                 let chain = self.chain.lock().unwrap();
                 let next_index = chain.blocks.len() as u64;
                 let prev_hash = chain.blocks.last()
                     .map(|b| b.hash.as_str())
                     .unwrap_or("genesis");
 
-                if !vs.is_selected_validator(&self.node_id, prev_hash, next_index) {
-                    let selected = vs.select_validator(prev_hash, next_index)
+                if !vs.is_selected_validator_weighted(&self.node_id, prev_hash, next_index, &stakes, &jailed, &wallet_map) {
+                    let selected = vs.select_validator_weighted(prev_hash, next_index, &stakes, &jailed, &wallet_map)
                         .map(|v| v.node_id.clone())
                         .unwrap_or_else(|| "?".into());
                     return Err(format!(
@@ -1120,6 +1169,8 @@ impl MasterNodeState {
                     match state.mint_block() {
                         Ok(block) => {
                             Self::post_block_staking(&state, &block);
+                            Self::post_block_slashing(&state, &block);
+                            Self::post_block_checkpoint(&state, &block).await;
                             let _ = block;
                         }
                         Err(e) => {
@@ -1146,26 +1197,28 @@ impl MasterNodeState {
                                 block.index, round, active_validators,
                             );
 
-                            // Eigene Stimme: Auto-Accept
-                            let own_vote = VoteMessage::new(
+                            // ── Phase 1: Pre-Vote ──────────────────────────────
+                            // Eigene Pre-Vote: Auto-Accept
+                            let own_vote = VoteMessage::new_with_phase(
                                 round,
                                 block.hash.clone(),
                                 state.node_id.clone(),
                                 true,
                                 &signing_key,
                                 String::new(),
+                                VotePhase::PreVote,
                             );
 
-                            // VotingRound starten
+                            // VotingRound starten (Phase 1: PreVote)
                             {
                                 let vs = state.validator_set.read().unwrap();
                                 let mut voting = state.active_voting.lock().unwrap();
                                 let mut vr = VotingRound::new(round, block.hash.clone(), state.node_id.clone());
-                                let _ = vr.add_vote(own_vote, &vs);
+                                let _ = vr.add_pre_vote(own_vote, &vs);
                                 *voting = Some(vr);
                             }
 
-                            // Proposal an alle Healthy Peers senden
+                            // Proposal an alle Healthy Peers senden → Pre-Votes sammeln
                             let peer_urls: Vec<String> = {
                                 let peers = state.peers.read().unwrap();
                                 peers.iter()
@@ -1191,18 +1244,17 @@ impl MasterNodeState {
                                 {
                                     Ok(resp) => {
                                         if let Ok(val) = resp.json::<serde_json::Value>().await {
-                                            // Peer antwortet mit VoteMessage
                                             if let Ok(vote) = serde_json::from_value::<VoteMessage>(
                                                 val.get("vote").cloned().unwrap_or_default()
                                             ) {
                                                 let vs = state.validator_set.read().unwrap();
                                                 let mut voting = state.active_voting.lock().unwrap();
                                                 if let Some(ref mut vr) = *voting {
-                                                    if let Err(e) = vr.add_vote(vote.clone(), &vs) {
-                                                        eprintln!("[consensus] Vote von {} ungültig: {e}", peer_url);
+                                                    if let Err(e) = vr.add_pre_vote(vote.clone(), &vs) {
+                                                        eprintln!("[consensus] PreVote von {} ungültig: {e}", peer_url);
                                                     } else {
                                                         println!(
-                                                            "[consensus] 🗳️  Vote von '{}': {}",
+                                                            "[consensus] 🗳️  PreVote von '{}': {}",
                                                             vote.voter_id,
                                                             if vote.accept { "✅ Accept" } else { "❌ Reject" }
                                                         );
@@ -1217,14 +1269,119 @@ impl MasterNodeState {
                                 }
                             }
 
-                            // Stimmen auswerten
+                            // Phase 1 auswerten: ⅔+1 Pre-Votes?
+                            let (prevote_quorum, prevote_info) = {
+                                let vs = state.validator_set.read().unwrap();
+                                let voting = state.active_voting.lock().unwrap();
+                                if let Some(ref vr) = *voting {
+                                    let tally = vr.tally_pre_votes(&vs);
+                                    let info = format!(
+                                        "{}/{} PreVote-Accept, {}/{} nötig",
+                                        tally.accepts, tally.total_validators,
+                                        tally.threshold, tally.total_validators,
+                                    );
+                                    (tally.quorum_reached, info)
+                                } else {
+                                    (false, "Keine Voting-Runde".into())
+                                }
+                            };
+
+                            if !prevote_quorum {
+                                println!(
+                                    "[consensus] ❌ Kein PreVote-Quorum ({}) – Block #{} verworfen",
+                                    prevote_info, block.index,
+                                );
+                                for tx in &block.transactions {
+                                    if tx.tx_type != TxType::Reward && tx.tx_type != TxType::Memorial {
+                                        let _ = state.mempool.add_tx(tx.clone(), None);
+                                    }
+                                }
+                                *state.active_voting.lock().unwrap() = None;
+                                continue;
+                            }
+
+                            println!(
+                                "[consensus] ✅ PreVote-Quorum erreicht ({}) – starte PreCommit-Phase",
+                                prevote_info,
+                            );
+
+                            // ── Phase 2: Pre-Commit ────────────────────────────
+                            // Übergang zur PreCommit-Phase + PreCommitRequest bauen
+                            let pre_commit_request = {
+                                let mut voting = state.active_voting.lock().unwrap();
+                                if let Some(ref mut vr) = *voting {
+                                    let req = PreCommitRequest {
+                                        round: vr.round,
+                                        block_hash: vr.block_hash.clone(),
+                                        proposer_id: vr.proposer_id.clone(),
+                                        pre_votes: vr.collected_pre_votes(),
+                                    };
+                                    vr.advance_to_precommit();
+                                    // Eigene Pre-Commit: Auto-Accept
+                                    let own_pc = VoteMessage::new_with_phase(
+                                        round,
+                                        block.hash.clone(),
+                                        state.node_id.clone(),
+                                        true,
+                                        &signing_key,
+                                        String::new(),
+                                        VotePhase::PreCommit,
+                                    );
+                                    let vs = state.validator_set.read().unwrap();
+                                    let _ = vr.add_pre_commit(own_pc, &vs);
+                                    Some(req)
+                                } else {
+                                    None
+                                }
+                            };
+
+                            if let Some(pcr) = pre_commit_request {
+                                let pcr_json = serde_json::to_vec(&pcr).unwrap_or_default();
+
+                                for peer_url in &peer_urls {
+                                    let url = format!("{}/api/v1/p2p/precommit", peer_url.trim_end_matches('/'));
+                                    match client.post(&url)
+                                        .header("Content-Type", "application/json")
+                                        .body(pcr_json.clone())
+                                        .send()
+                                        .await
+                                    {
+                                        Ok(resp) => {
+                                            if let Ok(val) = resp.json::<serde_json::Value>().await {
+                                                if let Ok(vote) = serde_json::from_value::<VoteMessage>(
+                                                    val.get("vote").cloned().unwrap_or_default()
+                                                ) {
+                                                    let vs = state.validator_set.read().unwrap();
+                                                    let mut voting = state.active_voting.lock().unwrap();
+                                                    if let Some(ref mut vr) = *voting {
+                                                        if let Err(e) = vr.add_pre_commit(vote.clone(), &vs) {
+                                                            eprintln!("[consensus] PreCommit von {} ungültig: {e}", peer_url);
+                                                        } else {
+                                                            println!(
+                                                                "[consensus] 🔒 PreCommit von '{}': {}",
+                                                                vote.voter_id,
+                                                                if vote.accept { "✅ Commit" } else { "❌ Reject" }
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            eprintln!("[consensus] PreCommit-Anfrage an {} fehlgeschlagen: {e}", peer_url);
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Phase 2 finalisieren: ⅔+1 Pre-Commits?
                             let (quorum_reached, tally_info) = {
                                 let vs = state.validator_set.read().unwrap();
                                 let mut voting = state.active_voting.lock().unwrap();
                                 if let Some(ref mut vr) = *voting {
                                     let tally = vr.finalize(&vs);
                                     let info = format!(
-                                        "{}/{} Accept, {}/{} nötig",
+                                        "{}/{} PreCommit-Accept, {}/{} nötig",
                                         tally.accepts, tally.total_validators,
                                         tally.threshold, tally.total_validators,
                                     );
@@ -1235,13 +1392,23 @@ impl MasterNodeState {
                             };
 
                             if quorum_reached {
-                                println!("[consensus] ✅ Quorum erreicht ({}) – Block #{} wird committed", tally_info, block.index);
+                                println!(
+                                    "[consensus] ✅ 2-Phase BFT Quorum erreicht ({}) – Block #{} wird committed",
+                                    tally_info, block.index,
+                                );
                                 match state.commit_mining_block(block.clone()) {
-                                    Ok(()) => Self::post_block_staking(&state, &block),
+                                    Ok(()) => {
+                                        Self::post_block_staking(&state, &block);
+                                        Self::post_block_slashing(&state, &block);
+                                        Self::post_block_checkpoint(&state, &block).await;
+                                    }
                                     Err(e) => eprintln!("[consensus] Commit fehlgeschlagen: {e}"),
                                 }
                             } else {
-                                println!("[consensus] ❌ Kein Quorum ({}) – Block #{} verworfen", tally_info, block.index);
+                                println!(
+                                    "[consensus] ❌ Kein PreCommit-Quorum ({}) – Block #{} verworfen",
+                                    tally_info, block.index,
+                                );
                                 // TXs zurück in den Mempool (außer Reward + Memorial)
                                 for tx in &block.transactions {
                                     if tx.tx_type != TxType::Reward && tx.tx_type != TxType::Memorial {
@@ -1305,6 +1472,189 @@ impl MasterNodeState {
         if distributed > rust_decimal::Decimal::ZERO || !matured.is_empty() {
             if let Err(e) = pool.persist() {
                 eprintln!("[staking] Pool-Persist: {e}");
+            }
+        }
+    }
+
+    /// Slashing-Prüfung nach einem committed Block.
+    ///
+    /// 1. Markiert den Block-Signer als aktiv (Downtime-Tracker)
+    /// 2. Entlässt Validatoren mit abgelaufener Jail-Zeit
+    /// 3. Prüft alle aktiven Validatoren auf Downtime
+    /// 4. Bei Double-Signing wird automatisch geslasht
+    fn post_block_slashing(state: &Arc<Self>, block: &Block) {
+        use crate::consensus::{
+            SLASH_JAIL_DURATION_SECS,
+        };
+
+        let mut slash_store = state.slashing_store.write().unwrap();
+
+        // 1. Block-Signer als aktiv markieren
+        if !block.signer.is_empty() {
+            slash_store.mark_active(&block.signer, block.index);
+        }
+
+        // 2. Abgelaufene Jails aufheben → Validator re-aktivieren
+        let released = slash_store.release_expired_jails();
+        if !released.is_empty() {
+            let mut vs = state.validator_set.write().unwrap();
+            for vid in &released {
+                vs.set_active(vid, true);
+                println!("[slashing] 🔓 Validator '{}' aus Jail entlassen, re-aktiviert", vid);
+            }
+        }
+
+        // 3. Downtime-Check für alle aktiven Validatoren
+        let validators: Vec<(String, Option<String>)> = {
+            let vs = state.validator_set.read().unwrap();
+            vs.validators.iter()
+                .filter(|v| v.active)
+                .filter(|v| v.node_id != block.signer) // Signer ist ja aktiv
+                .map(|v| (v.node_id.clone(), None)) // wallet_address ist Optional
+                .collect()
+        };
+
+        for (vid, _) in &validators {
+            // Bereits gejailed? Dann nicht nochmal prüfen
+            if slash_store.is_jailed(vid) {
+                continue;
+            }
+
+            if let Some(offense) = slash_store.check_downtime(vid, block.index) {
+                // Wallet-Adresse des Validators ermitteln (falls bekannt)
+                let wallet_addr = Self::resolve_validator_wallet(state, vid);
+
+                let slashed_amount = if let Some(ref wallet) = wallet_addr {
+                    let mut pool = state.staking_pool.write().unwrap();
+                    let stake = pool.stakers.get(wallet)
+                        .map(|s| s.staked_amount)
+                        .unwrap_or(rust_decimal::Decimal::ZERO);
+                    let penalty = stake * rust_decimal::Decimal::from(offense.penalty_percent())
+                        / rust_decimal::Decimal::from(100u64);
+                    pool.slash(wallet, penalty)
+                } else {
+                    rust_decimal::Decimal::ZERO
+                };
+
+                let record = slash_store.record_slash(
+                    vid,
+                    wallet_addr.as_deref(),
+                    offense,
+                    slashed_amount,
+                    block.index,
+                );
+
+                // Validator deaktivieren (Jail)
+                {
+                    let mut vs = state.validator_set.write().unwrap();
+                    vs.set_active(vid, false);
+                }
+
+                eprintln!(
+                    "[slashing] ⚠️  {} – {} STONE geslasht, Jail für {} Stunden",
+                    record.offense.description(),
+                    record.slashed_amount,
+                    SLASH_JAIL_DURATION_SECS / 3600,
+                );
+
+                state.events.publish(NodeEvent::ValidatorSlashed {
+                    validator_id: vid.clone(),
+                    offense: record.offense.description(),
+                    slashed_amount: record.slashed_amount.clone(),
+                    timestamp: record.timestamp,
+                });
+            }
+        }
+    }
+
+    /// Versucht die Wallet-Adresse eines Validators aufzulösen.
+    /// Sucht in der Node-Wallet-Konfiguration (gleiche node_id = gleiche wallet).
+    fn resolve_validator_wallet(state: &Arc<Self>, validator_id: &str) -> Option<String> {
+        // Wenn es unsere eigene Node ist
+        if validator_id == state.node_id {
+            return std::env::var("STONE_NODE_WALLET").ok();
+        }
+        // Für Remote-Validatoren: in der Trust-Registry nach wallet suchen
+        // (Erweiterbar in Zukunft)
+        None
+    }
+
+    /// Finality-Checkpoint nach einem committed Block erstellen (alle CHECKPOINT_INTERVAL Blöcke).
+    async fn post_block_checkpoint(state: &Arc<Self>, block: &Block) {
+        let should_create = {
+            let store = state.checkpoint_store.read().unwrap();
+            store.should_create_checkpoint(block.index)
+        };
+        if !should_create {
+            return;
+        }
+
+        let required = {
+            let vs = state.validator_set.read().unwrap();
+            let active = vs.active_count();
+            if active <= 1 { 1 } else { (active * 2) / 3 + 1 }
+        };
+
+        let mut checkpoint = crate::consensus::Checkpoint::new(
+            block.index,
+            block.hash.clone(),
+            required,
+        );
+
+        // Lokal signieren
+        let signing_key = load_or_create_validator_key();
+        checkpoint.sign(&state.node_id, &signing_key);
+
+        let finalized = checkpoint.is_finalized();
+        {
+            let mut store = state.checkpoint_store.write().unwrap();
+            store.add_or_update(checkpoint.clone());
+        }
+
+        if finalized {
+            println!(
+                "[checkpoint] ✅ Block #{} finalisiert (single-node) – unwiderruflich",
+                block.index
+            );
+        } else {
+            println!(
+                "[checkpoint] 📌 Checkpoint für Block #{} erstellt ({}/{} Signaturen, warte auf Peers)",
+                block.index, 1, required
+            );
+        }
+
+        // An Peers broadcasten (fire-and-forget, async)
+        let peer_urls: Vec<String> = {
+            let peers = state.peers.read().unwrap();
+            peers.iter()
+                .filter(|p| p.is_healthy())
+                .map(|p| p.url.clone())
+                .collect()
+        };
+        if !peer_urls.is_empty() {
+            let cp_json = serde_json::to_vec(&checkpoint).unwrap_or_default();
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(5))
+                .danger_accept_invalid_certs(true)
+                .build()
+                .unwrap_or_default();
+            for peer in &peer_urls {
+                let url = format!("{}/api/v1/checkpoint", peer.trim_end_matches('/'));
+                match client.post(&url)
+                    .header("Content-Type", "application/json")
+                    .body(cp_json.clone())
+                    .send()
+                    .await
+                {
+                    Ok(resp) => {
+                        if resp.status().is_success() {
+                            println!("[checkpoint] → Checkpoint für #{} an {} gesendet", block.index, peer);
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[checkpoint] Senden an {} fehlgeschlagen: {e}", peer);
+                    }
+                }
             }
         }
     }

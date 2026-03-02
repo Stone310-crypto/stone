@@ -268,6 +268,18 @@ pub fn apply_genesis(ledger: &mut TokenLedger) -> Result<Vec<super::transaction:
             "[token]   📦 {} → {} STONE (Vesting: {} Monate)",
             alloc.label, alloc.amount, alloc.vesting_months
         );
+
+        // Vesting-Schedule registrieren (falls > 0 Monate)
+        if alloc.vesting_months > 0 {
+            let schedule = super::ledger::VestingSchedule {
+                address: alloc.address.clone(),
+                total_amount: alloc.amount,
+                start_timestamp: chrono::Utc::now().timestamp(),
+                duration_months: alloc.vesting_months,
+                withdrawn: Decimal::ZERO,
+            };
+            ledger.add_vesting_schedule(schedule);
+        }
     }
 
     // Testnet-Faucet
@@ -306,6 +318,10 @@ pub struct SupplyInfo {
     pub max_supply: Decimal,
     pub circulating: Decimal,
     pub burned: Decimal,
+    /// Kumulative Fees die durch TX-Gebühren verbrannt wurden
+    pub fees_burned: Decimal,
+    /// Vesting-gesperrte Token (noch nicht freigesetzt)
+    pub vesting_locked: Decimal,
     pub accounts: usize,
 }
 
@@ -316,12 +332,24 @@ impl SupplyInfo {
             + ledger.balance("pool:treasury")
             + ledger.balance("pool:founders");
 
+        // Vesting-gesperrte Token berechnen
+        let now = chrono::Utc::now().timestamp();
+        let vesting_locked: Decimal = ledger.all_vesting_schedules()
+            .values()
+            .map(|s| {
+                let unreleased = s.total_amount - s.released_at(now);
+                unreleased.max(Decimal::ZERO)
+            })
+            .sum();
+
         SupplyInfo {
             network: config.network.to_string(),
             total_supply: ledger.total_supply(),
             max_supply: ledger.max_supply(),
             circulating: ledger.total_supply() - locked_pools,
             burned: ledger.max_supply() - ledger.total_supply(),
+            fees_burned: ledger.total_fees_burned(),
+            vesting_locked,
             accounts: ledger.account_count(),
         }
     }

@@ -156,10 +156,37 @@ pub async fn pull_from_peer(node: &Arc<MasterNodeState>, peer_url: &str, api_key
 
         let did_rollback = if let Some(fork_idx) = fork_at {
             let peer_len = blocks.len() as u64;
-            if peer_len >= local_len {
+
+            // ── Stake-gewichtete Fork-Choice ──
+            // Nicht nur Länge vergleichen, sondern auch kumulatives Stake-Gewicht
+            let (stakes, _jailed, wallet_map) = node.build_selection_context();
+            let local_stake = stone::consensus::cumulative_stake_weight(
+                &chain.blocks, fork_idx, &stakes, &wallet_map,
+            );
+            let peer_stake = stone::consensus::cumulative_stake_weight(
+                &blocks, fork_idx, &stakes, &wallet_map,
+            );
+
+            let (prefer_peer, reason) = stone::consensus::should_prefer_peer_chain(
+                local_len, peer_len, local_stake, peer_stake,
+            );
+
+            if prefer_peer {
+                // ── Checkpoint-Schutz: Reorg über finalisierte Checkpoints verhindern ──
+                {
+                    let cp_store = node.checkpoint_store.read().unwrap();
+                    if let Err(cp_reason) = cp_store.check_reorg_allowed(fork_idx as u64) {
+                        eprintln!(
+                            "[sync] {peer_url}: Fork bei Index {fork_idx} ABGELEHNT – {cp_reason}"
+                        );
+                        node.metrics.sync_failure.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return;
+                    }
+                }
+
                 eprintln!(
-                    "[sync] {peer_url}: Fork bei Index {fork_idx} erkannt – \
-                     Peer-Chain ({peer_len} Blöcke) >= lokal ({local_len}) → Rollback & Übernahme"
+                    "[sync] {peer_url}: Fork bei Index {fork_idx} erkannt – {reason} \
+                     (Peer: {peer_len} Blöcke/{peer_stake} Stake, Lokal: {local_len}/{local_stake}) → Rollback"
                 );
                 chain.blocks.truncate(fork_idx);
                 chain.latest_hash = chain
@@ -171,8 +198,8 @@ pub async fn pull_from_peer(node: &Arc<MasterNodeState>, peer_url: &str, api_key
                 true
             } else {
                 eprintln!(
-                    "[sync] {peer_url}: Fork bei Index {fork_idx} – \
-                     unsere Chain ({local_len}) > Peer ({peer_len}) → behalte lokale Chain"
+                    "[sync] {peer_url}: Fork bei Index {fork_idx} – {reason} \
+                     (Peer: {peer_len}/{peer_stake}, Lokal: {local_len}/{local_stake}) → behalte lokale Chain"
                 );
                 false
             }

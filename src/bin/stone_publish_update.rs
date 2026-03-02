@@ -18,10 +18,9 @@
 //! 5. Sendet Manifest + alle Chunks per HTTP POST an den Node
 
 use chrono::Utc;
-use ed25519_dalek::SigningKey;
 use base64::Engine as _;
 use stone::updater::{
-    UpdateManifest, UPDATE_CHUNK_SIZE, canonical_manifest_bytes, chunk_binary, sha256_hex,
+    UpdateManifest, UPDATE_CHUNK_SIZE, chunk_binary, sha256_hex,
     sign_manifest, load_signing_key,
 };
 use std::{fs, path::Path, process};

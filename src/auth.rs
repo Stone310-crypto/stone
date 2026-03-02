@@ -162,10 +162,10 @@ pub fn rebuild_users_from_ledger(
     // 1. Alle Chain-registrierten Accounts übernehmen
     let mut chain_wallets: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut chain_api_keys: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut idx = 0usize;
+    let mut _idx = 0usize;
 
     for (wallet, name) in chain_accounts {
-        idx += 1;
+        _idx += 1;
         let api_key_hash = ledger.account_api_key_hash(wallet).unwrap_or("").to_string();
 
         // ID: Versuche aus bestehenden Usern zu übernehmen, sonst generieren

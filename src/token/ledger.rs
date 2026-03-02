@@ -31,8 +31,66 @@ use super::transaction::{TokenTx, TxError, TxType, validate_tx};
 /// Maximales Token-Supply: 50.000.000 STONE
 pub const MAX_SUPPLY: &str = "50000000";
 
-/// Minimale Transaktionsgebühr (0.001 STONE)
-pub const MIN_FEE: &str = "0.001";
+/// Minimale Transaktionsgebühr (0.0001 STONE — Basis-Fee, wird geburnt)
+pub const MIN_FEE: &str = "0.0001";
+
+// ─── Vesting ─────────────────────────────────────────────────────────────────
+
+/// Vesting-Schedule für einen Pool-Account.
+///
+/// Erzwingt lineare Token-Freigabe über `duration_months` Monate ab
+/// `start_timestamp`. Nur der freigegebene Anteil kann transferiert werden.
+///
+/// `released(now) = total_amount × min(elapsed_months / duration_months, 1)`
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VestingSchedule {
+    /// Pool/Account-Adresse
+    pub address: String,
+    /// Gesamtbetrag unter Vesting
+    pub total_amount: Decimal,
+    /// Unix-Timestamp des Genesis/Start
+    pub start_timestamp: i64,
+    /// Vesting-Dauer in Monaten
+    pub duration_months: u32,
+    /// Bisher abgehobener/freigegebener Betrag
+    pub withdrawn: Decimal,
+}
+
+impl VestingSchedule {
+    /// Berechnet den bis jetzt insgesamt freigegebenen Betrag (linear).
+    pub fn released_at(&self, now: i64) -> Decimal {
+        if self.duration_months == 0 {
+            return self.total_amount; // Kein Vesting → alles sofort
+        }
+        let elapsed_secs = (now - self.start_timestamp).max(0) as u64;
+        let elapsed_months = elapsed_secs / (30 * 24 * 3600); // ~30 Tage pro Monat
+        if elapsed_months >= self.duration_months as u64 {
+            return self.total_amount; // Vesting vollständig
+        }
+        let ratio = Decimal::new(elapsed_months as i64, 0)
+            / Decimal::new(self.duration_months as i64, 0);
+        (self.total_amount * ratio).round_dp(8)
+    }
+
+    /// Berechnet den aktuell verfügbaren (noch nicht abgehobenen) Betrag.
+    pub fn available_at(&self, now: i64) -> Decimal {
+        (self.released_at(now) - self.withdrawn).max(Decimal::ZERO)
+    }
+
+    /// Versucht `amount` als Withdrawal zu buchen. Gibt Fehler zurück wenn
+    /// der Betrag die Vesting-Freigabe überschreitet.
+    pub fn withdraw(&mut self, amount: Decimal, now: i64) -> Result<(), String> {
+        let available = self.available_at(now);
+        if amount > available {
+            return Err(format!(
+                "Vesting-Sperre: {} STONE verfügbar, {} angefordert (freigesetzt: {}, abgehoben: {})",
+                available, amount, self.released_at(now), self.withdrawn,
+            ));
+        }
+        self.withdrawn += amount;
+        Ok(())
+    }
+}
 
 // ─── Ledger-Fehler ───────────────────────────────────────────────────────────
 
@@ -49,6 +107,8 @@ pub enum LedgerError {
     KeyRotationConflict { new_key: String },
     /// Versuch eine TX mit einem rotierten Key zu senden
     KeyRevoked { address: String, active_key: String },
+    /// Transfer-Betrag übersteigt den freigesetzten Vesting-Anteil
+    VestingLocked { account: String, message: String },
 }
 
 impl std::fmt::Display for LedgerError {
@@ -70,6 +130,8 @@ impl std::fmt::Display for LedgerError {
                 write!(f, "Neuer Key {new_key}... hat bereits Ledger-Einträge"),
             LedgerError::KeyRevoked { address, active_key } =>
                 write!(f, "Key {address}... wurde rotiert – aktiver Key: {active_key}..."),
+            LedgerError::VestingLocked { account, message } =>
+                write!(f, "Vesting-Sperre für {account}: {message}"),
         }
     }
 }
@@ -140,6 +202,11 @@ pub struct TokenLedger {
     /// Wallet-Adresse → API-Key-Hash (SHA-256 der Phrase).
     /// Dient als Authentifizierungsbeweis, wird aus AccountRegister-TX memo gelesen.
     account_api_keys: HashMap<String, String>,
+    /// Vesting-Schedules: pool-Adresse → VestingSchedule
+    /// Verhindert Auszahlungen über den freigegebenen Betrag hinaus.
+    vesting_schedules: HashMap<String, VestingSchedule>,
+    /// Kumulative Fee-Burns seit Genesis
+    total_fees_burned: Decimal,
 }
 
 impl TokenLedger {
@@ -155,6 +222,8 @@ impl TokenLedger {
             key_rotation_history: HashMap::new(),
             account_names: HashMap::new(),
             account_api_keys: HashMap::new(),
+            vesting_schedules: HashMap::new(),
+            total_fees_burned: Decimal::ZERO,
         }
     }
 
@@ -265,7 +334,7 @@ impl TokenLedger {
 
     /// Token von einem Account auf einen anderen übertragen.
     ///
-    /// Prüft: Balance, Nonce, Signatur.
+    /// Prüft: Balance, Vesting-Sperre, Nonce, Signatur.
     pub fn transfer(
         &mut self,
         from: &str,
@@ -284,13 +353,25 @@ impl TokenLedger {
             });
         }
 
+        // Vesting-Check: bei Pool-Adressen prüfen ob der Betrag freigesetzt ist
+        if let Some(schedule) = self.vesting_schedules.get_mut(from) {
+            let now = chrono::Utc::now().timestamp();
+            if let Err(e) = schedule.withdraw(total_debit, now) {
+                return Err(LedgerError::VestingLocked {
+                    account: from.to_string(),
+                    message: e,
+                });
+            }
+        }
+
         // Abbuchen
         *self.balances.entry(from.to_string()).or_insert(Decimal::ZERO) -= total_debit;
         // Gutschreiben
         *self.balances.entry(to.to_string()).or_insert(Decimal::ZERO) += amount;
-        // Fee wird verbrannt (reduziert total_supply)
+        // Fee wird verbrannt (reduziert total_supply → deflationärer Effekt)
         if fee > Decimal::ZERO {
             self.total_supply -= fee;
+            self.total_fees_burned += fee;
         }
 
         Ok(())
@@ -315,6 +396,34 @@ impl TokenLedger {
             amount, &from[..12.min(from.len())], self.total_supply
         );
         Ok(())
+    }
+
+    // ── Vesting ───────────────────────────────────────────────────────────
+
+    /// Registriert einen Vesting-Schedule für eine Pool-Adresse.
+    ///
+    /// Wird einmalig bei Genesis aufgerufen für Pools mit `vesting_months > 0`.
+    pub fn add_vesting_schedule(&mut self, schedule: VestingSchedule) {
+        println!(
+            "[token] 🔒 Vesting: {} – {} STONE über {} Monate",
+            schedule.address, schedule.total_amount, schedule.duration_months,
+        );
+        self.vesting_schedules.insert(schedule.address.clone(), schedule);
+    }
+
+    /// Gibt den Vesting-Schedule für eine Adresse zurück (falls vorhanden).
+    pub fn vesting_schedule(&self, address: &str) -> Option<&VestingSchedule> {
+        self.vesting_schedules.get(address)
+    }
+
+    /// Gibt alle aktiven Vesting-Schedules zurück.
+    pub fn all_vesting_schedules(&self) -> &HashMap<String, VestingSchedule> {
+        &self.vesting_schedules
+    }
+
+    /// Kumulative verbrannte Fees seit Genesis.
+    pub fn total_fees_burned(&self) -> Decimal {
+        self.total_fees_burned
     }
 
     // ── Key-Rotation ──────────────────────────────────────────────────────
@@ -689,8 +798,21 @@ impl TokenLedger {
                 .map_err(|e| LedgerError::Persistence(format!("put acct_key: {e}")))?;
         }
 
-        println!("[token] 💾 Ledger persistiert: {} Accounts, {} Registrierte, {} Key-Rotations, Supply: {}",
-            self.account_count(), self.registered_account_count(), self.key_rotations.len(), self.total_supply);
+        // Vesting-Schedules
+        for (addr, schedule) in &self.vesting_schedules {
+            let key = format!("vesting/{}", addr);
+            let json = serde_json::to_string(schedule).unwrap_or_default();
+            db.put(key.as_bytes(), json.as_bytes())
+                .map_err(|e| LedgerError::Persistence(format!("put vesting: {e}")))?;
+        }
+
+        // Kumulative Fee-Burns
+        db.put(b"fees_burned", self.total_fees_burned.to_string().as_bytes())
+            .map_err(|e| LedgerError::Persistence(format!("put fees_burned: {e}")))?;
+
+        println!("[token] 💾 Ledger persistiert: {} Accounts, {} Registrierte, {} Key-Rotations, {} Vesting, Supply: {}",
+            self.account_count(), self.registered_account_count(), self.key_rotations.len(),
+            self.vesting_schedules.len(), self.total_supply);
         Ok(())
     }
 
@@ -800,11 +922,34 @@ impl TokenLedger {
             }
         }
 
+        // Vesting-Schedules laden
+        let iter = db.prefix_iterator(b"vesting/");
+        for item in iter {
+            if let Ok((key, value)) = item {
+                let key_str = String::from_utf8_lossy(&key);
+                if !key_str.starts_with("vesting/") {
+                    break;
+                }
+                let addr = key_str.strip_prefix("vesting/").unwrap_or("").to_string();
+                if let Ok(schedule) = serde_json::from_slice::<VestingSchedule>(&value) {
+                    ledger.vesting_schedules.insert(addr, schedule);
+                }
+            }
+        }
+
+        // Kumulative Fee-Burns laden
+        if let Ok(Some(val)) = db.get(b"fees_burned") {
+            if let Ok(burned) = String::from_utf8_lossy(&val).parse::<Decimal>() {
+                ledger.total_fees_burned = burned;
+            }
+        }
+
         println!(
-            "[token] 📂 Ledger geladen: {} Accounts, {} Registrierte, {} Key-Rotations, Supply: {}",
+            "[token] 📂 Ledger geladen: {} Accounts, {} Registrierte, {} Key-Rotations, {} Vesting, Supply: {}",
             ledger.account_count(),
             ledger.registered_account_count(),
             ledger.key_rotations.len(),
+            ledger.vesting_schedules.len(),
             ledger.total_supply
         );
         ledger

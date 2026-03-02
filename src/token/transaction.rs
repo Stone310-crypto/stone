@@ -107,7 +107,7 @@ impl FeeTier {
         match self {
             FeeTier::Express  => Decimal::new(1, 2),   // 0.01 STONE
             FeeTier::Priority => Decimal::new(1, 3),   // 0.001 STONE
-            FeeTier::Standard => Decimal::ZERO,         // 0.0 STONE (kostenlos)
+            FeeTier::Standard => Decimal::new(1, 4),   // 0.0001 STONE (Basis-Fee, wird geburnt)
         }
     }
 

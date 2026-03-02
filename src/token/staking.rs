@@ -11,8 +11,8 @@
 //! | Lock-Periode        | 7 Tage (Unstake-Wartezeit)  |
 //! | Reward-Quelle       | pool:storage_rewards (60%)  |
 //! | Epoch-Länge         | 720 Blöcke (~6h bei 30s)    |
-//! | Staking-APY         | 9% (fest)                   |
-//! | Rewards pro Epoch   | total_staked × APY / epochs_per_year |
+//! | Staking-APY         | 2%-9% (dynamisch, Pool-abhängig) |
+//! | Rewards pro Epoch   | total_staked × dynamic_APY / epochs_per_year |
 //!
 //! ## Flow
 //!
@@ -37,14 +37,44 @@ pub const UNSTAKE_LOCK_SECS: i64 = 7 * 24 * 3600;
 /// Epoch-Länge in Blöcken (bei 30s Mining-Intervall ≈ 6 Stunden)
 pub const EPOCH_LENGTH: u64 = 720;
 
-/// Jährliche Staking-Rendite (APY) als Dezimal: 9% = 0.09
-pub const STAKING_APY: &str = "0.09";
+/// Maximale jährliche Staking-Rendite (APY-Obergrenze bei vollem Reward-Pool)
+pub const STAKING_APY_MAX: &str = "0.09";
+
+/// Minimale jährliche Staking-Rendite (APY-Untergrenze wenn Pool fast leer)
+pub const STAKING_APY_FLOOR: &str = "0.02";
+
+/// Initiale Größe des Storage-Reward-Pools (60% von 50M = 30M)
+pub const INITIAL_REWARD_POOL: &str = "30000000";
 
 /// Anzahl Epochen pro Jahr: 365.25 * 24 * 3600 / (EPOCH_LENGTH * 30s) ≈ 1461
 pub const EPOCHS_PER_YEAR: u64 = 1461;
 
 /// Staking-Pool-Adresse (virtueller Account)
 pub const STAKING_POOL_ADDRESS: &str = "pool:staking";
+
+/// Berechnet die aktuelle dynamische APY basierend auf dem Reward-Pool-Füllstand.
+///
+/// Formel: APY = FLOOR + (MAX - FLOOR) × (pool_balance / initial_pool)
+///
+/// | Pool-Füllstand | APY     |
+/// |----------------|---------|
+/// | 100% (30M)     | 9.0%    |
+/// | 50% (15M)      | 5.5%    |
+/// | 10% (3M)       | 2.7%    |
+/// | 0%             | 2.0%    |
+pub fn dynamic_apy(reward_pool_balance: Decimal) -> Decimal {
+    let max_apy: Decimal = STAKING_APY_MAX.parse().unwrap();
+    let floor_apy: Decimal = STAKING_APY_FLOOR.parse().unwrap();
+    let initial_pool: Decimal = INITIAL_REWARD_POOL.parse().unwrap();
+
+    if initial_pool <= Decimal::ZERO {
+        return floor_apy;
+    }
+
+    let ratio = (reward_pool_balance / initial_pool).min(Decimal::ONE).max(Decimal::ZERO);
+    let apy = floor_apy + (max_apy - floor_apy) * ratio;
+    apy.round_dp(6)
+}
 
 // ─── Staker-Eintrag ──────────────────────────────────────────────────────────
 
@@ -278,8 +308,8 @@ impl StakingPool {
             return Decimal::ZERO;
         }
 
-        // Feste 9% APY: epoch_reward = total_staked × APY / epochs_per_year
-        let apy: Decimal = STAKING_APY.parse().unwrap();
+        // Dynamische APY basierend auf Reward-Pool-Füllstand
+        let apy = dynamic_apy(reward_pool_balance);
         let epochs_year = Decimal::new(EPOCHS_PER_YEAR as i64, 0);
         let epoch_reward = (self.total_staked * apy / epochs_year).round_dp(8);
 
@@ -326,9 +356,10 @@ impl StakingPool {
         self.current_epoch += 1;
         self.last_epoch_block = current_block;
 
+        let current_apy_pct = (dynamic_apy(reward_pool_balance) * Decimal::new(100, 0)).round_dp(2);
         println!(
-            "[staking] 💰 Epoch #{}: {} STONE Rewards an {} Staker (9% APY, Pool: {})",
-            self.current_epoch, total_distributed, stakers.len(), reward_pool_balance,
+            "[staking] 💰 Epoch #{}: {} STONE Rewards an {} Staker ({}% APY, Pool: {})",
+            self.current_epoch, total_distributed, stakers.len(), current_apy_pct, reward_pool_balance,
         );
 
         total_distributed
@@ -362,8 +393,8 @@ impl StakingPool {
 
     /// Pool-Info für die API.
     pub fn pool_info(&self, reward_pool_balance: Decimal) -> StakingPoolInfo {
-        // Feste 9% APY
-        let apy: Decimal = STAKING_APY.parse::<Decimal>().unwrap() * Decimal::new(100, 0);
+        // Dynamische APY basierend auf Pool-Füllstand
+        let apy = dynamic_apy(reward_pool_balance) * Decimal::new(100, 0);
 
         StakingPoolInfo {
             total_staked: self.total_staked,
@@ -433,6 +464,39 @@ impl StakingPool {
         }
 
         Ok(amount)
+    }
+
+    // ── Slashing ──────────────────────────────────────────────────────────
+
+    /// Slash: Reduziert den Stake eines Validators um den angegebenen Betrag.
+    ///
+    /// Der geslashte Betrag wird verbrannt (aus dem Pool entfernt, nicht umverteilt).
+    /// Gibt den tatsächlich geslashten Betrag zurück (kann kleiner sein wenn Stake < amount).
+    pub fn slash(&mut self, address: &str, amount: Decimal) -> Decimal {
+        let entry = match self.stakers.get_mut(address) {
+            Some(e) => e,
+            None => return Decimal::ZERO,  // Kein Stake vorhanden
+        };
+
+        let actual = amount.min(entry.staked_amount);
+        if actual <= Decimal::ZERO {
+            return Decimal::ZERO;
+        }
+
+        entry.staked_amount -= actual;
+        self.total_staked -= actual;
+
+        println!(
+            "[slashing] 🔥 {} STONE von {} geslasht (verbleibend: {} STONE)",
+            actual, &address[..12.min(address.len())], entry.staked_amount,
+        );
+
+        // Staker entfernen wenn komplett leer
+        if entry.staked_amount == Decimal::ZERO && entry.pending_rewards == Decimal::ZERO {
+            self.stakers.remove(address);
+        }
+
+        actual
     }
 
     // ── Persistierung ─────────────────────────────────────────────────────

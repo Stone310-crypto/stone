@@ -35,13 +35,15 @@ use super::handlers::{
     },
     p2p::{
         handle_p2p_config, handle_p2p_dial, handle_p2p_info, handle_p2p_peers,
-        handle_p2p_ping, handle_p2p_proposal, handle_p2p_status,
+        handle_p2p_ping, handle_p2p_precommit, handle_p2p_proposal, handle_p2p_status,
     },
     peers::{handle_add_peer, handle_list_peers, handle_remove_peer, handle_sync},
     poa::{
         handle_add_validator, handle_cast_vote, handle_consensus_status,
-        handle_detect_forks, handle_list_validators, handle_remove_validator,
-        handle_resolve_fork, handle_set_validator_active, handle_validator_self,
+        handle_detect_forks, handle_list_checkpoints, handle_list_validators,
+        handle_receive_checkpoint, handle_remove_validator,
+        handle_resolve_fork, handle_set_validator_active, handle_slashing_info,
+        handle_slashing_validator, handle_validator_self,
     },
     status::{handle_health, handle_info, handle_metrics, handle_network_stats, handle_shard_health, handle_status, handle_verify},
     token::{
@@ -134,8 +136,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/p2p/dial", post(handle_p2p_dial))
         .route("/api/v1/p2p/info", get(handle_p2p_info))
         .route("/api/v1/p2p/config", get(handle_p2p_config))
-        // P2P Consensus Voting
+        // P2P Consensus Voting (2-Phase BFT)
         .route("/api/v1/p2p/proposal", post(handle_p2p_proposal))
+        .route("/api/v1/p2p/precommit", post(handle_p2p_precommit))
         // Nutzer (Admin)
         .route("/api/v1/users", get(handle_list_users))
         .route("/api/v1/users/:user_id", delete(handle_delete_user))
@@ -165,6 +168,12 @@ pub fn build_router(state: AppState) -> Router {
         // Fork-Erkennung
         .route("/api/v1/forks", get(handle_detect_forks))
         .route("/api/v1/forks/resolve", post(handle_resolve_fork))
+        // Finality Checkpoints
+        .route("/api/v1/checkpoints", get(handle_list_checkpoints))
+        .route("/api/v1/checkpoint", post(handle_receive_checkpoint))
+        // Slashing
+        .route("/api/v1/slashing", get(handle_slashing_info))
+        .route("/api/v1/slashing/:validator_id", get(handle_slashing_validator))
         // WebSocket
         .route("/ws", get(handle_websocket))
         // ─── Web-of-Trust ────────────────────────────────────────────────────
@@ -203,6 +212,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/updates/publish", post(handle_update_publish))
         .route("/api/v1/updates/install", post(handle_update_install))
         .route("/api/v1/updates/download", post(handle_update_download))
+        .route("/api/updates/download", post(handle_update_download))
         .route("/api/v1/updates/config", post(handle_update_config))
         // ─── Organisationen ──────────────────────────────────────────────────
         .route("/api/v1/orgs", get(handle_list_orgs).post(handle_create_org))

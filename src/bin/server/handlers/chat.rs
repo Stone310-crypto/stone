@@ -130,14 +130,14 @@ pub async fn handle_chat_send(
         ledger.nonce(&wallet.address())
     };
 
-    // TX signieren (amount=0, fee=0 für Chat)
-    let tx = match wallet.sign_tx_with_tier(
+    // TX signieren (amount=0, fee=0 für Chat – ChatMessages sind gebührenfrei)
+    let tx = match wallet.sign_tx(
         TxType::ChatMessage,
         to_wallet.clone(),
         rust_decimal::Decimal::ZERO,
+        rust_decimal::Decimal::ZERO,
         nonce,
         memo,
-        stone::token::transaction::FeeTier::Standard,
     ) {
         Ok(t) => t,
         Err(e) => {

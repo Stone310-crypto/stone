@@ -122,6 +122,31 @@ cargo run --release --bin stone-publish-update -- "${PUBLISH_ARGS[@]}"
 echo ""
 ok "Update v${VERSION} veröffentlicht!"
 echo ""
+
+# ─── Schritt 4: Download auf Remote-Server auslösen ──────────────────────────
+
+info "Löse Download auf ${SEED_NODE} aus..."
+
+DL_RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+    "${SEED_NODE}/api/v1/updates/download" \
+    -H "x-api-key: ${API_KEY}" \
+    -H "Content-Type: application/json" 2>/dev/null || true)
+
+DL_HTTP_CODE=$(echo "$DL_RESPONSE" | tail -1)
+DL_BODY=$(echo "$DL_RESPONSE" | sed '$d')
+
+if [ "$DL_HTTP_CODE" = "202" ] || [ "$DL_HTTP_CODE" = "200" ]; then
+    ok "Download gestartet auf ${SEED_NODE}"
+    echo "  $DL_BODY" | head -3
+else
+    warn "Download-Trigger fehlgeschlagen (HTTP ${DL_HTTP_CODE})"
+    echo "  $DL_BODY" | head -3
+    echo ""
+    echo "  Manuell starten:"
+    echo "    curl -X POST ${SEED_NODE}/api/v1/updates/download -H 'x-api-key: ${API_KEY}'"
+fi
+
+echo ""
 echo "╔══════════════════════════════════════════════════════════════════════╗"
 echo "║  Update-Status prüfen:                                             ║"
 echo "║  curl ${SEED_NODE}/api/v1/updates/status | jq                      ║"

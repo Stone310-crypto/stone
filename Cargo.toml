@@ -1,7 +1,7 @@
 # Cargo.toml – Stone Master Node
 [package]
 name = "stone"
-version = "0.6.1"
+version = "0.7.6"
 edition = "2021"
 
 # ─── Binaries ────────────────────────────────────────────────────────────────
@@ -70,6 +70,8 @@ ed25519-dalek   = { version = "2.1", features = ["rand_core"] }
 x25519-dalek    = { version = "2.0", features = ["static_secrets"] }
 # AES-256-GCM für Dokument-Verschlüsselung
 aes-gcm         = "0.10"
+# Argon2id KDF für Key-Encryption (Validator-Schlüssel)
+argon2          = "0.5"
 
 # ─── P2P-Netzwerk (libp2p) ───────────────────────────────────────────────────
 libp2p = { version = "0.54", features = [

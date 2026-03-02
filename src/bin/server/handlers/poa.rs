@@ -10,7 +10,9 @@ use serde_json::json;
 use stone::{
     consensus::{
         detect_forks, load_or_create_validator_key, local_validator_pubkey_hex, resolve_fork,
-        ForkCandidate, ValidatorInfo, VoteMessage,
+        Checkpoint, ForkCandidate, ValidatorInfo, VoteMessage, CHECKPOINT_INTERVAL,
+        SLASH_DOUBLE_SIGN_PERCENT, SLASH_DOWNTIME_PERCENT, SLASH_INVALID_BLOCK_PERCENT,
+        DOWNTIME_THRESHOLD_BLOCKS, SLASH_JAIL_DURATION_SECS,
     },
     master_node::NodeEvent,
 };
@@ -218,8 +220,57 @@ pub async fn handle_consensus_status(
     } else {
         json!({ "active": false })
     };
+    drop(voting);
+    drop(vs);
 
-    (StatusCode::OK, axum::Json(status))
+    // Nächste Validator-Auswahl mit Stake-Gewichtung
+    let (stakes, jailed, wallet_map) = state.node.build_selection_context();
+    let vs = state.node.validator_set.read().unwrap();
+
+    let chain = state.node.chain.lock().unwrap();
+    let next_index = chain.blocks.len() as u64;
+    let prev_hash = chain.blocks.last()
+        .map(|b| b.hash.clone())
+        .unwrap_or_else(|| "genesis".into());
+    drop(chain);
+
+    let next_validator = vs.select_validator_weighted(&prev_hash, next_index, &stakes, &jailed, &wallet_map)
+        .map(|v| v.node_id.clone());
+
+    // Gewichte für alle Validatoren berechnen
+    let base_weight = rust_decimal::Decimal::ONE;
+    let validator_weights: Vec<serde_json::Value> = vs.validators.iter()
+        .filter(|v| v.active)
+        .map(|v| {
+            let wallet = wallet_map.get(&v.node_id);
+            let stake = wallet
+                .and_then(|w| stakes.get(w))
+                .copied()
+                .unwrap_or(rust_decimal::Decimal::ZERO);
+            let is_jailed = jailed.contains(&v.node_id);
+            let total_weight = if is_jailed {
+                rust_decimal::Decimal::ZERO
+            } else {
+                stake + base_weight
+            };
+            json!({
+                "node_id": v.node_id,
+                "stake": stake.to_string(),
+                "base_weight": "1",
+                "total_weight": total_weight.to_string(),
+                "jailed": is_jailed,
+                "is_next": next_validator.as_deref() == Some(&v.node_id),
+            })
+        })
+        .collect();
+
+    (StatusCode::OK, axum::Json(json!({
+        "voting": status,
+        "next_block_index": next_index,
+        "next_validator": next_validator,
+        "validator_weights": validator_weights,
+        "selection_mode": "stake-weighted",
+    })))
 }
 
 /// POST /api/v1/consensus/vote
@@ -375,4 +426,153 @@ pub async fn handle_resolve_fork(
         )
             .into_response()),
     }
+}
+
+// ─── Checkpoint / Finality Endpoints ─────────────────────────────────────────
+
+/// GET /api/v1/checkpoints — Alle Checkpoints abrufen (öffentlich)
+pub async fn handle_list_checkpoints(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let store = state.node.checkpoint_store.read().unwrap();
+    let latest_finalized = store.latest_finalized().map(|c| c.block_index);
+    (
+        StatusCode::OK,
+        axum::Json(json!({
+            "checkpoints": store.checkpoints,
+            "total": store.checkpoints.len(),
+            "finalized": store.finalized_count(),
+            "latest_finalized_block": latest_finalized,
+            "checkpoint_interval": CHECKPOINT_INTERVAL,
+        })),
+    )
+}
+
+/// POST /api/v1/checkpoint — Checkpoint von Peer empfangen und Signatur mergen
+pub async fn handle_receive_checkpoint(
+    State(state): State<AppState>,
+    axum::Json(incoming): axum::Json<Checkpoint>,
+) -> impl IntoResponse {
+    // Validierung: Block-Hash muss mit unserer Chain übereinstimmen
+    let local_hash = {
+        let chain = state.node.chain.lock().unwrap();
+        let idx = incoming.block_index as usize;
+        if idx < chain.blocks.len() {
+            Some(chain.blocks[idx].hash.clone())
+        } else {
+            None
+        }
+    };
+
+    match local_hash {
+        Some(hash) if hash == incoming.block_hash => {
+            // Signaturen mergen
+            let mut store = state.node.checkpoint_store.write().unwrap();
+            let was_finalized_before = store.latest_finalized().map(|c| c.block_index);
+            store.add_or_update(incoming.clone());
+            let is_now_finalized = store.latest_finalized().map(|c| c.block_index);
+
+            let newly_finalized = is_now_finalized != was_finalized_before
+                && is_now_finalized == Some(incoming.block_index);
+
+            if newly_finalized {
+                println!(
+                    "[checkpoint] ✅ Block #{} durch Peer-Signaturen finalisiert!",
+                    incoming.block_index
+                );
+            }
+
+            (
+                StatusCode::OK,
+                axum::Json(json!({
+                    "ok": true,
+                    "block_index": incoming.block_index,
+                    "finalized": newly_finalized,
+                })),
+            )
+        }
+        Some(hash) => {
+            (
+                StatusCode::CONFLICT,
+                axum::Json(json!({
+                    "error": format!(
+                        "Block-Hash Mismatch: lokal={} vs. checkpoint={}",
+                        hash, incoming.block_hash
+                    ),
+                })),
+            )
+        }
+        None => {
+            // Block noch nicht vorhanden – speichern wir trotzdem (Peer könnte weiter sein)
+            let mut store = state.node.checkpoint_store.write().unwrap();
+            store.add_or_update(incoming.clone());
+            (
+                StatusCode::ACCEPTED,
+                axum::Json(json!({
+                    "ok": true,
+                    "note": "Block noch nicht lokal vorhanden, Checkpoint gespeichert",
+                    "block_index": incoming.block_index,
+                })),
+            )
+        }
+    }
+}
+
+// ─── Slashing Endpoints ─────────────────────────────────────────────────────────────
+
+/// GET /api/v1/slashing — Alle Slashing-Records und Jail-Status (öffentlich)
+pub async fn handle_slashing_info(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let store = state.node.slashing_store.read().unwrap();
+    let jailed_validators: Vec<_> = store.jailed.iter()
+        .map(|(id, until)| json!({
+            "validator_id": id,
+            "jail_until": until,
+            "remaining_secs": (*until - chrono::Utc::now().timestamp()).max(0),
+        }))
+        .collect();
+
+    (
+        StatusCode::OK,
+        axum::Json(json!({
+            "records": store.records,
+            "total_slashing_events": store.records.len(),
+            "jailed_validators": jailed_validators,
+            "jailed_count": store.jailed.len(),
+            "config": {
+                "double_sign_penalty_percent": SLASH_DOUBLE_SIGN_PERCENT,
+                "downtime_penalty_percent": SLASH_DOWNTIME_PERCENT,
+                "invalid_block_penalty_percent": SLASH_INVALID_BLOCK_PERCENT,
+                "downtime_threshold_blocks": DOWNTIME_THRESHOLD_BLOCKS,
+                "jail_duration_secs": SLASH_JAIL_DURATION_SECS,
+            },
+        })),
+    )
+}
+
+/// GET /api/v1/slashing/:validator_id — Slashing-Info für einen bestimmten Validator
+pub async fn handle_slashing_validator(
+    State(state): State<AppState>,
+    Path(validator_id): Path<String>,
+) -> impl IntoResponse {
+    let store = state.node.slashing_store.read().unwrap();
+    let records: Vec<_> = store.records.iter()
+        .filter(|r| r.validator_id == validator_id)
+        .collect();
+    let is_jailed = store.is_jailed(&validator_id);
+    let jail_until = store.jailed.get(&validator_id).copied();
+    let total_slashed = store.total_slashed(&validator_id);
+
+    (
+        StatusCode::OK,
+        axum::Json(json!({
+            "validator_id": validator_id,
+            "records": records,
+            "offense_count": records.len(),
+            "total_slashed": total_slashed.to_string(),
+            "is_jailed": is_jailed,
+            "jail_until": jail_until,
+        })),
+    )
 }
