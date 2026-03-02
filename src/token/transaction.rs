@@ -59,6 +59,62 @@ pub enum TxType {
     /// Token aus dem Staking-Pool auszahlen (nach Lock-Periode).
     /// `from` = Staker-Wallet, `to` = "pool:staking", `amount` = Unstake-Betrag
     Unstake,
+    /// Eternal Memorial Transaction – in jedem Block als Erinnerung.
+    /// `from` = "memorial", `to` = "forever", `amount` = 0, `memo` = Gedenktext
+    Memorial,
+}
+
+// ─── Fee-Tier ────────────────────────────────────────────────────────────────
+
+/// Gebührenstufe einer Transaktion.
+///
+/// | Tier     | Fee (STONE) | Verarbeitung                                       |
+/// |----------|-------------|-----------------------------------------------------|
+/// | Express  | 0.01        | Sofort im nächsten Block                            |
+/// | Priority | 0.001       | Innerhalb von ~5 Minuten (nächste Validator-Runde)  |
+/// | Standard | 0.0         | Wartet bis zum nächsten Dokument-Upload (kostenlos) |
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum FeeTier {
+    Express,
+    Priority,
+    Standard,
+}
+
+impl Default for FeeTier {
+    fn default() -> Self {
+        FeeTier::Standard
+    }
+}
+
+impl std::fmt::Display for FeeTier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            FeeTier::Express  => write!(f, "express"),
+            FeeTier::Priority => write!(f, "priority"),
+            FeeTier::Standard => write!(f, "standard"),
+        }
+    }
+}
+
+impl FeeTier {
+    /// Die automatische Fee für diese Stufe.
+    pub fn fee(&self) -> Decimal {
+        match self {
+            FeeTier::Express  => Decimal::new(1, 2),   // 0.01 STONE
+            FeeTier::Priority => Decimal::new(1, 3),   // 0.001 STONE
+            FeeTier::Standard => Decimal::ZERO,         // 0.0 STONE (kostenlos)
+        }
+    }
+
+    /// Sortier-Priorität (kleiner = höhere Priorität).
+    pub fn priority_order(&self) -> u8 {
+        match self {
+            FeeTier::Express  => 0,
+            FeeTier::Priority => 1,
+            FeeTier::Standard => 2,
+        }
+    }
 }
 
 impl std::fmt::Display for TxType {
@@ -73,6 +129,7 @@ impl std::fmt::Display for TxType {
             TxType::AccountUpdate   => write!(f, "account_update"),
             TxType::Stake           => write!(f, "stake"),
             TxType::Unstake         => write!(f, "unstake"),
+            TxType::Memorial        => write!(f, "memorial"),
         }
     }
 }
@@ -110,6 +167,9 @@ pub struct TokenTx {
     /// Verhindert Cross-Chain Replay-Angriffe.
     #[serde(default = "default_chain_id")]
     pub chain_id: String,
+    /// Gebührenstufe: Express (sofort, 0.01), Priority (~5min, 0.001), Standard (kostenlos, wartet auf Dokument-Upload)
+    #[serde(default)]
+    pub fee_tier: FeeTier,
 }
 
 /// Default Chain-ID: liest aus STONE_NETWORK ENV, Fallback "stone-testnet"
@@ -252,6 +312,7 @@ pub fn create_signed_tx(
         signature: String::new(),
         memo,
         chain_id: default_chain_id(),
+        fee_tier: FeeTier::Standard,
     };
 
     // TX-ID berechnen
@@ -276,6 +337,11 @@ pub fn create_signed_tx(
 pub fn verify_tx_signature(tx: &TokenTx) -> Result<(), TxError> {
     // System-Transaktionen: Signatur wird nicht gegen einen Public-Key geprüft
     if (tx.tx_type == TxType::Mint || tx.tx_type == TxType::Reward) && tx.from == "system" {
+        return Ok(());
+    }
+
+    // Memorial-Transaktionen: keine Signatur nötig (System-TX in jedem Block)
+    if tx.tx_type == TxType::Memorial {
         return Ok(());
     }
 

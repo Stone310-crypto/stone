@@ -6,5 +6,6 @@ pub mod master_node;
 pub mod network;
 pub mod shard;
 pub mod storage;
+pub mod storage_proof;
 pub mod token;
 pub mod updater;

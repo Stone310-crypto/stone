@@ -1101,6 +1101,7 @@ mod tests {
             proposal_round: 0,
             validator_pub_key: String::new(),
             validator_signature: String::new(),
+            storage_proof: Default::default(),
         }
     }
 

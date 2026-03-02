@@ -290,6 +290,33 @@ impl Wallet {
         Ok(tx)
     }
 
+    /// Signiert eine TX mit explizitem Fee-Tier.
+    ///
+    /// Die `fee` wird automatisch aus dem Tier berechnet.
+    pub fn sign_tx_with_tier(
+        &self,
+        tx_type: TxType,
+        to: String,
+        amount: Decimal,
+        nonce: u64,
+        memo: String,
+        tier: super::transaction::FeeTier,
+    ) -> Result<TokenTx, WalletError> {
+        let fee = tier.fee();
+        let mut tx = create_signed_tx(
+            &self.signing_key,
+            tx_type,
+            self.address(),
+            to,
+            amount,
+            fee,
+            nonce,
+            memo,
+        )?;
+        tx.fee_tier = tier;
+        Ok(tx)
+    }
+
     // ── Key-Rotation ──────────────────────────────────────────────────────
 
     /// Generiert ein neues Wallet und erstellt eine signierte RotateKey-TX.

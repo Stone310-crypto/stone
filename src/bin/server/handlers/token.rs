@@ -550,6 +550,9 @@ pub struct SendRequest {
     /// Absender-Adresse zur Validierung (muss mit Mnemonic übereinstimmen)
     #[serde(default)]
     pub from: String,
+    /// Fee-Tier: "express" (0.01), "priority" (0.001), "standard" (0.0)
+    #[serde(default)]
+    pub fee_tier: Option<String>,
 }
 
 /// POST /api/v1/token/send
@@ -640,14 +643,28 @@ pub async fn handle_token_send(
         ledger.nonce(&wallet.address())
     };
 
-    // TX signieren
-    let tx = match wallet.sign_tx(
+    // Fee-Tier parsen
+    let tier = match req.fee_tier.as_deref() {
+        Some("express")  => stone::token::FeeTier::Express,
+        Some("priority") => stone::token::FeeTier::Priority,
+        Some("standard") | None => stone::token::FeeTier::Standard,
+        Some(other) => return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!("Unbekannter fee_tier: '{}'. Erlaubt: express, priority, standard", other),
+            })),
+        ),
+    };
+
+    // TX signieren mit Fee-Tier
+    let tx = match wallet.sign_tx_with_tier(
         TxType::Transfer,
         req.to.clone(),
         amount,
-        rust_decimal::Decimal::ZERO, // keine Fee aktuell
         nonce,
         String::new(),
+        tier,
     ) {
         Ok(t) => t,
         Err(e) => return (
@@ -685,7 +702,13 @@ pub async fn handle_token_send(
                     "from": tx.from,
                     "to": tx.to,
                     "amount": tx.amount.to_string(),
-                    "message": "TX im Mempool – wird beim nächsten Block-Commit verarbeitet",
+                    "fee": tx.fee.to_string(),
+                    "fee_tier": tx.fee_tier.to_string(),
+                    "message": match tx.fee_tier {
+                        stone::token::FeeTier::Express  => "Express-TX im Mempool – wird im nächsten Block verarbeitet",
+                        stone::token::FeeTier::Priority => "Priority-TX im Mempool – wird innerhalb von ~5 Minuten verarbeitet",
+                        stone::token::FeeTier::Standard => "Standard-TX im Mempool – wird beim nächsten Dokument-Upload verarbeitet (kostenlos)",
+                    },
                 })),
             )
         }
@@ -698,6 +721,160 @@ pub async fn handle_token_send(
                 })),
             )
         }
+    }
+}
+
+// ─── Authentifizierter Transfer (API-Key + Phrase via Proxy) ─────────────────
+
+#[derive(Deserialize)]
+pub struct SendAuthenticatedRequest {
+    /// Empfänger-Adresse (Public-Key-Hex, 64 Zeichen)
+    pub to: String,
+    /// Betrag in STONE
+    pub amount: String,
+    /// Fee-Tier: "express", "priority", "standard"
+    #[serde(default = "default_fee_tier")]
+    pub fee_tier: String,
+    /// Mnemonic — wird vom Flask-Proxy aus der verschlüsselten Session injiziert
+    /// (nie vom Browser direkt gesendet!)
+    pub mnemonic: String,
+}
+
+fn default_fee_tier() -> String { "standard".to_string() }
+
+/// POST /api/v1/token/send-authenticated
+///
+/// Wie `/api/v1/token/send`, aber ohne `from`-Feld. Der Absender wird aus
+/// dem Mnemonic abgeleitet. Designed für den Flask-Proxy der den Mnemonic
+/// aus der Server-Session injiziert — der Browser schickt ihn nie.
+///
+/// Body: { "to": "...", "amount": "10", "fee_tier": "express", "mnemonic": "..." }
+pub async fn handle_token_send_authenticated(
+    State(state): State<AppState>,
+    Json(req): Json<SendAuthenticatedRequest>,
+) -> impl IntoResponse {
+    use stone::token::Wallet;
+
+    // Empfänger validieren
+    if req.to.len() != 64 || !req.to.chars().all(|c| c.is_ascii_hexdigit()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "Ungültige Empfänger-Adresse: muss 64 Hex-Zeichen sein",
+            })),
+        );
+    }
+
+    // Betrag parsen
+    let amount: rust_decimal::Decimal = match req.amount.parse() {
+        Ok(a) => a,
+        Err(_) => return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": "Ungültiger Betrag" })),
+        ),
+    };
+    if amount <= rust_decimal::Decimal::ZERO {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": "Betrag muss positiv sein" })),
+        );
+    }
+
+    // Fee-Tier
+    let tier = match req.fee_tier.as_str() {
+        "express"  => stone::token::FeeTier::Express,
+        "priority" => stone::token::FeeTier::Priority,
+        "standard" => stone::token::FeeTier::Standard,
+        other => return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!("Unbekannter fee_tier: '{}'. Erlaubt: express, priority, standard", other),
+            })),
+        ),
+    };
+
+    // Wallet rekonstruieren
+    let wallet = match Wallet::from_mnemonic(&req.mnemonic) {
+        Ok(w) => w,
+        Err(e) => return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": format!("Session-Fehler: {e}") })),
+        ),
+    };
+
+    // Rate Limiting
+    if !state.rate_limits.transfer.check(&wallet.address()) {
+        let retry = state.rate_limits.transfer.retry_after_secs(&wallet.address());
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!("Rate Limit überschritten. Retry in {retry}s."),
+                "retry_after_secs": retry,
+            })),
+        );
+    }
+
+    // Nonce
+    let nonce = {
+        let ledger = state.node.token_ledger.read().unwrap();
+        ledger.nonce(&wallet.address())
+    };
+
+    // TX signieren
+    let tx = match wallet.sign_tx_with_tier(
+        TxType::Transfer,
+        req.to.clone(),
+        amount,
+        nonce,
+        String::new(),
+        tier,
+    ) {
+        Ok(t) => t,
+        Err(e) => return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "ok": false, "error": format!("TX-Signierung fehlgeschlagen: {e}") })),
+        ),
+    };
+
+    // In Mempool
+    let result = {
+        let ledger = state.node.token_ledger.read().unwrap();
+        state.node.mempool.add_tx(tx.clone(), Some(&ledger))
+    };
+
+    match result {
+        Ok(()) => {
+            if let Some(ref net) = state.network {
+                let net = net.clone();
+                let tx_clone = tx.clone();
+                tokio::spawn(async move { net.broadcast_tx(tx_clone).await; });
+            }
+            (
+                StatusCode::ACCEPTED,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "status": "pending",
+                    "tx_id": tx.tx_id,
+                    "from": tx.from,
+                    "to": tx.to,
+                    "amount": tx.amount.to_string(),
+                    "fee": tx.fee.to_string(),
+                    "fee_tier": tx.fee_tier.to_string(),
+                    "message": match tx.fee_tier {
+                        stone::token::FeeTier::Express  => "Express-TX – wird im nächsten Block verarbeitet",
+                        stone::token::FeeTier::Priority => "Priority-TX – wird innerhalb von ~5 Minuten verarbeitet",
+                        stone::token::FeeTier::Standard => "Standard-TX – wird beim nächsten Dokument-Upload verarbeitet (kostenlos)",
+                    },
+                })),
+            )
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
+        ),
     }
 }
 

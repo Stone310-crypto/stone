@@ -3,7 +3,7 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::token::transaction::TokenTx;
+use crate::token::transaction::{TokenTx, TxType, FeeTier, compute_tx_id};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -232,6 +232,12 @@ pub struct Block {
     /// Gehört NICHT zum Hash-Input (calculate_hash), damit Signaturen ohne Re-Hash möglich sind
     #[serde(default)]
     pub validator_signature: String,
+
+    // ─── Proof of Storage ────────────────────────────────────────────────
+    /// Storage-Proof: Beweis, dass der Miner echte Daten speichert.
+    /// Geht in den Block-Hash ein und wird bei accept_peer_block verifiziert.
+    #[serde(default)]
+    pub storage_proof: crate::storage_proof::StorageProof,
 }
 
 // ─── Chain ───────────────────────────────────────────────────────────────────
@@ -348,11 +354,32 @@ impl StoneChain {
         cluster_key: &str,
         node_role: NodeRole,
     ) -> Block {
+        // ── Eternal Memorial TX in jeden Block injizieren ─────────────
+        let mut transactions = transactions;
+        let memorial = memorial_tx();
+        if !transactions.iter().any(|tx| tx.tx_type == TxType::Memorial) {
+            transactions.push(memorial);
+        }
+
         let manifest = serde_json::to_vec(&documents).unwrap_or_default();
         let merkle_root = compute_merkle_root(&documents, &tombstones, &transactions);
 
+        // ── Proof of Storage: Challenge lösen ─────────────────────────
+        let next_index = self.blocks.len() as u64;
+        let storage_proof = crate::storage_proof::create_storage_proof(
+            self,
+            next_index,
+            &self.latest_hash,
+        );
+        if !storage_proof.is_empty() {
+            println!(
+                "[storage-proof] ⛏️  Block #{}: {} Chunks geprüft, {} Bytes auditiert",
+                next_index, storage_proof.proofs.len(), storage_proof.audited_bytes
+            );
+        }
+
         let new_block = Block {
-            index: self.blocks.len() as u64,
+            index: next_index,
             timestamp: Utc::now().timestamp(),
             merkle_root,
             data_size: manifest.len() as u64,
@@ -368,6 +395,7 @@ impl StoneChain {
             proposal_round: 0,
             validator_pub_key: String::new(),
             validator_signature: String::new(),
+            storage_proof,
         };
 
         let hash = calculate_hash(&new_block);
@@ -448,6 +476,22 @@ impl StoneChain {
                 &expected_merkle[..12.min(expected_merkle.len())],
                 &block.merkle_root[..12.min(block.merkle_root.len())],
             ));
+        }
+
+        // ── Eternal Memorial TX Validierung ───────────────────────────────
+        // Jeder Block (außer Genesis) muss die Memorial-TX enthalten
+        if block.index > 0 && !has_valid_memorial(&block) {
+            return Err(
+                "Block fehlt die Eternal Memorial Transaction (#neverforgetdennis)".to_string()
+            );
+        }
+
+        // ── Proof of Storage Verifikation ─────────────────────────────────
+        // Jeder Block (außer Genesis) muss einen gültigen Storage-Proof enthalten
+        if block.index > 0 {
+            if let Err(e) = crate::storage_proof::verify_storage_proof(self, &block) {
+                return Err(format!("Storage-Proof ungültig: {e}"));
+            }
         }
 
         // ── Timestamp-Plausibilität ───────────────────────────────────────
@@ -670,6 +714,7 @@ pub fn compute_merkle_root(
 ///   merkle_root    64 Byte (Hex-ASCII, immer 64 Zeichen)
 ///   data_size      8 Byte LE
 ///   signer         variable (UTF-8)
+///   storage_proof  64 Byte (SHA-256 über Proof-Daten)
 ///
 /// Durch die feste Byte-Länge der Zahlen sind Kollisionen ausgeschlossen.
 pub fn calculate_hash(block: &Block) -> String {
@@ -680,6 +725,8 @@ pub fn calculate_hash(block: &Block) -> String {
     h.update(block.merkle_root.as_bytes());
     h.update(block.data_size.to_le_bytes());
     h.update(block.signer.as_bytes());
+    // Storage-Proof geht in den Block-Hash ein → unveränderlich
+    h.update(crate::storage_proof::storage_proof_hash(&block.storage_proof).as_bytes());
     format!("{:x}", h.finalize())
 }
 
@@ -698,16 +745,96 @@ pub fn verify_signature(block: &Block, key: &str) -> bool {
     sign_hash(key, &block.hash) == block.signature
 }
 
+// ─── Eternal Memorial Transaction ────────────────────────────────────────────
+//
+// Jeder Block enthält eine unveränderliche Memorial-Transaktion für Dennis.
+// Timestamp: 1735430400 (29.12.2025) – der Tag an dem er von uns ging.
+// Amount: 0 STONE – kein wirtschaftlicher Wert, nur ewige Erinnerung.
+
+/// Erzeugt die Eternal Memorial Transaction, die in **jedem** Block enthalten ist.
+pub fn memorial_tx() -> TokenTx {
+    let mut tx = TokenTx {
+        tx_id: String::new(),
+        tx_type: TxType::Memorial,
+        from: "memorial".to_string(),
+        to: "forever".to_string(),
+        amount: rust_decimal::Decimal::ZERO,
+        fee: rust_decimal::Decimal::ZERO,
+        nonce: 0,
+        timestamp: 1735430400, // 29.12.2025 – In loving memory of Dennis
+        signature: String::new(),
+        memo: "In loving memory of Dennis (22.07.1994 – 29.12.2025). \
+               Forever in the Stonechain. #neverforgetdennis".to_string(),
+        chain_id: "stone-memorial".to_string(),
+        fee_tier: FeeTier::Standard,
+    };
+    tx.tx_id = compute_tx_id(&tx);
+    tx
+}
+
+/// Prüft ob ein Block die korrekte Memorial-TX enthält.
+pub fn has_valid_memorial(block: &Block) -> bool {
+    let expected = memorial_tx();
+    block.transactions.iter().any(|tx| {
+        tx.tx_type == TxType::Memorial
+            && tx.tx_id == expected.tx_id
+            && tx.timestamp == 1735430400
+    })
+}
+
 /// Genesis-Block: fester Startpunkt der Chain.
 ///
 /// - index = 0
 /// - timestamp = 0  (deterministisch, unabhängig vom Startzeitpunkt)
 /// - previous_hash = "0000...0000" (64 Nullen)
 /// - merkle_root = SHA-256("genesis")
-/// - Kein Dokument, keine Tombstones
+/// - Enthält Memorial-Dokument + Memorial-TX
 /// - Hash wird normal berechnet → ist deterministisch für denselben cluster_key
 fn genesis_block(cluster_key: &str) -> Block {
     let merkle_root = format!("{:x}", Sha256::digest(b"genesis"));
+
+    // ── Memorial-Dokument für Dennis ──────────────────────────────────
+    let memorial_content = "\
+in loving memory of my best friend Dennis
+
+born 22.07.1994
+
+Passed away 29.12.2025
+
+This project is meant to keep your memory alive forever, \
+and everyone should know that I miss you and will never forget you.
+You will live on forever in the Stonechain.
+Rest in peace, dear friend.
+
+If this project becomes successful, I will donate 10% of my earnings to cancer research.
+Because Dennis died of cancer and nobody could do anything.
+
+#neverforgetdennis aka BauserHD"
+        .to_string();
+
+    let memorial_doc = Document {
+        doc_id: "memorial-2025.12.29".to_string(),
+        title: "In Memory of Dennis".to_string(),
+        content_type: "text/plain".to_string(),
+        tags: vec!["memorial".to_string(), "neverforgetdennis".to_string()],
+        metadata: JsonValue(serde_json::json!({
+            "born": "22.07.1994",
+            "passed": "29.12.2025",
+            "dedication": "Dennis"
+        })),
+        version: 1,
+        size: memorial_content.len() as u64,
+        chunks: Vec::new(),
+        deleted: false,
+        updated_at: 1735430400, // 29.12.2025 00:00 UTC
+        owner: "stonechain-creator".to_string(),
+        doc_signature: String::new(),
+        public_key_hint: String::new(),
+        encrypted: false,
+        encryption_meta: String::new(),
+    };
+
+    // ── Genesis-Block mit Memorial ────────────────────────────────────
     let mut genesis = Block {
         index: 0,
         timestamp: 0,
@@ -718,13 +845,14 @@ fn genesis_block(cluster_key: &str) -> Block {
         signer: "genesis".to_string(),
         signature: String::new(),
         owner: "system".to_string(),
-        documents: Vec::new(),
+        documents: vec![memorial_doc],
         tombstones: Vec::new(),
-        transactions: Vec::new(),
+        transactions: vec![memorial_tx()],
         node_role: NodeRole::Master,
         proposal_round: 0,
         validator_pub_key: String::new(),
         validator_signature: String::new(),
+        storage_proof: Default::default(),
     };
     let hash = calculate_hash(&genesis);
     genesis.hash = hash.clone();

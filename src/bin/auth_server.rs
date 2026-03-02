@@ -232,6 +232,7 @@ fn load_or_create_genesis() -> Block {
         proposal_round: 0,
         validator_pub_key: String::new(),
         validator_signature: String::new(),
+        storage_proof: Default::default(),
     };
     let h = calculate_hash(&genesis);
     genesis.hash = h;

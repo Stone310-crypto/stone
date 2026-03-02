@@ -29,7 +29,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::sync::RwLock;
 
-use super::transaction::{TokenTx, TxError, validate_tx};
+use super::transaction::{FeeTier, TokenTx, TxError, validate_tx};
 use super::ledger::TokenLedger;
 
 // ─── Konstanten ──────────────────────────────────────────────────────────────
@@ -209,17 +209,83 @@ impl Mempool {
 
     /// Alle pending TXs für den nächsten Block abrufen und aus dem Mempool entfernen.
     ///
+    /// Sortiert nach Fee-Tier: Express → Priority → Standard.
+    /// Standard-TXs werden hier **nicht** entnommen — sie warten auf Dokument-Uploads.
     /// Gibt maximal `MAX_TXS_PER_BLOCK` TXs zurück.
     pub fn drain_for_block(&self) -> Vec<TokenTx> {
         let mut inner = self.inner.write().unwrap();
-        let count = inner.queue.len().min(MAX_TXS_PER_BLOCK);
-        let txs: Vec<TokenTx> = inner.queue.drain(..count).collect();
 
-        // known_ids NICHT entfernen – verhindert Replay innerhalb der Session
-        // (Die Chain hat eigenen Duplikat-Check über den Ledger)
+        // Partitioniere: Express + Priority sofort, Standard bleibt
+        let mut to_drain: Vec<TokenTx> = Vec::new();
+        let mut keep: VecDeque<TokenTx> = VecDeque::new();
 
+        for tx in inner.queue.drain(..) {
+            if tx.fee_tier == FeeTier::Standard {
+                keep.push_back(tx);
+            } else {
+                to_drain.push(tx);
+            }
+        }
+
+        // Sortiere Express vor Priority
+        to_drain.sort_by_key(|tx| tx.fee_tier.priority_order());
+
+        // Kapazitätslimit
+        let count = to_drain.len().min(MAX_TXS_PER_BLOCK);
+        let overflow: Vec<TokenTx> = to_drain.split_off(count);
+
+        // Überschuss + Standard-TXs zurück in Queue
+        for tx in overflow.into_iter().rev() {
+            keep.push_front(tx);
+        }
+        inner.queue = keep;
+
+        if !to_drain.is_empty() {
+            println!("[mempool] 📦 {} TXs für Block entnommen (Express/Priority), {} verbleibend (davon {} Standard)",
+                to_drain.len(), inner.queue.len(),
+                inner.queue.iter().filter(|t| t.fee_tier == FeeTier::Standard).count());
+        }
+        to_drain
+    }
+
+    /// Standard-TXs für einen Dokument-Upload-Block entnehmen.
+    ///
+    /// Wird aufgerufen wenn ein Dokument hochgeladen wird — Standard-TXs
+    /// „reiten" kostenlos mit auf dem Block.
+    pub fn drain_standard_txs(&self) -> Vec<TokenTx> {
+        let mut inner = self.inner.write().unwrap();
+        let mut standard: Vec<TokenTx> = Vec::new();
+        let mut rest: VecDeque<TokenTx> = VecDeque::new();
+
+        for tx in inner.queue.drain(..) {
+            if tx.fee_tier == FeeTier::Standard && standard.len() < MAX_TXS_PER_BLOCK {
+                standard.push(tx);
+            } else {
+                rest.push_back(tx);
+            }
+        }
+        inner.queue = rest;
+
+        if !standard.is_empty() {
+            println!("[mempool] 📄 {} Standard-TXs bei Dokument-Upload entnommen",
+                standard.len());
+        }
+        standard
+    }
+
+    /// Alle pending TXs entnehmen (Express + Priority + Standard).
+    /// Für den Mining-Loop: wird alle 30s aufgerufen, entnimmt alles.
+    pub fn drain_all_for_block(&self) -> Vec<TokenTx> {
+        let mut inner = self.inner.write().unwrap();
+        let mut txs: Vec<TokenTx> = inner.queue.drain(..).collect();
+        txs.sort_by_key(|tx| tx.fee_tier.priority_order());
+        let count = txs.len().min(MAX_TXS_PER_BLOCK);
+        let overflow: Vec<TokenTx> = txs.split_off(count);
+        for tx in overflow.into_iter().rev() {
+            inner.queue.push_front(tx);
+        }
         if !txs.is_empty() {
-            println!("[mempool] 📦 {} TXs für Block entnommen, {} verbleibend",
+            println!("[mempool] 📦 {} TXs für Mining-Block entnommen, {} verbleibend",
                 txs.len(), inner.queue.len());
         }
         txs

@@ -258,6 +258,7 @@ pub fn apply_genesis(ledger: &mut TokenLedger) -> Result<Vec<super::transaction:
             signature: String::new(), // System-TXs brauchen keine Signatur
             memo: alloc.label.clone(),
             chain_id: format!("stone-{}", config.network),
+            fee_tier: super::transaction::FeeTier::Express,
         };
         let tx_id = super::transaction::compute_tx_id(&tx);
         let tx = super::transaction::TokenTx { tx_id, ..tx };

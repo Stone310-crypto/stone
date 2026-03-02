@@ -567,6 +567,9 @@ impl TokenLedger {
                 // Nonce erhöhen
                 *self.nonces.entry(tx.from.clone()).or_insert(0) += 1;
             }
+            TxType::Memorial => {
+                // Eternal Memorial TX – keine Balance-Änderung, nur Präsenz im Block
+            }
         }
 
         // TX als verarbeitet markieren

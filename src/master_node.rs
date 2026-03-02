@@ -524,7 +524,10 @@ impl MasterNodeState {
         }
 
         // ── Mempool: Pending TXs für diesen Block entnehmen ──────────────────
-        let pending_txs = self.mempool.drain_for_block();
+        // Bei Dokument-Upload: Express + Priority sofort, Standard-TXs auch (kostenlos mitreiten)
+        let mut pending_txs = self.mempool.drain_for_block();
+        let standard_txs = self.mempool.drain_standard_txs();
+        pending_txs.extend(standard_txs);
 
         let mut chain = self.chain.lock().unwrap();
         let mut block = chain.add_documents(
@@ -770,6 +773,7 @@ impl MasterNodeState {
             signature: String::new(), // System-TXs brauchen keine Signatur
             memo: format!("Block #{block_index} Mining Reward"),
             chain_id,
+            fee_tier: crate::token::FeeTier::Express, // System-TXs immer Express
         };
         tx.tx_id = compute_tx_id(&tx);
         tx
@@ -828,7 +832,8 @@ impl MasterNodeState {
         };
 
         // ── Mempool-TXs + Reward-TX sammeln ──────────────────────────────
-        let mut pending_txs = self.mempool.drain_for_block();
+        // Mining-Loop: alle Tiers verarbeiten (Express + Priority + Standard)
+        let mut pending_txs = self.mempool.drain_all_for_block();
 
         // Reward-TX hinzufügen (falls Reward > 0)
         if reward_amount > Decimal::ZERO {

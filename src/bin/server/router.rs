@@ -32,7 +32,8 @@ use super::handlers::{
     status::{handle_health, handle_info, handle_metrics, handle_network_stats, handle_shard_health, handle_status, handle_verify},
     token::{
         handle_token_accounts, handle_token_faucet, handle_token_history,
-        handle_token_pending, handle_token_send, handle_token_supply,
+        handle_token_pending, handle_token_send, handle_token_send_authenticated,
+        handle_token_supply,
         handle_token_transfer, handle_wallet_balance, handle_wallet_create,
         handle_wallet_info, handle_wallet_rotations,
         handle_token_stake, handle_token_unstake,
@@ -167,6 +168,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/token/pending", get(handle_token_pending))
         .route("/api/v1/token/transfer", post(handle_token_transfer))
         .route("/api/v1/token/send", post(handle_token_send))
+        .route("/api/v1/token/send-authenticated", post(handle_token_send_authenticated))
         .route("/api/v1/token/faucet", post(handle_token_faucet))
         .route("/api/v1/token/history/:address", get(handle_token_history))
         .route("/api/v1/wallet/create", post(handle_wallet_create))
