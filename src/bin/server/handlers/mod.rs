@@ -3,6 +3,7 @@
 pub mod auth;
 pub mod blocks;
 pub mod chat;
+pub mod chat_policy;
 pub mod chunks;
 pub mod documents;
 pub mod mining;

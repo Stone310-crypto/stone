@@ -11,6 +11,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::json;
+use stone::chat_policy::{ChatPolicyStore, MessageTtl, messenger_min_stake};
 use stone::token::{transaction::TxType, Wallet};
 
 use super::super::auth_middleware::require_user;
@@ -28,6 +29,9 @@ pub struct SendChatRequest {
     pub encrypted_content: String,
     /// AES-256-GCM Nonce (base64, 12 Bytes)
     pub nonce: String,
+    /// Nachrichten-TTL: "30" (30 Tage) oder "90" (90 Tage). Default: 30
+    #[serde(default)]
+    pub ttl: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -101,6 +105,30 @@ pub async fn handle_chat_send(
             .into_response();
     }
 
+    // ── Stake-Gate: Messenger erfordert Minimum-Stake ─────────────────────
+    {
+        let pool = state.node.staking_pool.read().unwrap();
+        let staked = pool.stakers.get(&wallet.address())
+            .map(|s| s.staked_amount)
+            .unwrap_or(rust_decimal::Decimal::ZERO);
+        if let Err(missing) = ChatPolicyStore::check_messenger_access(staked) {
+            return (
+                StatusCode::FORBIDDEN,
+                axum::Json(json!({
+                    "ok": false,
+                    "error": format!(
+                        "Messenger erfordert mindestens {} STONE Stake. Du hast {} gestaked, es fehlen {} STONE.",
+                        messenger_min_stake(), staked, missing
+                    ),
+                    "required_stake": messenger_min_stake().to_string(),
+                    "current_stake": staked.to_string(),
+                    "missing": missing.to_string(),
+                })),
+            )
+                .into_response();
+        }
+    }
+
     // Prüfen: Empfänger muss ein registrierter Account sein
     {
         let ledger = state.node.token_ledger.read().unwrap();
@@ -113,7 +141,12 @@ pub async fn handle_chat_send(
         }
     }
 
-    // Memo-JSON bauen
+    // TTL bestimmen
+    let ttl = MessageTtl::from_str_or_default(
+        req.ttl.as_deref().unwrap_or("30")
+    );
+
+    // Memo-JSON bauen (mit TTL)
     let msg_id = uuid::Uuid::new_v4().to_string();
     let memo = json!({
         "msg_id": msg_id,
@@ -121,6 +154,7 @@ pub async fn handle_chat_send(
         "nonce": req.nonce,
         "from_user_id": user.id,
         "from_name": user.name,
+        "ttl": ttl.to_string(),
     })
     .to_string();
 
@@ -174,6 +208,7 @@ pub async fn handle_chat_send(
                     "from": tx.from,
                     "to": tx.to,
                     "status": "pending",
+                    "ttl": ttl.to_string(),
                     "message": "Nachricht wird beim nächsten Mining-Block bestätigt",
                 })),
             )
@@ -486,6 +521,16 @@ fn index_new_blocks_if_needed(state: &AppState) {
             );
             idx.index_new_blocks(&new_blocks);
             let _ = stone::chat::save_chat_index(&idx);
+        }
+    }
+
+    // ── Self-Destruct GC: Abgelaufene Nachrichten-Content löschen ─────────
+    {
+        let mut policy = state.node.chat_policy.write().unwrap();
+        let purged = stone::chat_policy::gc_expired_messages(&mut policy, &mut idx);
+        if purged > 0 {
+            let _ = stone::chat::save_chat_index(&idx);
+            let _ = policy.persist();
         }
     }
 }

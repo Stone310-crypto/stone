@@ -1052,6 +1052,14 @@ impl TokenLedger {
         Ok(())
     }
 
+    /// Slash-Betrag dem Node-Operator-Pool gutschreiben (z.B. aus Report-Slashing).
+    pub fn credit_to_operator_pool(&mut self, amount: Decimal) {
+        if amount > Decimal::ZERO {
+            let pool = super::reputation::NODE_OPERATOR_POOL;
+            *self.balances.entry(pool.to_string()).or_insert(Decimal::ZERO) += amount;
+        }
+    }
+
     /// Interne Fee-Split-Logik: 50% burn, 30% Validator, 20% Node-Operator-Pool.
     fn apply_fee_split(&mut self, fee: Decimal) {
         let (burn, validator_share, pool_share) = super::reputation::split_fee(fee);

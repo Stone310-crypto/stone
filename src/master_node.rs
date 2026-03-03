@@ -22,6 +22,7 @@ use crate::consensus::{
     VoteMessage, VotePhase, VotingRound,
 };
 use crate::shard::ShardHolderRegistry;
+use crate::chat_policy::ChatPolicyStore;
 use crate::token::{Mempool, TokenLedger, ReputationRegistry};
 use crate::token::transaction::{TokenTx, TxType, compute_tx_id};
 use chrono::Utc;
@@ -420,6 +421,8 @@ pub struct MasterNodeState {
     pub slashing_store: RwLock<SlashingStore>,
     /// Reputation-Registry (Node-Reputation + Fee-Share-Verteilung)
     pub reputation_registry: RwLock<ReputationRegistry>,
+    /// Chat-Policy Store (Self-Destruct TTL, Reports, Stake-Gate)
+    pub chat_policy: RwLock<ChatPolicyStore>,
 }
 
 #[derive(Default)]
@@ -470,6 +473,7 @@ impl MasterNodeState {
         let started_at = Utc::now().timestamp();
         let staking_pool = crate::token::StakingPool::load();
         let reputation_registry = ReputationRegistry::load();
+        let chat_policy = ChatPolicyStore::load();
         let state = Arc::new(Self {
             node_id: node_id.clone(),
             role,
@@ -496,6 +500,7 @@ impl MasterNodeState {
             checkpoint_store: RwLock::new(CheckpointStore::load()),
             slashing_store: RwLock::new(SlashingStore::load()),
             reputation_registry: RwLock::new(reputation_registry),
+            chat_policy: RwLock::new(chat_policy),
         });
 
         // Node-gestartet Event senden
@@ -1212,6 +1217,7 @@ impl MasterNodeState {
                             Self::post_block_staking(&state, &block);
                             Self::post_block_slashing(&state, &block);
                             Self::post_block_reputation(&state, &block);
+                            Self::post_block_chat_policy(&state, &block, None);
                             Self::post_block_checkpoint(&state, &block).await;
                             let _ = block;
                         }
@@ -1443,6 +1449,7 @@ impl MasterNodeState {
                                         Self::post_block_staking(&state, &block);
                                         Self::post_block_slashing(&state, &block);
                                         Self::post_block_reputation(&state, &block);
+                                        Self::post_block_chat_policy(&state, &block, None);
                                         Self::post_block_checkpoint(&state, &block).await;
                                     }
                                     Err(e) => eprintln!("[consensus] Commit fehlgeschlagen: {e}"),
@@ -1677,6 +1684,96 @@ impl MasterNodeState {
         // 4. Registry persistieren
         if let Err(e) = registry.persist() {
             eprintln!("[reputation] Registry-Persist: {e}");
+        }
+    }
+
+    /// Chat-Policy nach einem committed Block: TTL-Tracking + GC + Report-Finalisierung.
+    ///
+    /// 1. Neue ChatMessage-TXs im Block → TTL-Eintrag erstellen
+    /// 2. Garbage Collection: Abgelaufene Nachrichten-Content löschen
+    /// 3. Pending Reports prüfen und ggf. finalisieren
+    fn post_block_chat_policy(state: &Arc<Self>, block: &Block, chat_index: Option<&std::sync::Arc<std::sync::Mutex<crate::chat::ChatIndex>>>) {
+        let mut policy = state.chat_policy.write().unwrap();
+
+        // 1. Neue ChatMessage-TXs tracken
+        for tx in &block.transactions {
+            if tx.tx_type != TxType::ChatMessage {
+                continue;
+            }
+            // msg_id und TTL aus Memo extrahieren
+            if let Ok(data) = serde_json::from_str::<serde_json::Value>(&tx.memo) {
+                let msg_id = data["msg_id"].as_str().unwrap_or("").to_string();
+                if msg_id.is_empty() {
+                    continue;
+                }
+                let ttl_str = data["ttl"].as_str().unwrap_or("30d");
+                let ttl = crate::chat_policy::MessageTtl::from_str_or_default(ttl_str);
+
+                policy.track_message(
+                    &msg_id,
+                    &tx.tx_id,
+                    &tx.from,
+                    &tx.to,
+                    ttl,
+                    tx.timestamp,
+                    block.index,
+                );
+            }
+        }
+
+        // 2. Garbage Collection: Abgelaufene Nachrichten-Content löschen
+        if let Some(chat_idx_arc) = chat_index {
+            let mut chat_idx = chat_idx_arc.lock().unwrap();
+            let purged = crate::chat_policy::gc_expired_messages(&mut policy, &mut chat_idx);
+            if purged > 0 {
+                crate::chat::save_chat_index(&chat_idx);
+            }
+        }
+
+        // 3. Pending Reports finalisieren (Timeout etc.)
+        let finalized = policy.finalize_all_pending();
+        for (report_id, accepted, msg_id, reported_wallet) in &finalized {
+            if *accepted {
+                // Content im Chat-Index löschen
+                if let Some(chat_idx_arc) = chat_index {
+                    let mut chat_idx = chat_idx_arc.lock().unwrap();
+                    crate::chat_policy::purge_message_content(&mut chat_idx, msg_id);
+                    crate::chat::save_chat_index(&chat_idx);
+                }
+
+                // Slash
+                let slash_amount = {
+                    let pool = state.staking_pool.read().unwrap();
+                    let staked = pool.stakers.get(reported_wallet)
+                        .map(|s| s.staked_amount)
+                        .unwrap_or(Decimal::ZERO);
+                    staked * Decimal::from(crate::chat_policy::REPORT_SLASH_PCT)
+                        / Decimal::from(100u32)
+                };
+
+                if slash_amount > Decimal::ZERO {
+                    let mut pool = state.staking_pool.write().unwrap();
+                    let actual = pool.slash(reported_wallet, slash_amount);
+                    drop(pool);
+
+                    let mut ledger = state.token_ledger.write().unwrap();
+                    ledger.credit_to_operator_pool(actual);
+                    let _ = ledger.persist();
+
+                    println!(
+                        "[chat-policy] ⚖️  Report {} auto-finalisiert: {} STONE geslasht",
+                        &report_id[..8.min(report_id.len())], actual,
+                    );
+                }
+            }
+        }
+
+        // Persistieren (wenn sich etwas geändert hat)
+        let changed = policy.total_messages_tracked > 0 || !finalized.is_empty();
+        if changed {
+            if let Err(e) = policy.persist() {
+                eprintln!("[chat-policy] Persist: {e}");
+            }
         }
     }
 

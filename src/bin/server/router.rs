@@ -27,6 +27,10 @@ use super::handlers::{
         handle_chat_conversations, handle_chat_messages, handle_chat_pending,
         handle_chat_resolve, handle_chat_send,
     },
+    chat_policy::{
+        handle_chat_policy_status, handle_chat_policy_message,
+        handle_chat_report, handle_chat_reports, handle_chat_report_vote,
+    },
     orgs::{
         handle_accept_invite, handle_create_channel, handle_create_org,
         handle_decline_invite, handle_get_chat, handle_get_org, handle_invite,
@@ -236,6 +240,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/chat/messages/:peer_wallet", get(handle_chat_messages))
         .route("/api/v1/chat/pending", get(handle_chat_pending))
         .route("/api/v1/chat/resolve/:identifier", get(handle_chat_resolve))
+        // ─── Chat Policy (Self-Destruct, Reports, Stake-Gate) ──────────────
+        .route("/api/v1/chat/policy/status", get(handle_chat_policy_status))
+        .route("/api/v1/chat/policy/message/:msg_id", get(handle_chat_policy_message))
+        .route("/api/v1/chat/report", post(handle_chat_report))
+        .route("/api/v1/chat/reports", get(handle_chat_reports))
+        .route("/api/v1/chat/report/:report_id/vote", post(handle_chat_report_vote))
         // ─── Mining Dashboard ───────────────────────────────────────────────
         .route("/api/v1/mining/status", get(handle_mining_status))
         .route("/api/v1/mining/throttle", post(handle_mining_throttle))
