@@ -350,6 +350,8 @@ async fn start_full_node(state: SetupState) {
                 println!("[node] ✅ P2P gestartet – PeerId: {}", handle.local_peer_id);
                 let count = node.chain.lock().unwrap().blocks.len() as u64;
                 handle.set_chain_count(count).await;
+                // Chain-Referenz setzen damit P2P-Peers Blöcke direkt serviert bekommen
+                handle.set_chain_ref(node.chain.clone()).await;
                 // Event-Handler
                 {
                     let mut event_rx = handle.subscribe();

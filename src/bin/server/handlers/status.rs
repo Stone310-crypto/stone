@@ -212,12 +212,62 @@ pub async fn handle_verify(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     let chain = state.node.chain.lock().unwrap();
-    let valid = chain.verify(&state.node.cluster_key);
+    let cluster_key = &state.node.cluster_key;
+    let valid = chain.verify(cluster_key);
+
+    // Diagnostik: Ersten fehlerhaften Block finden
+    let mut first_error: Option<serde_json::Value> = None;
+    if !valid {
+        for i in 1..chain.blocks.len() {
+            let block = &chain.blocks[i];
+            let prev = &chain.blocks[i - 1];
+
+            if block.previous_hash != prev.hash {
+                first_error = Some(json!({
+                    "block_index": block.index,
+                    "error": "previous_hash_mismatch",
+                    "expected_prev_hash": &prev.hash,
+                    "actual_prev_hash": &block.previous_hash,
+                }));
+                break;
+            }
+
+            let recalc = stone::blockchain::calculate_hash(block);
+            if block.hash != recalc {
+                first_error = Some(json!({
+                    "block_index": block.index,
+                    "error": "hash_mismatch",
+                    "stored_hash": &block.hash,
+                    "recalculated_hash": &recalc,
+                    "signer": &block.signer,
+                    "timestamp": block.timestamp,
+                    "merkle_root": &block.merkle_root,
+                    "data_size": block.data_size,
+                    "tx_count": block.transactions.len(),
+                    "doc_count": block.documents.len(),
+                }));
+                break;
+            }
+
+            if !block.signature.is_empty()
+                && block.signature != stone::blockchain::sign_hash(cluster_key, &block.hash)
+            {
+                first_error = Some(json!({
+                    "block_index": block.index,
+                    "error": "signature_mismatch",
+                    "signer": &block.signer,
+                }));
+                break;
+            }
+        }
+    }
+
     (
         StatusCode::OK,
         axum::Json(json!({
             "valid": valid,
             "blocks": chain.blocks.len(),
+            "first_error": first_error,
         })),
     )
 }

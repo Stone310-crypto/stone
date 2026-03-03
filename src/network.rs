@@ -94,6 +94,13 @@ pub const TOPIC_PEERS: &str = "stone/peers/v1";
 pub const TOPIC_MEMPOOL: &str = "stone/mempool/v1";
 pub const TOPIC_STORAGE: &str = "stone/storage/v1";
 
+/// Protokoll-Version für den Sync-Handshake.
+/// Peers mit einer anderen Major-Version werden abgelehnt.
+pub const STONE_PROTOCOL_VERSION: &str = "stone/0.7";
+
+/// Dateiname für die persistierte Ban-Liste
+const BANNED_PEERS_FILENAME: &str = "banned_peers.json";
+
 /// Standard-libp2p-Port des Stone-Netzwerks
 pub const DEFAULT_P2P_PORT: u16 = 7654;
 
@@ -369,7 +376,6 @@ pub enum NetworkEvent {
 }
 
 /// Befehle die von außen an den Swarm-Task gesendet werden.
-#[derive(Debug)]
 pub enum NetworkCommand {
     /// Block an alle Peers broadcasten
     BroadcastBlock(Box<Block>),
@@ -420,6 +426,31 @@ pub enum NetworkCommand {
         topic: gossipsub::TopicHash,
         data: Vec<u8>,
     },
+
+    /// Chain-Referenz injizieren (nach Node-Start, damit der SwarmTask
+    /// Block-Requests direkt aus der lokalen Chain beantworten kann).
+    SetChainRef(std::sync::Arc<std::sync::Mutex<crate::blockchain::StoneChain>>),
+}
+
+impl std::fmt::Debug for NetworkCommand {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BroadcastBlock(_) => write!(f, "BroadcastBlock(..)"),
+            Self::BroadcastTx(_) => write!(f, "BroadcastTx(..)"),
+            Self::DialPeer(addr) => write!(f, "DialPeer({addr})"),
+            Self::SyncWithPeer { peer_id, our_block_count } => write!(f, "SyncWithPeer({peer_id}, {our_block_count})"),
+            Self::GetPeers(_) => write!(f, "GetPeers(..)"),
+            Self::SetLocalChainCount(c) => write!(f, "SetLocalChainCount({c})"),
+            Self::Ping { peer_id, .. } => write!(f, "Ping({peer_id})"),
+            Self::GetStatus(_) => write!(f, "GetStatus(..)"),
+            Self::Shutdown => write!(f, "Shutdown"),
+            Self::RequestShard { peer_id, chunk_hash, shard_index } => write!(f, "RequestShard({peer_id}, {chunk_hash}, {shard_index})"),
+            Self::StoreShard { peer_id, chunk_hash, shard_index, .. } => write!(f, "StoreShard({peer_id}, {chunk_hash}, {shard_index})"),
+            Self::ListPeerShards { peer_id, chunk_hash, .. } => write!(f, "ListPeerShards({peer_id}, {chunk_hash})"),
+            Self::PublishGossip { topic, .. } => write!(f, "PublishGossip({topic})"),
+            Self::SetChainRef(_) => write!(f, "SetChainRef(..)"),
+        }
+    }
 }
 
 /// Ergebnis eines Pings an einen Peer
@@ -523,16 +554,102 @@ pub struct PeerInfo {
 
 // ─── Request/Response Typen ───────────────────────────────────────────────────
 
-/// Anfrage an einen Peer: gib mir Block mit Index `index`
+/// Anfrage an einen Peer – erweitert um Range-Queries und Chain-Info.
+///
+/// Konvention für Abwärtskompatibilität:
+///   - `block_index == u64::MAX`          → Ping (keine Block-Daten)
+///   - `block_index == u64::MAX - 1`      → GetChainInfo
+///   - `block_index_end.is_some()`        → GetBlockRange(from..=to), max 50
+///   - sonst                              → GetBlock(block_index)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockRequest {
     pub block_index: u64,
+    /// Ende des Bereichs (inklusive). Wenn gesetzt → Range-Request.
+    #[serde(default)]
+    pub block_index_end: Option<u64>,
 }
 
-/// Antwort: der Block (oder None wenn nicht vorhanden)
+/// Antwort: einzelner Block, Block-Range, oder Chain-Info.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockResponse {
     pub block: Option<Block>,
+    /// Mehrere Blöcke (für Range-Requests)
+    #[serde(default)]
+    pub blocks: Vec<Block>,
+    /// Chain-Info (für GetChainInfo)
+    #[serde(default)]
+    pub chain_height: Option<u64>,
+    #[serde(default)]
+    pub genesis_hash: Option<String>,
+    #[serde(default)]
+    pub latest_hash: Option<String>,
+}
+
+/// Sentinel-Wert: Ping-Request
+pub const BLOCK_REQUEST_PING: u64 = u64::MAX;
+/// Sentinel-Wert: ChainInfo-Request
+pub const BLOCK_REQUEST_CHAIN_INFO: u64 = u64::MAX - 1;
+/// Maximale Blöcke pro Range-Request
+pub const MAX_BLOCKS_PER_RANGE: u64 = 50;
+
+// ─── P2P Rate Limiter ─────────────────────────────────────────────────────────
+
+/// Token-Bucket Rate Limiter pro Peer.
+/// Jeder Peer hat separate Budgets für Gossip-Blocks, TXs und Requests.
+#[derive(Debug, Clone)]
+pub struct PeerRateLimiter {
+    /// Gossip-Blocks pro Minute (Token-Bucket)
+    pub gossip_blocks: TokenBucket,
+    /// Gossip-TXs pro Minute
+    pub gossip_txs: TokenBucket,
+    /// Request/Response-Anfragen pro Minute
+    pub requests: TokenBucket,
+}
+
+#[derive(Debug, Clone)]
+pub struct TokenBucket {
+    pub tokens: f64,
+    pub max_tokens: f64,
+    pub refill_rate: f64, // tokens pro Sekunde
+    pub last_refill: Instant,
+}
+
+impl TokenBucket {
+    pub fn new(max_tokens: f64, per_minute: f64) -> Self {
+        Self {
+            tokens: max_tokens,
+            max_tokens,
+            refill_rate: per_minute / 60.0,
+            last_refill: Instant::now(),
+        }
+    }
+
+    /// Versucht ein Token zu konsumieren. Gibt `true` zurück wenn erlaubt.
+    pub fn try_consume(&mut self) -> bool {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * self.refill_rate).min(self.max_tokens);
+        self.last_refill = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+impl PeerRateLimiter {
+    pub fn new() -> Self {
+        Self {
+            // Max 10 Blocks/min (normal ~2/min bei 30s Block-Time, Burst bei Sync)
+            gossip_blocks: TokenBucket::new(10.0, 10.0),
+            // Max 120 TXs/min
+            gossip_txs: TokenBucket::new(30.0, 120.0),
+            // Max 300 Requests/min (Sync kann viele Requests erzeugen)
+            requests: TokenBucket::new(60.0, 300.0),
+        }
+    }
 }
 
 // ─── Shard Exchange Typen ─────────────────────────────────────────────────────
@@ -830,6 +947,17 @@ struct SwarmTask {
     /// Penalty-Score pro Peer: wenn > BAN_THRESHOLD → Peer wird gebannt
     peer_penalties: HashMap<PeerId, PeerPenalty>,
 
+    // ─── P2P Rate Limiting ──────────────────────────────────────────────────
+
+    /// Token-Bucket Rate Limiter pro Peer (DDoS-Protection)
+    peer_rate_limiters: HashMap<PeerId, PeerRateLimiter>,
+
+    // ─── Chain-Referenz für Block-Serving ────────────────────────────────────
+
+    /// Optionale Referenz auf die Chain — wird nach Start per Command injiziert.
+    /// Ermöglicht dem SwarmTask Blöcke direkt aus der lokalen Chain zu servieren.
+    chain_ref: Option<std::sync::Arc<std::sync::Mutex<crate::blockchain::StoneChain>>>,
+
     /// Shard-Speicher für eingehende Shard-Requests
     shard_store: crate::shard::ShardStore,
 
@@ -864,6 +992,73 @@ const BAN_THRESHOLD: u32 = 200;
 
 /// Penalty-Punkte verfallen nach dieser Zeit (Minuten)
 const PENALTY_DECAY_MINS: u64 = 30;
+
+// ─── Persistierte Ban-Liste ───────────────────────────────────────────────────
+
+/// Eintrag in der persistierten Ban-Liste
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct BannedPeerEntry {
+    peer_id: String,
+    score: u32,
+    reasons: Vec<String>,
+    banned_at: i64,
+    /// Unix-Timestamp wann der Ban abläuft (0 = nach Decay)
+    expires_at: i64,
+}
+
+/// Lädt die Ban-Liste aus `stone_data/banned_peers.json`
+fn load_banned_peers() -> HashMap<PeerId, PeerPenalty> {
+    let path = format!("{}/{}", data_dir(), BANNED_PEERS_FILENAME);
+    let Ok(data) = std::fs::read_to_string(&path) else {
+        return HashMap::new();
+    };
+    let Ok(entries) = serde_json::from_str::<Vec<BannedPeerEntry>>(&data) else {
+        eprintln!("[p2p] ⚠ Konnte Ban-Liste nicht parsen: {path}");
+        return HashMap::new();
+    };
+    let now = chrono::Utc::now().timestamp();
+    let mut map = HashMap::new();
+    for entry in entries {
+        // Abgelaufene Bans überspringen
+        if entry.expires_at > 0 && entry.expires_at < now {
+            continue;
+        }
+        if let Ok(peer_id) = entry.peer_id.parse::<PeerId>() {
+            map.insert(peer_id, PeerPenalty {
+                score: entry.score,
+                last_offense: Instant::now(), // konservativ: als "gerade passiert" behandeln
+                reasons: entry.reasons,
+            });
+        }
+    }
+    if !map.is_empty() {
+        println!("[p2p] 🔨 {} gebannte Peers aus Datei geladen", map.len());
+    }
+    map
+}
+
+/// Speichert die aktuelle Ban-Liste nach `stone_data/banned_peers.json`
+fn save_banned_peers(penalties: &HashMap<PeerId, PeerPenalty>) {
+    let now = chrono::Utc::now().timestamp();
+    let ban_duration_secs = (PENALTY_DECAY_MINS * 60 * 2) as i64;
+    let entries: Vec<BannedPeerEntry> = penalties
+        .iter()
+        .filter(|(_, p)| p.score >= BAN_THRESHOLD)
+        .map(|(peer_id, p)| BannedPeerEntry {
+            peer_id: peer_id.to_string(),
+            score: p.score,
+            reasons: p.reasons.clone(),
+            banned_at: now,
+            expires_at: now + ban_duration_secs,
+        })
+        .collect();
+    let path = format!("{}/{}", data_dir(), BANNED_PEERS_FILENAME);
+    if let Ok(json) = serde_json::to_string_pretty(&entries) {
+        if let Err(e) = std::fs::write(&path, json) {
+            eprintln!("[p2p] ⚠ Konnte Ban-Liste nicht speichern: {e}");
+        }
+    }
+}
 
 /// NAT-Status des Nodes
 #[derive(Debug, Clone, PartialEq)]
@@ -1363,21 +1558,101 @@ impl SwarmTask {
                 request_response::Event::Message { peer, message }
             ) => match message {
                 request_response::Message::Request { request, channel, .. } => {
-                    if request.block_index == u64::MAX {
+                    // ── Rate-Limit prüfen ──────────────────────────────────
+                    let limiter = self.peer_rate_limiters
+                        .entry(peer)
+                        .or_insert_with(PeerRateLimiter::new);
+                    if !limiter.requests.try_consume() {
+                        eprintln!("[p2p] ⚠ Rate-Limit für Requests von {peer} erreicht – ignoriert");
+                        self.add_peer_penalty(&peer, 10, "request rate limit");
+                        let _ = self.swarm.behaviour_mut().block_exchange.send_response(
+                            channel,
+                            BlockResponse {
+                                block: None, blocks: vec![],
+                                chain_height: None, genesis_hash: None, latest_hash: None,
+                            },
+                        );
+                        return;
+                    }
+
+                    if request.block_index == BLOCK_REQUEST_PING {
                         // Ping-Marker → sofort leere Antwort senden
                         println!("[p2p] 🏓 Ping von {peer} – antworte");
                         let _ = self.swarm.behaviour_mut().block_exchange.send_response(
                             channel,
-                            BlockResponse { block: None },
+                            BlockResponse {
+                                block: None, blocks: vec![],
+                                chain_height: None, genesis_hash: None, latest_hash: None,
+                            },
                         );
-                    } else {
-                        println!("[p2p] Block-Anfrage #{} von {peer}", request.block_index);
-                        let _ = self.event_tx.send(NetworkEvent::Error {
-                            message: format!("block-request:{}:{}", peer, request.block_index),
-                        });
+                    } else if request.block_index == BLOCK_REQUEST_CHAIN_INFO {
+                        // Chain-Info zurückgeben
+                        let (height, genesis, latest) = if let Some(ref chain_arc) = self.chain_ref {
+                            if let Ok(chain) = chain_arc.lock() {
+                                let h = chain.blocks.len() as u64;
+                                let g = chain.blocks.first().map(|b| b.hash.clone());
+                                let l = chain.blocks.last().map(|b| b.hash.clone());
+                                (Some(h), g, l)
+                            } else {
+                                (None, None, None)
+                            }
+                        } else {
+                            (Some(self.local_chain_count), None, None)
+                        };
+                        println!("[p2p] 📊 ChainInfo-Anfrage von {peer} → height={height:?}");
                         let _ = self.swarm.behaviour_mut().block_exchange.send_response(
                             channel,
-                            BlockResponse { block: None },
+                            BlockResponse {
+                                block: None, blocks: vec![],
+                                chain_height: height, genesis_hash: genesis, latest_hash: latest,
+                            },
+                        );
+                    } else if let Some(end) = request.block_index_end {
+                        // Range-Request: block_index..=end (max MAX_BLOCKS_PER_RANGE)
+                        let start = request.block_index;
+                        let clamped_end = end.min(start + MAX_BLOCKS_PER_RANGE - 1);
+                        println!("[p2p] 📦 Block-Range {start}..={clamped_end} von {peer}");
+                        let mut blocks = Vec::new();
+                        if let Some(ref chain_arc) = self.chain_ref {
+                            if let Ok(chain) = chain_arc.lock() {
+                                for idx in start..=clamped_end {
+                                    if let Some(b) = chain.blocks.get(idx as usize) {
+                                        blocks.push(b.clone());
+                                    } else {
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                        let _ = self.swarm.behaviour_mut().block_exchange.send_response(
+                            channel,
+                            BlockResponse {
+                                block: None, blocks,
+                                chain_height: None, genesis_hash: None, latest_hash: None,
+                            },
+                        );
+                    } else {
+                        // Einzelner Block
+                        let idx = request.block_index;
+                        println!("[p2p] 📦 Block #{idx} angefragt von {peer}");
+                        let block = if let Some(ref chain_arc) = self.chain_ref {
+                            if let Ok(chain) = chain_arc.lock() {
+                                chain.blocks.get(idx as usize).cloned()
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        if block.is_none() {
+                            eprintln!("[p2p] Block #{idx} nicht verfügbar (chain_ref={})" , self.chain_ref.is_some());
+                        }
+                        let _ = self.swarm.behaviour_mut().block_exchange.send_response(
+                            channel,
+                            BlockResponse {
+                                block, blocks: vec![],
+                                chain_height: None, genesis_hash: None, latest_hash: None,
+                            },
                         );
                     }
                 }
@@ -1392,8 +1667,23 @@ impl SwarmTask {
                             latency_ms: Some(ms),
                             error: None,
                         });
+                    } else if !response.blocks.is_empty() {
+                        // Range-Response: mehrere Blöcke
+                        println!("[p2p] ← {} Blöcke via Range-Sync von {peer}", response.blocks.len());
+                        for block in response.blocks {
+                            let hash = block.hash.clone();
+                            if !self.is_duplicate(&hash) {
+                                if let Some(entry) = self.peers.get_mut(&peer) {
+                                    entry.blocks_received += 1;
+                                }
+                                let _ = self.event_tx.send(NetworkEvent::BlockReceived {
+                                    block: Box::new(block),
+                                    from_peer: peer.to_string(),
+                                });
+                            }
+                        }
                     } else if let Some(block) = response.block {
-                        // Normaler Block-Sync
+                        // Einzelner Block-Sync
                         let hash = block.hash.clone();
                         if !self.is_duplicate(&hash) {
                             println!("[p2p] ← Block #{} via Sync von {peer}", block.index);
@@ -1405,6 +1695,13 @@ impl SwarmTask {
                                 from_peer: peer.to_string(),
                             });
                         }
+                    } else if response.chain_height.is_some() {
+                        // ChainInfo-Antwort
+                        println!(
+                            "[p2p] 📊 ChainInfo von {peer}: height={:?}, genesis={:?}",
+                            response.chain_height,
+                            response.genesis_hash.as_deref().map(|h| &h[..12.min(h.len())]),
+                        );
                     }
                 }
             },
@@ -1751,6 +2048,8 @@ impl SwarmTask {
             if let Some(info) = self.peers.get_mut(peer) {
                 info.connected = false;
             }
+            // Ban-Liste persistieren
+            save_banned_peers(&self.peer_penalties);
         }
     }
 
@@ -1774,6 +2073,16 @@ impl SwarmTask {
     fn handle_gossip_block(&mut self, data: Vec<u8>, source: PeerId) {
         // Gebannte Peers ignorieren
         if self.is_peer_banned(&source) {
+            return;
+        }
+
+        // ── Rate-Limit: Gossip-Blocks ─────────────────────────────────────────
+        let limiter = self.peer_rate_limiters
+            .entry(source)
+            .or_insert_with(PeerRateLimiter::new);
+        if !limiter.gossip_blocks.try_consume() {
+            eprintln!("[p2p] ⚠ Rate-Limit für Gossip-Blocks von {source} erreicht – ignoriert");
+            self.add_peer_penalty(&source, 15, "gossip block rate limit");
             return;
         }
 
@@ -1897,6 +2206,16 @@ impl SwarmTask {
             return;
         }
 
+        // ── Rate-Limit: Gossip-TXs ────────────────────────────────────────────
+        let limiter = self.peer_rate_limiters
+            .entry(source)
+            .or_insert_with(PeerRateLimiter::new);
+        if !limiter.gossip_txs.try_consume() {
+            eprintln!("[p2p] ⚠ Rate-Limit für Gossip-TXs von {source} erreicht – ignoriert");
+            self.add_peer_penalty(&source, 10, "gossip tx rate limit");
+            return;
+        }
+
         // Größenlimit: TXs > 64 KiB sind verdächtig
         const MAX_TX_BYTES: usize = 64 * 1024;
         if data.len() > MAX_TX_BYTES {
@@ -1947,9 +2266,15 @@ impl SwarmTask {
     /// Sendet unsere Chain-Länge an alle Peers (Gossipsub).
     /// Peers die mehr Blöcke haben werden uns antworten.
     fn send_sync_handshake(&mut self) {
+        // Genesis-Hash aus chain_ref lesen
+        let genesis_hash = self.chain_ref.as_ref().and_then(|arc| {
+            arc.lock().ok().and_then(|c| c.blocks.first().map(|b| b.hash.clone()))
+        });
         let msg = SyncHandshake {
             block_count: self.local_chain_count,
             peer_id: self.swarm.local_peer_id().to_string(),
+            genesis_hash,
+            protocol_version: Some(STONE_PROTOCOL_VERSION.to_string()),
         };
         if let Ok(data) = serde_json::to_vec(&msg) {
             let topic = IdentTopic::new(TOPIC_SYNC_HANDSHAKE);
@@ -1973,6 +2298,40 @@ impl SwarmTask {
             return; // eigene Nachricht
         }
 
+        // ── Protokoll-Version prüfen ──────────────────────────────────────
+        if let Some(ref remote_ver) = msg.protocol_version {
+            // Major-Version vergleichen (z.B. "stone/0.7" vs "stone/0.7")
+            let local_major = STONE_PROTOCOL_VERSION.split('.').next().unwrap_or("");
+            let remote_major = remote_ver.split('.').next().unwrap_or("");
+            if local_major != remote_major {
+                eprintln!(
+                    "[p2p] ⚠ Peer {source} hat inkompatible Protokoll-Version: {remote_ver} (wir: {STONE_PROTOCOL_VERSION}) – Verbindung trennen"
+                );
+                self.add_peer_penalty(&source, 200, "incompatible protocol version");
+                let _ = self.swarm.disconnect_peer_id(source);
+                return;
+            }
+        }
+
+        // ── Genesis-Hash prüfen ───────────────────────────────────────────
+        if let Some(ref remote_genesis) = msg.genesis_hash {
+            let our_genesis = self.chain_ref.as_ref().and_then(|arc| {
+                arc.lock().ok().and_then(|c| c.blocks.first().map(|b| b.hash.clone()))
+            });
+            if let Some(ref our_gen) = our_genesis {
+                if our_gen != remote_genesis {
+                    eprintln!(
+                        "[p2p] ⛔ Genesis-Mismatch mit {source}: lokal={}… remote={}… – Peer getrennt",
+                        &our_gen[..12.min(our_gen.len())],
+                        &remote_genesis[..12.min(remote_genesis.len())],
+                    );
+                    self.add_peer_penalty(&source, 200, "genesis mismatch");
+                    let _ = self.swarm.disconnect_peer_id(source);
+                    return;
+                }
+            }
+        }
+
         if msg.block_count > self.local_chain_count {
             println!(
                 "[p2p] 🔄 Sync: Peer {source} hat {} Blöcke, wir haben {}",
@@ -1985,11 +2344,15 @@ impl SwarmTask {
             });
 
             // Fehlende Blöcke einzeln per Request/Response abrufen
-            for idx in self.local_chain_count..msg.block_count {
+            // Range-Requests verwenden statt einzelner Blöcke
+            let mut idx = self.local_chain_count;
+            while idx < msg.block_count {
+                let end = (idx + MAX_BLOCKS_PER_RANGE - 1).min(msg.block_count - 1);
                 let _ = self.swarm.behaviour_mut().block_exchange.send_request(
                     &source,
-                    BlockRequest { block_index: idx },
+                    BlockRequest { block_index: idx, block_index_end: Some(end) },
                 );
+                idx = end + 1;
             }
         } else if msg.block_count < self.local_chain_count {
             // Wir haben mehr Blöcke → eigenen Handshake senden damit der Peer synct
@@ -2079,13 +2442,19 @@ impl SwarmTask {
                 // Expliziten Sync-Handshake an einen Peer senden
                 let _ = self.swarm.behaviour_mut().block_exchange.send_request(
                     &peer_id,
-                    BlockRequest { block_index: our_block_count },
+                    BlockRequest { block_index: our_block_count, block_index_end: None },
                 );
                 false
             }
 
             NetworkCommand::SetLocalChainCount(count) => {
                 self.local_chain_count = count;
+                false
+            }
+
+            NetworkCommand::SetChainRef(chain_arc) => {
+                println!("[p2p] Chain-Referenz gesetzt");
+                self.chain_ref = Some(chain_arc);
                 false
             }
 
@@ -2109,7 +2478,7 @@ impl SwarmTask {
                 // Ping-Marker: block_index = u64::MAX
                 let req_id = self.swarm.behaviour_mut().block_exchange.send_request(
                     &peer_id,
-                    BlockRequest { block_index: u64::MAX },
+                    BlockRequest { block_index: BLOCK_REQUEST_PING, block_index_end: None },
                 );
                 self.pending_pings.insert(req_id, (peer_id.to_string(), std::time::Instant::now(), reply));
                 false
@@ -2247,10 +2616,17 @@ impl SwarmTask {
 pub const TOPIC_SYNC_HANDSHAKE: &str = "stone/sync/v1";
 
 /// Kurze Nachricht die beim Verbinden gesendet wird um Chain-Längen zu vergleichen.
+/// Enthält Genesis-Hash und Protokoll-Version für Kompatibilitätsprüfung.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SyncHandshake {
     block_count: u64,
     peer_id: String,
+    /// Genesis-Block-Hash – Peers auf einer anderen Chain werden abgelehnt
+    #[serde(default)]
+    genesis_hash: Option<String>,
+    /// Protokoll-Version (z.B. "stone/0.7") – inkompatible Versionen werden abgelehnt
+    #[serde(default)]
+    protocol_version: Option<String>,
 }
 
 // ─── Gossipsub: Topics abonnieren ─────────────────────────────────────────────
@@ -2301,6 +2677,11 @@ impl NetworkHandle {
     /// Teilt dem Swarm unsere aktuelle Chain-Länge mit (z.B. nach jedem neuen Block).
     pub async fn set_chain_count(&self, count: u64) {
         let _ = self.cmd_tx.send(NetworkCommand::SetLocalChainCount(count)).await;
+    }
+
+    /// Setzt die Chain-Referenz, damit der SwarmTask Blöcke direkt servieren kann.
+    pub async fn set_chain_ref(&self, chain: std::sync::Arc<std::sync::Mutex<crate::blockchain::StoneChain>>) {
+        let _ = self.cmd_tx.send(NetworkCommand::SetChainRef(chain)).await;
     }
 
     /// Startet einen expliziten Chain-Sync mit einem bestimmten Peer.
@@ -2485,12 +2866,14 @@ pub async fn start_network(
         nat_status: NatStatus::Unknown,
         active_relays: HashSet::new(),
         relay_addrs,
-        peer_penalties: HashMap::new(),
+        peer_penalties: load_banned_peers(),
         shard_store: crate::shard::ShardStore::new().expect("ShardStore erstellen"),
         pending_shard_lists: HashMap::new(),
         net_metrics: NetworkMetrics::default(),
         started_at: Instant::now(),
         peer_storage: HashMap::new(),
+        peer_rate_limiters: HashMap::new(),
+        chain_ref: None,
     };
 
     tokio::spawn(task.run());

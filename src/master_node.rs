@@ -386,7 +386,7 @@ pub struct MasterNodeState {
     /// Cluster-Schlüssel für HMAC-Signierung
     pub cluster_key: String,
     /// Die Blockchain
-    pub chain: Mutex<StoneChain>,
+    pub chain: Arc<Mutex<StoneChain>>,
     /// Bekannte Peers
     pub peers: RwLock<Vec<PeerInfo>>,
     /// Aktive Konsensus-Runde (falls vorhanden)
@@ -478,7 +478,7 @@ impl MasterNodeState {
             node_id: node_id.clone(),
             role,
             cluster_key,
-            chain: Mutex::new(chain),
+            chain: Arc::new(Mutex::new(chain)),
             peers: RwLock::new(Vec::new()),
             consensus: Mutex::new(None),
             validator_set: RwLock::new(ValidatorSet::load()),

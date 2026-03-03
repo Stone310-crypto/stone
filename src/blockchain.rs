@@ -672,7 +672,11 @@ impl StoneChain {
             if block.hash != calculate_hash(block) {
                 return false;
             }
+            // HMAC-Signatur nur prüfen wenn kein PoA-Validator-Signatur vorhanden.
+            // Peer-synced Blocks haben ggf. einen anderen cluster_key – deren
+            // Authentizität wird durch die Ed25519 validator_signature garantiert.
             if !block.signature.is_empty()
+                && block.validator_signature.is_empty()
                 && block.signature != sign_hash(cluster_key, &block.hash)
             {
                 return false;

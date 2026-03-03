@@ -254,30 +254,43 @@ pub async fn pull_from_peer(node: &Arc<MasterNodeState>, peer_url: &str, api_key
         }
     }
 
-    // Blöcke in Chain eintragen + Token-TXs verarbeiten
+    // Blöcke in Chain eintragen + Token-TXs verarbeiten (mit Validierung)
     {
         let mut chain = node.chain.lock().unwrap();
         for block in pending_blocks {
-            // Token-TXs im Ledger verarbeiten
-            if !block.transactions.is_empty() {
-                let mut ledger = node.token_ledger.write().unwrap();
-                let receipts = ledger.apply_block_txs(&block.transactions, block.index);
-                if !receipts.is_empty() {
-                    if let Err(e) = ledger.persist() {
-                        eprintln!("[token] Ledger-Persist nach Sync-Block #{}: {e}", block.index);
+            let idx = block.index;
+            let block_txs = block.transactions.clone();
+
+            // accept_peer_block: Hash, Merkle, Memorial, Storage-Proof, Timestamp etc.
+            // poa_ok = None → kein PoA-Check (HTTP-Sync hat keinen Validator-Set-Kontext)
+            match chain.accept_peer_block(block, None) {
+                Ok(_) => {
+                    // Token-TXs im Ledger verarbeiten
+                    if !block_txs.is_empty() {
+                        let mut ledger = node.token_ledger.write().unwrap();
+                        let receipts = ledger.apply_block_txs(&block_txs, idx);
+                        if !receipts.is_empty() {
+                            if let Err(e) = ledger.persist() {
+                                eprintln!("[token] Ledger-Persist nach Sync-Block #{idx}: {e}");
+                            }
+                        }
+                        // TXs aus eigenem Mempool entfernen
+                        for tx in &block_txs {
+                            node.mempool.mark_known(&tx.tx_id);
+                            node.mempool.remove_tx(&tx.tx_id);
+                        }
                     }
+
+                    added += 1;
                 }
-                // TXs aus eigenem Mempool entfernen
-                for tx in &block.transactions {
-                    node.mempool.mark_known(&tx.tx_id);
-                    node.mempool.remove_tx(&tx.tx_id);
+                Err(ref e) if e.starts_with("Stale:") => {
+                    // Block bereits bekannt – stillschweigend ignorieren
+                }
+                Err(e) => {
+                    eprintln!("[sync] {peer_url}: Block #{idx} abgelehnt: {e}");
+                    break; // Bei Validierungsfehler abbrechen
                 }
             }
-
-            chain.latest_hash = block.hash.clone();
-            chain.blocks.push(block.clone());
-            chain.persist_last_block();
-            added += 1;
         }
     }
 

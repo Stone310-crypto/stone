@@ -151,6 +151,8 @@ async fn main() {
                         let count = node.chain.lock().unwrap().blocks.len() as u64;
                         handle.set_chain_count(count).await;
                     }
+                    // Chain-Referenz setzen damit P2P-Peers Blöcke direkt serviert bekommen
+                    handle.set_chain_ref(node.chain.clone()).await;
 
                     {
                         use stone::network::NetworkEvent;
