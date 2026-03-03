@@ -282,7 +282,10 @@ pub fn create_signed_tx(
     memo: String,
 ) -> Result<TokenTx, TxError> {
     // Validierung
-    if tx_type == TxType::RotateKey || tx_type == TxType::AccountRegister || tx_type == TxType::AccountUpdate {
+    if tx_type == TxType::RotateKey || tx_type == TxType::AccountRegister
+        || tx_type == TxType::AccountUpdate || tx_type == TxType::ChatMessage
+        || tx_type == TxType::Memorial
+    {
         // Diese TX-Typen: amount muss 0 sein, fee >= 0
         if amount != Decimal::ZERO {
             return Err(TxError::InvalidAmount(format!("{tx_type}: Betrag muss 0 sein")));
@@ -301,8 +304,10 @@ pub fn create_signed_tx(
     if amount.scale() > 8 {
         return Err(TxError::InvalidAmount("Maximal 8 Dezimalstellen".into()));
     }
-    if memo.len() > 256 {
-        return Err(TxError::MissingField("Memo darf maximal 256 Bytes sein".into()));
+    // Memo-Limit: ChatMessage darf größere Memos (verschlüsselte Nachrichten), andere TXs 256 Bytes
+    let memo_limit = if tx_type == TxType::ChatMessage { 4096 } else { 256 };
+    if memo.len() > memo_limit {
+        return Err(TxError::MissingField(format!("Memo darf maximal {} Bytes sein (hat {})", memo_limit, memo.len())));
     }
 
     let mut tx = TokenTx {

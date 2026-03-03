@@ -248,6 +248,12 @@ pub async fn handle_chat_messages(
     let idx = state.chat_index.lock().unwrap();
     let messages = idx.messages_between(&user.wallet_address, &peer_wallet, query.limit, query.offset);
 
+    // Diagnostic info
+    let block_height = state.node.chain.lock().unwrap().blocks.len() as u64;
+    let last_indexed = idx.last_indexed_block;
+    let mempool_count = state.node.mempool.pending_count();
+    let mining_active = state.node.metrics.mining_throttle_pct.load(std::sync::atomic::Ordering::Relaxed) > 0;
+
     (
         StatusCode::OK,
         axum::Json(json!({
@@ -257,6 +263,12 @@ pub async fn handle_chat_messages(
             "count": messages.len(),
             "limit": query.limit,
             "offset": query.offset,
+            "_debug": {
+                "block_height": block_height,
+                "last_indexed_block": last_indexed,
+                "mempool_count": mempool_count,
+                "mining_active": mining_active,
+            }
         })),
     )
         .into_response()
@@ -363,10 +375,9 @@ pub async fn handle_chat_pending(
         Err(e) => return e.into_response(),
     };
 
-    let pending: Vec<_> = state
-        .node
-        .mempool
-        .pending_txs()
+    let all_pending = state.node.mempool.pending_txs();
+    let total_mempool = all_pending.len();
+    let pending: Vec<_> = all_pending
         .into_iter()
         .filter(|tx| {
             tx.tx_type == TxType::ChatMessage
@@ -383,12 +394,18 @@ pub async fn handle_chat_pending(
         })
         .collect();
 
+    let block_height = state.node.chain.lock().unwrap().blocks.len() as u64;
+
     (
         StatusCode::OK,
         axum::Json(json!({
             "ok": true,
             "pending": pending,
             "count": pending.len(),
+            "_debug": {
+                "total_mempool": total_mempool,
+                "block_height": block_height,
+            }
         })),
     )
         .into_response()
@@ -421,20 +438,53 @@ fn resolve_recipient(identifier: &str, state: &AppState) -> Option<String> {
 }
 
 /// Neue Blöcke in den Chat-Index laden (inkrementell)
+///
+/// Erkennt auch Chain-Resets: wenn `last_indexed_block > chain_len`,
+/// wird der Index komplett neu aufgebaut.
 fn index_new_blocks_if_needed(state: &AppState) {
     let chain = state.node.chain.lock().unwrap();
     let mut idx = state.chat_index.lock().unwrap();
 
-    if chain.blocks.len() as u64 > idx.last_indexed_block {
+    let chain_len = chain.blocks.len() as u64;
+    let last_idx = idx.last_indexed_block;
+
+    // ── Chain-Reset erkennen ──────────────────────────────────────────────
+    // Wenn der Index weiter ist als die aktuelle Chain, wurde die Chain neu
+    // aufgebaut (z.B. nach Node-Reset). Index muss komplett neu gebaut werden.
+    if last_idx > 0 && chain_len > 0 && last_idx >= chain_len {
+        println!(
+            "[chat-index] ⚠️ Chain-Reset erkannt! last_indexed_block={} aber chain hat nur {} Blöcke. Rebuild...",
+            last_idx, chain_len
+        );
+        let all_blocks: Vec<_> = chain.blocks.iter().collect();
+        *idx = stone::chat::ChatIndex::rebuild_from_chain(&all_blocks);
+        let _ = stone::chat::save_chat_index(&idx);
+        println!(
+            "[chat-index] ✅ Rebuild fertig: {} Konversationen, last_indexed_block={}",
+            idx.conversations.len(),
+            idx.last_indexed_block,
+        );
+        return;
+    }
+
+    // ── Inkrementelles Indexieren ─────────────────────────────────────────
+    // chain hat Blöcke [0..chain_len-1], last_indexed_block ist der letzte verarbeitete
+    if chain_len > 0 && (chain_len - 1) > last_idx {
+        let skip_count = (last_idx + 1) as usize;
         let new_blocks: Vec<_> = chain
             .blocks
             .iter()
-            .skip(idx.last_indexed_block as usize)
+            .skip(skip_count)
             .collect();
 
         if !new_blocks.is_empty() {
+            println!(
+                "[chat-index] 📋 {} neue Blöcke indexieren (Block #{} → #{})",
+                new_blocks.len(),
+                skip_count,
+                chain_len - 1,
+            );
             idx.index_new_blocks(&new_blocks);
-            // Persist im Hintergrund (fire & forget)
             let _ = stone::chat::save_chat_index(&idx);
         }
     }

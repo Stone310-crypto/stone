@@ -13,6 +13,7 @@
 pub mod genesis;
 pub mod ledger;
 pub mod mempool;
+pub mod reputation;
 pub mod staking;
 pub mod transaction;
 pub mod wallet;
@@ -21,6 +22,7 @@ pub mod wallet;
 pub use genesis::{apply_genesis, GenesisConfig, NetworkMode, SupplyInfo};
 pub use ledger::{AccountInfo, LedgerError, TokenLedger, TxReceipt, VestingSchedule};
 pub use mempool::{Mempool, MempoolError, MempoolStats};
+pub use reputation::{ReputationRegistry, ReputationSummary, NodeReputationInfo};
 pub use staking::{StakingPool, StakingPoolInfo, StakerInfo, StakingError};
 pub use transaction::{FeeTier, TokenTx, TxError, TxType, create_signed_tx, validate_tx, verify_tx_signature};
 pub use wallet::{Wallet, WalletError, WalletInfo};

@@ -64,6 +64,9 @@ use super::handlers::{
         handle_update_chunk, handle_update_config, handle_update_download,
         handle_update_install, handle_update_publish, handle_update_status,
     },
+    reputation::{
+        handle_reputation_status, handle_reputation_nodes, handle_reputation_node,
+    },
     users::{handle_delete_user, handle_list_users},
     ws::handle_websocket,
 };
@@ -239,6 +242,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/mining/withdraw", post(handle_mining_withdraw))
         .route("/api/v1/mining/stake", post(handle_mining_stake))
         .route("/api/v1/mining/unstake", post(handle_mining_unstake))
+        // ─── Reputation ──────────────────────────────────────────────────────
+        .route("/api/v1/reputation/status", get(handle_reputation_status))
+        .route("/api/v1/reputation/nodes", get(handle_reputation_nodes))
+        .route("/api/v1/reputation/node/:node_id", get(handle_reputation_node))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
         .layer(build_cors())
         .with_state(state)

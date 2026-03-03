@@ -22,7 +22,7 @@ use crate::consensus::{
     VoteMessage, VotePhase, VotingRound,
 };
 use crate::shard::ShardHolderRegistry;
-use crate::token::{Mempool, TokenLedger};
+use crate::token::{Mempool, TokenLedger, ReputationRegistry};
 use crate::token::transaction::{TokenTx, TxType, compute_tx_id};
 use chrono::Utc;
 use rust_decimal::Decimal;
@@ -418,6 +418,8 @@ pub struct MasterNodeState {
     pub checkpoint_store: RwLock<CheckpointStore>,
     /// Slashing-Store (Strafen, Jail-Status, Downtime-Tracker)
     pub slashing_store: RwLock<SlashingStore>,
+    /// Reputation-Registry (Node-Reputation + Fee-Share-Verteilung)
+    pub reputation_registry: RwLock<ReputationRegistry>,
 }
 
 #[derive(Default)]
@@ -467,6 +469,7 @@ impl MasterNodeState {
 
         let started_at = Utc::now().timestamp();
         let staking_pool = crate::token::StakingPool::load();
+        let reputation_registry = ReputationRegistry::load();
         let state = Arc::new(Self {
             node_id: node_id.clone(),
             role,
@@ -492,6 +495,7 @@ impl MasterNodeState {
             shard_registry: ShardHolderRegistry::new(),
             checkpoint_store: RwLock::new(CheckpointStore::load()),
             slashing_store: RwLock::new(SlashingStore::load()),
+            reputation_registry: RwLock::new(reputation_registry),
         });
 
         // Node-gestartet Event senden
@@ -883,8 +887,31 @@ impl MasterNodeState {
     /// Multi-Node-Modus: Verwende `prepare_mining_block()` + `commit_mining_block()`.
     pub fn mint_block(&self) -> Result<Block, String> {
         let block = self.prepare_mining_block()?;
-        self.commit_mining_block(block.clone())?;
-        Ok(block)
+        match self.commit_mining_block(block.clone()) {
+            Ok(()) => Ok(block),
+            Err(e) => {
+                // CRITICAL: TXs wurden aus dem Mempool entnommen aber der Block konnte
+                // nicht committed werden. TXs zurück in den Mempool legen!
+                let mut restored = 0u32;
+                for tx in &block.transactions {
+                    // Nur echte User-TXs zurücklegen (keine System-TXs wie Reward/Memorial)
+                    if tx.tx_type != TxType::Reward && tx.tx_type != TxType::Mint
+                        && tx.tx_type != crate::token::transaction::TxType::Memorial
+                    {
+                        if let Ok(()) = self.mempool.add_tx(tx.clone(), None) {
+                            restored += 1;
+                        }
+                    }
+                }
+                if restored > 0 {
+                    eprintln!(
+                        "[mining] ⚠️ Block-Commit fehlgeschlagen, {} TXs zurück in Mempool: {e}",
+                        restored
+                    );
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Erstellt einen neuen Mining-Block **ohne** ihn zu committen.
@@ -936,6 +963,17 @@ impl MasterNodeState {
 
         // ── Mempool-TXs + Reward-TX sammeln ──────────────────────────────
         let mut pending_txs = self.mempool.drain_all_for_block();
+
+        // Log ChatMessage TXs für Debugging
+        let chat_tx_count = pending_txs.iter()
+            .filter(|tx| tx.tx_type == TxType::ChatMessage)
+            .count();
+        if chat_tx_count > 0 {
+            println!(
+                "[mining] 💬 {} ChatMessage TX(s) werden in Block #{} aufgenommen",
+                chat_tx_count, next_index
+            );
+        }
 
         // Reward-TX hinzufügen (falls Reward > 0)
         if reward_amount > Decimal::ZERO {
@@ -1000,7 +1038,10 @@ impl MasterNodeState {
         // ── Token-TXs im Ledger verarbeiten ──────────────────────────────
         if !block.transactions.is_empty() {
             let mut ledger = self.token_ledger.write().unwrap();
+            // Fee-Split: Validator-Wallet setzen BEVOR TXs verarbeitet werden
+            ledger.set_current_validator(Some(validator_wallet.clone()));
             let receipts = ledger.apply_block_txs(&block.transactions, block.index);
+            ledger.set_current_validator(None);
 
             // ── Staking-TXs im StakingPool verarbeiten ────────────────────
             {
@@ -1170,6 +1211,7 @@ impl MasterNodeState {
                         Ok(block) => {
                             Self::post_block_staking(&state, &block);
                             Self::post_block_slashing(&state, &block);
+                            Self::post_block_reputation(&state, &block);
                             Self::post_block_checkpoint(&state, &block).await;
                             let _ = block;
                         }
@@ -1400,6 +1442,7 @@ impl MasterNodeState {
                                     Ok(()) => {
                                         Self::post_block_staking(&state, &block);
                                         Self::post_block_slashing(&state, &block);
+                                        Self::post_block_reputation(&state, &block);
                                         Self::post_block_checkpoint(&state, &block).await;
                                     }
                                     Err(e) => eprintln!("[consensus] Commit fehlgeschlagen: {e}"),
@@ -1564,6 +1607,76 @@ impl MasterNodeState {
                     timestamp: record.timestamp,
                 });
             }
+        }
+    }
+
+    /// Reputation-System nach einem committed Block aktualisieren.
+    ///
+    /// 1. Block-Signer als aktiven Node registrieren (falls noch nicht bekannt)
+    /// 2. Heartbeat + Block-Signed für den Signer aufzeichnen
+    /// 3. Alle Scores neu berechnen
+    /// 4. Falls Distribution-Intervall erreicht: Pool ausschütten
+    fn post_block_reputation(state: &Arc<Self>, block: &Block) {
+        let mut registry = state.reputation_registry.write().unwrap();
+
+        // 1. Block-Signer registrieren & Heartbeat
+        if !block.signer.is_empty() {
+            let signer_wallet = {
+                // Wallet-Adresse des Signers ermitteln
+                if block.signer == state.node_id {
+                    let signing_key = load_or_create_validator_key();
+                    local_validator_pubkey_hex(&signing_key)
+                } else {
+                    // Für Remote-Nodes: validator_pub_key aus dem Block verwenden
+                    if !block.validator_pub_key.is_empty() {
+                        block.validator_pub_key.clone()
+                    } else {
+                        block.signer.clone()
+                    }
+                }
+            };
+            registry.register_node(&block.signer, &signer_wallet);
+            registry.record_heartbeat(&block.signer);
+            registry.record_block_signed(&block.signer);
+        }
+
+        // 2. Scores aktualisieren
+        registry.compute_all_scores();
+
+        // 3. Distribution prüfen (alle 720 Blöcke)
+        if registry.distribution_due(block.index) {
+            let pool_balance = {
+                let ledger = state.token_ledger.read().unwrap();
+                ledger.balance(crate::token::reputation::NODE_OPERATOR_POOL)
+            };
+
+            let payouts = registry.calculate_distribution(pool_balance, block.index);
+            if !payouts.is_empty() {
+                let mut ledger = state.token_ledger.write().unwrap();
+                let mut total_paid = rust_decimal::Decimal::ZERO;
+                for (addr, amount) in &payouts {
+                    if let Err(e) = ledger.credit_operator_reward(addr, *amount) {
+                        eprintln!("[reputation] Reward-Gutschrift an {}… fehlgeschlagen: {e}",
+                            &addr[..16.min(addr.len())]);
+                    } else {
+                        total_paid += amount;
+                    }
+                }
+                if total_paid > rust_decimal::Decimal::ZERO {
+                    println!(
+                        "[reputation] 💰 Distribution Block #{}: {} STONE an {} Nodes verteilt",
+                        block.index, total_paid, payouts.len()
+                    );
+                    if let Err(e) = ledger.persist() {
+                        eprintln!("[reputation] Ledger-Persist nach Distribution: {e}");
+                    }
+                }
+            }
+        }
+
+        // 4. Registry persistieren
+        if let Err(e) = registry.persist() {
+            eprintln!("[reputation] Registry-Persist: {e}");
         }
     }
 

@@ -207,6 +207,8 @@ pub struct TokenLedger {
     vesting_schedules: HashMap<String, VestingSchedule>,
     /// Kumulative Fee-Burns seit Genesis
     total_fees_burned: Decimal,
+    /// Aktueller Block-Validator (für Fee-Split, wird vor apply_block_txs gesetzt)
+    current_block_validator: Option<String>,
 }
 
 impl TokenLedger {
@@ -224,6 +226,7 @@ impl TokenLedger {
             account_api_keys: HashMap::new(),
             vesting_schedules: HashMap::new(),
             total_fees_burned: Decimal::ZERO,
+            current_block_validator: None,
         }
     }
 
@@ -368,13 +371,20 @@ impl TokenLedger {
         *self.balances.entry(from.to_string()).or_insert(Decimal::ZERO) -= total_debit;
         // Gutschreiben
         *self.balances.entry(to.to_string()).or_insert(Decimal::ZERO) += amount;
-        // Fee wird verbrannt (reduziert total_supply → deflationärer Effekt)
+
+        // Fee-Split: 50% burn, 30% Validator, 20% Node-Operator-Pool
         if fee > Decimal::ZERO {
-            self.total_supply -= fee;
-            self.total_fees_burned += fee;
+            self.apply_fee_split(fee);
         }
 
         Ok(())
+    }
+
+    /// Setzt den aktuellen Block-Validator (für Fee-Split).
+    ///
+    /// Muss vor `apply_block_txs()` aufgerufen werden.
+    pub fn set_current_validator(&mut self, wallet: Option<String>) {
+        self.current_block_validator = wallet;
     }
 
     /// Token verbrennen (Burn).
@@ -552,6 +562,7 @@ impl TokenLedger {
         //    Stake/Unstake werden vom Node erstellt (nicht vom User signiert) → Nonce überspringen.
         if tx.tx_type == TxType::Transfer || tx.tx_type == TxType::Burn || tx.tx_type == TxType::RotateKey
             || tx.tx_type == TxType::AccountRegister || tx.tx_type == TxType::AccountUpdate
+            || tx.tx_type == TxType::ChatMessage
         {
             // Prüfen ob der Key durch Rotation invalidiert wurde
             if let Some(active) = self.resolve_active_key(&tx.from) {
@@ -662,8 +673,9 @@ impl TokenLedger {
                 }
                 *self.balances.entry(tx.from.clone()).or_insert(Decimal::ZERO) -= total_debit;
                 *self.balances.entry(super::staking::STAKING_POOL_ADDRESS.to_string()).or_insert(Decimal::ZERO) += tx.amount;
+                // Fee-Split: 50% burn, 30% Validator, 20% Node-Operator-Pool
                 if tx.fee > Decimal::ZERO {
-                    self.total_supply -= tx.fee; // Fee wird verbrannt
+                    self.apply_fee_split(tx.fee);
                 }
                 // Nonce erhöhen
                 *self.nonces.entry(tx.from.clone()).or_insert(0) += 1;
@@ -680,12 +692,12 @@ impl TokenLedger {
                     });
                 }
                 *self.balances.entry(super::staking::STAKING_POOL_ADDRESS.to_string()).or_insert(Decimal::ZERO) -= tx.amount;
-                // Fee abziehen und verbrennen
+                // Fee-Split: 50% burn, 30% Validator, 20% Node-Operator-Pool
                 if tx.fee > Decimal::ZERO {
                     let balance = self.balance(&tx.from);
                     if balance >= tx.fee {
                         *self.balances.entry(tx.from.clone()).or_insert(Decimal::ZERO) -= tx.fee;
-                        self.total_supply -= tx.fee;
+                        self.apply_fee_split(tx.fee);
                     }
                 }
                 // Betrag geht zunächst auf ein Escrow (in der Lock-Queue) –
@@ -1022,5 +1034,49 @@ impl TokenLedger {
         *self.balances.entry("pool:storage_rewards".to_string()).or_insert(Decimal::ZERO) -= amount;
         *self.balances.entry(address.to_string()).or_insert(Decimal::ZERO) += amount;
         Ok(())
+    }
+
+    /// Gutschreibung eines Node-Operator-Rewards aus pool:node_operators.
+    pub fn credit_operator_reward(&mut self, address: &str, amount: Decimal) -> Result<(), LedgerError> {
+        let pool = super::reputation::NODE_OPERATOR_POOL;
+        let pool_balance = self.balance(pool);
+        if pool_balance < amount {
+            return Err(LedgerError::InsufficientBalance {
+                account: pool.to_string(),
+                available: pool_balance,
+                required: amount,
+            });
+        }
+        *self.balances.entry(pool.to_string()).or_insert(Decimal::ZERO) -= amount;
+        *self.balances.entry(address.to_string()).or_insert(Decimal::ZERO) += amount;
+        Ok(())
+    }
+
+    /// Interne Fee-Split-Logik: 50% burn, 30% Validator, 20% Node-Operator-Pool.
+    fn apply_fee_split(&mut self, fee: Decimal) {
+        let (burn, validator_share, pool_share) = super::reputation::split_fee(fee);
+
+        // 50% verbrennen
+        if burn > Decimal::ZERO {
+            self.total_supply -= burn;
+            self.total_fees_burned += burn;
+        }
+
+        // 30% → aktueller Block-Validator
+        if validator_share > Decimal::ZERO {
+            if let Some(ref vw) = self.current_block_validator {
+                *self.balances.entry(vw.clone()).or_insert(Decimal::ZERO) += validator_share;
+            } else {
+                // Kein Validator bekannt → auch verbrennen
+                self.total_supply -= validator_share;
+                self.total_fees_burned += validator_share;
+            }
+        }
+
+        // 20% → Node-Operator-Pool
+        if pool_share > Decimal::ZERO {
+            *self.balances.entry(super::reputation::NODE_OPERATOR_POOL.to_string())
+                .or_insert(Decimal::ZERO) += pool_share;
+        }
     }
 }

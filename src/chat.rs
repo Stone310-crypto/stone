@@ -192,31 +192,60 @@ impl ChatIndex {
 
     /// Nur neue Blöcke in den Index aufnehmen (inkrementell).
     pub fn index_new_blocks(&mut self, blocks: &[&crate::blockchain::Block]) {
+        let mut chat_count = 0u32;
         for block in blocks {
             if block.index <= self.last_indexed_block {
                 continue;
             }
-            for tx in &block.transactions {
-                if tx.tx_type != crate::token::TxType::ChatMessage {
-                    continue;
-                }
-                if let Ok(data) = serde_json::from_str::<serde_json::Value>(&tx.memo) {
-                    let entry = ChatEntry {
-                        msg_id: data["msg_id"].as_str().unwrap_or("").to_string(),
-                        from_wallet: tx.from.clone(),
-                        to_wallet: tx.to.clone(),
-                        from_user_id: data["from_user_id"].as_str().unwrap_or("").to_string(),
-                        from_name: data["from_name"].as_str().unwrap_or("").to_string(),
-                        encrypted_content: data["encrypted"].as_str().unwrap_or("").to_string(),
-                        nonce: data["nonce"].as_str().unwrap_or("").to_string(),
-                        timestamp: tx.timestamp,
-                        block_index: block.index,
-                        tx_id: tx.tx_id.clone(),
-                    };
-                    self.add_message(entry);
+            let tx_count = block.transactions.len();
+            let chat_txs: Vec<_> = block.transactions.iter()
+                .filter(|tx| tx.tx_type == crate::token::TxType::ChatMessage)
+                .collect();
+            if !chat_txs.is_empty() {
+                println!(
+                    "[chat-index] Block #{}: {} ChatMessage TXs gefunden (von {} TXs gesamt)",
+                    block.index, chat_txs.len(), tx_count
+                );
+            }
+            for tx in &chat_txs {
+                match serde_json::from_str::<serde_json::Value>(&tx.memo) {
+                    Ok(data) => {
+                        let entry = ChatEntry {
+                            msg_id: data["msg_id"].as_str().unwrap_or("").to_string(),
+                            from_wallet: tx.from.clone(),
+                            to_wallet: tx.to.clone(),
+                            from_user_id: data["from_user_id"].as_str().unwrap_or("").to_string(),
+                            from_name: data["from_name"].as_str().unwrap_or("").to_string(),
+                            encrypted_content: data["encrypted"].as_str().unwrap_or("").to_string(),
+                            nonce: data["nonce"].as_str().unwrap_or("").to_string(),
+                            timestamp: tx.timestamp,
+                            block_index: block.index,
+                            tx_id: tx.tx_id.clone(),
+                        };
+                        println!(
+                            "[chat-index] ✅ ChatMessage indexiert: {} → {} (msg_id: {}, block: #{})",
+                            &tx.from[..12.min(tx.from.len())],
+                            &tx.to[..12.min(tx.to.len())],
+                            &entry.msg_id[..8.min(entry.msg_id.len())],
+                            block.index,
+                        );
+                        self.add_message(entry);
+                        chat_count += 1;
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "[chat-index] ⚠️ Memo-Parse fehlgeschlagen für TX {} in Block #{}: {e} — Memo: {}",
+                            &tx.tx_id[..12.min(tx.tx_id.len())],
+                            block.index,
+                            &tx.memo[..80.min(tx.memo.len())],
+                        );
+                    }
                 }
             }
             self.last_indexed_block = block.index;
+        }
+        if chat_count > 0 {
+            println!("[chat-index] 📬 {} neue Chat-Nachrichten indexiert, last_indexed_block = {}", chat_count, self.last_indexed_block);
         }
     }
 }
