@@ -34,6 +34,8 @@ pub struct AppState {
     pub node: Arc<MasterNodeState>,
     pub users: Arc<Mutex<Vec<User>>>,
     pub api_key: Arc<String>,
+    /// Separater Admin-Key (aus STONE_ADMIN_KEY). Falls nicht gesetzt, Fallback auf api_key.
+    pub admin_key: Arc<String>,
     /// P2P-Netzwerk-Handle (None = P2P deaktiviert)
     pub network: Option<NetworkHandle>,
     /// Rate Limiter für verschiedene Endpoints
@@ -82,6 +84,20 @@ pub fn load_api_key() -> String {
         println!("[auth] Setze x-api-key: {key} in deinen Web-UI Anfragen.");
     }
     key
+}
+
+/// Lädt den separaten Admin-Key aus `STONE_ADMIN_KEY`.
+/// Falls nicht gesetzt, wird der normale API-Key als Fallback verwendet.
+pub fn load_admin_key(fallback_api_key: &str) -> String {
+    if let Ok(v) = std::env::var("STONE_ADMIN_KEY") {
+        let v = v.trim().to_string();
+        if !v.is_empty() {
+            println!("[auth] Separater Admin-Key aus STONE_ADMIN_KEY geladen");
+            return v;
+        }
+    }
+    println!("[auth] ⚠️  Kein STONE_ADMIN_KEY gesetzt – verwende API-Key als Admin-Key (unsicher!)");
+    fallback_api_key.to_string()
 }
 
 pub fn generate_api_key() -> String {

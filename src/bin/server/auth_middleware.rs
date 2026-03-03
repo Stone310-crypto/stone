@@ -10,6 +10,19 @@ use stone::auth::User;
 
 use super::state::AppState;
 
+/// Constant-time string comparison to prevent timing attacks on API key checks.
+/// Leaks only the string lengths (not content).
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut result = 0u8;
+    for (x, y) in a.bytes().zip(b.bytes()) {
+        result |= x ^ y;
+    }
+    result == 0
+}
+
 pub fn extract_api_key(headers: &HeaderMap) -> Option<String> {
     headers
         .get("x-api-key")
@@ -20,9 +33,11 @@ pub fn extract_api_key(headers: &HeaderMap) -> Option<String> {
 pub fn resolve_user_by_key(
     key: &str,
     users: &Arc<Mutex<Vec<User>>>,
+    api_key: &str,
     admin_key: &str,
 ) -> Option<User> {
-    if key == admin_key {
+    // Prüfe ob der Key dem API-Key ODER dem Admin-Key entspricht
+    if constant_time_eq(key, api_key) || constant_time_eq(key, admin_key) {
         return Some(User {
             id: "admin".into(),
             name: "admin".into(),
@@ -35,12 +50,8 @@ pub fn resolve_user_by_key(
             org_role: String::new(),
         });
     }
-    users
-        .lock()
-        .unwrap()
-        .iter()
-        .find(|u| u.api_key == key)
-        .cloned()
+    let guard = users.lock().unwrap();
+    guard.iter().find(|u| constant_time_eq(&u.api_key, key)).cloned()
 }
 
 pub fn require_user(headers: &HeaderMap, state: &AppState) -> Result<User, Response> {
@@ -51,7 +62,7 @@ pub fn require_user(headers: &HeaderMap, state: &AppState) -> Result<User, Respo
         )
             .into_response()
     })?;
-    resolve_user_by_key(&key, &state.users, &state.api_key).ok_or_else(|| {
+    resolve_user_by_key(&key, &state.users, &state.api_key, &state.admin_key).ok_or_else(|| {
         (
             StatusCode::UNAUTHORIZED,
             axum::Json(json!({"error": "Ungültiger API-Key"})),
@@ -68,7 +79,7 @@ pub fn require_admin(headers: &HeaderMap, state: &AppState) -> Result<(), Respon
         )
             .into_response()
     })?;
-    if key == state.api_key.as_str() {
+    if constant_time_eq(&key, state.admin_key.as_str()) {
         Ok(())
     } else {
         Err((

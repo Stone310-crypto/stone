@@ -7,6 +7,7 @@
 //!  │  StoneSwarm                                            │
 //!  │                                                        │
 //!  │  Transport: TCP + Noise (Ed25519) + Yamux              │
+//!  │           + QUIC (UDP, native TLS 1.3)                 │
 //!  │           + Relay (für NAT-Traversal)                  │
 //!  │                                                        │
 //!  │  Protokolle:                                           │
@@ -64,6 +65,7 @@ use libp2p::{
     kad::{self, store::MemoryStore},
     mdns,
     noise,
+    quic,
     relay,
     request_response::{self, ProtocolSupport},
     swarm::SwarmEvent,
@@ -117,11 +119,16 @@ pub const DEFAULT_P2P_PORT: u16 = 7654;
 
 /// Eingebaute Seed-Nodes – der erste Einstiegspunkt ins Stone-Netzwerk.
 /// Jeder dieser Nodes ist gleichzeitig Relay-Server und Bootstrap-Node.
+/// TCP und QUIC (UDP) Adressen – QUIC wird für NAT-Traversal bevorzugt.
 const SEED_NODES: &[&str] = &[
-    // Server-Node (unrootles) – Öffentliche IPv6
+    // Server-Node (unrootles) – Öffentliche IPv6 (TCP)
     "/ip6/2a0d:3341:b16b:4808:5054:ff:fea7:bab0/tcp/4001/p2p/12D3KooWLqikBBCRhCZ2MgSYG3R579BNUgrN5E6dZnYSEYdmAKTd",
-    // Server-Node (unrootles) – Tailscale (Fallback)
+    // Server-Node (unrootles) – Öffentliche IPv6 (QUIC/UDP)
+    "/ip6/2a0d:3341:b16b:4808:5054:ff:fea7:bab0/udp/4001/quic-v1/p2p/12D3KooWLqikBBCRhCZ2MgSYG3R579BNUgrN5E6dZnYSEYdmAKTd",
+    // Server-Node (unrootles) – Tailscale (TCP, Fallback)
     "/ip4/100.90.28.68/tcp/4001/p2p/12D3KooWLqikBBCRhCZ2MgSYG3R579BNUgrN5E6dZnYSEYdmAKTd",
+    // Server-Node (unrootles) – Tailscale (QUIC/UDP, Fallback)
+    "/ip4/100.90.28.68/udp/4001/quic-v1/p2p/12D3KooWLqikBBCRhCZ2MgSYG3R579BNUgrN5E6dZnYSEYdmAKTd",
 ];
 
 /// Gibt das aktive Daten-Verzeichnis zurück.
@@ -800,10 +807,12 @@ pub fn build_swarm(
     let kad = kad::Behaviour::with_config(peer_id, MemoryStore::new(peer_id), kad_config);
 
     // ── Identify ──────────────────────────────────────────────────────────────
-    let identify = identify::Behaviour::new(identify::Config::new(
+    let mut identify_config = identify::Config::new(
         "/stone/id/1.0.0".to_string(),
         keypair.public(),
-    ));
+    );
+    identify_config.agent_version = format!("stone/{}", env!("CARGO_PKG_VERSION"));
+    let identify = identify::Behaviour::new(identify_config);
 
     // ── mDNS ──────────────────────────────────────────────────────────────────
     let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)?;
@@ -864,7 +873,13 @@ pub fn build_swarm(
     // DCUtR baut auf dem Relay auf: nach einer Relay-Verbindung wird
     // automatisch versucht eine direkte Verbindung herzustellen (Hole-Punching).
 
-    // Voller NAT-Traversal Stack: TCP + Noise + Yamux + Relay-Client + DCUtR
+    // Voller NAT-Traversal Stack: TCP + QUIC + Noise + Yamux + Relay-Client + DCUtR
+    //
+    // QUIC (UDP-basiert) verbessert NAT-Traversal erheblich:
+    //  - UDP Hole-Punching hat höhere Erfolgsrate als TCP
+    //  - Eingebautes TLS 1.3 (kein separater Noise-Handshake nötig)
+    //  - Schnellerer Verbindungsaufbau (0-RTT möglich)
+    //  - Multiplexing nativ (kein Yamux-Layer nötig)
     let swarm = SwarmBuilder::with_existing_identity(keypair)
         .with_tokio()
         .with_tcp(
@@ -872,6 +887,7 @@ pub fn build_swarm(
             noise::Config::new,
             yamux::Config::default,
         )?
+        .with_quic()
         .with_relay_client(noise::Config::new, yamux::Config::default)?
         .with_behaviour(|key, relay_client| {
             let dcutr = dcutr::Behaviour::new(key.public().to_peer_id());
@@ -1104,6 +1120,40 @@ impl SwarmTask {
                 return;
             }
             eprintln!("[p2p] ℹ️  Nutze zufälligen P2P-Port (STONE_P2P_PORT setzen um festen Port zu erzwingen)");
+        }
+
+        // ── QUIC-Transport: UDP-Listener auf dem gleichen Port ────────────────
+        // QUIC hat bessere NAT-Traversal-Eigenschaften als TCP, da UDP Hole-
+        // Punching zuverlässiger funktioniert. Wir lauschen auf beiden Protokollen.
+        {
+            // Port aus der TCP-Adresse extrahieren
+            let tcp_port = listen_addr.iter().find_map(|p| {
+                if let libp2p::multiaddr::Protocol::Tcp(port) = p {
+                    Some(port)
+                } else {
+                    None
+                }
+            }).unwrap_or(DEFAULT_P2P_PORT);
+
+            let quic_addr: Multiaddr = format!("/ip4/0.0.0.0/udp/{tcp_port}/quic-v1")
+                .parse()
+                .unwrap();
+            match self.swarm.listen_on(quic_addr.clone()) {
+                Ok(_) => println!("[p2p] 🚀 QUIC-Transport aktiv auf UDP/{tcp_port}"),
+                Err(e) => eprintln!("[p2p] ⚠️  QUIC konnte nicht gestartet werden: {e}"),
+            }
+
+            // Auch IPv6 QUIC wenn verfügbar
+            let quic_v6: Multiaddr = format!("/ip6/::/udp/{tcp_port}/quic-v1")
+                .parse()
+                .unwrap();
+            match self.swarm.listen_on(quic_v6) {
+                Ok(_) => println!("[p2p] 🚀 QUIC-Transport aktiv auf UDP/{tcp_port} (IPv6)"),
+                Err(e) => {
+                    // IPv6 oft nicht verfügbar – nur Debug-Level
+                    let _ = e; // kein Fehler-Log nötig
+                }
+            }
         }
 
         // Dual-Stack: wenn IPv6 konfiguriert, zusätzlich auf IPv4 lauschen
@@ -1401,9 +1451,39 @@ impl SwarmTask {
 
                 let _ = self.event_tx.send(NetworkEvent::PeerIdentified {
                     peer_id: peer_id.to_string(),
-                    agent: info.agent_version,
+                    agent: info.agent_version.clone(),
                     addresses: addrs,
                 });
+
+                // ── Auto-Relay: Wenn wir hinter NAT sind und ein neuer Stone-Peer
+                //    sich verbindet, versuche ihn als Relay zu nutzen.
+                //    Stone-Nodes sind standardmäßig Relay-Server.
+                if self.nat_status == NatStatus::Private
+                    && info.agent_version.contains("stone")
+                    && !self.active_relays.contains(&peer_id)
+                    && self.active_relays.len() < 3
+                {
+                    // Öffentliche Adresse des Peers als Relay-Basis nutzen
+                    if let Some(relay_addr) = info.listen_addrs.iter().find(|a| {
+                        a.iter().any(|p| {
+                            matches!(p,
+                                libp2p::multiaddr::Protocol::Ip4(ip) if !ip.is_private() && !ip.is_loopback()
+                            ) || matches!(p,
+                                libp2p::multiaddr::Protocol::Ip6(ip) if !ip.is_loopback()
+                            )
+                        })
+                    }) {
+                        let circuit_addr = relay_addr
+                            .clone()
+                            .with(libp2p::multiaddr::Protocol::P2p(peer_id))
+                            .with(libp2p::multiaddr::Protocol::P2pCircuit);
+                        if let Ok(_) = self.swarm.listen_on(circuit_addr.clone()) {
+                            println!(
+                                "[p2p] 🔍 Auto-Relay: Neuer Stone-Peer {peer_id} als Relay-Kandidat"
+                            );
+                        }
+                    }
+                }
             }
 
             // ── mDNS ──────────────────────────────────────────────────────────
@@ -1725,9 +1805,11 @@ impl SwarmTask {
             // ── Relay-Client Events ──────────────────────────────────────────────
 
             StoneBehaviourEvent::RelayClient(relay::client::Event::ReservationReqAccepted {
+                relay_peer_id,
                 ..
             }) => {
-                println!("[p2p] ✅ Relay-Reservation akzeptiert");
+                self.active_relays.insert(relay_peer_id);
+                println!("[p2p] ✅ Relay-Reservation akzeptiert von {relay_peer_id} ({} aktive Relays)", self.active_relays.len());
             }
 
             StoneBehaviourEvent::RelayClient(relay::client::Event::OutboundCircuitEstablished {
@@ -1773,6 +1855,8 @@ impl SwarmTask {
                         println!("[p2p] 🔒 NAT-Status: Privat – nutze Relay für Erreichbarkeit");
                         // Bei privatem NAT automatisch Relay-Reservierungen herstellen
                         self.establish_relay_reservations();
+                        // Zusätzlich: Alle bereits verbundenen Peers als potentielle Relays nutzen
+                        self.auto_discover_relays();
                     }
                     autonat::NatStatus::Unknown => {
                         self.nat_status = NatStatus::Unknown;
@@ -2007,6 +2091,83 @@ impl SwarmTask {
                     eprintln!("[p2p] Ungültige Relay-Adresse '{addr_str}': {e}");
                 }
             }
+        }
+    }
+
+    /// Auto-Discovery: Versucht alle verbundenen Peers als Relay zu nutzen.
+    ///
+    /// Wird aufgerufen wenn AutoNAT „Private" erkennt. Anstatt nur auf
+    /// konfigurierte Relay-Nodes zu warten, probiert Stone jeden verbundenen
+    /// Peer als Relay — da jeder Stone-Node gleichzeitig Relay-Server ist.
+    /// Das ermöglicht NAT-Traversal ohne manuelle Konfiguration.
+    fn auto_discover_relays(&mut self) {
+        let local = *self.swarm.local_peer_id();
+        let max_relay_attempts = 3; // Maximal 3 Relays gleichzeitig versuchen
+        let mut attempts = 0;
+
+        // Alle aktuell verbundenen Peers als potentielle Relays sammeln
+        let connected_peers: Vec<(PeerId, Vec<Multiaddr>)> = self
+            .peers
+            .iter()
+            .filter(|(pid, info)| {
+                info.connected
+                    && **pid != local
+                    && !self.active_relays.contains(pid)
+            })
+            .map(|(pid, info)| {
+                let addrs: Vec<Multiaddr> = info
+                    .addresses
+                    .iter()
+                    .filter_map(|a| a.parse().ok())
+                    .collect();
+                (*pid, addrs)
+            })
+            .collect();
+
+        for (peer_id, addrs) in connected_peers {
+            if attempts >= max_relay_attempts {
+                break;
+            }
+
+            // Bevorzuge öffentliche IP-Adressen (nicht 10.x, 192.168.x, etc.)
+            let public_addr = addrs.iter().find(|a| {
+                a.iter().any(|p| {
+                    matches!(p,
+                        libp2p::multiaddr::Protocol::Ip4(ip) if !ip.is_private() && !ip.is_loopback()
+                    ) || matches!(p, libp2p::multiaddr::Protocol::Ip6(ip) if !ip.is_loopback())
+                })
+            });
+
+            // Fallback: nehme erste verfügbare Adresse
+            let relay_base_addr = public_addr.or(addrs.first());
+
+            if let Some(base_addr) = relay_base_addr {
+                // Relay-Circuit-Adresse aufbauen: /ip4/.../tcp/.../p2p/<relayPeerId>/p2p-circuit
+                let circuit_addr = base_addr
+                    .clone()
+                    .with(libp2p::multiaddr::Protocol::P2p(peer_id))
+                    .with(libp2p::multiaddr::Protocol::P2pCircuit);
+
+                match self.swarm.listen_on(circuit_addr.clone()) {
+                    Ok(_) => {
+                        println!(
+                            "[p2p] 🔍 Auto-Relay: Versuche {peer_id} als Relay ({circuit_addr})"
+                        );
+                        attempts += 1;
+                    }
+                    Err(e) => {
+                        // Kein Fehler-Log: Viele Peers unterstützen es nicht → erwartbar
+                        let _ = e;
+                    }
+                }
+            }
+        }
+
+        if attempts > 0 {
+            println!(
+                "[p2p] 🔍 Auto-Relay: {} verbundene Peers als Relay-Kandidaten probiert",
+                attempts
+            );
         }
     }
 
@@ -2827,15 +2988,15 @@ pub async fn start_network(
 
     // NAT-Traversal Konfiguration loggen
     println!("[p2p] NAT-Traversal:");
+    println!("[p2p]   QUIC:     ✅ (UDP, native TLS 1.3)");
     println!("[p2p]   AutoNAT:  {}", if config.autonat_enabled { "✅" } else { "❌" });
     println!("[p2p]   UPnP:     {}", if config.upnp_enabled { "✅" } else { "❌" });
     println!("[p2p]   DCUtR:    {}", if config.dcutr_enabled { "✅" } else { "❌" });
+    println!("[p2p]   Relay:    ✅ (Auto-Discovery + Server)");
     if !config.relay_nodes.is_empty() {
         for r in &config.relay_nodes {
             println!("[p2p]   Relay:    {r}");
         }
-    } else {
-        println!("[p2p]   Relay:    Keine Relay-Nodes konfiguriert (STONE_RELAY_NODES)");
     }
 
     let mut swarm = build_swarm(keypair, &config)?;
@@ -2897,6 +3058,13 @@ pub fn local_p2p_addr(port: u16) -> Option<String> {
     let peer_id = read_peer_id()?;
     let ip = local_ip().unwrap_or_else(|| "127.0.0.1".to_string());
     Some(format!("/ip4/{ip}/tcp/{port}/p2p/{peer_id}"))
+}
+
+/// Gibt die QUIC-Adresse zurück (UDP-basiert, für NAT-Traversal).
+pub fn local_quic_addr(port: u16) -> Option<String> {
+    let peer_id = read_peer_id()?;
+    let ip = local_ip().unwrap_or_else(|| "127.0.0.1".to_string());
+    Some(format!("/ip4/{ip}/udp/{port}/quic-v1/p2p/{peer_id}"))
 }
 
 fn local_ip() -> Option<String> {

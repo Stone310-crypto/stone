@@ -991,6 +991,26 @@ impl TokenLedger {
         }
         ledger
     }
+
+    /// Rekonstruiert das `processed_txs`-Set aus der Chain.
+    ///
+    /// Wird nach `load()` aufgerufen, damit der Duplikat-Schutz auch nach
+    /// einem Neustart greift (processed_txs wird nicht in RocksDB persistiert).
+    pub fn rebuild_processed_txs(&mut self, blocks: &[crate::blockchain::Block]) {
+        let before = self.processed_txs.len();
+        for block in blocks {
+            for tx in &block.transactions {
+                self.processed_txs.insert(tx.tx_id.clone());
+            }
+        }
+        let added = self.processed_txs.len() - before;
+        if added > 0 {
+            println!(
+                "[token] 🛡️  Replay-Schutz: {} TX-IDs aus Chain geladen",
+                self.processed_txs.len()
+            );
+        }
+    }
 }
 
 impl Default for TokenLedger {

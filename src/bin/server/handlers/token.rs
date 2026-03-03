@@ -19,7 +19,7 @@
 use axum::{
     Json,
     extract::{Path, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
 use serde::Deserialize;
@@ -28,6 +28,7 @@ use stone::token::{
     AccountInfo, SupplyInfo, TokenTx, TxType,
 };
 
+use super::super::auth_middleware::{require_admin, require_user};
 use super::super::state::AppState;
 
 // ─── Supply Info ─────────────────────────────────────────────────────────────
@@ -87,25 +88,33 @@ pub async fn handle_wallet_info(
 
 // ─── Alle Accounts (Admin) ──────────────────────────────────────────────────
 
-/// GET /api/v1/token/accounts
+/// GET /api/v1/token/accounts — Nur Admin
 pub async fn handle_token_accounts(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
+    if let Err(e) = require_admin(&headers, &state) {
+        return e.into_response();
+    }
     let ledger = state.node.token_ledger.read().unwrap();
     let accounts = ledger.all_accounts();
     Json(serde_json::json!({
         "ok": true,
         "count": accounts.len(),
         "accounts": accounts,
-    }))
+    })).into_response()
 }
 
 // ─── Pending TXs ────────────────────────────────────────────────────────────
 
-/// GET /api/v1/token/pending
+/// GET /api/v1/token/pending — Nur authentifizierte User
 pub async fn handle_token_pending(
     State(state): State<AppState>,
+    headers: HeaderMap,
 ) -> impl IntoResponse {
+    if let Err(e) = require_user(&headers, &state) {
+        return e.into_response();
+    }
     let txs = state.node.mempool.pending_txs();
     let items: Vec<serde_json::Value> = txs.iter().map(|tx| {
         serde_json::json!({
@@ -121,11 +130,11 @@ pub async fn handle_token_pending(
         })
     }).collect();
 
-    Json(serde_json::json!({
+    (StatusCode::OK, Json(serde_json::json!({
         "ok": true,
         "count": items.len(),
         "pending": items,
-    }))
+    }))).into_response()
 }
 
 // ─── Token Transfer → Mempool ────────────────────────────────────────────────
@@ -147,15 +156,17 @@ pub async fn handle_token_transfer(
 ) -> impl IntoResponse {
     let tx = req.tx;
 
-    // Nur Transfers, Burns, Key-Rotations, Stake und Unstake erlauben (Mint/Reward kommen nur vom System)
-    if tx.tx_type != TxType::Transfer && tx.tx_type != TxType::Burn && tx.tx_type != TxType::RotateKey
-        && tx.tx_type != TxType::Stake && tx.tx_type != TxType::Unstake
-    {
+    // Nur Transfers, Burns und Key-Rotations erlauben.
+    // Stake/Unstake NICHT über diesen Endpoint — nur über die authentifizierten
+    // Mining-Handler (/api/v1/mining/stake, /unstake), da Stake/Unstake-TXs
+    // serverseitig signiert werden und die Signaturprüfung übersprungen wird.
+    // Ohne diese Einschränkung könnte ein Angreifer fremde Wallets staken.
+    if tx.tx_type != TxType::Transfer && tx.tx_type != TxType::Burn && tx.tx_type != TxType::RotateKey {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "ok": false,
-                "error": "Nur Transfer-, Burn-, RotateKey-, Stake- und Unstake-Transaktionen können eingereicht werden",
+                "error": "Nur Transfer-, Burn- und RotateKey-Transaktionen können über diesen Endpoint eingereicht werden. Für Staking nutze /api/v1/mining/stake bzw. /unstake.",
             })),
         );
     }

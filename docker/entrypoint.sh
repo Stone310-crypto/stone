@@ -12,6 +12,8 @@
 #   STONE_SEED_PEERS     – Komma-separierte Seed-Peer Multiaddrs
 #   STONE_HTTP_PORT      – HTTP-Port (default: 8080)
 #   STONE_P2P_PORT       – P2P-Port (default: 4001)
+#   STONE_ADMIN_KEY      – Separater Admin-Key (optional, empfohlen)
+#   STONE_VALIDATOR_PASSPHRASE – Passphrase für Validator-Key-Verschlüsselung
 # ─────────────────────────────────────────────────────────────────────────────
 set -e
 
@@ -72,6 +74,7 @@ if [ -f "$CONFIG_FILE" ]; then
         export STONE_P2P_PORT="$P2P_PORT"
         export STONE_P2P_LISTEN="/ip4/0.0.0.0/tcp/$P2P_PORT"
         export STONE_DATA_DIR="$DATA_DIR"
+        # QUIC lauscht automatisch auf demselben Port (UDP)
         exec /opt/stone-node/target/release/stone-setup
     fi
 fi
@@ -163,7 +166,8 @@ echo "  ┌───────────────────────
 echo "  │  ✅ Stone Node '$NODE_NAME' erfolgreich gestartet!  │"
 echo "  │                                                     │"
 echo "  │  🌐 Dashboard:  http://localhost:$HTTP_PORT         │"
-echo "  │  📡 P2P:        /ip4/0.0.0.0/tcp/$P2P_PORT         │"
+echo "  │  📡 P2P TCP:    /ip4/0.0.0.0/tcp/$P2P_PORT         │"
+echo "  │  🚀 P2P QUIC:   /ip4/0.0.0.0/udp/$P2P_PORT/quic-v1 │"
 echo "  │  💾 Storage:    ${STORAGE_GB} GB                    │"
 echo "  └─────────────────────────────────────────────────────┘"
 echo ""

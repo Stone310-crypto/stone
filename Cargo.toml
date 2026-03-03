@@ -76,6 +76,7 @@ argon2          = "0.5"
 # ─── P2P-Netzwerk (libp2p) ───────────────────────────────────────────────────
 libp2p = { version = "0.54", features = [
     "tcp",
+    "quic",
     "noise",
     "yamux",
     "mdns",

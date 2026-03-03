@@ -9,7 +9,7 @@
 #   docker build -f docker/Dockerfile -t stone-node .
 #
 # Run:
-#   docker run -d -p 8080:8080 -p 4001:4001 \
+#   docker run -d -p 8080:8080 -p 4001:4001 -p 4001:4001/udp \
 #     -e STONE_NODE_NAME=mein-node \
 #     -e STONE_PASSWORD=MeinPasswort1! \
 #     stone-node
@@ -80,8 +80,8 @@ RUN chmod +x /opt/stone-node/entrypoint.sh
 
 # Ports:
 #   8080 = HTTP API + Dashboard
-#   4001 = P2P (libp2p TCP)
-EXPOSE 8080 4001
+#   4001 = P2P TCP (libp2p) + QUIC (UDP)
+EXPOSE 8080 4001 4001/udp
 
 # Volumes für persistente Daten
 VOLUME ["/opt/stone-node/stone_data"]

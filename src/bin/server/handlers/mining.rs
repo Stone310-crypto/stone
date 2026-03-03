@@ -263,20 +263,26 @@ pub async fn handle_mining_withdraw(
         ).into_response();
     }
 
-    // Ziel-Wallet validieren (muss gültiger Hex-Key sein)
-    if req.to_wallet.is_empty() || hex::decode(&req.to_wallet).is_err() {
+    // Ziel-Wallet validieren (muss gültiger 32-Byte Ed25519 Public Key in Hex sein)
+    if req.to_wallet.len() != 64
+        || !req.to_wallet.chars().all(|c| c.is_ascii_hexdigit())
+    {
         return (
             StatusCode::BAD_REQUEST,
             axum::Json(json!({
                 "ok": false,
-                "error": "Ungültige Ziel-Wallet-Adresse (muss Hex-kodierter Public Key sein)",
+                "error": "Ungültige Ziel-Wallet-Adresse (muss 64 Hex-Zeichen / 32-Byte Ed25519 Public Key sein)",
             })),
         ).into_response();
     }
 
-    // Validator-Key laden
+    // Validator-Key laden – Withdrawal kommt IMMER aus der Validator-Wallet,
+    // weil nur dafür der Signing-Key auf dem Server liegt.
+    // Wenn mining_wallet gebunden ist, gehen die Rewards direkt dorthin
+    // (kein Withdrawal nötig). Vom Validator-Wallet können Rewards
+    // abgehoben werden die VOR der Bindung akkumuliert wurden.
     let signing_key = load_or_create_validator_key();
-    let source_wallet = state.node.effective_reward_wallet();
+    let source_wallet = local_validator_pubkey_hex(&signing_key);
 
     // Balance prüfen
     let (balance, nonce) = {

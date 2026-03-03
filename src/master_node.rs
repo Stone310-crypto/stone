@@ -461,6 +461,10 @@ impl MasterNodeState {
         if ledger.total_supply() == rust_decimal::Decimal::ZERO && chain.blocks.len() > 0 {
             // Versuche Rebuild aus Chain (falls DB fehlt, aber Chain TXs hat)
             ledger = TokenLedger::rebuild_from_chain(&chain.blocks);
+        } else {
+            // Replay-Schutz: processed_txs aus Chain rekonstruieren
+            // (wird nicht in RocksDB persistiert, muss nach jedem Start geladen werden)
+            ledger.rebuild_processed_txs(&chain.blocks);
         }
         if ledger.total_supply() == rust_decimal::Decimal::ZERO {
             // Erster Start: Genesis-Allokation anwenden
@@ -588,16 +592,32 @@ impl MasterNodeState {
         owner: String,
         signer: String,
     ) -> Result<Block, String> {
+        // ── Lock-Ordnung: chain → ledger → (drop) → validator_set ────────
+        //
+        // WICHTIG: validator_set.write() darf NICHT gehalten werden während
+        // chain.lock() gehalten wird, da prepare_mining_block() in umgekehrter
+        // Reihenfolge lockt (validator_set.read → chain.lock → drop chain → ...).
+        // Deshalb: chain/ledger-Arbeit zuerst, dann validator_set-Updates.
+
         // PoA: Validator-Prüfung auf Node-Ebene (nicht User-Ebene)
-        // Der Signer/User ist der Dokument-Owner — die Node ist der Validator.
         //
         // v0.5.0: Stake-gewichtete Validator-Rotation
         // Validatoren mit mehr Stake haben proportional höhere Chance,
         // gejailte Validatoren werden übersprungen.
-        {
+        //
+        // Schritt 1: Chain-Daten holen (eigener Scope → chain wird gedroppt)
+        let (next_index, prev_hash_owned) = {
+            let chain = self.chain.lock().unwrap();
+            let idx = chain.blocks.len() as u64;
+            let hash = chain.blocks.last()
+                .map(|b| b.hash.clone())
+                .unwrap_or_else(|| "genesis".into());
+            (idx, hash)
+        };
+        // Schritt 2: Validator-Prüfung (chain NICHT gehalten)
+        let should_sign = {
             let vs = self.validator_set.read().unwrap();
             if !vs.validators.is_empty() {
-                // Schritt 1: Ist diese Node überhaupt ein aktiver Validator?
                 if !vs.is_active_validator(&self.node_id) {
                     return Err(format!(
                         "PoA: Diese Node ('{}') ist kein aktiver Validator. \
@@ -605,15 +625,9 @@ impl MasterNodeState {
                         self.node_id
                     ));
                 }
-                // Schritt 2: Stake-gewichtete Auswahl — ist diese Node dran?
                 let (stakes, jailed, wallet_map) = self.build_selection_context();
-                let chain = self.chain.lock().unwrap();
-                let next_index = chain.blocks.len() as u64;
-                let prev_hash = chain.blocks.last()
-                    .map(|b| b.hash.as_str())
-                    .unwrap_or("genesis");
-                if !vs.is_selected_validator_weighted(&self.node_id, prev_hash, next_index, &stakes, &jailed, &wallet_map) {
-                    let selected = vs.select_validator_weighted(prev_hash, next_index, &stakes, &jailed, &wallet_map)
+                if !vs.is_selected_validator_weighted(&self.node_id, &prev_hash_owned, next_index, &stakes, &jailed, &wallet_map) {
+                    let selected = vs.select_validator_weighted(&prev_hash_owned, next_index, &stakes, &jailed, &wallet_map)
                         .map(|v| v.node_id.clone())
                         .unwrap_or_else(|| "?".into());
                     return Err(format!(
@@ -622,42 +636,43 @@ impl MasterNodeState {
                         self.node_id, next_index, selected
                     ));
                 }
-                drop(chain);
+                true
+            } else {
+                false
             }
-        }
+        };
 
         // ── Mempool: Pending TXs für diesen Block entnehmen ──────────────────
-        // Bei Dokument-Upload: Express + Priority sofort, Standard-TXs auch (kostenlos mitreiten)
         let mut pending_txs = self.mempool.drain_for_block();
         let standard_txs = self.mempool.drain_standard_txs();
         pending_txs.extend(standard_txs);
 
-        let mut chain = self.chain.lock().unwrap();
-        let mut block = chain.add_documents(
-            documents.clone(),
-            tombstones.clone(),
-            pending_txs,
-            owner.clone(),
-            signer.clone(),
-            &self.cluster_key,
-            self.role.clone(),
-        );
+        // ── Chain + Ledger + Signierung (chain gelockt) ──────────────────────
+        let block = {
+            let mut chain = self.chain.lock().unwrap();
+            let mut block = chain.add_documents(
+                documents.clone(),
+                tombstones.clone(),
+                pending_txs,
+                owner.clone(),
+                signer.clone(),
+                &self.cluster_key,
+                self.role.clone(),
+            );
 
-        // ── Token-TXs im Ledger verarbeiten ──────────────────────────────────
-        if !block.transactions.is_empty() {
-            let mut ledger = self.token_ledger.write().unwrap();
-            let receipts = ledger.apply_block_txs(&block.transactions, block.index);
-            if !receipts.is_empty() {
-                if let Err(e) = ledger.persist() {
-                    eprintln!("[token] Ledger-Persistierung nach Block #{} fehlgeschlagen: {e}", block.index);
+            // Token-TXs im Ledger verarbeiten (chain → ledger: korrekte Reihenfolge)
+            if !block.transactions.is_empty() {
+                let mut ledger = self.token_ledger.write().unwrap();
+                let receipts = ledger.apply_block_txs(&block.transactions, block.index);
+                if !receipts.is_empty() {
+                    if let Err(e) = ledger.persist() {
+                        eprintln!("[token] Ledger-Persistierung nach Block #{} fehlgeschlagen: {e}", block.index);
+                    }
                 }
             }
-        }
 
-        // PoA: Block-Signierung mit Validator-Schlüssel
-        {
-            let vs = self.validator_set.read().unwrap();
-            if !vs.validators.is_empty() {
+            // PoA: Block-Signierung (kein vs-Lock nötig, nur cached Key)
+            if should_sign {
                 let signing_key = load_or_create_validator_key();
                 let pub_key_hex = local_validator_pubkey_hex(&signing_key);
                 let sig = sign_block(&signing_key, &block.hash);
@@ -669,19 +684,22 @@ impl MasterNodeState {
                 if let Ok(store) = ChainStore::open() {
                     let _ = store.write_block_sync(&block);
                 }
-                // Auch in der in-memory chain aktualisieren
+                // In-memory chain aktualisieren
                 if let Some(last) = chain.blocks.last_mut() {
                     last.validator_pub_key = block.validator_pub_key.clone();
                     last.validator_signature = block.validator_signature.clone();
                 }
+            }
 
-                // Statistik: blocks_signed auf der Node-ID (nicht User) erhöhen
-                drop(vs);
-                let mut vs_w = self.validator_set.write().unwrap();
-                if let Some(v) = vs_w.get_mut(&self.node_id) {
-                    v.blocks_signed += 1;
-                    vs_w.save();
-                }
+            block
+        }; // ← chain wird hier gedroppt
+
+        // ── Validator-Statistik aktualisieren (chain NICHT gehalten) ─────────
+        if should_sign {
+            let mut vs_w = self.validator_set.write().unwrap();
+            if let Some(v) = vs_w.get_mut(&self.node_id) {
+                v.blocks_signed += 1;
+                vs_w.save();
             }
         }
 
@@ -982,6 +1000,15 @@ impl MasterNodeState {
         };
 
         // ── PoA-Check: Ist diese Node der ausgewählte Validator? ──────────
+        // Lock-Ordnung: chain zuerst (Daten cachen) → drop → dann validator_set
+        let (chain_next_index, chain_prev_hash) = {
+            let chain = self.chain.lock().unwrap();
+            let idx = chain.blocks.len() as u64;
+            let hash = chain.blocks.last()
+                .map(|b| b.hash.clone())
+                .unwrap_or_else(|| "genesis".into());
+            (idx, hash)
+        };
         {
             let vs = self.validator_set.read().unwrap();
             if !vs.validators.is_empty() {
@@ -990,22 +1017,16 @@ impl MasterNodeState {
                 }
 
                 let (stakes, jailed, wallet_map) = self.build_selection_context();
-                let chain = self.chain.lock().unwrap();
-                let next_index = chain.blocks.len() as u64;
-                let prev_hash = chain.blocks.last()
-                    .map(|b| b.hash.as_str())
-                    .unwrap_or("genesis");
 
-                if !vs.is_selected_validator_weighted(&self.node_id, prev_hash, next_index, &stakes, &jailed, &wallet_map) {
-                    let selected = vs.select_validator_weighted(prev_hash, next_index, &stakes, &jailed, &wallet_map)
+                if !vs.is_selected_validator_weighted(&self.node_id, &chain_prev_hash, chain_next_index, &stakes, &jailed, &wallet_map) {
+                    let selected = vs.select_validator_weighted(&chain_prev_hash, chain_next_index, &stakes, &jailed, &wallet_map)
                         .map(|v| v.node_id.clone())
                         .unwrap_or_else(|| "?".into());
                     return Err(format!(
-                        "Mining: Node '{}' nicht ausgewählt für Block #{next_index} (→ '{selected}')",
+                        "Mining: Node '{}' nicht ausgewählt für Block #{chain_next_index} (→ '{selected}')",
                         self.node_id
                     ));
                 }
-                drop(chain);
             }
         }
 

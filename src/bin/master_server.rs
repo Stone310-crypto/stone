@@ -43,7 +43,7 @@ use stone::{
 use server::{
     router::build_router,
     rate_limiter::RateLimits,
-    state::{load_api_key, load_peers_from_disk, load_trust_from_disk, AppState, HEARTBEAT_INTERVAL},
+    state::{load_api_key, load_admin_key, load_peers_from_disk, load_trust_from_disk, AppState, HEARTBEAT_INTERVAL},
     sync::{fetch_missing_chunks, pull_from_peer, spawn_auto_sync_task},
 };
 
@@ -60,6 +60,7 @@ async fn main() {
     ChunkStore::new().expect("ChunkStore anlegen");
 
     let api_key = Arc::new(load_api_key());
+    let admin_key = Arc::new(load_admin_key(&api_key));
     let node_id = std::env::var("STONE_NODE_ID")
         .or_else(|_| std::env::var("STONE_NODE_NAME"))
         .unwrap_or_else(|_| {
@@ -457,6 +458,7 @@ async fn main() {
         node: node.clone(),
         users,
         api_key: api_key.clone(),
+        admin_key,
         network: network_handle,
         rate_limits,
         updater: Arc::new(std::sync::RwLock::new({

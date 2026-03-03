@@ -18,13 +18,15 @@ services:
     hostname: stone-node
     ports:
       - "8080:8080"
-      - "4001:4001"
+      - "4001:4001"      # P2P TCP
+      - "4001:4001/udp"  # P2P QUIC (UDP)
     environment:
       STONE_NODE_NAME: "stone-node"
       STONE_PASSWORD: "TestPasswort1!"
       STONE_STORAGE_GB: "50"
       STONE_HTTP_PORT: "8080"
       STONE_P2P_PORT: "4001"
+      # STONE_ADMIN_KEY: "" # Optional: separater Admin-Key
     volumes:
       - node_data:/opt/stone-node/stone_data
     networks:
@@ -42,7 +44,8 @@ services:
       - cluster
     ports:
       - "8082:8080"
-      - "4012:4001"
+      - "4012:4001"      # P2P TCP
+      - "4012:4001/udp"  # P2P QUIC (UDP)
     environment:
       STONE_NODE_NAME: "stone-node-2"
       STONE_PASSWORD: "TestPasswort2!"
@@ -50,7 +53,7 @@ services:
       STONE_HTTP_PORT: "8080"
       STONE_P2P_PORT: "4001"
       STONE_NO_SEED: "1"
-      STONE_SEED_PEERS: "/dns4/stone-node/tcp/4001"
+      STONE_SEED_PEERS: "/dns4/stone-node/tcp/4001,/dns4/stone-node/udp/4001/quic-v1"
     volumes:
       - node2_data:/opt/stone-node/stone_data
     networks:
@@ -71,7 +74,8 @@ services:
       - cluster
     ports:
       - "8083:8080"
-      - "4013:4001"
+      - "4013:4001"      # P2P TCP
+      - "4013:4001/udp"  # P2P QUIC (UDP)
     environment:
       STONE_NODE_NAME: "stone-node-3"
       STONE_PASSWORD: "TestPasswort3!"
@@ -79,7 +83,7 @@ services:
       STONE_HTTP_PORT: "8080"
       STONE_P2P_PORT: "4001"
       STONE_NO_SEED: "1"
-      STONE_SEED_PEERS: "/dns4/stone-node/tcp/4001"
+      STONE_SEED_PEERS: "/dns4/stone-node/tcp/4001,/dns4/stone-node/udp/4001/quic-v1"
     volumes:
       - node3_data:/opt/stone-node/stone_data
     networks:
