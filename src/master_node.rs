@@ -423,6 +423,10 @@ pub struct MasterNodeState {
     pub reputation_registry: RwLock<ReputationRegistry>,
     /// Chat-Policy Store (Self-Destruct TTL, Reports, Stake-Gate)
     pub chat_policy: RwLock<ChatPolicyStore>,
+    /// Gebundene Mining-Reward-Wallet (Account-gebunden).
+    /// Falls gesetzt, gehen alle Block-Rewards an diese Wallet statt an die Validator-Wallet.
+    /// Wird in `stone_data/mining_config.json` persistiert.
+    pub mining_wallet: RwLock<Option<String>>,
 }
 
 #[derive(Default)]
@@ -501,6 +505,7 @@ impl MasterNodeState {
             slashing_store: RwLock::new(SlashingStore::load()),
             reputation_registry: RwLock::new(reputation_registry),
             chat_policy: RwLock::new(chat_policy),
+            mining_wallet: RwLock::new(Self::load_mining_wallet()),
         });
 
         // Node-gestartet Event senden
@@ -919,6 +924,47 @@ impl MasterNodeState {
         }
     }
 
+    // ─── Mining-Wallet Persistierung ───────────────────────────────────────
+
+    fn mining_config_path() -> String {
+        let dir = std::env::var("STONE_DATA_DIR").unwrap_or_else(|_| "stone_data".to_string());
+        format!("{dir}/mining_config.json")
+    }
+
+    fn load_mining_wallet() -> Option<String> {
+        let path = Self::mining_config_path();
+        let data = std::fs::read_to_string(&path).ok()?;
+        let config: serde_json::Value = serde_json::from_str(&data).ok()?;
+        config.get("mining_wallet")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+    }
+
+    pub fn save_mining_wallet(wallet: &Option<String>) {
+        let path = Self::mining_config_path();
+        let config = serde_json::json!({
+            "mining_wallet": wallet.as_deref().unwrap_or(""),
+            "updated_at": chrono::Utc::now().to_rfc3339(),
+        });
+        if let Ok(json) = serde_json::to_string_pretty(&config) {
+            if let Err(e) = std::fs::write(&path, json) {
+                eprintln!("[mining] ⚠ Konnte mining_config.json nicht speichern: {e}");
+            }
+        }
+    }
+
+    /// Gibt die aktive Reward-Wallet zurück: mining_wallet falls gesetzt, sonst validator_wallet.
+    pub fn effective_reward_wallet(&self) -> String {
+        let mw = self.mining_wallet.read().unwrap();
+        if let Some(ref wallet) = *mw {
+            wallet.clone()
+        } else {
+            let signing_key = load_or_create_validator_key();
+            local_validator_pubkey_hex(&signing_key)
+        }
+    }
+
     /// Erstellt einen neuen Mining-Block **ohne** ihn zu committen.
     ///
     /// Der Block ist vollständig (Hash, Validator-Signatur) und kann
@@ -928,6 +974,12 @@ impl MasterNodeState {
         // ── Validator-Schlüssel laden (Wallet = Ed25519 Public Key Hex) ───
         let signing_key = load_or_create_validator_key();
         let validator_wallet = local_validator_pubkey_hex(&signing_key);
+
+        // ── Reward-Wallet bestimmen: gebundene Mining-Wallet oder Validator-Wallet
+        let reward_wallet = {
+            let mw = self.mining_wallet.read().unwrap();
+            mw.clone().unwrap_or_else(|| validator_wallet.clone())
+        };
 
         // ── PoA-Check: Ist diese Node der ausgewählte Validator? ──────────
         {
@@ -982,7 +1034,7 @@ impl MasterNodeState {
 
         // Reward-TX hinzufügen (falls Reward > 0)
         if reward_amount > Decimal::ZERO {
-            let reward_tx = Self::create_reward_tx(&validator_wallet, reward_amount, next_index);
+            let reward_tx = Self::create_reward_tx(&reward_wallet, reward_amount, next_index);
             pending_txs.push(reward_tx);
         }
 
@@ -1014,7 +1066,7 @@ impl MasterNodeState {
             block.index,
             block.transactions.len(),
             reward_amount,
-            &validator_wallet[..16.min(validator_wallet.len())],
+            &reward_wallet[..16.min(reward_wallet.len())],
         );
 
         Ok(block)

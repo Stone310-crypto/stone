@@ -22,6 +22,7 @@ use super::handlers::{
     mining::{
         handle_mining_status, handle_mining_throttle, handle_mining_withdraw,
         handle_mining_stake, handle_mining_unstake,
+        handle_bind_mining_wallet, handle_mining_wallet_info,
     },
     chat::{
         handle_chat_conversations, handle_chat_messages, handle_chat_pending,
@@ -252,6 +253,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/mining/withdraw", post(handle_mining_withdraw))
         .route("/api/v1/mining/stake", post(handle_mining_stake))
         .route("/api/v1/mining/unstake", post(handle_mining_unstake))
+        .route("/api/v1/mining/bind-wallet", post(handle_bind_mining_wallet))
+        .route("/api/v1/mining/wallet", get(handle_mining_wallet_info))
         // ─── Reputation ──────────────────────────────────────────────────────
         .route("/api/v1/reputation/status", get(handle_reputation_status))
         .route("/api/v1/reputation/nodes", get(handle_reputation_nodes))

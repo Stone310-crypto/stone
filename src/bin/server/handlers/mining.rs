@@ -46,6 +46,13 @@ pub struct UnstakeRequest {
     pub amount: String,
 }
 
+#[derive(Deserialize)]
+pub struct BindWalletRequest {
+    /// Wallet-Adresse die an das Mining gebunden werden soll
+    /// (muss die Wallet des eingeloggten Users sein)
+    pub wallet: String,
+}
+
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
 /// GET /api/v1/mining/status — Mining-Status und Metriken
@@ -160,7 +167,7 @@ pub async fn handle_mining_status(
         .into_response()
 }
 
-/// POST /api/v1/mining/throttle — Mining-Leistung begrenzen
+/// POST /api/v1/mining/throttle — Mining-Leistung begrenzen (nur Admin)
 ///
 /// Setzt die Mining-Leistung in Prozent:
 /// - 0   = Mining komplett deaktiviert
@@ -171,10 +178,10 @@ pub async fn handle_mining_throttle(
     headers: HeaderMap,
     axum::Json(req): axum::Json<ThrottleRequest>,
 ) -> impl IntoResponse {
-    let _user = match require_user(&headers, &state) {
-        Ok(u) => u,
-        Err(e) => return e.into_response(),
-    };
+    // Nur Admin darf Mining-Leistung steuern
+    if let Err(e) = super::super::auth_middleware::require_admin(&headers, &state) {
+        return e.into_response();
+    }
 
     let pct = req.percent.min(100);
     state
@@ -206,8 +213,7 @@ pub async fn handle_mining_throttle(
 
 /// POST /api/v1/mining/withdraw — Mining-Rewards auf eigene Wallet transferieren
 ///
-/// Erstellt eine signierte Transfer-TX vom Validator-Wallet des Nodes
-/// auf die angegebene Ziel-Wallet und schiebt sie in den Mempool.
+/// Nur der User dessen Wallet die gebundene Mining-Wallet ist, darf Rewards abheben.
 ///
 /// Body: `{ "to_wallet": "hex...", "amount": "5.0", "memo": "optional" }`
 pub async fn handle_mining_withdraw(
@@ -215,10 +221,25 @@ pub async fn handle_mining_withdraw(
     headers: HeaderMap,
     axum::Json(req): axum::Json<WithdrawRequest>,
 ) -> impl IntoResponse {
-    let _user = match require_user(&headers, &state) {
+    let user = match require_user(&headers, &state) {
         Ok(u) => u,
         Err(e) => return e.into_response(),
     };
+
+    // ── Account-Bindung prüfen: Nur der Reward-Wallet-Owner darf withdrawen ──
+    let reward_wallet = state.node.effective_reward_wallet();
+    if user.wallet_address != reward_wallet {
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(json!({
+                "ok": false,
+                "error": "Nur der Mining-Wallet-Besitzer darf Rewards abheben",
+                "your_wallet": user.wallet_address,
+                "mining_wallet": reward_wallet,
+                "hint": "Binde deine Wallet zuerst mit POST /api/v1/mining/bind-wallet",
+            })),
+        ).into_response();
+    }
 
     // Betrag parsen
     let amount: rust_decimal::Decimal = match req.amount.parse() {
@@ -255,12 +276,12 @@ pub async fn handle_mining_withdraw(
 
     // Validator-Key laden
     let signing_key = load_or_create_validator_key();
-    let validator_wallet = local_validator_pubkey_hex(&signing_key);
+    let source_wallet = state.node.effective_reward_wallet();
 
     // Balance prüfen
     let (balance, nonce) = {
         let ledger = state.node.token_ledger.read().unwrap();
-        (ledger.balance(&validator_wallet), ledger.nonce(&validator_wallet))
+        (ledger.balance(&source_wallet), ledger.nonce(&source_wallet))
     };
 
     if balance < amount {
@@ -272,7 +293,7 @@ pub async fn handle_mining_withdraw(
                     "Nicht genug Balance: {} STONE verfügbar, {} angefordert",
                     balance, amount
                 ),
-                "validator_wallet": validator_wallet,
+                "mining_wallet": source_wallet,
                 "balance": balance.to_string(),
             })),
         ).into_response();
@@ -288,7 +309,7 @@ pub async fn handle_mining_withdraw(
     let tx = match create_signed_tx(
         &signing_key,
         TxType::Transfer,
-        validator_wallet.clone(),
+        source_wallet.clone(),
         req.to_wallet.clone(),
         amount,
         rust_decimal::Decimal::ZERO, // keine Fee für Mining-Withdrawal
@@ -327,7 +348,7 @@ pub async fn handle_mining_withdraw(
                 axum::Json(json!({
                     "ok": true,
                     "tx_id": tx_id,
-                    "from": validator_wallet,
+                    "from": source_wallet,
                     "to": req.to_wallet,
                     "amount": amount.to_string(),
                     "message": "Transfer in Mempool – wird im nächsten Block verarbeitet",
@@ -566,4 +587,127 @@ pub async fn handle_mining_unstake(
             axum::Json(json!({ "ok": false, "error": format!("Mempool: {e}") })),
         ).into_response(),
     }
+}
+
+// ─── Mining-Wallet Bindung ────────────────────────────────────────────────────
+
+/// POST /api/v1/mining/bind-wallet — Bindet die Wallet des eingeloggten Users als Mining-Reward-Empfänger.
+///
+/// Nur ein Admin oder der aktuelle Reward-Wallet-Owner kann die Bindung ändern.
+/// Bei der ersten Bindung (kein mining_wallet gesetzt) kann jeder Admin die Wallet binden.
+///
+/// Body: `{ "wallet": "hex..." }` — muss die wallet_address des eingeloggten Users sein.
+pub async fn handle_bind_mining_wallet(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::Json(req): axum::Json<BindWalletRequest>,
+) -> impl IntoResponse {
+    let user = match require_user(&headers, &state) {
+        Ok(u) => u,
+        Err(e) => return e.into_response(),
+    };
+
+    // User-Wallet muss übereinstimmen (User kann nur seine eigene Wallet binden)
+    if req.wallet != user.wallet_address {
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(json!({
+                "ok": false,
+                "error": "Du kannst nur deine eigene Wallet binden",
+                "your_wallet": user.wallet_address,
+                "requested_wallet": req.wallet,
+            })),
+        ).into_response();
+    }
+
+    if user.wallet_address.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({ "ok": false, "error": "Kein Wallet zugewiesen" })),
+        ).into_response();
+    }
+
+    // Wallet-Adresse validieren (muss gültiger Hex-Key sein)
+    if hex::decode(&req.wallet).is_err() {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({ "ok": false, "error": "Ungültige Wallet-Adresse (muss Hex-kodiert sein)" })),
+        ).into_response();
+    }
+
+    // Berechtigung prüfen: Admin ODER aktueller Reward-Wallet-Owner
+    let is_admin = super::super::auth_middleware::require_admin(&headers, &state).is_ok();
+    let current_reward_wallet = state.node.effective_reward_wallet();
+    let is_current_owner = user.wallet_address == current_reward_wallet;
+
+    // Prüfen ob bereits eine Mining-Wallet gebunden ist
+    let has_binding = state.node.mining_wallet.read().unwrap().is_some();
+
+    if has_binding && !is_admin && !is_current_owner {
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(json!({
+                "ok": false,
+                "error": "Mining-Wallet bereits gebunden. Nur der aktuelle Owner oder Admin kann die Bindung ändern.",
+                "current_mining_wallet": current_reward_wallet,
+            })),
+        ).into_response();
+    }
+
+    // Wallet binden
+    let new_wallet = Some(req.wallet.clone());
+    {
+        let mut mw = state.node.mining_wallet.write().unwrap();
+        *mw = new_wallet.clone();
+    }
+    stone::master_node::MasterNodeState::save_mining_wallet(&new_wallet);
+
+    println!(
+        "[mining] 🔒 Mining-Wallet gebunden: {} (durch User: {})",
+        &req.wallet[..16.min(req.wallet.len())],
+        user.name,
+    );
+
+    (
+        StatusCode::OK,
+        axum::Json(json!({
+            "ok": true,
+            "mining_wallet": req.wallet,
+            "bound_by": user.name,
+            "message": "Mining-Rewards gehen ab sofort an diese Wallet",
+        })),
+    ).into_response()
+}
+
+/// GET /api/v1/mining/wallet — Zeigt die aktuelle Mining-Wallet-Konfiguration.
+pub async fn handle_mining_wallet_info(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let _user = match require_user(&headers, &state) {
+        Ok(u) => u,
+        Err(e) => return e.into_response(),
+    };
+
+    let signing_key = load_or_create_validator_key();
+    let validator_wallet = local_validator_pubkey_hex(&signing_key);
+    let mining_wallet = state.node.mining_wallet.read().unwrap().clone();
+    let effective = state.node.effective_reward_wallet();
+
+    let balance = {
+        let ledger = state.node.token_ledger.read().unwrap();
+        ledger.balance(&effective).to_string()
+    };
+
+    (
+        StatusCode::OK,
+        axum::Json(json!({
+            "ok": true,
+            "validator_wallet": validator_wallet,
+            "mining_wallet": mining_wallet,
+            "effective_reward_wallet": effective,
+            "reward_balance": balance,
+            "is_bound": mining_wallet.is_some(),
+        })),
+    ).into_response()
 }
