@@ -124,15 +124,10 @@ pub const DEFAULT_P2P_PORT: u16 = 7654;
 /// WICHTIG: Die Reihenfolge bestimmt die Verbindungs-Priorität.
 /// Der VPS (212.227.54.241) ist der primäre Bootstrap und muss immer zuerst stehen.
 const SEED_NODES: &[&str] = &[
-    // ── VPS (212.227.54.241) – primärer Bootstrap, immer online ───────────
-    "/ip4/212.227.54.241/tcp/4001/p2p/12D3KooWAq975k49YZiCdaf3V96iJtU9fxqmoGRZW3e3Ceupv17k",
-    "/ip4/212.227.54.241/udp/4001/quic-v1/p2p/12D3KooWAq975k49YZiCdaf3V96iJtU9fxqmoGRZW3e3Ceupv17k",
-    // ── Server-Node (unrootles) – Öffentliche IPv6 ───────────────────────
-    "/ip6/2a0d:3341:b16b:4808:5054:ff:fea7:bab0/tcp/4001/p2p/12D3KooWLqikBBCRhCZ2MgSYG3R579BNUgrN5E6dZnYSEYdmAKTd",
-    "/ip6/2a0d:3341:b16b:4808:5054:ff:fea7:bab0/udp/4001/quic-v1/p2p/12D3KooWLqikBBCRhCZ2MgSYG3R579BNUgrN5E6dZnYSEYdmAKTd",
-    // ── Server-Node (unrootles) – Tailscale (Fallback) ───────────────────
-    "/ip4/100.90.28.68/tcp/4001/p2p/12D3KooWLqikBBCRhCZ2MgSYG3R579BNUgrN5E6dZnYSEYdmAKTd",
-    "/ip4/100.90.28.68/udp/4001/quic-v1/p2p/12D3KooWLqikBBCRhCZ2MgSYG3R579BNUgrN5E6dZnYSEYdmAKTd",
+    // ── VPS (212.227.54.241) – primärer Bootstrap + Relay, immer online ───
+    // Dieser Node hat Port 4001 offen und ist der zentrale Relay für NAT-Nodes.
+    "/ip4/212.227.54.241/tcp/4001/p2p/12D3KooWNz9GTNsFks567mHaQLKR4Ai6MCiw5WUDWAgvny1ow4tJ",
+    "/ip4/212.227.54.241/udp/4001/quic-v1/p2p/12D3KooWNz9GTNsFks567mHaQLKR4Ai6MCiw5WUDWAgvny1ow4tJ",
 ];
 
 /// Gibt das aktive Daten-Verzeichnis zurück.
@@ -1579,8 +1574,9 @@ impl SwarmTask {
                             )
                         })
                     }) {
-                        let circuit_addr = relay_addr
-                            .clone()
+                        // Erst /p2p entfernen falls vorhanden, dann sauber aufbauen
+                        let stripped = strip_p2p_suffix(relay_addr.clone());
+                        let circuit_addr = stripped
                             .with(libp2p::multiaddr::Protocol::P2p(peer_id))
                             .with(libp2p::multiaddr::Protocol::P2pCircuit);
                         if let Ok(_) = self.swarm.listen_on(circuit_addr.clone()) {
@@ -2318,8 +2314,9 @@ impl SwarmTask {
 
             if let Some(base_addr) = relay_base_addr {
                 // Relay-Circuit-Adresse aufbauen: /ip4/.../tcp/.../p2p/<relayPeerId>/p2p-circuit
-                let circuit_addr = base_addr
-                    .clone()
+                // Erst vorhandenes /p2p/ entfernen um Duplikate zu vermeiden
+                let stripped = strip_p2p_suffix(base_addr.clone());
+                let circuit_addr = stripped
                     .with(libp2p::multiaddr::Protocol::P2p(peer_id))
                     .with(libp2p::multiaddr::Protocol::P2pCircuit);
 
