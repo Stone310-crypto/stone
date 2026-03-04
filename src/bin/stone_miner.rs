@@ -14,7 +14,7 @@
 //!   stone-miner                       # Start mit Web-Dashboard
 //!   stone-miner --wallet <ADRESSE>    # Wallet direkt angeben
 //!   stone-miner --headless            # Ohne Dashboard (Log-Modus)
-//!   stone-miner --port 3030           # Dashboard-Port ändern (Default: 8080)
+//!   stone-miner --port 3030           # Dashboard-Port ändern (Default: 8081)
 
 #[path = "server/mod.rs"]
 mod server;
@@ -112,8 +112,8 @@ fn default_node_name() -> String {
         .and_then(|h| h.into_string().ok())
         .unwrap_or_else(|| "stone-miner".into())
 }
-fn default_http_port() -> u16 { 8080 }
-fn default_dashboard_port() -> u16 { 4005 }
+fn default_http_port() -> u16 { 8081 }
+fn default_dashboard_port() -> u16 { 6969 }
 
 impl MinerConfig {
     fn config_path() -> String {
@@ -611,7 +611,7 @@ async fn handle_p2p_event(
 
         NetworkEvent::PeerIdentified { peer_id, addresses, .. } => {
             let http_port = std::env::var("STONE_PORT")
-                .ok().and_then(|v| v.parse::<u16>().ok()).unwrap_or(8080);
+                .ok().and_then(|v| v.parse::<u16>().ok()).unwrap_or(1);
             let mut ip: Option<String> = None;
             for addr in &addresses {
                 let parts: Vec<&str> = addr.split('/').collect();
@@ -1035,7 +1035,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("      --headless       Log-Modus ohne Web-Dashboard");
                 println!("  -h, --help           Diese Hilfe anzeigen");
                 println!();
-                println!("Dashboard: http://localhost:<port>/ui (Default: 8080)");
+                println!("Dashboard: http://localhost:<port>/ui (Default: 8081)");
                 std::process::exit(0);
             }
             _ => { i += 1; }
@@ -1287,10 +1287,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let http_addr = std::net::SocketAddr::from(([0, 0, 0, 0], http_port));
     let dashboard_addr = std::net::SocketAddr::from(([0, 0, 0, 0], dashboard_port));
 
-    // Start Node-API HTTP server (port 8080)
+    // Start Node-API HTTP server (port 8081)
     let node_listener = tokio::net::TcpListener::bind(http_addr).await?;
 
-    // Start Dashboard HTTP server (port 4005)
+    // Start Dashboard HTTP server (port 6969)
     let dashboard_listener = tokio::net::TcpListener::bind(dashboard_addr).await?;
 
     miner_state.add_log(format!("Node: {node_id}"));

@@ -1480,7 +1480,19 @@ impl SwarmTask {
                 let local_peer = *self.swarm.local_peer_id();
                 let full_addr = format!("{address}/p2p/{local_peer}");
                 println!("[p2p] 🎧 Lausche auf: {full_addr}");
-                let _ = self.event_tx.send(NetworkEvent::Listening { addr: full_addr });
+                let _ = self.event_tx.send(NetworkEvent::Listening { addr: full_addr.clone() });
+
+                // Relay-Circuit-Adressen als externe Adresse bekanntgeben,
+                // damit Identify sie an andere Peers verbreitet.
+                let is_circuit = address.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit));
+                if is_circuit {
+                    let ext_addr = address.clone()
+                        .with(libp2p::multiaddr::Protocol::P2p(local_peer));
+                    self.swarm.add_external_address(ext_addr.clone());
+                    // Auch in Kademlia eintragen
+                    self.swarm.behaviour_mut().kad.add_address(&local_peer, ext_addr.clone());
+                    println!("[p2p] 🌍 Circuit-Listen als externe Adresse: {ext_addr}");
+                }
             }
 
             SwarmEvent::OutgoingConnectionError { peer_id, error, .. } => {
@@ -1541,8 +1553,30 @@ impl SwarmTask {
                 let addrs: Vec<String> = info.listen_addrs.iter().map(|a| a.to_string()).collect();
                 println!("[p2p] Identify: {peer_id} – agent={}", info.agent_version);
 
+                // Nur routable Adressen in Kademlia eintragen:
+                // - Öffentliche IPs (nicht 127.x, nicht 10.x, nicht 192.168.x, nicht 100.64-127.x CGNAT)
+                // - Relay-Circuit-Adressen (/p2p-circuit)
+                // Private/Tailscale-Adressen führen zu sinnlosen Dial-Versuchen auf anderen Nodes.
                 for addr in &info.listen_addrs {
-                    self.swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
+                    let is_circuit = addr.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::P2pCircuit));
+                    let is_routable = addr.iter().any(|p| {
+                        match p {
+                            libp2p::multiaddr::Protocol::Ip4(ip) => {
+                                !ip.is_loopback()
+                                    && !ip.is_unspecified()
+                                    && !ip.is_private()
+                                    // CGNAT range 100.64.0.0/10 (Tailscale etc.)
+                                    && !(ip.octets()[0] == 100 && ip.octets()[1] >= 64 && ip.octets()[1] <= 127)
+                            }
+                            libp2p::multiaddr::Protocol::Ip6(ip) => {
+                                !ip.is_loopback() && !ip.is_unspecified()
+                            }
+                            _ => false,
+                        }
+                    });
+                    if is_circuit || is_routable {
+                        self.swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
+                    }
                 }
 
                 if let Some(entry) = self.peers.get_mut(&peer_id) {
@@ -1981,6 +2015,37 @@ impl SwarmTask {
             }) => {
                 self.active_relays.insert(relay_peer_id);
                 println!("[p2p] ✅ Relay-Reservation akzeptiert von {relay_peer_id} ({} aktive Relays)", self.active_relays.len());
+
+                // ── Relay-Circuit-Adresse als externe Adresse bekanntgeben ──
+                // Damit andere Peers (insbesondere NAT-Peers) uns über den Relay
+                // finden können, muss die Circuit-Adresse via Identify verbreitet
+                // und in Kademlia eingetragen werden.
+                if let Some(info) = self.peers.get(&relay_peer_id) {
+                    // Öffentliche Adresse des Relays finden
+                    for addr_str in &info.addresses {
+                        if let Ok(addr) = addr_str.parse::<Multiaddr>() {
+                            let is_public = addr.iter().any(|p| {
+                                matches!(p,
+                                    libp2p::multiaddr::Protocol::Ip4(ip)
+                                        if !ip.is_private() && !ip.is_loopback() && !ip.is_unspecified()
+                                ) || matches!(p,
+                                    libp2p::multiaddr::Protocol::Ip6(ip)
+                                        if !ip.is_loopback() && !ip.is_unspecified()
+                                )
+                            });
+                            if is_public {
+                                let circuit_addr = strip_p2p_suffix(addr)
+                                    .with(libp2p::multiaddr::Protocol::P2p(relay_peer_id))
+                                    .with(libp2p::multiaddr::Protocol::P2pCircuit);
+                                let local_peer = *self.swarm.local_peer_id();
+                                let full_circuit = circuit_addr.clone()
+                                    .with(libp2p::multiaddr::Protocol::P2p(local_peer));
+                                self.swarm.add_external_address(full_circuit.clone());
+                                println!("[p2p] 🌍 Relay-Circuit als externe Adresse: {full_circuit}");
+                            }
+                        }
+                    }
+                }
             }
 
             StoneBehaviourEvent::RelayClient(relay::client::Event::OutboundCircuitEstablished {
