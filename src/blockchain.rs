@@ -343,6 +343,32 @@ impl StoneChain {
         }
     }
 
+    /// Kürzt die Chain auf `target_len` Blöcke (für Fork-Reorg).
+    /// Entfernt alle Blöcke ab Index `target_len` und aktualisiert latest_hash.
+    /// Die entfernten Blöcke werden auch aus RocksDB gelöscht.
+    pub fn truncate_to(&mut self, target_len: u64) {
+        let target = target_len as usize;
+        if target >= self.blocks.len() {
+            return; // Nichts zu tun
+        }
+        let removed = self.blocks.len() - target;
+        self.blocks.truncate(target);
+        self.latest_hash = self.blocks.last().map(|b| b.hash.clone()).unwrap_or_default();
+        println!(
+            "[chain] 🔄 Chain auf {} Blöcke gekürzt ({} entfernt), latest_hash={}...",
+            target,
+            removed,
+            &self.latest_hash[..8.min(self.latest_hash.len())],
+        );
+        // RocksDB: entfernte Blöcke löschen
+        use crate::storage::ChainStore;
+        if let Ok(store) = ChainStore::open() {
+            for idx in target..target + removed {
+                store.delete_block(idx as u64);
+            }
+        }
+    }
+
     /// Neuen Block mit Dokumenten und Token-Transaktionen hinzufügen
     pub fn add_documents(
         &mut self,
@@ -468,13 +494,59 @@ impl StoneChain {
     ) -> Result<(), String> {
         let local_len = self.blocks.len() as u64;
 
-        // Block ist älter als unsere Chain → stillschweigend ignorieren
+        // ── Fork-Reorg: Block liegt hinter unserer Chain ──────────────────
+        // Bei kurzen Chains (< 50 Blöcke) Reorg erlauben, falls der Block
+        // von einer längeren Peer-Chain stammt.
         if block.index < local_len {
-            return Err(format!(
-                "Stale: Block #{} bereits bekannt (lokale Höhe: {local_len})",
-                block.index
-            ));
+            // Prüfe ob der Block identisch mit unserem ist → Stale (ignorieren)
+            if let Some(existing) = self.blocks.get(block.index as usize) {
+                if existing.hash == block.hash {
+                    return Err(format!(
+                        "Stale: Block #{} bereits bekannt (identisch)",
+                        block.index
+                    ));
+                }
+                // Block hat gleichen Index aber anderen Hash → Fork!
+                if local_len <= 50 {
+                    // Prüfe ob der block.previous_hash zu unserem Vorgänger passt
+                    let prev_ok = if block.index == 0 {
+                        true // Genesis
+                    } else {
+                        self.blocks.get((block.index - 1) as usize)
+                            .map(|b| b.hash == block.previous_hash)
+                            .unwrap_or(false)
+                    };
+                    if prev_ok {
+                        println!(
+                            "[chain] 🔄 Fork-Reorg bei Block #{}: lokal={}… peer={}… – ersetze lokale Blöcke",
+                            block.index,
+                            &existing.hash[..8.min(existing.hash.len())],
+                            &block.hash[..8.min(block.hash.len())],
+                        );
+                        self.truncate_to(block.index);
+                        // Weiter mit normaler Block-Akzeptanz
+                    } else {
+                        return Err(format!(
+                            "Stale: Block #{} bereits bekannt (Fork, previous_hash passt nicht)",
+                            block.index
+                        ));
+                    }
+                } else {
+                    return Err(format!(
+                        "Stale: Block #{} bereits bekannt (lokale Höhe: {local_len})",
+                        block.index
+                    ));
+                }
+            } else {
+                return Err(format!(
+                    "Stale: Block #{} Index out-of-range (lokale Höhe: {local_len})",
+                    block.index
+                ));
+            }
         }
+
+        // Aktuelle Länge nach potentiellem Reorg neu lesen
+        let local_len = self.blocks.len() as u64;
 
         // Block für einen Index den wir noch nicht haben, aber nicht der nächste →
         // Lücke in der Chain → vollständiger Resync vom Peer nötig
@@ -486,11 +558,50 @@ impl StoneChain {
         }
 
         if block.previous_hash != self.latest_hash {
-            return Err(format!(
-                "previous_hash passt nicht: erwartet {}, empfangen {} – möglicher Fork",
-                &self.latest_hash[..12.min(self.latest_hash.len())],
-                &block.previous_hash[..12.min(block.previous_hash.len())],
-            ));
+            // ── Fork-Erkennung bei kurzer Chain ───────────────────────────
+            // Wenn unsere Chain sehr kurz ist (< 50 Blöcke), ist es wahrscheinlich
+            // ein lokaler Fork durch Mining vor Peer-Sync. In diesem Fall: Reorg
+            // durchführen, also unsere divergierenden Blöcke entfernen und den
+            // Peer-Block akzeptieren.
+            if local_len <= 50 && block.index > 0 {
+                // Suche den gemeinsamen Vorgänger (Fork-Punkt)
+                if let Some(prev_block) = self.blocks.iter().find(|b| b.hash == block.previous_hash) {
+                    let fork_point = prev_block.index + 1;
+                    println!(
+                        "[chain] 🔄 Fork-Reorg: Lokale Chain hat {} Blöcke, Fork bei #{} – entferne {} lokale Blöcke",
+                        local_len, fork_point, local_len - fork_point
+                    );
+                    self.truncate_to(fork_point);
+                    // Jetzt sollte latest_hash == block.previous_hash sein
+                    if block.previous_hash != self.latest_hash {
+                        return Err(format!(
+                            "previous_hash nach Reorg immer noch falsch: erwartet {}, empfangen {}",
+                            &self.latest_hash[..12.min(self.latest_hash.len())],
+                            &block.previous_hash[..12.min(block.previous_hash.len())],
+                        ));
+                    }
+                    // Block-Index muss jetzt auch passen
+                    let new_len = self.blocks.len() as u64;
+                    if block.index != new_len {
+                        return Err(format!(
+                            "Gap nach Reorg: erwarte Index {new_len}, empfangen {}",
+                            block.index
+                        ));
+                    }
+                } else {
+                    return Err(format!(
+                        "previous_hash passt nicht: erwartet {}, empfangen {} – möglicher Fork (kein gemeinsamer Vorgänger)",
+                        &self.latest_hash[..12.min(self.latest_hash.len())],
+                        &block.previous_hash[..12.min(block.previous_hash.len())],
+                    ));
+                }
+            } else {
+                return Err(format!(
+                    "previous_hash passt nicht: erwartet {}, empfangen {} – möglicher Fork",
+                    &self.latest_hash[..12.min(self.latest_hash.len())],
+                    &block.previous_hash[..12.min(block.previous_hash.len())],
+                ));
+            }
         }
 
         // ── Hash-Integrität ───────────────────────────────────────────────

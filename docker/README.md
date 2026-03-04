@@ -48,14 +48,18 @@ docker-compose -f docker/docker-compose.yml --profile cluster down -v
 | `STONE_STORAGE_GB`   | ❌       | `50`    | Angebotener Speicher in GB                       |
 | `STONE_SEED_PEERS`   | ❌       | –       | Komma-separierte libp2p Multiaddrs               |
 | `STONE_HTTP_PORT`    | ❌       | `8080`  | HTTP-Port (intern im Container)                  |
-| `STONE_P2P_PORT`     | ❌       | `4001`  | P2P-Port (intern im Container)                   |
+| `STONE_P2P_PORT`     | ❌       | `4001`  | P2P-Port TCP + QUIC/UDP (intern im Container)    |
 | `STONE_NO_SEED`      | ❌       | –       | Auf `1` setzen um eingebaute Production-Seed-Nodes zu deaktivieren |
+| `STONE_ADMIN_KEY`    | ❌       | –       | Separater Admin-API-Key (empfohlen für Produktion) |
+| `STONE_VALIDATOR_PASSPHRASE` | ❌ | –   | Passphrase für Validator-Key-Verschlüsselung      |
 
 ### Seed-Peers Format
 
 ```
 /ip4/192.168.1.100/tcp/4001
+/ip4/192.168.1.100/udp/4001/quic-v1
 /dns4/stone-node1/tcp/4001
+/dns4/stone-node1/udp/4001/quic-v1
 /ip4/10.0.0.5/tcp/4001/p2p/12D3KooW...
 ```
 
@@ -83,9 +87,18 @@ Mehrere Peers mit Komma trennen:
 │    │   POST /api/setup/finish                │
 │    └─ stone-setup läuft als Full-Node        │
 │                                              │
+│  Transport:                                  │
+│    TCP  + Noise + Yamux  (Port 4001)         │
+│    QUIC + TLS 1.3       (Port 4001/UDP)      │
+│                                              │
+│  NAT-Traversal:                              │
+│    AutoNAT + UPnP + DCUtR + Relay            │
+│    → Nodes hinter NAT verbinden ohne Ports   │
+│                                              │
 │  Ports:                                      │
-│    8080 → HTTP API + Dashboard               │
-│    4001 → P2P (libp2p TCP)                   │
+│    8080     → HTTP API + Dashboard             │
+│    4001/tcp → P2P (libp2p TCP + Noise)        │
+│    4001/udp → P2P (QUIC, native TLS 1.3)      │
 │                                              │
 │  Volume:                                     │
 │    /opt/stone-node/stone_data                │
@@ -107,10 +120,11 @@ docker run -d \
   --network stone-docker_stonenet \
   -p 8084:8080 \
   -p 4014:4001 \
+  -p 4014:4001/udp \
   -e STONE_NODE_NAME="validator-4" \
   -e STONE_PASSWORD="SecurePass99!" \
   -e STONE_STORAGE_GB=100 \
-  -e STONE_SEED_PEERS="/dns4/stone-node1/tcp/4001" \
+  -e STONE_SEED_PEERS="/dns4/stone-node1/tcp/4001,/dns4/stone-node1/udp/4001/quic-v1" \
   stone-node
 ```
 

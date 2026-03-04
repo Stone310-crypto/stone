@@ -178,23 +178,31 @@ async fn main() {
                                     }
 
                                     let poa_ok = {
-                                        let vs = node_bg.validator_set.read().unwrap();
-                                        if vs.validators.is_empty() {
-                                            None
+                                        // Während Initial-Sync: PoA-Prüfung überspringen.
+                                        // Die synced Blöcke wurden vom Netzwerk bereits akzeptiert.
+                                        let syncing = !node_bg.metrics.initial_sync_done.load(
+                                            std::sync::atomic::Ordering::Relaxed
+                                        );
+                                        if syncing {
+                                            None // PoA bei Sync überspringen
                                         } else {
-                                            // v0.3.0: Prüfe auch ob der Signer der ausgewählte Validator war
-                                            let prev_hash = {
-                                                let chain = node_bg.chain.lock().unwrap();
-                                                chain.blocks.last().map(|b| b.hash.clone()).unwrap_or_else(|| "genesis".into())
-                                            };
-                                            let result = vs.verify_block_with_selection(
-                                                &block.hash,
-                                                &block.signer,
-                                                &block.validator_signature,
-                                                &prev_hash,
-                                                block.index,
-                                            );
-                                            Some(result.is_acceptable())
+                                            let vs = node_bg.validator_set.read().unwrap();
+                                            if vs.validators.is_empty() {
+                                                None
+                                            } else {
+                                                let prev_hash = {
+                                                    let chain = node_bg.chain.lock().unwrap();
+                                                    chain.blocks.last().map(|b| b.hash.clone()).unwrap_or_else(|| "genesis".into())
+                                                };
+                                                let result = vs.verify_block_with_selection(
+                                                    &block.hash,
+                                                    &block.signer,
+                                                    &block.validator_signature,
+                                                    &prev_hash,
+                                                    block.index,
+                                                );
+                                                Some(result.is_acceptable())
+                                            }
                                         }
                                     };
 
@@ -255,6 +263,11 @@ async fn main() {
                                     match result {
                                         BlockResult::Accepted(count) => {
                                             handle_bg.set_chain_count(count).await;
+                                            // Logging bei erstem Peer-Block, aber
+                                            // initial_sync_done NICHT setzen – das macht
+                                            // erst der 60-Sekunden-Timeout im Mining-Loop,
+                                            // damit die PoA-Bypass-Phase den kompletten
+                                            // initialen Sync abdeckt.
                                         }
                                         BlockResult::NeedsResync { idx, from, err } => {
                                             eprintln!(
@@ -274,14 +287,44 @@ async fn main() {
                                                     for (i, part) in parts.iter().enumerate() {
                                                         if *part == "ip4" {
                                                             if let Some(ip) = parts.get(i + 1) {
-                                                                if *ip != "127.0.0.1" && *ip != "0.0.0.0" {
-                                                                    resolved_url = Some(format!("http://{}:{}", ip, http_port));
-                                                                    break;
+                                                                // Localhost, Unspecified, Docker-Bridge
+                                                                // und private Netzwerke überspringen
+                                                                if *ip == "127.0.0.1"
+                                                                    || *ip == "0.0.0.0"
+                                                                    || ip.starts_with("172.")
+                                                                    || ip.starts_with("10.")
+                                                                    || ip.starts_with("192.168.")
+                                                                    || ip.starts_with("169.254.")
+                                                                {
+                                                                    continue;
                                                                 }
+                                                                resolved_url = Some(format!("http://{}:{}", ip, http_port));
+                                                                break;
                                                             }
                                                         }
                                                     }
                                                     if resolved_url.is_some() { break; }
+                                                }
+                                                // Fallback: Wenn kein öffentliches IP gefunden,
+                                                // nimm das erste nicht-localhost IP (z.B. Tailscale 100.x / privates Netz)
+                                                if resolved_url.is_none() {
+                                                    for addr in &np.addresses {
+                                                        let parts: Vec<&str> = addr.split('/').collect();
+                                                        for (i, part) in parts.iter().enumerate() {
+                                                            if *part == "ip4" {
+                                                                if let Some(ip) = parts.get(i + 1) {
+                                                                    if *ip != "127.0.0.1"
+                                                                        && *ip != "0.0.0.0"
+                                                                        && !ip.starts_with("172.")
+                                                                    {
+                                                                        resolved_url = Some(format!("http://{}:{}", ip, http_port));
+                                                                        break;
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                        if resolved_url.is_some() { break; }
+                                                    }
                                                 }
                                             }
 

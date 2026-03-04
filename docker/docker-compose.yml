@@ -26,6 +26,8 @@ services:
       STONE_STORAGE_GB: "50"
       STONE_HTTP_PORT: "8080"
       STONE_P2P_PORT: "4001"
+      # Bootstrap zuerst zum VPS (öffentliche IPv4), dann IPv6-Server
+      STONE_SEED_PEERS: "/ip4/212.227.54.241/tcp/4001/p2p/12D3KooWAq975k49YZiCdaf3V96iJtU9fxqmoGRZW3e3Ceupv17k,/ip4/212.227.54.241/udp/4001/quic-v1/p2p/12D3KooWAq975k49YZiCdaf3V96iJtU9fxqmoGRZW3e3Ceupv17k"
       # STONE_ADMIN_KEY: "" # Optional: separater Admin-Key
     volumes:
       - node_data:/opt/stone-node/stone_data
@@ -53,7 +55,8 @@ services:
       STONE_HTTP_PORT: "8080"
       STONE_P2P_PORT: "4001"
       STONE_NO_SEED: "1"
-      STONE_SEED_PEERS: "/dns4/stone-node/tcp/4001,/dns4/stone-node/udp/4001/quic-v1"
+      # VPS als primärer Bootstrap + lokaler Docker-Node als Fallback
+      STONE_SEED_PEERS: "/ip4/212.227.54.241/tcp/4001/p2p/12D3KooWAq975k49YZiCdaf3V96iJtU9fxqmoGRZW3e3Ceupv17k,/ip4/212.227.54.241/udp/4001/quic-v1/p2p/12D3KooWAq975k49YZiCdaf3V96iJtU9fxqmoGRZW3e3Ceupv17k,/dns4/stone-node/tcp/4001,/dns4/stone-node/udp/4001/quic-v1"
     volumes:
       - node2_data:/opt/stone-node/stone_data
     networks:
@@ -83,7 +86,8 @@ services:
       STONE_HTTP_PORT: "8080"
       STONE_P2P_PORT: "4001"
       STONE_NO_SEED: "1"
-      STONE_SEED_PEERS: "/dns4/stone-node/tcp/4001,/dns4/stone-node/udp/4001/quic-v1"
+      # VPS als primärer Bootstrap + lokaler Docker-Node als Fallback
+      STONE_SEED_PEERS: "/ip4/212.227.54.241/tcp/4001/p2p/12D3KooWAq975k49YZiCdaf3V96iJtU9fxqmoGRZW3e3Ceupv17k,/ip4/212.227.54.241/udp/4001/quic-v1/p2p/12D3KooWAq975k49YZiCdaf3V96iJtU9fxqmoGRZW3e3Ceupv17k,/dns4/stone-node/tcp/4001,/dns4/stone-node/udp/4001/quic-v1"
     volumes:
       - node3_data:/opt/stone-node/stone_data
     networks:

@@ -29,7 +29,7 @@ use chrono::Utc;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
@@ -450,6 +450,8 @@ pub struct MasterMetrics {
     pub mining_throttle_pct: AtomicU64,
     /// Anzahl der Chat-Nachrichten die geminet wurden
     pub chat_messages_mined: AtomicU64,
+    /// Initialer Peer-Sync abgeschlossen (Mining erst danach starten)
+    pub initial_sync_done: AtomicBool,
 }
 
 impl MasterNodeState {
@@ -511,6 +513,16 @@ impl MasterNodeState {
             chat_policy: RwLock::new(chat_policy),
             mining_wallet: RwLock::new(Self::load_mining_wallet()),
         });
+
+        // Wenn die Chain bereits > 10 Blöcke hat (Restart einer synced Node),
+        // Mining sofort erlauben (kein Initial-Sync nötig)
+        {
+            let chain_len = state.chain.lock().unwrap().blocks.len();
+            if chain_len > 10 {
+                state.metrics.initial_sync_done.store(true, Ordering::Relaxed);
+                println!("[mining] Chain hat {chain_len} Blöcke – Initial-Sync übersprungen");
+            }
+        }
 
         // Node-gestartet Event senden
         state.events.publish(NodeEvent::NodeStarted {
@@ -1238,6 +1250,19 @@ impl MasterNodeState {
             let mut ticker = tokio::time::interval(interval);
             loop {
                 ticker.tick().await;
+
+                // ── Initial-Sync abwarten ─────────────────────────────────
+                // Erst nach abgeschlossenem Peer-Sync starten, damit keine
+                // Fork-Blöcke erzeugt werden. Timeout: 60s nach Node-Start.
+                if !state.metrics.initial_sync_done.load(Ordering::Relaxed) {
+                    let uptime = Utc::now().timestamp() - state.started_at;
+                    if uptime < 60 {
+                        continue; // Warte auf Sync
+                    }
+                    // Timeout: kein Peer hat mehr Blöcke oder kein Peer verbunden
+                    println!("[mining] ⏰ Initial-Sync Timeout (60s) – starte Mining");
+                    state.metrics.initial_sync_done.store(true, Ordering::Relaxed);
+                }
 
                 // Mining-Throttle: Leistungsbegrenzung prüfen
                 {

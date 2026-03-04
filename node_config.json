@@ -5,7 +5,8 @@
   "wallet_address": "e3f130548fac7b4bc73feaf0fce1fd819df3f8303c5eaa596a9fd54c81eafac5",
   "mnemonic_once": "",
   "seed_peers": [
-    "/ip4/100.90.28.68/tcp/4001/p2p/12D3KooWLqikBBCRhCZ2MgSYG3R579BNUgrN5E6dZnYSEYdmAKTd"
+    "/ip4/100.90.28.68/tcp/4001/p2p/12D3KooWLqikBBCRhCZ2MgSYG3R579BNUgrN5E6dZnYSEYdmAKTd",
+    "/ip4/145.224.75.168/tcp/4001/p2p/12D3KooWLqikBBCRhCZ2MgSYG3R579BNUgrN5E6dZnYSEYdmAKTd"
   ],
   "http_port": 8080,
   "p2p_port": 4001,

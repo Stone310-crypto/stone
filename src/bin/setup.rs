@@ -594,18 +594,26 @@ async fn handle_p2p_event(
             }
 
             let poa_ok = {
-                let vs = node.validator_set.read().unwrap();
-                if vs.validators.is_empty() { None }
-                else {
-                    // v0.3.0: Prüfe auch ob der Signer der ausgewählte Validator war
-                    let prev_hash = {
-                        let chain = node.chain.lock().unwrap();
-                        chain.blocks.last().map(|b| b.hash.clone()).unwrap_or_else(|| "genesis".into())
-                    };
-                    Some(vs.verify_block_with_selection(
-                        &block.hash, &block.signer, &block.validator_signature,
-                        &prev_hash, block.index,
-                    ).is_acceptable())
+                // Während Initial-Sync: PoA-Prüfung überspringen.
+                // Die synced Blöcke wurden vom Netzwerk bereits akzeptiert.
+                let syncing = !node.metrics.initial_sync_done.load(
+                    std::sync::atomic::Ordering::Relaxed
+                );
+                if syncing {
+                    None // PoA bei Sync überspringen
+                } else {
+                    let vs = node.validator_set.read().unwrap();
+                    if vs.validators.is_empty() { None }
+                    else {
+                        let prev_hash = {
+                            let chain = node.chain.lock().unwrap();
+                            chain.blocks.last().map(|b| b.hash.clone()).unwrap_or_else(|| "genesis".into())
+                        };
+                        Some(vs.verify_block_with_selection(
+                            &block.hash, &block.signer, &block.validator_signature,
+                            &prev_hash, block.index,
+                        ).is_acceptable())
+                    }
                 }
             };
 

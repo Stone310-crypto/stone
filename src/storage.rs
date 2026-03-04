@@ -185,6 +185,15 @@ impl ChainStore {
 
     // ─── Lesen ───────────────────────────────────────────────────────────────
 
+    /// Löscht einen Block anhand seines Index aus RocksDB.
+    /// Wird für Chain-Reorg (Fork-Auflösung) verwendet.
+    pub fn delete_block(&self, index: u64) {
+        if let Some(cf) = self.db.cf_handle("blocks") {
+            let key = index.to_le_bytes();
+            let _ = self.db.delete_cf(cf, key);
+        }
+    }
+
     /// Liest einen einzelnen Block anhand seines Index.
     pub fn read_block(&self, index: u64) -> Result<Block, StorageError> {
         let cf = self.db.cf_handle("blocks")

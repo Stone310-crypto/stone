@@ -20,5 +20,49 @@
     "block_height": 0,
     "latency_ms": null,
     "sync_failures": 0
+  },
+  {
+    "url": "http://172.17.0.1:8080",
+    "name": "12D3KooWLqik",
+    "ca": null,
+    "status": "Unreachable",
+    "last_seen": 0,
+    "last_hash": null,
+    "block_height": 0,
+    "latency_ms": null,
+    "sync_failures": 0
+  },
+  {
+    "url": "http://212.227.54.241:8080",
+    "name": "12D3KooWAq97",
+    "ca": null,
+    "status": "Unreachable",
+    "last_seen": 0,
+    "last_hash": null,
+    "block_height": 0,
+    "latency_ms": null,
+    "sync_failures": 0
+  },
+  {
+    "url": "http://172.18.0.1:8080",
+    "name": "12D3KooWAq97",
+    "ca": null,
+    "status": "Unreachable",
+    "last_seen": 0,
+    "last_hash": null,
+    "block_height": 0,
+    "latency_ms": null,
+    "sync_failures": 0
+  },
+  {
+    "url": "http://100.98.163.71:8080",
+    "name": "12D3KooWLqik",
+    "ca": null,
+    "status": "Healthy",
+    "last_seen": 1772582836,
+    "last_hash": "963dcbd3559d2f606dc8042ccb9230cc780be84f8d8b1c722ff2271c99f066c6",
+    "block_height": 24,
+    "latency_ms": 1,
+    "sync_failures": 0
   }
 ]

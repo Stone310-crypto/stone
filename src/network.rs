@@ -121,13 +121,14 @@ pub const DEFAULT_P2P_PORT: u16 = 7654;
 /// Jeder dieser Nodes ist gleichzeitig Relay-Server und Bootstrap-Node.
 /// TCP und QUIC (UDP) Adressen – QUIC wird für NAT-Traversal bevorzugt.
 const SEED_NODES: &[&str] = &[
-    // Server-Node (unrootles) – Öffentliche IPv6 (TCP)
+    // ── VPS (212.227.54.241) – öffentlich erreichbar ─────────────────────────
+    "/ip4/212.227.54.241/tcp/4001/p2p/12D3KooWAq975k49YZiCdaf3V96iJtU9fxqmoGRZW3e3Ceupv17k",
+    "/ip4/212.227.54.241/udp/4001/quic-v1/p2p/12D3KooWAq975k49YZiCdaf3V96iJtU9fxqmoGRZW3e3Ceupv17k",
+    // ── Server-Node (unrootles) – Öffentliche IPv6 ───────────────────────────
     "/ip6/2a0d:3341:b16b:4808:5054:ff:fea7:bab0/tcp/4001/p2p/12D3KooWLqikBBCRhCZ2MgSYG3R579BNUgrN5E6dZnYSEYdmAKTd",
-    // Server-Node (unrootles) – Öffentliche IPv6 (QUIC/UDP)
     "/ip6/2a0d:3341:b16b:4808:5054:ff:fea7:bab0/udp/4001/quic-v1/p2p/12D3KooWLqikBBCRhCZ2MgSYG3R579BNUgrN5E6dZnYSEYdmAKTd",
-    // Server-Node (unrootles) – Tailscale (TCP, Fallback)
+    // ── Server-Node (unrootles) – Tailscale (Fallback) ───────────────────────
     "/ip4/100.90.28.68/tcp/4001/p2p/12D3KooWLqikBBCRhCZ2MgSYG3R579BNUgrN5E6dZnYSEYdmAKTd",
-    // Server-Node (unrootles) – Tailscale (QUIC/UDP, Fallback)
     "/ip4/100.90.28.68/udp/4001/quic-v1/p2p/12D3KooWLqikBBCRhCZ2MgSYG3R579BNUgrN5E6dZnYSEYdmAKTd",
 ];
 
@@ -994,6 +995,18 @@ struct SwarmTask {
 
     /// Speicher-Ankündigungen von Peers: PeerId-String → StorageAnnouncement
     peer_storage: HashMap<String, StorageAnnouncement>,
+
+    /// Ausstehende ChainInfo-Anfragen: request_id → PeerId
+    /// Wird verwendet um die Antwort dem richtigen Peer zuzuordnen und Sync auszulösen.
+    pending_chain_info: HashMap<request_response::OutboundRequestId, PeerId>,
+
+    /// Sync-Buffer: Sammelt Blöcke aus parallelen Range-Responses und fügt sie
+    /// geordnet ein. Key = Block-Index für schnellen Lookup.
+    sync_buffer: std::collections::BTreeMap<u64, (Block, String)>,
+    /// Zeitpunkt als zuletzt Blöcke in den sync_buffer kamen (für Flush-Timeout)
+    sync_buffer_last_insert: Option<Instant>,
+    /// Erwarteter nächster Block-Index für den Sync (= unsere Chain-Höhe beim Sync-Start)
+    sync_expected_next: u64,
 }
 
 /// Tracking für Fehlverhalten eines Peers
@@ -1198,6 +1211,14 @@ impl SwarmTask {
         let mut reconnect_ticker = tokio::time::interval(reconnect_interval);
         reconnect_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        // Periodischer Sync-Check: alle 30s prüfen ob verbundene Peers mehr Blöcke haben
+        let mut sync_ticker = tokio::time::interval(Duration::from_secs(30));
+        sync_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        // Sync-Buffer Flush-Ticker: alle 500ms prüfen ob gepufferte Blöcke geflusht werden können
+        let mut flush_ticker = tokio::time::interval(Duration::from_millis(500));
+        flush_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
             tokio::select! {
                 event = self.swarm.next() => {
@@ -1214,6 +1235,14 @@ impl SwarmTask {
                 }
                 _ = reconnect_ticker.tick() => {
                     self.reconnect_bootstrap_nodes();
+                }
+                _ = sync_ticker.tick() => {
+                    self.sync_with_connected_peers();
+                }
+                _ = flush_ticker.tick() => {
+                    if !self.sync_buffer.is_empty() {
+                        self.flush_sync_buffer();
+                    }
                 }
             }
         }
@@ -1353,7 +1382,17 @@ impl SwarmTask {
                         addr,
                     });
 
-                    // Chain-Sync anstoßen: Handshake-Nachricht via Gossipsub senden
+                    // Chain-Sync anstoßen:
+                    // 1) Direkte ChainInfo-Anfrage per Request/Response (sofort zuverlässig)
+                    if self.config.auto_sync_on_connect {
+                        let req_id = self.swarm.behaviour_mut().block_exchange.send_request(
+                            &peer_id,
+                            BlockRequest { block_index: BLOCK_REQUEST_CHAIN_INFO, block_index_end: None },
+                        );
+                        self.pending_chain_info.insert(req_id, peer_id);
+                        println!("[p2p] 🔄 ChainInfo-Anfrage an {peer_id} gesendet (Initial-Sync)");
+                    }
+                    // 2) GossipSub-Handshake zusätzlich (für Peers die später joinen)
                     if self.config.auto_sync_on_connect {
                         self.send_sync_handshake();
                     }
@@ -1748,7 +1787,7 @@ impl SwarmTask {
                             error: None,
                         });
                     } else if !response.blocks.is_empty() {
-                        // Range-Response: mehrere Blöcke
+                        // Range-Response: Blöcke in Sync-Buffer sammeln
                         println!("[p2p] ← {} Blöcke via Range-Sync von {peer}", response.blocks.len());
                         for block in response.blocks {
                             let hash = block.hash.clone();
@@ -1756,12 +1795,12 @@ impl SwarmTask {
                                 if let Some(entry) = self.peers.get_mut(&peer) {
                                     entry.blocks_received += 1;
                                 }
-                                let _ = self.event_tx.send(NetworkEvent::BlockReceived {
-                                    block: Box::new(block),
-                                    from_peer: peer.to_string(),
-                                });
+                                self.sync_buffer.insert(block.index, (block, peer.to_string()));
                             }
                         }
+                        self.sync_buffer_last_insert = Some(Instant::now());
+                        // Sofort versuchen die geordneten Blöcke zu flushen
+                        self.flush_sync_buffer();
                     } else if let Some(block) = response.block {
                         // Einzelner Block-Sync
                         let hash = block.hash.clone();
@@ -1776,12 +1815,69 @@ impl SwarmTask {
                             });
                         }
                     } else if response.chain_height.is_some() {
-                        // ChainInfo-Antwort
+                        // ChainInfo-Antwort → prüfe ob wir Blöcke nachholen müssen
+                        let remote_height = response.chain_height.unwrap_or(0);
                         println!(
-                            "[p2p] 📊 ChainInfo von {peer}: height={:?}, genesis={:?}",
-                            response.chain_height,
+                            "[p2p] 📊 ChainInfo von {peer}: height={remote_height}, genesis={:?}, lokal={}",
                             response.genesis_hash.as_deref().map(|h| &h[..12.min(h.len())]),
+                            self.local_chain_count,
                         );
+
+                        // Genesis-Prüfung falls beide Seiten eine Chain haben
+                        if let Some(ref remote_genesis) = response.genesis_hash {
+                            let our_genesis = self.chain_ref.as_ref().and_then(|arc| {
+                                arc.lock().ok().and_then(|c| c.blocks.first().map(|b| b.hash.clone()))
+                            });
+                            if let Some(ref our_gen) = our_genesis {
+                                if our_gen != remote_genesis {
+                                    eprintln!(
+                                        "[p2p] ⛔ Genesis-Mismatch mit {peer}: lokal={}… remote={}…",
+                                        &our_gen[..12.min(our_gen.len())],
+                                        &remote_genesis[..12.min(remote_genesis.len())],
+                                    );
+                                    // Nicht syncen bei Genesis-Mismatch
+                                    self.pending_chain_info.remove(&request_id);
+                                    return;
+                                }
+                            }
+                        }
+
+                        // Aktuelle lokale Höhe aus chain_ref lesen (genauer als local_chain_count)
+                        let actual_local = self.chain_ref.as_ref()
+                            .and_then(|arc| arc.lock().ok().map(|c| c.blocks.len() as u64))
+                            .unwrap_or(self.local_chain_count);
+
+                        if remote_height > actual_local {
+                            println!(
+                                "[p2p] 🔄 Sync: Peer {peer} hat {remote_height} Blöcke, wir haben {actual_local} → hole {} fehlende",
+                                remote_height - actual_local
+                            );
+                            // Sync-Buffer vorbereiten
+                            self.sync_buffer.clear(); // Alten Buffer leeren
+
+                            let _ = self.event_tx.send(NetworkEvent::SyncStarted {
+                                peer_id: peer.to_string(),
+                                local_count: actual_local,
+                                remote_count: remote_height,
+                            });
+
+                            // Bei kurzer lokaler Chain (< 50 Blöcke): von Block 1 starten
+                            // um potentielle Forks aufzulösen (lokale Mining-Blöcke ersetzen)
+                            let sync_from = if actual_local <= 50 { 1u64 } else { actual_local };
+                            self.sync_expected_next = sync_from;
+
+                            // Range-Requests für fehlende Blöcke
+                            let mut idx = sync_from;
+                            while idx < remote_height {
+                                let end = (idx + MAX_BLOCKS_PER_RANGE - 1).min(remote_height - 1);
+                                let _ = self.swarm.behaviour_mut().block_exchange.send_request(
+                                    &peer,
+                                    BlockRequest { block_index: idx, block_index_end: Some(end) },
+                                );
+                                idx = end + 1;
+                            }
+                        }
+                        self.pending_chain_info.remove(&request_id);
                     }
                 }
             },
@@ -2347,10 +2443,29 @@ impl SwarmTask {
                 }
                 self.net_metrics.blocks_received += 1;
 
-                let _ = self.event_tx.send(NetworkEvent::BlockReceived {
-                    block: Box::new(block),
-                    from_peer: source.to_string(),
-                });
+                // Aktuelle Chain-Höhe lesen um zu entscheiden ob gebuffert werden muss
+                let actual_local = self.chain_ref.as_ref()
+                    .and_then(|arc| arc.lock().ok().map(|c| c.blocks.len() as u64))
+                    .unwrap_or(self.local_chain_count);
+
+                if block.index < actual_local {
+                    // Block liegt hinter unserer Chain → veraltet, ignorieren
+                    return;
+                }
+
+                // Block ist voraus ODER Sync-Buffer ist aktiv → puffern
+                // Dies fängt auch Gossip-Blöcke die VOR dem Sync-Start ankommen!
+                if block.index > actual_local || !self.sync_buffer.is_empty() {
+                    self.sync_buffer.insert(block.index, (block, source.to_string()));
+                    self.sync_buffer_last_insert = Some(Instant::now());
+                    self.flush_sync_buffer();
+                } else {
+                    // Normalfall: Block ist der nächste erwartete und kein Sync aktiv
+                    let _ = self.event_tx.send(NetworkEvent::BlockReceived {
+                        block: Box::new(block),
+                        from_peer: source.to_string(),
+                    });
+                }
             }
             Err(e) => {
                 eprintln!("[p2p] Gossip Block-Dekodierung fehlgeschlagen von {source}: {e}");
@@ -2424,6 +2539,98 @@ impl SwarmTask {
 
     // ── Chain-Sync Handshake ──────────────────────────────────────────────────
 
+    /// Flusht geordnete Blöcke aus dem Sync-Buffer in den Event-Channel.
+    /// Nur zusammenhängende Blöcke ab `sync_expected_next` werden gesendet.
+    fn flush_sync_buffer(&mut self) {
+        // Aktuelle Chain-Höhe aus chain_ref lesen (genauer als sync_expected_next)
+        let actual_local = self.chain_ref.as_ref()
+            .and_then(|arc| arc.lock().ok().map(|c| c.blocks.len() as u64))
+            .unwrap_or(self.local_chain_count);
+
+        // sync_expected_next auf Chain-Höhe setzen falls höher
+        if actual_local > self.sync_expected_next {
+            self.sync_expected_next = actual_local;
+        }
+
+        let mut flushed = 0u64;
+        loop {
+            let next = self.sync_expected_next;
+            if let Some((_, (block, from_peer))) = self.sync_buffer.remove_entry(&next) {
+                let _ = self.event_tx.send(NetworkEvent::BlockReceived {
+                    block: Box::new(block),
+                    from_peer,
+                });
+                self.sync_expected_next = next + 1;
+                flushed += 1;
+            } else {
+                break;
+            }
+        }
+        if flushed > 0 {
+            println!("[p2p] 🔄 Sync-Buffer: {flushed} Blöcke geordnet eingefügt (nächster erwartet: #{})", self.sync_expected_next);
+            // NICHT local_chain_count hier setzen – master_server aktualisiert
+            // es über SetLocalChainCount wenn Blöcke tatsächlich akzeptiert werden
+        }
+
+        // Aufräumen: Blöcke die unter der aktuellen Chain-Höhe liegen entfernen (veraltet)
+        let stale_keys: Vec<u64> = self.sync_buffer.range(..actual_local).map(|(k, _)| *k).collect();
+        for k in stale_keys {
+            self.sync_buffer.remove(&k);
+        }
+
+        // Timeout: Wenn > 30s lang keine neuen Blöcke kamen und Buffer nicht leer
+        // → wahrscheinlich Lücke → Buffer leeren und Resync triggern
+        if !self.sync_buffer.is_empty() {
+            if let Some(last) = self.sync_buffer_last_insert {
+                if last.elapsed() > Duration::from_secs(30) {
+                    let remaining = self.sync_buffer.len();
+                    eprintln!("[p2p] ⚠ Sync-Buffer Timeout: {remaining} Blöcke verwaist (nächster erwartet: #{}, erster im Buffer: #{})" ,
+                        self.sync_expected_next,
+                        self.sync_buffer.keys().next().unwrap_or(&0),
+                    );
+                    self.sync_buffer.clear();
+                    self.sync_buffer_last_insert = None;
+                }
+            }
+        } else {
+            self.sync_buffer_last_insert = None;
+        }
+    }
+
+    /// Sendet ChainInfo-Anfragen an alle verbundenen Peers per Request/Response.
+    /// Zuverlässiger als GossipSub (braucht keinen Mesh).
+    fn sync_with_connected_peers(&mut self) {
+        let connected: Vec<PeerId> = self.peers.iter()
+            .filter(|(_, info)| info.connected)
+            .map(|(pid, _)| *pid)
+            .collect();
+
+        if connected.is_empty() {
+            return;
+        }
+
+        // Aktuelle Chain-Höhe aus chain_ref lesen
+        let actual_local = self.chain_ref.as_ref()
+            .and_then(|arc| arc.lock().ok().map(|c| c.blocks.len() as u64))
+            .unwrap_or(self.local_chain_count);
+
+        // Nur syncen wenn wir möglicherweise hinterher sind
+        // (auch GossipSub-Handshake senden für Peers die hinter UNS sind)
+        self.send_sync_handshake();
+
+        for peer_id in connected {
+            // Nicht doppelt anfragen wenn schon eine Anfrage läuft
+            if self.pending_chain_info.values().any(|p| *p == peer_id) {
+                continue;
+            }
+            let req_id = self.swarm.behaviour_mut().block_exchange.send_request(
+                &peer_id,
+                BlockRequest { block_index: BLOCK_REQUEST_CHAIN_INFO, block_index_end: None },
+            );
+            self.pending_chain_info.insert(req_id, peer_id);
+        }
+    }
+
     /// Sendet unsere Chain-Länge an alle Peers (Gossipsub).
     /// Peers die mehr Blöcke haben werden uns antworten.
     fn send_sync_handshake(&mut self) {
@@ -2494,19 +2701,35 @@ impl SwarmTask {
         }
 
         if msg.block_count > self.local_chain_count {
+            // Aktuelle lokale Höhe aus chain_ref lesen (genauer als local_chain_count)
+            let actual_local = self.chain_ref.as_ref()
+                .and_then(|arc| arc.lock().ok().map(|c| c.blocks.len() as u64))
+                .unwrap_or(self.local_chain_count);
+
+            if msg.block_count <= actual_local {
+                return; // chain_ref ist aktueller, kein Sync nötig
+            }
+
             println!(
-                "[p2p] 🔄 Sync: Peer {source} hat {} Blöcke, wir haben {}",
-                msg.block_count, self.local_chain_count
+                "[p2p] 🔄 Sync: Peer {source} hat {} Blöcke, wir haben {actual_local}",
+                msg.block_count,
             );
+
+            // Sync-Buffer vorbereiten
+            self.sync_buffer.clear();
+
             let _ = self.event_tx.send(NetworkEvent::SyncStarted {
                 peer_id: source.to_string(),
-                local_count: self.local_chain_count,
+                local_count: actual_local,
                 remote_count: msg.block_count,
             });
 
-            // Fehlende Blöcke einzeln per Request/Response abrufen
-            // Range-Requests verwenden statt einzelner Blöcke
-            let mut idx = self.local_chain_count;
+            // Bei kurzer lokaler Chain: von Block 1 starten (Fork-Auflösung)
+            let sync_from = if actual_local <= 50 { 1u64 } else { actual_local };
+            self.sync_expected_next = sync_from;
+
+            // Fehlende Blöcke per Range-Requests abrufen
+            let mut idx = sync_from;
             while idx < msg.block_count {
                 let end = (idx + MAX_BLOCKS_PER_RANGE - 1).min(msg.block_count - 1);
                 let _ = self.swarm.behaviour_mut().block_exchange.send_request(
@@ -3035,6 +3258,10 @@ pub async fn start_network(
         peer_storage: HashMap::new(),
         peer_rate_limiters: HashMap::new(),
         chain_ref: None,
+        pending_chain_info: HashMap::new(),
+        sync_buffer: std::collections::BTreeMap::new(),
+        sync_buffer_last_insert: None,
+        sync_expected_next: 0,
     };
 
     tokio::spawn(task.run());
