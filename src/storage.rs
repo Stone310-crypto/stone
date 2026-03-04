@@ -24,7 +24,7 @@
 //! - Deduplizierung automatisch (gleiche Bytes → gleicher Hash → eine Datei)
 //! - Lesen, Schreiben, Existenz-Check, Größe, Aufräumen (Garbage Collection)
 
-use crate::blockchain::{Block, Document, chunk_dir, data_dir, ChunkRef, CHUNK_SIZE as BLOCK_CHUNK_SIZE};
+use crate::blockchain::{Block, Document, chunk_dir, data_dir, ChunkRef};
 use crate::shard::{self, ShardStore};
 use bincode::config::standard;
 use rocksdb::{ColumnFamilyDescriptor, DB, Options, WriteBatch, WriteOptions};
@@ -187,11 +187,62 @@ impl ChainStore {
 
     /// Löscht einen Block anhand seines Index aus RocksDB.
     /// Wird für Chain-Reorg (Fork-Auflösung) verwendet.
-    pub fn delete_block(&self, index: u64) {
-        if let Some(cf) = self.db.cf_handle("blocks") {
-            let key = index.to_le_bytes();
-            let _ = self.db.delete_cf(cf, key);
+    ///
+    /// Entfernt auch die zugehörigen Dokument-Index-Einträge und
+    /// aktualisiert die Metadaten (block_count, latest_hash).
+    pub fn delete_block(&self, index: u64) -> Result<(), StorageError> {
+        let cf_blocks = self.db.cf_handle("blocks")
+            .ok_or_else(|| StorageError::NotFound("CF 'blocks'".into()))?;
+        let cf_index = self.db.cf_handle("index")
+            .ok_or_else(|| StorageError::NotFound("CF 'index'".into()))?;
+        let cf_meta = self.db.cf_handle("meta")
+            .ok_or_else(|| StorageError::NotFound("CF 'meta'".into()))?;
+
+        let key = index.to_le_bytes();
+
+        // Zuerst den Block lesen um die Dokument-IDs zu bekommen
+        let doc_ids: Vec<String> = if let Some(data) = self.db.get_cf(cf_blocks, key)? {
+            if let Ok((block, _)) = bincode::serde::decode_from_slice::<Block, _>(&data, standard()) {
+                block.documents.iter().map(|d| d.doc_id.clone()).collect()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        let mut batch = WriteBatch::default();
+
+        // Block entfernen
+        batch.delete_cf(cf_blocks, key);
+
+        // Dokument-Index-Einträge entfernen (nur wenn sie auf diesen Block zeigen)
+        for doc_id in &doc_ids {
+            if let Some(bytes) = self.db.get_cf(cf_index, doc_id.as_bytes())? {
+                if bytes.len() == 8 {
+                    let arr: [u8; 8] = bytes.try_into().unwrap();
+                    if u64::from_le_bytes(arr) == index {
+                        batch.delete_cf(cf_index, doc_id.as_bytes());
+                    }
+                }
+            }
         }
+
+        // Metadaten aktualisieren: block_count und latest_hash auf den Vorgänger setzen
+        if index == 0 {
+            batch.delete_cf(cf_meta, b"block_count");
+            batch.delete_cf(cf_meta, b"latest_hash");
+            batch.delete_cf(cf_meta, b"genesis_hash");
+        } else {
+            batch.put_cf(cf_meta, b"block_count", index.to_le_bytes());
+            // latest_hash auf den Vorgänger-Block setzen
+            if let Ok(prev_block) = self.read_block(index - 1) {
+                batch.put_cf(cf_meta, b"latest_hash", prev_block.hash.as_bytes());
+            }
+        }
+
+        self.db.write(batch)?;
+        Ok(())
     }
 
     /// Liest einen einzelnen Block anhand seines Index.
@@ -583,13 +634,18 @@ impl StoneStore {
         k: u8,
         m: u8,
     ) -> Result<Vec<ChunkRef>, StorageError> {
-        let chunk_size = BLOCK_CHUNK_SIZE;
         let mut coded_refs = Vec::with_capacity(chunk_refs.len());
 
-        for (i, chunk_ref) in chunk_refs.iter().enumerate() {
-            let start = i * chunk_size;
-            let end = (start + chunk_size).min(raw_data.len());
+        // Chunk-Grenzen aus den ChunkRef.size-Werten ableiten statt den
+        // globalen BLOCK_CHUNK_SIZE zu nehmen — so funktioniert es auch
+        // wenn Chunks mit einer abweichenden Größe erzeugt wurden.
+        let mut offset = 0usize;
+        for chunk_ref in chunk_refs.iter() {
+            let len = chunk_ref.size as usize;
+            let start = offset;
+            let end = (start + len).min(raw_data.len());
             let chunk_data = &raw_data[start..end];
+            offset = end;
 
             // Reed-Solomon Encoding
             let shard_pieces = shard::encode_chunk(chunk_data, k as usize, m as usize)
@@ -930,15 +986,17 @@ async fn fetch_missing_shards_for_chunk(
             break;
         }
 
-        let remaining = deadline - tokio::time::Instant::now();
-        if remaining.is_zero() {
+        let now = tokio::time::Instant::now();
+        let remaining = if deadline > now {
+            deadline - now
+        } else {
             eprintln!(
                 "[sharding] ⏰ Timeout: {} von {} benötigten Shards empfangen",
                 fetched.len(),
                 needed
             );
             break;
-        }
+        };
 
         match tokio::time::timeout(remaining, event_rx.recv()).await {
             Ok(Ok(crate::network::NetworkEvent::ShardReceived {

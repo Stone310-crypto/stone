@@ -120,14 +120,17 @@ pub const DEFAULT_P2P_PORT: u16 = 7654;
 /// Eingebaute Seed-Nodes – der erste Einstiegspunkt ins Stone-Netzwerk.
 /// Jeder dieser Nodes ist gleichzeitig Relay-Server und Bootstrap-Node.
 /// TCP und QUIC (UDP) Adressen – QUIC wird für NAT-Traversal bevorzugt.
+///
+/// WICHTIG: Die Reihenfolge bestimmt die Verbindungs-Priorität.
+/// Der VPS (212.227.54.241) ist der primäre Bootstrap und muss immer zuerst stehen.
 const SEED_NODES: &[&str] = &[
-    // ── VPS (212.227.54.241) – öffentlich erreichbar ─────────────────────────
+    // ── VPS (212.227.54.241) – primärer Bootstrap, immer online ───────────
     "/ip4/212.227.54.241/tcp/4001/p2p/12D3KooWAq975k49YZiCdaf3V96iJtU9fxqmoGRZW3e3Ceupv17k",
     "/ip4/212.227.54.241/udp/4001/quic-v1/p2p/12D3KooWAq975k49YZiCdaf3V96iJtU9fxqmoGRZW3e3Ceupv17k",
-    // ── Server-Node (unrootles) – Öffentliche IPv6 ───────────────────────────
+    // ── Server-Node (unrootles) – Öffentliche IPv6 ───────────────────────
     "/ip6/2a0d:3341:b16b:4808:5054:ff:fea7:bab0/tcp/4001/p2p/12D3KooWLqikBBCRhCZ2MgSYG3R579BNUgrN5E6dZnYSEYdmAKTd",
     "/ip6/2a0d:3341:b16b:4808:5054:ff:fea7:bab0/udp/4001/quic-v1/p2p/12D3KooWLqikBBCRhCZ2MgSYG3R579BNUgrN5E6dZnYSEYdmAKTd",
-    // ── Server-Node (unrootles) – Tailscale (Fallback) ───────────────────────
+    // ── Server-Node (unrootles) – Tailscale (Fallback) ───────────────────
     "/ip4/100.90.28.68/tcp/4001/p2p/12D3KooWLqikBBCRhCZ2MgSYG3R579BNUgrN5E6dZnYSEYdmAKTd",
     "/ip4/100.90.28.68/udp/4001/quic-v1/p2p/12D3KooWLqikBBCRhCZ2MgSYG3R579BNUgrN5E6dZnYSEYdmAKTd",
 ];
@@ -259,8 +262,8 @@ impl P2pConfig {
         }
     }
 
-    /// Bootstrap-Nodes aus ENV `STONE_BOOTSTRAP_NODES` (kommagetrennt) laden
-    /// und eingebaute Seed-Nodes hinzufügen.
+    /// Bootstrap-Nodes aus ENV `STONE_BOOTSTRAP_NODES` / `STONE_SEED_NODES` (kommagetrennt)
+    /// laden und eingebaute Seed-Nodes hinzufügen.
     pub fn merge_env(&mut self) {
         // ── Seed-Nodes automatisch hinzufügen ─────────────────────────────────
         // Kann per STONE_NO_SEED=1 deaktiviert werden (für isolierte Netze)
@@ -278,10 +281,13 @@ impl P2pConfig {
             }
         }
 
-        if let Ok(raw) = std::env::var("STONE_BOOTSTRAP_NODES") {
-            for addr in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
-                if !self.bootstrap_nodes.contains(&addr.to_string()) {
-                    self.bootstrap_nodes.push(addr.to_string());
+        // Beide ENV-Variablen unterstützen (STONE_BOOTSTRAP_NODES + STONE_SEED_NODES)
+        for env_key in ["STONE_BOOTSTRAP_NODES", "STONE_SEED_NODES"] {
+            if let Ok(raw) = std::env::var(env_key) {
+                for addr in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+                    if !self.bootstrap_nodes.contains(&addr.to_string()) {
+                        self.bootstrap_nodes.push(addr.to_string());
+                    }
                 }
             }
         }
@@ -1007,6 +1013,13 @@ struct SwarmTask {
     sync_buffer_last_insert: Option<Instant>,
     /// Erwarteter nächster Block-Index für den Sync (= unsere Chain-Höhe beim Sync-Start)
     sync_expected_next: u64,
+
+    // ─── Reconnect-Backoff ───────────────────────────────────────────────
+
+    /// Per-Peer exponentieller Backoff für Reconnect-Versuche.
+    /// PeerId → (frühester nächster Versuch, aktueller Backoff-Intervall)
+    /// Verhindert Connect-Disconnect-Storms wenn beide Seiten gleichzeitig dialen.
+    reconnect_backoff: HashMap<PeerId, (Instant, Duration)>,
 }
 
 /// Tracking für Fehlverhalten eines Peers
@@ -1219,6 +1232,10 @@ impl SwarmTask {
         let mut flush_ticker = tokio::time::interval(Duration::from_millis(500));
         flush_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        // Cleanup-Ticker: alle 5 Minuten verwaiste rate_limiters, penalties, storage aufräumen
+        let mut cleanup_ticker = tokio::time::interval(Duration::from_secs(300));
+        cleanup_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
             tokio::select! {
                 event = self.swarm.next() => {
@@ -1243,6 +1260,9 @@ impl SwarmTask {
                     if !self.sync_buffer.is_empty() {
                         self.flush_sync_buffer();
                     }
+                }
+                _ = cleanup_ticker.tick() => {
+                    self.periodic_cleanup();
                 }
             }
         }
@@ -1302,44 +1322,91 @@ impl SwarmTask {
     }
 
     fn reconnect_bootstrap_nodes(&mut self) {
-        // Nur Bootstrap-Nodes reconnecten die gerade nicht verbunden sind
-        let disconnected_count = self.peers.values()
-            .filter(|p| !p.connected)
-            .count();
-
-        if disconnected_count == 0 && !self.peers.is_empty() {
-            return; // alle bereits verbunden
-        }
-
+        let now = Instant::now();
         let connected_peer_ids: HashSet<String> = self.peers.values()
             .filter(|p| p.connected)
             .map(|p| p.peer_id.clone())
             .collect();
 
+        // Wenn wir gar keine Verbindungen haben → alle Bootstrap-Nodes anwählen
+        // (priorisiert: SEED_NODES stehen am Anfang der Liste = VPS zuerst)
+        let no_connections = connected_peer_ids.is_empty();
+
+        if !no_connections {
+            // Prüfen ob alle bekannten Peers bereits verbunden sind
+            let disconnected_count = self.peers.values()
+                .filter(|p| !p.connected)
+                .count();
+            if disconnected_count == 0 && !self.peers.is_empty() {
+                return; // alle bereits verbunden
+            }
+        }
+
+        // Backoff für erfolgreich verbundene Peers zurücksetzen
+        for pid in self.swarm.connected_peers().cloned().collect::<Vec<_>>() {
+            self.reconnect_backoff.remove(&pid);
+        }
+
+        let mut attempted = 0u32;
         for addr_str in self.bootstrap_addrs.clone() {
             use libp2p::multiaddr::Protocol;
             if let Ok(addr) = addr_str.parse::<Multiaddr>() {
-                let peer_id_str = addr.iter().find_map(|p| {
+                let peer_id_opt = addr.iter().find_map(|p| {
                     if let Protocol::P2p(pid) = p {
-                        Some(pid.to_string())
+                        Some(pid)
                     } else {
                         None
                     }
                 });
-                if let Some(pid) = peer_id_str {
+                if let Some(pid) = peer_id_opt {
                     // Eigene PeerId nicht anwählen
-                    let local = self.swarm.local_peer_id().to_string();
-                    if pid == local {
+                    if pid == *self.swarm.local_peer_id() {
                         continue;
                     }
-                    if !connected_peer_ids.contains(&pid) {
-                        println!("[p2p] Reconnect-Versuch: {pid}");
-                        let _ = self.swarm.dial(addr);
+                    if connected_peer_ids.contains(&pid.to_string()) {
+                        continue;
                     }
+
+                    // ── Exponentieller Backoff pro Peer ──────────────────
+                    // Verhindert Connect-Disconnect-Storm wenn beide Seiten
+                    // gleichzeitig dialen und libp2p die doppelte Verbindung
+                    // sofort wieder schließt.
+                    const MIN_BACKOFF: Duration = Duration::from_secs(5);
+                    const MAX_BACKOFF: Duration = Duration::from_secs(300); // 5 min
+
+                    if let Some((next_try, _)) = self.reconnect_backoff.get(&pid) {
+                        if now < *next_try {
+                            continue; // Backoff noch nicht abgelaufen
+                        }
+                    }
+
+                    // Backoff aktualisieren: verdoppeln (exponentiell), max 5 min
+                    let current_backoff = self.reconnect_backoff
+                        .get(&pid)
+                        .map(|(_, d)| *d)
+                        .unwrap_or(MIN_BACKOFF);
+                    let next_backoff = (current_backoff * 2).min(MAX_BACKOFF);
+                    self.reconnect_backoff.insert(
+                        pid,
+                        (now + next_backoff, next_backoff),
+                    );
+
+                    println!("[p2p] Reconnect-Versuch: {pid} ({addr_str}) [backoff={:.0}s]", next_backoff.as_secs_f64());
+                    let _ = self.swarm.dial(addr);
+                    attempted += 1;
                 }
             }
         }
-        self.last_reconnect = Instant::now();
+
+        if no_connections && attempted > 0 {
+            // Bei null Verbindungen: auch Kademlia-Bootstrap anstoßen
+            if self.config.kad_enabled {
+                let _ = self.swarm.behaviour_mut().kad.bootstrap();
+            }
+            println!("[p2p] ⚠ Keine Verbindungen – {attempted} Bootstrap-Dial(s) gestartet");
+        }
+
+        self.last_reconnect = now;
     }
 
     // ── Swarm-Events ─────────────────────────────────────────────────────────
@@ -1852,8 +1919,21 @@ impl SwarmTask {
                                 "[p2p] 🔄 Sync: Peer {peer} hat {remote_height} Blöcke, wir haben {actual_local} → hole {} fehlende",
                                 remote_height - actual_local
                             );
-                            // Sync-Buffer vorbereiten
-                            self.sync_buffer.clear(); // Alten Buffer leeren
+
+                            // Bei kurzer lokaler Chain (< 50 Blöcke): von Block 1 starten
+                            // um potentielle Forks aufzulösen (lokale Mining-Blöcke ersetzen)
+                            let sync_from = if actual_local <= 50 { 1u64 } else { actual_local };
+
+                            // Sync-Buffer NICHT leeren wenn bereits Blöcke drin sind
+                            // (ein anderer Peer antwortet gleichzeitig → Blöcke behalten)
+                            // Nur leeren wenn der Buffer Blöcke enthält die HINTER dem
+                            // neuen Sync-Start liegen (= komplett veralteter Sync)
+                            if !self.sync_buffer.is_empty() {
+                                let buf_min = self.sync_buffer.keys().next().copied().unwrap_or(0);
+                                if buf_min < sync_from {
+                                    self.sync_buffer.clear();
+                                }
+                            }
 
                             let _ = self.event_tx.send(NetworkEvent::SyncStarted {
                                 peer_id: peer.to_string(),
@@ -1861,9 +1941,6 @@ impl SwarmTask {
                                 remote_count: remote_height,
                             });
 
-                            // Bei kurzer lokaler Chain (< 50 Blöcke): von Block 1 starten
-                            // um potentielle Forks aufzulösen (lokale Mining-Blöcke ersetzen)
-                            let sync_from = if actual_local <= 50 { 1u64 } else { actual_local };
                             self.sync_expected_next = sync_from;
 
                             // Range-Requests für fehlende Blöcke
@@ -1894,6 +1971,8 @@ impl SwarmTask {
                         error: Some(error.to_string()),
                     });
                 } else {
+                    // pending_chain_info aufräumen bei Fehler (verhindert Memory-Leak + Sync-Blockade)
+                    self.pending_chain_info.remove(&request_id);
                     eprintln!("[p2p] Request-Fehler zu {peer}: {error}");
                 }
             }
@@ -2267,6 +2346,75 @@ impl SwarmTask {
         }
     }
 
+    // ── Periodisches Aufräumen ────────────────────────────────────────────────
+
+    /// Räumt verwaiste Einträge in Rate-Limitern, Penalty-Map und Storage-Announcements auf.
+    /// Wird alle 5 Minuten vom Cleanup-Ticker aufgerufen.
+    fn periodic_cleanup(&mut self) {
+        let now = Instant::now();
+        let connected: HashSet<PeerId> = self.swarm.connected_peers().cloned().collect();
+
+        // 1. Rate-Limiter: Einträge für Peers entfernen die seit >10 Minuten nicht verbunden sind
+        let stale_limiters: Vec<PeerId> = self.peer_rate_limiters.keys()
+            .filter(|pid| !connected.contains(pid))
+            .cloned()
+            .collect();
+        if !stale_limiters.is_empty() {
+            for pid in &stale_limiters {
+                self.peer_rate_limiters.remove(pid);
+            }
+            println!("[p2p] 🧹 {} verwaiste Rate-Limiter aufgeräumt", stale_limiters.len());
+        }
+
+        // 2. Penalties: abgelaufene Penalties (Score halbiert auf <5) entfernen
+        let expired_penalties: Vec<PeerId> = self.peer_penalties.iter()
+            .filter(|(_, p)| {
+                p.last_offense.elapsed() > Duration::from_secs(PENALTY_DECAY_MINS * 60 * 2)
+                    && p.score < BAN_THRESHOLD
+            })
+            .map(|(pid, _)| *pid)
+            .collect();
+        if !expired_penalties.is_empty() {
+            for pid in &expired_penalties {
+                self.peer_penalties.remove(pid);
+            }
+            println!("[p2p] 🧹 {} abgelaufene Penalties aufgeräumt", expired_penalties.len());
+        }
+
+        // 3. Storage-Announcements: Einträge älter als 10 Minuten von nicht-verbundenen Peers entfernen
+        let stale_storage: Vec<String> = self.peer_storage.iter()
+            .filter(|(peer_id_str, ann)| {
+                let age = chrono::Utc::now().timestamp() - ann.timestamp;
+                age > 600 && !connected.iter().any(|pid| pid.to_string() == **peer_id_str)
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        if !stale_storage.is_empty() {
+            for k in &stale_storage {
+                self.peer_storage.remove(k);
+            }
+        }
+
+        // 4. Reconnect-Backoff: Einträge für verbundene Peers entfernen
+        self.reconnect_backoff.retain(|pid, _| !connected.contains(pid));
+
+        // 5. Pending-Pings die > 30s alt sind aufräumen (verwaiste oneshot-Sender)
+        let stale_pings: Vec<request_response::OutboundRequestId> = self.pending_pings.iter()
+            .filter(|(_, (_, start, _))| start.elapsed() > Duration::from_secs(30))
+            .map(|(rid, _)| *rid)
+            .collect();
+        for rid in stale_pings {
+            if let Some((peer_id_str, _, reply)) = self.pending_pings.remove(&rid) {
+                let _ = reply.send(PingResult {
+                    peer_id: peer_id_str,
+                    reachable: false,
+                    latency_ms: None,
+                    error: Some("Timeout (cleanup)".to_string()),
+                });
+            }
+        }
+    }
+
     // ── Peer-Scoring & Banning ────────────────────────────────────────────────
 
     /// Fügt einem Peer Penalty-Punkte hinzu. Bei Überschreitung des Schwellwerts
@@ -2608,6 +2756,17 @@ impl SwarmTask {
             }
         }
 
+        // ── Verwaiste pending_chain_info aufräumen ─────────────────────
+        // Einträge für nicht mehr verbundene Peers oder solche die > 30s alt sind
+        // entfernen, damit neue Sync-Anfragen möglich sind.
+        {
+            let connected_ids: HashSet<PeerId> = self.peers.iter()
+                .filter(|(_, info)| info.connected)
+                .map(|(pid, _)| *pid)
+                .collect();
+            self.pending_chain_info.retain(|_, peer_id| connected_ids.contains(peer_id));
+        }
+
         let connected: Vec<PeerId> = self.peers.iter()
             .filter(|(_, info)| info.connected)
             .map(|(pid, _)| *pid)
@@ -2709,23 +2868,26 @@ impl SwarmTask {
             }
         }
 
-        if msg.block_count > self.local_chain_count {
-            // Aktuelle lokale Höhe aus chain_ref lesen (genauer als local_chain_count)
-            let actual_local = self.chain_ref.as_ref()
-                .and_then(|arc| arc.lock().ok().map(|c| c.blocks.len() as u64))
-                .unwrap_or(self.local_chain_count);
+        // Aktuelle lokale Höhe aus chain_ref lesen (genauer als local_chain_count)
+        let actual_local = self.chain_ref.as_ref()
+            .and_then(|arc| arc.lock().ok().map(|c| c.blocks.len() as u64))
+            .unwrap_or(self.local_chain_count);
 
-            if msg.block_count <= actual_local {
-                return; // chain_ref ist aktueller, kein Sync nötig
-            }
+        if msg.block_count > actual_local {
 
             println!(
                 "[p2p] 🔄 Sync: Peer {source} hat {} Blöcke, wir haben {actual_local}",
                 msg.block_count,
             );
 
-            // Sync-Buffer vorbereiten
-            self.sync_buffer.clear();
+            // Sync-Buffer NICHT leeren wenn bereits Blöcke drin sind (parallele Syncs)
+            let sync_from = if actual_local <= 50 { 1u64 } else { actual_local };
+            if !self.sync_buffer.is_empty() {
+                let buf_min = self.sync_buffer.keys().next().copied().unwrap_or(0);
+                if buf_min < sync_from {
+                    self.sync_buffer.clear();
+                }
+            }
 
             let _ = self.event_tx.send(NetworkEvent::SyncStarted {
                 peer_id: source.to_string(),
@@ -2734,7 +2896,6 @@ impl SwarmTask {
             });
 
             // Bei kurzer lokaler Chain: von Block 1 starten (Fork-Auflösung)
-            let sync_from = if actual_local <= 50 { 1u64 } else { actual_local };
             self.sync_expected_next = sync_from;
 
             // Fehlende Blöcke per Range-Requests abrufen
@@ -2747,7 +2908,7 @@ impl SwarmTask {
                 );
                 idx = end + 1;
             }
-        } else if msg.block_count < self.local_chain_count {
+        } else if msg.block_count < actual_local {
             // Wir haben mehr Blöcke → eigenen Handshake senden damit der Peer synct
             self.send_sync_handshake();
         }
@@ -2832,11 +2993,13 @@ impl SwarmTask {
             }
 
             NetworkCommand::SyncWithPeer { peer_id, our_block_count } => {
-                // Expliziten Sync-Handshake an einen Peer senden
-                let _ = self.swarm.behaviour_mut().block_exchange.send_request(
+                // ChainInfo anfragen → Antwort löst automatisch Range-Sync aus
+                let req_id = self.swarm.behaviour_mut().block_exchange.send_request(
                     &peer_id,
-                    BlockRequest { block_index: our_block_count, block_index_end: None },
+                    BlockRequest { block_index: BLOCK_REQUEST_CHAIN_INFO, block_index_end: None },
                 );
+                self.pending_chain_info.insert(req_id, peer_id);
+                let _ = our_block_count; // wird für Logging genutzt falls nötig
                 false
             }
 
@@ -3271,6 +3434,7 @@ pub async fn start_network(
         sync_buffer: std::collections::BTreeMap::new(),
         sync_buffer_last_insert: None,
         sync_expected_next: 0,
+        reconnect_backoff: HashMap::new(),
     };
 
     tokio::spawn(task.run());

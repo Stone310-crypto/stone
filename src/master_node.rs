@@ -1296,13 +1296,7 @@ impl MasterNodeState {
             }
         }
 
-        // ── Block in ChainStore persistieren ──────────────────────────────
-        {
-            use crate::storage::ChainStore;
-            if let Ok(store) = ChainStore::open() {
-                let _ = store.write_block_sync(&block);
-            }
-        }
+        // Block wurde bereits durch commit_block() → persist_last_block() persistiert.
 
         // ── Validator-Statistik aktualisieren ─────────────────────────────
         {

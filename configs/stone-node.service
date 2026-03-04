@@ -6,9 +6,9 @@ Wants=network-online.target
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/opt/stone-node
-EnvironmentFile=/opt/stone-node/.env
-ExecStart=/opt/stone-node/target/release/stone-setup
+WorkingDirectory=__STONE_ROOT__
+EnvironmentFile=__STONE_ROOT__/.env
+ExecStart=__STONE_PATH__/stone-setup
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal

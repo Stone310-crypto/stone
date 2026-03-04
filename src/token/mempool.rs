@@ -309,6 +309,20 @@ impl Mempool {
         self.inner.read().unwrap().queue.len()
     }
 
+    /// Anzahl der pending TXs eines bestimmten Senders.
+    ///
+    /// Wird verwendet um die korrekte Nonce für neue TXs zu berechnen,
+    /// BEVOR sie erstellt werden: `effective_nonce = ledger.nonce(addr) + sender_pending_count(addr)`.
+    pub fn sender_pending_count(&self, sender: &str) -> u64 {
+        self.inner
+            .read()
+            .unwrap()
+            .queue
+            .iter()
+            .filter(|tx| tx.from == sender)
+            .count() as u64
+    }
+
     /// Alle pending TXs als Snapshot (für API).
     pub fn pending_txs(&self) -> Vec<TokenTx> {
         self.inner.read().unwrap().queue.iter().cloned().collect()

@@ -85,7 +85,7 @@ pub async fn handle_snapshot_create(
 ) -> impl IntoResponse {
     let (height, genesis, latest) = {
         let chain = state.node.chain.lock().unwrap();
-        let h = chain.blocks.len() as u64;
+        let h = chain.blocks.last().map(|b| b.index).unwrap_or(0);
         let g = chain.blocks.first().map(|b| b.hash.clone()).unwrap_or_default();
         let l = chain.latest_hash.clone();
         (h, g, l)

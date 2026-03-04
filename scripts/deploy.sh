@@ -86,7 +86,7 @@ if [ "$BUILD" = true ]; then
     # Binary-Größen anzeigen
     echo ""
     for bin in "${BINARIES[@]}"; do
-        SIZE=$(du -h "$RELEASE_DIR/$bin" | cut -f1)
+        SIZE=$(ls -lh "$RELEASE_DIR/$bin" | awk '{print $5}')
         echo -e "${GREEN}[build]${NC}   ✅ $bin: ${SIZE}"
     done
     echo ""
@@ -114,6 +114,7 @@ deploy_to_node() {
     local path="$5"
     local service="$6"
     local bins="$7"
+    local root="$8"
 
     echo -e "${BLUE}[deploy]${NC} → ${YELLOW}$name${NC} ($user@$host:$port)"
 
@@ -131,7 +132,7 @@ deploy_to_node() {
             continue
         fi
 
-        local size=$(du -h "$src" | cut -f1)
+        local size=$(ls -lh "$src" | awk '{print $5}')
         echo -e "${BLUE}[deploy]${NC}   📦 Uploading $bin ($size) ..."
         
         # Upload als .new, dann atomar tauschen
@@ -156,11 +157,14 @@ REMOTE_SCRIPT
 
     # Service neustarten
     if [ -n "$service" ]; then
-        # Service-File aktualisieren (falls vorhanden)
+        # Service-File dynamisch generieren (Pfad anpassen)
         local service_src="$PROJECT_DIR/configs/stone-node.service"
         if [ -f "$service_src" ]; then
-            echo -e "${BLUE}[deploy]${NC}   📄 Service-File aktualisieren..."
-            scp -P "$port" -q "$service_src" "$user@$host:/etc/systemd/system/$service.service"
+            echo -e "${BLUE}[deploy]${NC}   📄 Service-File aktualisieren (root=$root, bin=$path)..."
+            local tmp_service="/tmp/stone-node-${name}.service"
+            sed -e "s|__STONE_ROOT__|$root|g" -e "s|__STONE_PATH__|$path|g" "$service_src" > "$tmp_service"
+            scp -P "$port" -q "$tmp_service" "$user@$host:/etc/systemd/system/$service.service"
+            rm -f "$tmp_service"
             ssh -p "$port" "$user@$host" "systemctl daemon-reload"
         fi
 
@@ -168,13 +172,32 @@ REMOTE_SCRIPT
         ssh -p "$port" "$user@$host" bash -s <<REMOTE_SCRIPT
             set -e
             systemctl restart "$service"
-            sleep 2
+            sleep 3
             
             if systemctl is-active --quiet "$service"; then
                 echo "  ✅ $service läuft"
+                
+                # P2P-Port Health-Check (4001 oder konfigurierter Port)
+                sleep 2
+                if command -v ss &>/dev/null; then
+                    if ss -tlnp 2>/dev/null | grep -q ":4001 "; then
+                        echo "  ✅ P2P-Port 4001 lauscht"
+                    else
+                        echo "  ⚠ P2P-Port 4001 lauscht noch nicht (normal bei langsamem Start)"
+                    fi
+                fi
+                
+                # HTTP-Port Health-Check
+                if command -v curl &>/dev/null; then
+                    if curl -sf -o /dev/null --max-time 5 http://127.0.0.1:8080/api/v1/health 2>/dev/null; then
+                        echo "  ✅ HTTP-API erreichbar"
+                    else
+                        echo "  ⚠ HTTP-API noch nicht erreichbar (normal bei langsamem Start)"
+                    fi
+                fi
             else
                 echo "  ❌ $service gestartet aber nicht aktiv!"
-                journalctl -u "$service" --no-pager -n 10
+                journalctl -u "$service" --no-pager -n 20
                 
                 # Rollback
                 cd "$path"
@@ -200,13 +223,15 @@ parse_and_deploy() {
     local current_name="" current_host="" current_user="root"
     local current_port="22" current_path="" current_service=""
     local current_bins="stone-setup stone-master"
+    local current_root=""
     local in_node=false
 
     flush_node() {
         if [ "$in_node" = true ] && [ -n "$current_name" ] && [ -n "$current_host" ]; then
             if [ -z "$SPECIFIC_NODE" ] || [ "$SPECIFIC_NODE" = "$current_name" ]; then
+                local node_root="${current_root:-$current_path}"
                 deploy_to_node "$current_name" "$current_host" "$current_user" \
-                    "$current_port" "$current_path" "$current_service" "$current_bins"
+                    "$current_port" "$current_path" "$current_service" "$current_bins" "$node_root"
             fi
         fi
     }
@@ -222,6 +247,7 @@ parse_and_deploy() {
             current_name="" current_host="" current_user="root"
             current_port="22" current_path="" current_service=""
             current_bins="stone-setup stone-master"
+            current_root=""
             in_node=true
             continue
         fi
@@ -235,6 +261,7 @@ parse_and_deploy() {
                 user)    current_user="$val" ;;
                 port)    current_port="$val" ;;
                 path)    current_path="$val" ;;
+                root)    current_root="$val" ;;
                 service) current_service="$val" ;;
                 bins)    current_bins="$val" ;;
             esac

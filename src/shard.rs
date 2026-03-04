@@ -222,11 +222,31 @@ impl ShardStore {
         Ok(refs)
     }
 
-    /// Liest einen lokalen Shard.
+    /// Liest einen lokalen Shard und verifiziert optional seinen Hash.
     pub fn read_shard(&self, chunk_hash: &str, shard_index: u8) -> Result<Vec<u8>> {
         let path = self.shard_path(chunk_hash, shard_index);
         std::fs::read(&path)
             .with_context(|| format!("Shard {chunk_hash}/{shard_index} nicht gefunden"))
+    }
+
+    /// Liest einen lokalen Shard und prüft seine Integrität gegen den erwarteten Hash.
+    ///
+    /// Gibt `Err` zurück wenn die Datei nicht existiert oder der Hash nicht stimmt.
+    pub fn read_shard_verified(
+        &self,
+        chunk_hash: &str,
+        shard_index: u8,
+        expected_hash: &str,
+    ) -> Result<Vec<u8>> {
+        let data = self.read_shard(chunk_hash, shard_index)?;
+        let actual = shard_hash(&data);
+        if actual != expected_hash {
+            bail!(
+                "Shard {chunk_hash}/{shard_index} Integritätsfehler: \
+                 erwartet {expected_hash}, bekommen {actual}"
+            );
+        }
+        Ok(data)
     }
 
     /// Prüft ob ein bestimmter Shard lokal vorhanden ist.
@@ -257,8 +277,11 @@ impl ShardStore {
 
     /// Rekonstruiert einen Chunk aus lokal verfügbaren Shards.
     ///
-    /// Gibt `Err` zurück wenn weniger als k Shards lokal vorhanden sind.
+    /// Gibt `Err` zurück wenn weniger als k Shards lokal lesbar sind.
     /// In dem Fall müssen fehlende Shards erst von anderen Nodes geholt werden.
+    ///
+    /// Einzelne korrupte/nicht-lesbare Shards werden übersprungen;
+    /// die Rekonstruktion klappt solange mindestens k gültige Shards vorhanden sind.
     pub fn try_reconstruct_local(
         &self,
         chunk_hash: &str,
@@ -276,12 +299,31 @@ impl ShardStore {
         }
 
         let mut shard_data: HashMap<usize, Vec<u8>> = HashMap::new();
+        let mut read_errors = 0usize;
         for idx in indices.iter().take(k as usize + m as usize) {
-            let data = self.read_shard(chunk_hash, *idx)?;
-            shard_data.insert(*idx as usize, data);
-            if shard_data.len() >= k as usize {
-                break;
+            match self.read_shard(chunk_hash, *idx) {
+                Ok(data) => {
+                    shard_data.insert(*idx as usize, data);
+                    if shard_data.len() >= k as usize {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[shard] ⚠ Shard {chunk_hash}/{idx} nicht lesbar, überspringe: {e}"
+                    );
+                    read_errors += 1;
+                }
             }
+        }
+
+        if shard_data.len() < k as usize {
+            bail!(
+                "Nur {} von {} benötigten Shards lesbar für Chunk {chunk_hash} \
+                 ({read_errors} Lesefehler)",
+                shard_data.len(),
+                k
+            );
         }
 
         decode_chunk(&shard_data, k as usize, m as usize, original_size)
@@ -396,26 +438,33 @@ pub fn assign_shards_to_peers(
     }
 
     // Für jeden Shard-Index: Berechne Shard-Key und finde nächsten Peer
+    // per XOR-Distanz (Kademlia-ähnlich) auf den ersten 8 Bytes.
     let mut assignments = Vec::with_capacity(n);
     for shard_idx in 0..n {
         let shard_key = format!("{chunk_hash}:{shard_idx}");
-        let shard_key_hash = hex::encode(Sha256::digest(shard_key.as_bytes()));
+        let shard_key_hash = Sha256::digest(shard_key.as_bytes());
 
-        // Sortiere Peers nach XOR-Distance zum Shard-Key
-        let _peer_distances: Vec<(usize, &str)> = peer_ids
+        // XOR-Distance: Vergleiche die ersten 8 Bytes von Shard-Key-Hash
+        // und Peer-Id-Hash. Der Peer mit der kleinsten Distanz bekommt den Shard.
+        let shard_prefix = u64::from_be_bytes(
+            shard_key_hash[..8].try_into().unwrap_or([0u8; 8]),
+        );
+
+        let best_peer_idx = peer_ids
             .iter()
             .enumerate()
             .map(|(i, pid)| {
-                // Einfache Distanz-Berechnung: XOR der ersten 8 Bytes der Hashes
-                (i, pid.as_str())
+                let peer_hash = Sha256::digest(pid.as_bytes());
+                let peer_prefix = u64::from_be_bytes(
+                    peer_hash[..8].try_into().unwrap_or([0u8; 8]),
+                );
+                (i, shard_prefix ^ peer_prefix)
             })
-            .collect();
+            .min_by_key(|&(_, dist)| dist)
+            .map(|(i, _)| i)
+            .unwrap_or(shard_idx % peer_ids.len());
 
-        // Round-Robin mit Offset basierend auf Shard-Key für gleichmäßige Verteilung
-        let key_byte = u64::from_str_radix(&shard_key_hash[..16], 16).unwrap_or(0);
-        let peer_idx = (key_byte as usize + shard_idx) % peer_ids.len();
-
-        assignments.push((shard_idx as u8, peer_ids[peer_idx].clone()));
+        assignments.push((shard_idx as u8, peer_ids[best_peer_idx].clone()));
     }
 
     assignments
@@ -772,17 +821,20 @@ impl ShardHolderRegistry {
         let mut actions = Vec::new();
 
         for (chunk_hash, shard_map) in map.iter() {
-            // Bestimme k+m aus den vorhandenen Shard-Indizes
-            let max_idx = shard_map.keys().max().copied().unwrap_or(0);
-            let total_shards = (max_idx + 1) as u8;
-            if total_shards < 2 { continue; }
+            // Bestimme n = Anzahl tatsächlich registrierter Shard-Slots.
+            // ACHTUNG: Wir verwenden die Anzahl der Einträge in der Map,
+            // nicht max(index)+1 — sonst fehlen bei lückenhaften Registries Slots.
+            let registered_count = shard_map.len() as u8;
+            if registered_count < 2 { continue; }
 
             // Berechne ideale Zuweisung mit aktuellem Peer-Set
+            // n = registered_count wird als k+m übergeben (k=n, m=0),
+            // damit genau n Shard-Zuweisungen berechnet werden.
             let ideal = assign_shards_to_peers(
                 chunk_hash,
                 connected_peers,
-                total_shards, // k+m als total
-                0,            // m=0 da wir total_shards schon als k+m haben
+                registered_count, // k+m als total
+                0,                // m=0 da registered_count schon k+m repräsentiert
             );
 
             for (shard_idx, ideal_peer) in &ideal {

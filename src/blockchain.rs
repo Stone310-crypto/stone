@@ -373,7 +373,9 @@ impl StoneChain {
         use crate::storage::ChainStore;
         if let Ok(store) = ChainStore::open() {
             for idx in target..target + removed {
-                store.delete_block(idx as u64);
+                if let Err(e) = store.delete_block(idx as u64) {
+                    eprintln!("[chain] ⚠ Block {idx} löschen fehlgeschlagen: {e}");
+                }
             }
         }
     }

@@ -26,7 +26,7 @@ use crate::blockchain::data_dir;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 // ─── Konfiguration ───────────────────────────────────────────────────────────
@@ -188,6 +188,9 @@ pub fn create_snapshot(
 }
 
 /// Erstellt einen RocksDB-Checkpoint (hardlinks, sehr schnell).
+///
+/// WICHTIG: `dst_path` darf NICHT existieren — RocksDB erstellt es selbst.
+/// Bei Lock-Konflikten (DB von anderem Thread geöffnet) wird bis zu 3× mit Backoff versucht.
 fn create_rocksdb_checkpoint(db_path: &str, dst_path: &Path) -> Result<(), SnapshotError> {
     use rocksdb::{Options, DB};
 
@@ -195,32 +198,70 @@ fn create_rocksdb_checkpoint(db_path: &str, dst_path: &Path) -> Result<(), Snaps
         return Ok(()); // DB existiert nicht — überspringe
     }
 
-    // Öffnen, Checkpoint erstellen, schließen
-    let mut opts = Options::default();
-    opts.create_if_missing(false);
-    opts.create_missing_column_families(true);
+    // Sicherstellen, dass dst_path NICHT existiert (RocksDB-Anforderung)
+    if dst_path.exists() {
+        fs::remove_dir_all(dst_path)?;
+    }
 
-    // chain_db hat 3 CFs, token_db hat nur "default"
-    // Wir versuchen erst mit 3 CFs (chain_db), falls das fehlschlägt mit default
-    let db = if db_path.ends_with("chain_db") {
-        let cf_blocks = rocksdb::ColumnFamilyDescriptor::new("blocks", Options::default());
-        let cf_meta = rocksdb::ColumnFamilyDescriptor::new("meta", Options::default());
-        let cf_index = rocksdb::ColumnFamilyDescriptor::new("index", Options::default());
-        DB::open_cf_descriptors(&opts, db_path, vec![cf_blocks, cf_meta, cf_index])
-            .map_err(|e| SnapshotError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("RocksDB open {db_path}: {e}"))))?
-    } else {
-        DB::open(&opts, db_path)
-            .map_err(|e| SnapshotError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("RocksDB open {db_path}: {e}"))))?
-    };
+    // Retry-Logik: DB könnte kurzzeitig von anderem Thread gelockt sein
+    let max_retries = 3;
+    let mut last_err = String::new();
 
-    let cp = rocksdb::checkpoint::Checkpoint::new(&db)
-        .map_err(|e| SnapshotError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("Checkpoint new: {e}"))))?;
+    for attempt in 0..max_retries {
+        if attempt > 0 {
+            // Exponentieller Backoff: 500ms, 1500ms
+            std::thread::sleep(std::time::Duration::from_millis(500 * (1 << (attempt - 1))));
+            eprintln!("[snapshot] 🔄 Retry #{attempt} für RocksDB-Checkpoint ({db_path})");
+            // dst_path nochmals bereinigen (falls vorheriger Versuch Reste hinterließ)
+            if dst_path.exists() {
+                let _ = fs::remove_dir_all(dst_path);
+            }
+        }
 
-    fs::create_dir_all(dst_path)?;
-    cp.create_checkpoint(dst_path)
-        .map_err(|e| SnapshotError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("Checkpoint create: {e}"))))?;
+        let mut opts = Options::default();
+        opts.create_if_missing(false);
+        opts.create_missing_column_families(true);
 
-    Ok(())
+        // chain_db hat 3 CFs, token_db hat nur "default"
+        let db_result = if db_path.ends_with("chain_db") {
+            let cf_blocks = rocksdb::ColumnFamilyDescriptor::new("blocks", Options::default());
+            let cf_meta = rocksdb::ColumnFamilyDescriptor::new("meta", Options::default());
+            let cf_index = rocksdb::ColumnFamilyDescriptor::new("index", Options::default());
+            DB::open_cf_descriptors(&opts, db_path, vec![cf_blocks, cf_meta, cf_index])
+        } else {
+            DB::open(&opts, db_path)
+        };
+
+        let db = match db_result {
+            Ok(db) => db,
+            Err(e) => {
+                last_err = format!("RocksDB open {db_path}: {e}");
+                continue; // Nächster Versuch
+            }
+        };
+
+        let cp = match rocksdb::checkpoint::Checkpoint::new(&db) {
+            Ok(cp) => cp,
+            Err(e) => {
+                last_err = format!("Checkpoint new: {e}");
+                continue;
+            }
+        };
+
+        // KEIN create_dir_all hier! RocksDB erstellt das Verzeichnis selbst.
+        match cp.create_checkpoint(dst_path) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = format!("Checkpoint create: {e}");
+                continue;
+            }
+        }
+    }
+
+    Err(SnapshotError::Io(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        format!("RocksDB-Checkpoint fehlgeschlagen nach {max_retries} Versuchen: {last_err}"),
+    )))
 }
 
 // ─── Snapshot wiederherstellen ───────────────────────────────────────────────
@@ -273,7 +314,17 @@ pub fn restore_snapshot(
         fs::rename(&token_db, &token_db_backup)?;
     }
 
-    // 3. Entpacken
+    // 3. p2p_config.json VOR dem Entpacken sichern (enthält lokale PeerId)
+    let own_p2p_config = PathBuf::from(format!("{}/p2p_config.json", dd));
+    let p2p_backup = PathBuf::from(format!("{}/p2p_config.json.local_backup", dd));
+    let had_p2p_config = if own_p2p_config.exists() {
+        fs::copy(&own_p2p_config, &p2p_backup).ok();
+        true
+    } else {
+        false
+    };
+
+    // 4. Entpacken
     let archive_file = fs::File::open(archive_path)?;
     let zst_decoder = zstd::Decoder::new(archive_file)?;
     let mut tar_archive = tar::Archive::new(zst_decoder);
@@ -281,22 +332,31 @@ pub fn restore_snapshot(
     // In data_dir entpacken
     let dd_path = PathBuf::from(&dd);
     fs::create_dir_all(&dd_path)?;
-    tar_archive.unpack(&dd_path)?;
+    if let Err(e) = tar_archive.unpack(&dd_path) {
+        // Unpack fehlgeschlagen → Backups wiederherstellen
+        eprintln!("[snapshot] ⚠️  Unpack fehlgeschlagen, stelle Backups wieder her: {e}");
+        if Path::new(&chain_db_backup).exists() {
+            let _ = fs::rename(&chain_db_backup, &chain_db);
+        }
+        if Path::new(&token_db_backup).exists() {
+            let _ = fs::rename(&token_db_backup, &token_db);
+        }
+        if had_p2p_config {
+            let _ = fs::rename(&p2p_backup, &own_p2p_config);
+        }
+        return Err(SnapshotError::Io(e));
+    }
 
-    // 4. Backups löschen (Snapshot erfolgreich)
+    // 5. Backups löschen (Snapshot erfolgreich)
     let _ = fs::remove_dir_all(&chain_db_backup);
     let _ = fs::remove_dir_all(&token_db_backup);
 
-    // JSON-Dateien die wir nicht überschreiben wollen (p2p_config enthält PeerId)
-    // → p2p_config.json wird NICHT aus dem Snapshot übernommen
-    let own_p2p_config = format!("{}/p2p_config.json", dd);
-    let snapshot_p2p = format!("{}/p2p_config.json.snapshot", dd);
-    if Path::new(&own_p2p_config).exists() {
-        // Eigene Config behalten — Snapshot-Version umbenennen
-        let _ = fs::rename(
-            format!("{}/p2p_config.json", dd),
-            &snapshot_p2p,
-        );
+    // 6. Lokale p2p_config.json wiederherstellen (enthält eigene PeerId)
+    if had_p2p_config {
+        // Snapshot-Version der p2p_config umbenennen, lokale wiederherstellen
+        let snapshot_p2p = PathBuf::from(format!("{}/p2p_config.json.snapshot", dd));
+        let _ = fs::rename(&own_p2p_config, &snapshot_p2p);
+        let _ = fs::rename(&p2p_backup, &own_p2p_config);
     }
 
     eprintln!(
