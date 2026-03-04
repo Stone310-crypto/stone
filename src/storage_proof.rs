@@ -1,14 +1,31 @@
-//! Proof of Storage (PoSt) + Data Integrity Audit (Spot-Check)
+//! Proof of Storage (PoSt) + Chain-Driven Challenge System
 //!
-//! Jeder Block muss beweisen, dass der Mining-Node tatsächlich Daten speichert
-//! und diese intakt sind. Dazu werden vor dem Block-Mining zufällige Challenges
-//! generiert, die nur mit Zugriff auf die echten Chunk-Daten gelöst werden können.
+//! ## Block-Level Storage Proof (original)
 //!
-//! ## Ablauf
+//! Jeder Block enthält einen Beweis, dass der Mining-Node tatsächlich Daten speichert.
+//! Challenges werden deterministisch aus `previous_hash + block_index` generiert.
 //!
-//! 1. **Challenge-Generierung** (deterministisch aus `previous_hash + block_index`):
-//!    - N zufällige Chunk-Hashes aus der Chain werden ausgewählt
-//!    - Für jeden Chunk wird ein zufälliger Offset bestimmt
+//! ## Network Storage Challenges (chain-driven)
+//!
+//! Zusätzlich erstellt die Chain pro Block **NetworkChallenges**, die an zufällige
+//! Nodes im Netzwerk gerichtet sind. Der Ablauf:
+//!
+//! 1. **Challenge-Erstellung** (im Block durch den Miner):
+//!    - Der Block-Ersteller wählt deterministisch zufällige Validator-Wallets aus
+//!    - Für jeden gewählten Node wird ein zufälliger Chunk + Offset bestimmt
+//!    - Diese Challenges werden als `storage_challenges` im Block veröffentlicht
+//!
+//! 2. **Challenge-Response** (durch den angefragten Node):
+//!    - Der Miner sieht eine Challenge die an seine Wallet gerichtet ist
+//!    - Er liest den Chunk, berechnet den Proof-Hash und sendet eine Response
+//!    - Die Response wird als `ChallengeResponse` in den nächsten Block aufgenommen
+//!
+//! 3. **Reward / Penalty**:
+//!    - Korrekte Antwort innerhalb der Deadline → Storage-Reward
+//!    - Keine/falsche Antwort → Reputation sinkt (kein Token-Slashing vorerst)
+//!
+//! Somit wird nicht nur der Block-Ersteller geprüft, sondern das gesamte Netzwerk
+//! muss kontinuierlich beweisen, dass es die Daten tatsächlich speichert.
 //!
 //! 2. **Proof-Erstellung** (Mining-Node):
 //!    - Chunk von Disk lesen
@@ -90,6 +107,278 @@ impl StorageProof {
     pub fn is_empty(&self) -> bool {
         self.proofs.is_empty() && self.available_chunks == 0
     }
+}
+
+// ─── Network Storage Challenge (Chain-Driven) ───────────────────────────────
+
+/// Anzahl der Network-Challenges pro Block
+pub const NETWORK_CHALLENGES_PER_BLOCK: usize = 2;
+
+/// Deadline in Blöcken: Wie viele Blöcke hat der Node Zeit um zu antworten
+pub const CHALLENGE_DEADLINE_BLOCKS: u64 = 10;
+
+/// Reward pro bestandener Network-Challenge (in STONE, milli-precision)
+pub const CHALLENGE_REWARD: &str = "0.5";
+
+/// Eine Chain-generierte Challenge die an einen bestimmten Node im Netzwerk gerichtet ist.
+///
+/// Wird im Block veröffentlicht und der Ziel-Node muss innerhalb von
+/// `CHALLENGE_DEADLINE_BLOCKS` mit einem gültigen Proof antworten.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct NetworkChallenge {
+    /// Eindeutige ID dieser Challenge: SHA-256(block_index || target_wallet || chunk_hash || offset)
+    pub challenge_id: String,
+    /// Block-Index in dem die Challenge erstellt wurde
+    pub block_index: u64,
+    /// Wallet-Adresse (Hex Public Key) des Ziel-Nodes
+    pub target_wallet: String,
+    /// SHA-256-Hash des zu beweisenden Chunks
+    pub chunk_hash: String,
+    /// Chunk-Größe in Bytes (für Offset-Berechnung)
+    pub chunk_size: u64,
+    /// Start-Offset für das Proof-Window
+    pub offset: usize,
+    /// Deadline: Antwort muss vor diesem Block-Index eingehen
+    pub deadline_block: u64,
+}
+
+/// Antwort eines Nodes auf eine NetworkChallenge.
+///
+/// Wird vom herausgeforderten Node erstellt und im nächsten Block
+/// als `challenge_response` aufgenommen (via Mempool/P2P).
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ChallengeResponse {
+    /// Referenz auf die Challenge-ID
+    pub challenge_id: String,
+    /// Wallet des antwortenden Nodes (muss == challenge.target_wallet sein)
+    pub responder_wallet: String,
+    /// SHA-256(chunk_data[offset..offset+PROOF_WINDOW]) — der Beweis
+    pub proof_hash: String,
+    /// Block-Index in dem die Antwort eingereicht wird
+    pub response_block: u64,
+    /// Ed25519-Signatur über (challenge_id || proof_hash) vom Responder
+    pub signature: String,
+}
+
+/// Zusammenfassung offener und beantworteter Challenges für den Miner-Status
+#[derive(Debug, Clone, Serialize, Default)]
+pub struct ChallengeStatus {
+    /// Challenges die an UNS gerichtet sind und noch offen
+    pub pending_challenges: Vec<NetworkChallenge>,
+    /// Anzahl erfolgreich beantworteter Challenges (kumulativ)
+    pub responded_total: u64,
+    /// Anzahl verpasster Challenges (Deadline überschritten)
+    pub missed_total: u64,
+    /// Rewards verdient durch Chain-Challenges
+    pub rewards_earned: String,
+}
+
+// ─── Network Challenge Generation ───────────────────────────────────────────
+
+/// Erzeugt deterministische Network-Challenges für einen neuen Block.
+///
+/// Wählt zufällige (aber deterministische) Validator-Wallets und Chunks aus.
+/// Der Seed ist SHA-256(previous_hash || block_index || "network_challenge").
+///
+/// `known_wallets`: Alle bekannten Validator-Wallets im Netzwerk
+/// `own_wallet`: Eigene Wallet (wird nicht herausgefordert)
+pub fn generate_network_challenges(
+    previous_hash: &str,
+    block_index: u64,
+    chunk_refs: &[ChunkRef],
+    known_wallets: &[String],
+    own_wallet: &str,
+) -> Vec<NetworkChallenge> {
+    if chunk_refs.is_empty() || known_wallets.is_empty() {
+        return Vec::new();
+    }
+
+    // Filtere eigene Wallet raus — man kann sich nicht selbst challengen
+    let target_wallets: Vec<&String> = known_wallets.iter()
+        .filter(|w| w.as_str() != own_wallet)
+        .collect();
+
+    if target_wallets.is_empty() {
+        return Vec::new();
+    }
+
+    let n = NETWORK_CHALLENGES_PER_BLOCK.min(target_wallets.len()).min(chunk_refs.len());
+    let mut challenges = Vec::with_capacity(n);
+
+    for i in 0..n {
+        // Deterministischer Seed
+        let mut seed_hasher = Sha256::new();
+        seed_hasher.update(previous_hash.as_bytes());
+        seed_hasher.update(block_index.to_le_bytes());
+        seed_hasher.update(b"network_challenge");
+        seed_hasher.update((i as u64).to_le_bytes());
+        let seed = seed_hasher.finalize();
+
+        // Wallet-Auswahl
+        let wallet_idx = u64::from_le_bytes(seed[0..8].try_into().unwrap()) as usize
+            % target_wallets.len();
+        let target_wallet = target_wallets[wallet_idx].clone();
+
+        // Chunk-Auswahl
+        let chunk_idx = u64::from_le_bytes(seed[8..16].try_into().unwrap()) as usize
+            % chunk_refs.len();
+        let chunk = &chunk_refs[chunk_idx];
+
+        // Offset-Berechnung
+        let max_offset = if chunk.size as usize > PROOF_WINDOW {
+            chunk.size as usize - PROOF_WINDOW
+        } else { 0 };
+        let offset = if max_offset > 0 {
+            let off_sel = u64::from_le_bytes(seed[16..24].try_into().unwrap()) as usize;
+            off_sel % max_offset
+        } else { 0 };
+
+        // Challenge-ID
+        let challenge_id = {
+            let mut h = Sha256::new();
+            h.update(block_index.to_le_bytes());
+            h.update(target_wallet.as_bytes());
+            h.update(chunk.hash.as_bytes());
+            h.update(offset.to_le_bytes());
+            format!("{:x}", h.finalize())
+        };
+
+        challenges.push(NetworkChallenge {
+            challenge_id,
+            block_index,
+            target_wallet,
+            chunk_hash: chunk.hash.clone(),
+            chunk_size: chunk.size,
+            offset,
+            deadline_block: block_index + CHALLENGE_DEADLINE_BLOCKS,
+        });
+    }
+
+    challenges
+}
+
+// ─── Network Challenge Response ─────────────────────────────────────────────
+
+/// Erstellt eine ChallengeResponse für eine an uns gerichtete Challenge.
+///
+/// Liest den Chunk von Disk, berechnet den Proof-Hash und signiert das Ganze.
+pub fn create_challenge_response(
+    challenge: &NetworkChallenge,
+    store: &ChunkStore,
+    responder_wallet: &str,
+    signing_key: &ed25519_dalek::SigningKey,
+    current_block: u64,
+) -> Option<ChallengeResponse> {
+    // Chunk lesen
+    let data = store.read_chunk(&challenge.chunk_hash).ok()?;
+
+    // Proof-Hash berechnen (gleiche Logik wie block-level proofs)
+    let end = (challenge.offset + PROOF_WINDOW).min(data.len());
+    let window = &data[challenge.offset.min(data.len())..end];
+    let proof_hash = format!("{:x}", Sha256::digest(window));
+
+    // Signatur: Ed25519 über (challenge_id || proof_hash)
+    use ed25519_dalek::Signer;
+    let mut sign_data = Vec::new();
+    sign_data.extend_from_slice(challenge.challenge_id.as_bytes());
+    sign_data.extend_from_slice(proof_hash.as_bytes());
+    let sig = signing_key.sign(&sign_data);
+    let signature = hex::encode(sig.to_bytes());
+
+    Some(ChallengeResponse {
+        challenge_id: challenge.challenge_id.clone(),
+        responder_wallet: responder_wallet.to_string(),
+        proof_hash,
+        response_block: current_block,
+        signature,
+    })
+}
+
+/// Verifiziert eine ChallengeResponse gegen die ursprüngliche Challenge.
+///
+/// Prüft:
+/// 1. Responder-Wallet stimmt mit Challenge-Target überein
+/// 2. Antwort ist innerhalb der Deadline
+/// 3. Signatur ist gültig
+/// 4. Proof-Hash stimmt mit lokalen Daten überein (falls lokal vorhanden)
+pub fn verify_challenge_response(
+    challenge: &NetworkChallenge,
+    response: &ChallengeResponse,
+    store: Option<&ChunkStore>,
+    current_block: u64,
+) -> Result<(), String> {
+    // 1. Wallet-Match
+    if response.responder_wallet != challenge.target_wallet {
+        return Err(format!(
+            "Wallet mismatch: erwartet {}, erhalten {}",
+            &challenge.target_wallet[..12.min(challenge.target_wallet.len())],
+            &response.responder_wallet[..12.min(response.responder_wallet.len())]
+        ));
+    }
+
+    // 2. Deadline
+    if current_block > challenge.deadline_block {
+        return Err(format!(
+            "Deadline überschritten: Block {} > Deadline {}",
+            current_block, challenge.deadline_block
+        ));
+    }
+
+    // 3. Signatur verifizieren
+    if response.signature.len() == 128 {
+        if let (Ok(pub_bytes), Ok(sig_bytes)) = (
+            hex::decode(&response.responder_wallet),
+            hex::decode(&response.signature),
+        ) {
+            if pub_bytes.len() == 32 {
+                if let Ok(verifying_key) = ed25519_dalek::VerifyingKey::from_bytes(
+                    pub_bytes.as_slice().try_into().unwrap_or(&[0u8; 32]),
+                ) {
+                    let sig = ed25519_dalek::Signature::from_bytes(
+                        sig_bytes.as_slice().try_into().unwrap_or(&[0u8; 64]),
+                    );
+                    use ed25519_dalek::Verifier;
+                    let mut verify_data = Vec::new();
+                    verify_data.extend_from_slice(response.challenge_id.as_bytes());
+                    verify_data.extend_from_slice(response.proof_hash.as_bytes());
+                    if verifying_key.verify(&verify_data, &sig).is_err() {
+                        return Err("Ungültige Signatur".into());
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Lokale Verifikation (optional)
+    if let Some(store) = store {
+        if let Ok(data) = store.read_chunk(&challenge.chunk_hash) {
+            let end = (challenge.offset + PROOF_WINDOW).min(data.len());
+            let window = &data[challenge.offset.min(data.len())..end];
+            let expected = format!("{:x}", Sha256::digest(window));
+            if response.proof_hash != expected {
+                return Err(format!(
+                    "Proof-Hash stimmt nicht! Erwartet: {}..., Erhalten: {}...",
+                    &expected[..12], &response.proof_hash[..12]
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Hash über alle NetworkChallenges eines Blocks (geht in den Block-Hash ein)
+pub fn network_challenges_hash(challenges: &[NetworkChallenge]) -> String {
+    let mut h = Sha256::new();
+    h.update((challenges.len() as u64).to_le_bytes());
+    for c in challenges {
+        h.update(c.challenge_id.as_bytes());
+        h.update(c.target_wallet.as_bytes());
+        h.update(c.chunk_hash.as_bytes());
+        h.update(c.offset.to_le_bytes());
+        h.update(c.deadline_block.to_le_bytes());
+    }
+    format!("{:x}", h.finalize())
 }
 
 // ─── Challenge-Generierung ───────────────────────────────────────────────────

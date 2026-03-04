@@ -30,6 +30,10 @@ path = "src/bin/stone_keygen.rs"
 name = "stone-publish-update"
 path = "src/bin/stone_publish_update.rs"
 
+[[bin]]
+name = "stone-miner"
+path = "src/bin/stone_miner.rs"
+
 # ─── Abhängigkeiten ───────────────────────────────────────────────────────────
 [dependencies]
 # Serialisierung
@@ -102,6 +106,10 @@ hostname        = "0.3"
 url             = "2.5"
 dotenvy         = "0.15"
 
+# Snapshot-Komprimierung (tar + zstd)
+tar             = "0.4"
+zstd            = "0.13"
+
 # Erasure Coding (Reed-Solomon) für Chunk-Sharding
 reed-solomon-erasure = "6.0"
 
@@ -115,3 +123,10 @@ uuid = { version = "1.0", features = ["v4", "serde"] }
 dialoguer   = { version = "0.11", features = ["fuzzy-select"] }
 indicatif   = "0.17"
 console     = "0.15"
+
+# ─── TUI (Standalone Miner) ──────────────────────────────────────────────────
+ratatui     = "0.29"
+crossterm   = "0.28"
+
+# ─── System-Metriken (Miner Dashboard) ───────────────────────────────────────
+sysinfo     = "0.31"

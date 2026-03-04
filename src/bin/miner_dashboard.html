@@ -1,0 +1,700 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>⛏ Stone Miner Dashboard</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{
+  --bg:#0d1117;--card:#161b22;--border:#30363d;--text:#c9d1d9;--muted:#8b949e;
+  --cyan:#58a6ff;--green:#3fb950;--red:#f85149;--yellow:#d29922;--purple:#bc8cff;
+  --orange:#f0883e;
+}
+body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;min-height:100vh}
+a{color:var(--cyan);text-decoration:none}
+
+/* Header */
+.header{background:#010409;border-bottom:1px solid var(--border);padding:12px 24px;display:flex;align-items:center;gap:16px;position:sticky;top:0;z-index:100}
+.header h1{font-size:18px;font-weight:600;color:#fff}
+.header .version{color:var(--muted);font-size:13px}
+.header .status{display:flex;align-items:center;gap:6px;margin-left:auto;font-size:14px;font-weight:500}
+.header .dot{width:8px;height:8px;border-radius:50%;display:inline-block}
+.dot.on{background:var(--green);box-shadow:0 0 8px var(--green)}
+.dot.off{background:var(--yellow)}
+.header .uptime{color:var(--muted);font-size:13px;margin-left:16px}
+
+/* Controls Bar */
+.controls{background:#010409;border-bottom:1px solid var(--border);padding:8px 24px;display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.btn{padding:6px 16px;border-radius:6px;border:1px solid var(--border);background:var(--card);color:var(--text);cursor:pointer;font-size:13px;font-weight:500;transition:all .15s}
+.btn:hover{border-color:var(--muted);background:#21262d}
+.btn.primary{background:#238636;border-color:#2ea043;color:#fff}
+.btn.primary:hover{background:#2ea043}
+.btn.danger{background:#da3633;border-color:var(--red);color:#fff}
+.btn.danger:hover{background:var(--red)}
+.btn.warning{background:var(--yellow);border-color:var(--orange);color:#000}
+.throttle-group{display:flex;align-items:center;gap:8px;margin-left:auto}
+.throttle-group label{font-size:13px;color:var(--muted)}
+.throttle-group input[type=range]{width:120px;accent-color:var(--cyan)}
+.throttle-group .val{font-size:13px;color:var(--cyan);min-width:32px;text-align:right}
+
+/* Grid */
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px;padding:20px 24px}
+
+/* Cards */
+.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:16px 20px}
+.card h2{font-size:14px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;margin-bottom:12px;display:flex;align-items:center;gap:8px}
+.card h2 .icon{font-size:18px}
+.stat-row{display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid #21262d}
+.stat-row:last-child{border-bottom:none}
+.stat-label{font-size:13px;color:var(--muted)}
+.stat-value{font-size:14px;font-weight:600;color:#fff}
+.stat-value.green{color:var(--green)}
+.stat-value.cyan{color:var(--cyan)}
+.stat-value.yellow{color:var(--yellow)}
+.stat-value.red{color:var(--red)}
+.stat-value.purple{color:var(--purple)}
+
+/* Progress Bars */
+.progress-bar{width:100%;height:6px;background:#21262d;border-radius:3px;overflow:hidden;margin-top:4px}
+.progress-bar .fill{height:100%;border-radius:3px;transition:width .5s ease}
+.fill.green{background:var(--green)}.fill.cyan{background:var(--cyan)}
+.fill.yellow{background:var(--yellow)}.fill.red{background:var(--red)}
+
+/* Big Number */
+.big-num{font-size:32px;font-weight:700;color:#fff;line-height:1}
+.big-unit{font-size:14px;color:var(--muted);margin-left:4px}
+
+/* Wallet Addresses */
+.addr{font-family:'SF Mono',SFMono-Regular,Consolas,monospace;font-size:12px;color:var(--cyan);background:#0d1117;padding:2px 6px;border-radius:4px;word-break:break-all}
+
+/* Log Panel */
+.log-panel{margin:0 24px 24px;background:var(--card);border:1px solid var(--border);border-radius:8px;overflow:hidden}
+.log-panel h2{font-size:14px;font-weight:600;color:var(--muted);padding:12px 16px;border-bottom:1px solid var(--border);text-transform:uppercase;letter-spacing:.5px}
+.log-content{height:200px;overflow-y:auto;padding:8px 16px;font-family:'SF Mono',SFMono-Regular,Consolas,monospace;font-size:12px;line-height:1.6}
+.log-line{white-space:pre-wrap;word-break:break-all}
+.log-line.ok{color:var(--green)}.log-line.warn{color:var(--yellow)}
+.log-line.err{color:var(--red)}.log-line.info{color:var(--muted)}
+
+/* Storage Health Gauge */
+.gauge-container{display:flex;align-items:center;gap:12px;margin:8px 0}
+.gauge{width:60px;height:60px;border-radius:50%;position:relative;display:flex;align-items:center;justify-content:center}
+.gauge .pct{font-size:16px;font-weight:700;color:#fff}
+.gauge svg{position:absolute;transform:rotate(-90deg)}
+.gauge circle{fill:none;stroke-width:4}
+.gauge .bg{stroke:#21262d}
+.gauge .fg{stroke:var(--green);stroke-linecap:round;transition:stroke-dashoffset .5s ease}
+
+/* ─── Setup Screen ─── */
+.setup-overlay{position:fixed;top:0;left:0;right:0;bottom:0;background:var(--bg);z-index:200;display:flex;align-items:center;justify-content:center}
+.setup-box{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:32px 40px;max-width:520px;width:90%}
+.setup-box h1{font-size:24px;color:#fff;margin-bottom:4px}
+.setup-box .subtitle{color:var(--muted);font-size:14px;margin-bottom:24px}
+.setup-box .mining-addr{font-family:'SF Mono',Consolas,monospace;font-size:13px;color:var(--cyan);background:#0d1117;padding:8px 12px;border-radius:6px;word-break:break-all;margin:8px 0 20px}
+.setup-box label{display:block;font-size:13px;color:var(--muted);margin-bottom:4px;margin-top:16px}
+.setup-box input[type=text],.setup-box input[type=number]{width:100%;padding:8px 12px;border:1px solid var(--border);border-radius:6px;background:#0d1117;color:var(--text);font-size:14px;font-family:inherit}
+.setup-box input:focus{outline:none;border-color:var(--cyan)}
+.setup-box .hint{font-size:11px;color:var(--muted);margin-top:3px}
+.setup-box .btn-setup{width:100%;padding:10px;margin-top:24px;font-size:15px;font-weight:600;border-radius:8px;border:none;cursor:pointer;background:#238636;color:#fff;transition:background .15s}
+.setup-box .btn-setup:hover{background:#2ea043}
+.setup-box .error{color:var(--red);font-size:13px;margin-top:8px;display:none}
+.setup-banner{text-align:center;font-size:48px;margin-bottom:8px}
+
+/* Editable Payout */
+.payout-edit-row{display:flex;align-items:center;gap:6px}
+.payout-edit-row .addr{flex:1;min-width:0}
+.payout-edit-row .btn-edit{padding:3px 8px;font-size:11px;border-radius:4px;border:1px solid var(--border);background:var(--card);color:var(--muted);cursor:pointer;white-space:nowrap}
+.payout-edit-row .btn-edit:hover{border-color:var(--cyan);color:var(--cyan)}
+.payout-input-row{display:none;gap:6px;align-items:center;margin-top:4px}
+.payout-input-row.active{display:flex}
+.payout-input-row input{flex:1;padding:5px 8px;border:1px solid var(--border);border-radius:4px;background:#0d1117;color:var(--cyan);font-family:'SF Mono',Consolas,monospace;font-size:12px}
+.payout-input-row input:focus{outline:none;border-color:var(--cyan)}
+.payout-input-row .btn-save{padding:4px 10px;font-size:11px;border-radius:4px;border:none;background:#238636;color:#fff;cursor:pointer;font-weight:600}
+.payout-input-row .btn-save:hover{background:#2ea043}
+.payout-input-row .btn-cancel{padding:4px 8px;font-size:11px;border-radius:4px;border:1px solid var(--border);background:transparent;color:var(--muted);cursor:pointer}
+
+/* Toast Notifications */
+.toast-container{position:fixed;top:80px;right:24px;z-index:300;display:flex;flex-direction:column;gap:8px;pointer-events:none}
+.toast{padding:10px 16px;border-radius:8px;font-size:13px;font-weight:500;pointer-events:auto;animation:toastIn .3s ease;box-shadow:0 4px 12px rgba(0,0,0,.4);max-width:360px}
+.toast.success{background:#1a3a1a;border:1px solid var(--green);color:var(--green)}
+.toast.info{background:#0d2137;border:1px solid var(--cyan);color:var(--cyan)}
+.toast.warn{background:#2d2100;border:1px solid var(--yellow);color:var(--yellow)}
+.toast.error{background:#3a1a1a;border:1px solid var(--red);color:var(--red)}
+@keyframes toastIn{from{opacity:0;transform:translateX(40px)}to{opacity:1;transform:translateX(0)}}
+@keyframes toastOut{from{opacity:1;transform:translateX(0)}to{opacity:0;transform:translateX(40px)}}
+
+/* Mining Active Pulse */
+.mining-pulse{display:inline-block;width:10px;height:10px;border-radius:50%;background:var(--green);margin-right:6px;animation:pulse 1.5s infinite}
+@keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(63,185,80,.5)}50%{box-shadow:0 0 0 8px rgba(63,185,80,0)}}
+
+/* Responsive */
+@media(max-width:768px){
+  .grid{grid-template-columns:1fr;padding:12px}
+  .header{padding:10px 12px}
+  .controls{padding:8px 12px}
+  .log-panel{margin:0 12px 12px}
+  .setup-box{padding:24px}
+  .toast-container{right:12px;left:12px}
+  .toast{max-width:100%}
+}
+</style>
+</head>
+<body>
+
+<!-- ═══ Setup Screen (shown when not configured) ═══ -->
+<div class="setup-overlay" id="setupScreen" style="display:none">
+  <div class="setup-box">
+    <div class="setup-banner">⛏</div>
+    <h1>Stone Miner Setup</h1>
+    <div class="subtitle">Konfiguriere deinen Miner, bevor du loslegst.</div>
+
+    <div style="font-size:12px;color:var(--muted);margin-bottom:2px">Deine Mining-Wallet (automatisch erstellt)</div>
+    <div class="mining-addr" id="setupMiningAddr">Wird geladen…</div>
+
+    <label for="setupPayoutWallet">Payout-Wallet-Adresse</label>
+    <input type="text" id="setupPayoutWallet" placeholder="64 Hex-Zeichen (leer = Mining-Wallet)" maxlength="128">
+    <div class="hint">Rewards werden 1× täglich hierhin überwiesen. Leer lassen → bleiben auf Mining-Wallet.</div>
+
+    <label for="setupNodeName">Node-Name</label>
+    <input type="text" id="setupNodeName" placeholder="z.B. MeinMiner01">
+    <div class="hint">Optionaler Name für deinen Miner im Netzwerk.</div>
+
+    <label for="setupPayoutHour">Payout-Stunde (0–23)</label>
+    <input type="number" id="setupPayoutHour" value="14" min="0" max="23">
+    <div class="hint">Zu welcher Uhrzeit sollen die Rewards täglich ausgezahlt werden?</div>
+
+    <div class="error" id="setupError"></div>
+    <button class="btn-setup" onclick="saveSetup()">🚀 Mining starten</button>
+  </div>
+</div>
+
+<!-- Toast Container -->
+<div class="toast-container" id="toastContainer"></div>
+
+<!-- Header -->
+<div class="header">
+  <h1>⛏ Stone Miner</h1>
+  <span class="version" id="version">v0.7.6</span>
+  <div class="status">
+    <span class="dot" id="statusDot"></span>
+    <span id="statusText">Verbinde...</span>
+  </div>
+  <span class="uptime" id="uptime">—</span>
+</div>
+
+<!-- Controls -->
+<div class="controls">
+  <button class="btn primary" id="btnToggle" onclick="toggleMining()">⛏ Mining Starten</button>
+  <button class="btn warning" id="btnPayout" onclick="forcePayout()">💸 Sofort Auszahlen</button>
+  <div class="throttle-group">
+    <label>Leistung:</label>
+    <input type="range" id="throttle" min="0" max="100" step="10" value="100" oninput="updateThrottle(this.value)">
+    <span class="val" id="throttleVal">100%</span>
+  </div>
+</div>
+
+<!-- Stats Grid -->
+<div class="grid">
+
+  <!-- Mining Status -->
+  <div class="card">
+    <h2><span class="icon">⛏</span> Mining</h2>
+    <div style="display:flex;align-items:baseline;gap:8px;margin-bottom:12px">
+      <span class="big-num" id="blockHeight">0</span>
+      <span class="big-unit">Blöcke</span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">Blocks Mined</span>
+      <span class="stat-value green" id="blocksMined">0</span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">Total Rewards</span>
+      <span class="stat-value yellow" id="totalRewards">0 STONE</span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">Block Reward</span>
+      <span class="stat-value" id="currentReward">10.0 STONE</span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">Halving in</span>
+      <span class="stat-value" id="halvingInfo">— Blöcke</span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">Mining Intervall</span>
+      <span class="stat-value" id="miningInterval">30s</span>
+    </div>
+  </div>
+
+  <!-- Storage Mining (Proof-of-Storage) -->
+  <div class="card">
+    <h2><span class="icon">💾</span> Storage Mining</h2>
+    <div class="gauge-container">
+      <div class="gauge">
+        <svg width="60" height="60" viewBox="0 0 60 60">
+          <circle class="bg" cx="30" cy="30" r="26"></circle>
+          <circle class="fg" id="healthArc" cx="30" cy="30" r="26"
+            stroke-dasharray="163.36" stroke-dashoffset="0"></circle>
+        </svg>
+        <span class="pct" id="healthPct">—%</span>
+      </div>
+      <div>
+        <div style="font-size:12px;color:var(--muted)">Storage Health</div>
+        <div style="font-size:13px;margin-top:2px"><span id="challengesPassed">0</span>/<span id="challengesTotal">0</span> Challenges bestanden</div>
+      </div>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">Chunks gespeichert</span>
+      <span class="stat-value cyan" id="chunksStored">0</span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">Speicher belegt</span>
+      <span class="stat-value" id="storageUsed">0 B</span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">Audit-Challenges fehlgeschlagen</span>
+      <span class="stat-value red" id="challengesFailed">0</span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">Letztes Audit</span>
+      <span class="stat-value" id="lastAudit">—</span>
+    </div>
+    <div style="margin:8px 0 4px;border-top:1px solid #21262d"></div>
+    <h2 style="font-size:12px;margin-top:8px"><span class="icon">⛓</span> Chain-Challenges</h2>
+    <div class="stat-row">
+      <span class="stat-label">Empfangen</span>
+      <span class="stat-value purple" id="chainChallengesRecv">0</span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">Beantwortet</span>
+      <span class="stat-value green" id="chainChallengesResp">0</span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">Verpasst</span>
+      <span class="stat-value red" id="chainChallengesMissed">0</span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">Chain-Rewards</span>
+      <span class="stat-value yellow" id="chainRewards">0 STONE</span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">Pending</span>
+      <span class="stat-value" id="pendingChallenges">0</span>
+    </div>
+  </div>
+
+  <!-- Wallet -->
+  <div class="card">
+    <h2><span class="icon">👛</span> Wallet</h2>
+    <div style="margin-bottom:10px">
+      <div style="font-size:11px;color:var(--muted);margin-bottom:2px">Mining Wallet</div>
+      <div class="addr" id="miningAddr">—</div>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">Mining Balance</span>
+      <span class="stat-value yellow" id="miningBalance">0 STONE</span>
+    </div>
+    <div style="margin:10px 0 6px;border-top:1px solid #21262d"></div>
+    <div style="margin-bottom:10px">
+      <div style="font-size:11px;color:var(--muted);margin-bottom:2px">Payout Wallet</div>
+      <div class="payout-edit-row">
+        <div class="addr" id="payoutAddr">—</div>
+        <button class="btn-edit" onclick="startEditPayout()" id="btnEditPayout">✏️</button>
+      </div>
+      <div class="payout-input-row" id="payoutEditRow">
+        <input type="text" id="payoutInput" placeholder="64 Hex-Zeichen (leer = Mining-Wallet)" maxlength="128">
+        <button class="btn-save" onclick="savePayout()">💾</button>
+        <button class="btn-cancel" onclick="cancelEditPayout()">✕</button>
+      </div>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">Payout Balance</span>
+      <span class="stat-value" id="payoutBalance">0 STONE</span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">Nächste Zahlung</span>
+      <span class="stat-value" id="nextPayout">—</span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">Total Paid Out</span>
+      <span class="stat-value green" id="totalPaid">0 STONE</span>
+    </div>
+  </div>
+
+  <!-- Network -->
+  <div class="card">
+    <h2><span class="icon">🌐</span> Netzwerk</h2>
+    <div style="display:flex;align-items:baseline;gap:8px;margin-bottom:12px">
+      <span class="big-num" id="peersHealthy">0</span>
+      <span class="big-unit">/ <span id="peersTotal">0</span> Peers</span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">P2P Status</span>
+      <span class="stat-value green" id="p2pStatus">—</span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">Node Name</span>
+      <span class="stat-value" id="nodeName">—</span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">Chain gültig</span>
+      <span class="stat-value green" id="chainValid">—</span>
+    </div>
+  </div>
+
+  <!-- System -->
+  <div class="card">
+    <h2><span class="icon">🖥</span> System</h2>
+    <div class="stat-row" style="flex-direction:column;align-items:stretch">
+      <div style="display:flex;justify-content:space-between">
+        <span class="stat-label">CPU</span>
+        <span class="stat-value" id="cpuPct">—%</span>
+      </div>
+      <div class="progress-bar"><div class="fill cyan" id="cpuBar" style="width:0%"></div></div>
+    </div>
+    <div class="stat-row" style="flex-direction:column;align-items:stretch">
+      <div style="display:flex;justify-content:space-between">
+        <span class="stat-label">RAM</span>
+        <span class="stat-value" id="ramInfo">—</span>
+      </div>
+      <div class="progress-bar"><div class="fill green" id="ramBar" style="width:0%"></div></div>
+    </div>
+    <div class="stat-row" style="flex-direction:column;align-items:stretch">
+      <div style="display:flex;justify-content:space-between">
+        <span class="stat-label">Disk</span>
+        <span class="stat-value" id="diskInfo">—</span>
+      </div>
+      <div class="progress-bar"><div class="fill yellow" id="diskBar" style="width:0%"></div></div>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">stone_data Größe</span>
+      <span class="stat-value" id="stoneDataSize">—</span>
+    </div>
+  </div>
+
+</div>
+
+<!-- Log Panel -->
+<div class="log-panel">
+  <h2>📋 Log</h2>
+  <div class="log-content" id="logContent"></div>
+</div>
+
+<script>
+let stats = {};
+let prevLogs = 0;
+let isConfigured = false;
+
+function fmt(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1048576) return (bytes/1024).toFixed(1)+' KB';
+  if (bytes < 1073741824) return (bytes/1048576).toFixed(1)+' MB';
+  return (bytes/1073741824).toFixed(2)+' GB';
+}
+
+function fmtUptime(s) {
+  const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = s%60;
+  if (h > 0) return h+'h '+String(m).padStart(2,'0')+'m';
+  return m+'m '+String(sec).padStart(2,'0')+'s';
+}
+
+function shortAddr(a) {
+  if (!a || a.length < 20) return a || '—';
+  return a.slice(0,10)+'…'+a.slice(-10);
+}
+
+async function fetchStats() {
+  try {
+    const r = await fetch('/api/miner/stats');
+    if (!r.ok) return;
+    stats = await r.json();
+
+    // Check configured state
+    if (!stats.configured && !isConfigured) {
+      document.getElementById('setupScreen').style.display = 'flex';
+      document.getElementById('setupMiningAddr').textContent = stats.wallet?.mining_address || '—';
+      document.getElementById('setupNodeName').placeholder = stats.info?.node_name || 'MeinMiner01';
+      return;
+    }
+    isConfigured = true;
+    document.getElementById('setupScreen').style.display = 'none';
+    updateUI();
+    checkMiningProgress(stats.mining);
+  } catch(e) {
+    document.getElementById('statusDot').className = 'dot off';
+    document.getElementById('statusText').textContent = 'Keine Verbindung';
+  }
+}
+
+// saveSetup() is defined at the bottom of the file with toast support
+
+function updateUI() {
+  const m = stats.mining || {};
+  const s = stats.storage || {};
+  const w = stats.wallet || {};
+  const n = stats.network || {};
+  const sys = stats.system || {};
+  const info = stats.info || {};
+
+  // Header
+  document.getElementById('version').textContent = 'v'+(info.version||'?');
+  const dot = document.getElementById('statusDot');
+  const stxt = document.getElementById('statusText');
+  if (m.active) {
+    dot.className='dot on';
+    stxt.innerHTML='<span class="mining-pulse"></span>Mining aktiv';
+  } else {
+    dot.className='dot off';
+    stxt.textContent='Mining pausiert';
+  }
+  document.getElementById('uptime').textContent = fmtUptime(info.uptime_secs||0);
+
+  // Controls
+  const btn = document.getElementById('btnToggle');
+  if (m.active) { btn.textContent='⏸ Mining Stoppen'; btn.className='btn danger'; }
+  else { btn.textContent='⛏ Mining Starten'; btn.className='btn primary'; }
+  document.getElementById('throttle').value = m.throttle_pct||0;
+  document.getElementById('throttleVal').textContent = (m.throttle_pct||0)+'%';
+
+  // Mining
+  document.getElementById('blockHeight').textContent = m.block_height||0;
+  document.getElementById('blocksMined').textContent = m.blocks_mined||0;
+  document.getElementById('totalRewards').textContent = (m.total_rewards||'0')+' STONE';
+  document.getElementById('currentReward').textContent = (m.current_reward||'0')+' STONE';
+  const hblk = m.blocks_until_halving||0;
+  const hdays = ((hblk*(m.mining_interval_secs||30))/86400).toFixed(0);
+  document.getElementById('halvingInfo').textContent = hblk.toLocaleString()+' Blöcke (~'+hdays+' Tage)';
+  document.getElementById('miningInterval').textContent = (m.mining_interval_secs||30)+'s';
+
+  // Storage
+  const hp = s.health_pct != null ? s.health_pct : 100;
+  document.getElementById('healthPct').textContent = hp.toFixed(1)+'%';
+  const circ = 2*Math.PI*26;
+  document.getElementById('healthArc').setAttribute('stroke-dashoffset', circ*(1-hp/100));
+  const arc = document.getElementById('healthArc');
+  arc.style.stroke = hp >= 95 ? 'var(--green)' : hp >= 80 ? 'var(--yellow)' : 'var(--red)';
+  document.getElementById('chunksStored').textContent = s.chunks_stored||0;
+  document.getElementById('storageUsed').textContent = fmt(s.storage_used_bytes||0);
+  document.getElementById('challengesPassed').textContent = s.challenges_passed||0;
+  document.getElementById('challengesTotal').textContent = s.challenges_total||0;
+  document.getElementById('challengesFailed').textContent = s.challenges_failed||0;
+  document.getElementById('lastAudit').textContent = s.last_audit_human||'—';
+
+  // Chain-Challenges
+  document.getElementById('chainChallengesRecv').textContent = s.chain_challenges_received||0;
+  document.getElementById('chainChallengesResp').textContent = s.chain_challenges_responded||0;
+  document.getElementById('chainChallengesMissed').textContent = s.chain_challenges_missed||0;
+  document.getElementById('chainRewards').textContent = (s.chain_rewards_earned||'0')+' STONE';
+  document.getElementById('pendingChallenges').textContent = s.pending_challenges||0;
+
+  // Wallet
+  document.getElementById('miningAddr').textContent = shortAddr(w.mining_address);
+  document.getElementById('payoutAddr').textContent = shortAddr(w.payout_address);
+  document.getElementById('miningBalance').textContent = (w.mining_balance||'0')+' STONE';
+  document.getElementById('payoutBalance').textContent = (w.payout_balance||'0')+' STONE';
+  document.getElementById('nextPayout').textContent = w.next_payout||'—';
+  document.getElementById('totalPaid').textContent = (w.total_paid_out||'0')+' STONE';
+
+  // Network
+  document.getElementById('peersHealthy').textContent = n.peers_healthy||0;
+  document.getElementById('peersTotal').textContent = n.peers_total||0;
+  document.getElementById('p2pStatus').textContent = n.p2p_active ? 'Aktiv' : 'Inaktiv';
+  document.getElementById('p2pStatus').className = 'stat-value '+(n.p2p_active?'green':'red');
+  document.getElementById('nodeName').textContent = info.node_name||'—';
+  document.getElementById('chainValid').textContent = n.chain_valid ? '✓ Ja' : '✗ Nein';
+  document.getElementById('chainValid').className = 'stat-value '+(n.chain_valid?'green':'red');
+
+  // System
+  const cpu = sys.cpu_usage_pct||0;
+  document.getElementById('cpuPct').textContent = cpu.toFixed(1)+'%';
+  document.getElementById('cpuBar').style.width = cpu+'%';
+  document.getElementById('cpuBar').className = 'fill '+(cpu>80?'red':cpu>50?'yellow':'cyan');
+
+  const memPct = sys.memory_total_mb>0 ? (sys.memory_used_mb/sys.memory_total_mb*100) : 0;
+  document.getElementById('ramInfo').textContent = (sys.memory_used_mb||0)+' / '+(sys.memory_total_mb||0)+' MB';
+  document.getElementById('ramBar').style.width = memPct.toFixed(1)+'%';
+  document.getElementById('ramBar').className = 'fill '+(memPct>80?'red':memPct>60?'yellow':'green');
+
+  const diskPct = sys.disk_total_mb>0 ? (sys.disk_used_mb/sys.disk_total_mb*100) : 0;
+  document.getElementById('diskInfo').textContent = (sys.disk_used_mb||0)+' / '+(sys.disk_total_mb||0)+' MB';
+  document.getElementById('diskBar').style.width = diskPct.toFixed(1)+'%';
+  document.getElementById('diskBar').className = 'fill '+(diskPct>80?'red':diskPct>60?'yellow':'yellow');
+
+  document.getElementById('stoneDataSize').textContent = fmt(sys.stone_data_size_bytes||0);
+
+  // Logs
+  updateLogs(stats.logs || []);
+}
+
+function updateLogs(lines) {
+  const el = document.getElementById('logContent');
+  if (lines.length === prevLogs) return;
+  prevLogs = lines.length;
+  el.innerHTML = '';
+  for (const line of lines) {
+    const div = document.createElement('div');
+    div.className = 'log-line';
+    if (line.includes('✅') || line.includes('mined') || line.includes('Reward')) div.className += ' ok';
+    else if (line.includes('⚠') || line.includes('❌') || line.includes('fehl')) div.className += ' err';
+    else if (line.includes('💸') || line.includes('Payout') || line.includes('Sync')) div.className += ' warn';
+    else div.className += ' info';
+    div.textContent = line;
+    el.appendChild(div);
+  }
+  el.scrollTop = el.scrollHeight;
+}
+
+async function toggleMining() {
+  try {
+    const r = await fetch('/api/miner/mining/toggle', {method:'POST'});
+    const d = await r.json();
+    if (d.mining) {
+      showToast('⛏ Mining gestartet! Dein Node mined jetzt Blöcke.', 'success', 4000);
+    } else {
+      showToast('⏸ Mining pausiert.', 'warn', 3000);
+    }
+    fetchStats();
+  } catch(e) {}
+}
+
+async function forcePayout() {
+  try {
+    const r = await fetch('/api/miner/payout', {method:'POST'});
+    const d = await r.json();
+    if (d.message) alert(d.message);
+    fetchStats();
+  } catch(e) { alert('Fehler: '+e.message); }
+}
+
+async function updateThrottle(v) {
+  document.getElementById('throttleVal').textContent = v+'%';
+  try { await fetch('/api/miner/mining/throttle?value='+v, {method:'POST'}); } catch(e) {}
+}
+
+// ─── Toast Notifications ─────
+function showToast(msg, type='info', duration=3500) {
+  const c = document.getElementById('toastContainer');
+  const t = document.createElement('div');
+  t.className = 'toast '+type;
+  t.textContent = msg;
+  c.appendChild(t);
+  setTimeout(()=>{
+    t.style.animation='toastOut .3s ease forwards';
+    setTimeout(()=>t.remove(), 300);
+  }, duration);
+}
+
+// ─── Editable Payout Wallet ─────
+function startEditPayout() {
+  const row = document.getElementById('payoutEditRow');
+  const inp = document.getElementById('payoutInput');
+  inp.value = stats?.wallet?.payout_address || '';
+  row.classList.add('active');
+  document.getElementById('btnEditPayout').style.display='none';
+  inp.focus();
+}
+
+function cancelEditPayout() {
+  document.getElementById('payoutEditRow').classList.remove('active');
+  document.getElementById('btnEditPayout').style.display='';
+}
+
+async function savePayout() {
+  const inp = document.getElementById('payoutInput');
+  const val = inp.value.trim();
+  if (val && !/^[0-9a-fA-F]{64}$/.test(val)) {
+    showToast('Ungültige Wallet-Adresse (64 Hex-Zeichen oder leer lassen)', 'error', 4000);
+    return;
+  }
+  try {
+    const r = await fetch('/api/miner/config', {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({payout_wallet: val}),
+    });
+    const d = await r.json();
+    if (d.ok) {
+      showToast('✅ Payout-Adresse gespeichert!', 'success');
+      cancelEditPayout();
+      fetchStats();
+    } else {
+      showToast(d.message || 'Fehler', 'error');
+    }
+  } catch(e) {
+    showToast('Verbindungsfehler: '+e.message, 'error');
+  }
+}
+
+// ─── Mining Feedback Tracker ─────
+let lastBlocksMined = -1;
+let lastBlockHeight = -1;
+
+function checkMiningProgress(m) {
+  if (!m) return;
+  // First load: just store values
+  if (lastBlocksMined < 0) {
+    lastBlocksMined = m.blocks_mined || 0;
+    lastBlockHeight = m.block_height || 0;
+    return;
+  }
+  // Detect newly mined block
+  const mined = m.blocks_mined || 0;
+  if (mined > lastBlocksMined) {
+    const diff = mined - lastBlocksMined;
+    const reward = m.current_reward || '10.0';
+    showToast(`⛏ Block #${m.block_height} gemined! +${reward} STONE`, 'success', 5000);
+    lastBlocksMined = mined;
+  }
+  // Detect chain height increase (from peers)
+  const height = m.block_height || 0;
+  if (height > lastBlockHeight + 1 && mined === lastBlocksMined) {
+    // Someone else mined
+  }
+  lastBlockHeight = height;
+}
+
+// ─── Setup → Mining transition toast ─────
+async function saveSetup() {
+  const errEl = document.getElementById('setupError');
+  errEl.style.display = 'none';
+
+  const payload = {
+    payout_wallet: document.getElementById('setupPayoutWallet').value.trim(),
+    node_name: document.getElementById('setupNodeName').value.trim() || null,
+    payout_hour: parseInt(document.getElementById('setupPayoutHour').value) || 14,
+  };
+
+  if (payload.payout_wallet && !/^[0-9a-fA-F]{64}$/.test(payload.payout_wallet)) {
+    errEl.textContent = 'Ungültige Wallet-Adresse (64 Hex-Zeichen erwartet) oder leer lassen.';
+    errEl.style.display = 'block';
+    return;
+  }
+
+  try {
+    const r = await fetch('/api/miner/config', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload),
+    });
+    const d = await r.json();
+    if (d.ok) {
+      isConfigured = true;
+      document.getElementById('setupScreen').style.display = 'none';
+      showToast('🚀 Miner konfiguriert! Mining startet...', 'success', 5000);
+      setTimeout(()=> showToast('⛏ Erster Block wird in ~30 Sekunden gemined.', 'info', 6000), 1500);
+      fetchStats();
+    } else {
+      errEl.textContent = d.message || 'Fehler beim Speichern';
+      errEl.style.display = 'block';
+    }
+  } catch(e) {
+    errEl.textContent = 'Verbindungsfehler: ' + e.message;
+    errEl.style.display = 'block';
+  }
+}
+
+// Poll every 2 seconds
+fetchStats();
+setInterval(fetchStats, 2000);
+</script>
+</body>
+</html>

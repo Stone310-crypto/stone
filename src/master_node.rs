@@ -427,6 +427,9 @@ pub struct MasterNodeState {
     /// Falls gesetzt, gehen alle Block-Rewards an diese Wallet statt an die Validator-Wallet.
     /// Wird in `stone_data/mining_config.json` persistiert.
     pub mining_wallet: RwLock<Option<String>>,
+    /// Pending ChallengeResponses: Nodes schicken ihre Proofs hierher,
+    /// werden im nächsten Block aufgenommen und belohnt.
+    pub pending_challenge_responses: Mutex<Vec<crate::storage_proof::ChallengeResponse>>,
 }
 
 #[derive(Default)]
@@ -512,6 +515,7 @@ impl MasterNodeState {
             reputation_registry: RwLock::new(reputation_registry),
             chat_policy: RwLock::new(chat_policy),
             mining_wallet: RwLock::new(Self::load_mining_wallet()),
+            pending_challenge_responses: Mutex::new(Vec::new()),
         });
 
         // Wenn die Chain bereits > 10 Blöcke hat (Restart einer synced Node),
@@ -917,6 +921,72 @@ impl MasterNodeState {
         tx
     }
 
+    /// Sammelt pending ChallengeResponses und validiert sie gegen offene Challenges in der Chain.
+    fn collect_pending_challenge_responses(
+        &self,
+        chain: &StoneChain,
+    ) -> Vec<crate::storage_proof::ChallengeResponse> {
+        let mut pending = self.pending_challenge_responses.lock().unwrap();
+        if pending.is_empty() {
+            return Vec::new();
+        }
+
+        let current_block = chain.blocks.len() as u64;
+
+        // Sammle alle offenen Challenges aus den letzten DEADLINE Blöcken
+        let lookback = crate::storage_proof::CHALLENGE_DEADLINE_BLOCKS as usize + 5;
+        let start = chain.blocks.len().saturating_sub(lookback);
+        let open_challenges: Vec<&crate::storage_proof::NetworkChallenge> = chain.blocks[start..]
+            .iter()
+            .flat_map(|b| b.storage_challenges.iter())
+            .filter(|c| c.deadline_block >= current_block)
+            .collect();
+
+        // Sammle alle schon beantworteten Challenge-IDs
+        let answered: std::collections::HashSet<&str> = chain.blocks[start..]
+            .iter()
+            .flat_map(|b| b.challenge_responses.iter())
+            .map(|r| r.challenge_id.as_str())
+            .collect();
+
+        // Nur Responses für offene, noch nicht beantwortete Challenges aufnehmen
+        let store = crate::storage::ChunkStore::new().ok();
+
+        let valid_responses: Vec<crate::storage_proof::ChallengeResponse> = pending
+            .drain(..)
+            .filter(|resp| {
+                // Challenge existiert und ist offen?
+                let challenge = open_challenges.iter().find(|c| c.challenge_id == resp.challenge_id);
+                match challenge {
+                    None => {
+                        println!("[storage-challenge] ⚠ Response für unbekannte Challenge {} ignoriert", &resp.challenge_id[..12.min(resp.challenge_id.len())]);
+                        false
+                    }
+                    Some(challenge) => {
+                        if answered.contains(resp.challenge_id.as_str()) {
+                            println!("[storage-challenge] ⚠ Challenge {} schon beantwortet", &resp.challenge_id[..12.min(resp.challenge_id.len())]);
+                            return false;
+                        }
+                        match crate::storage_proof::verify_challenge_response(
+                            challenge,
+                            resp,
+                            store.as_ref(),
+                            current_block,
+                        ) {
+                            Ok(()) => true,
+                            Err(e) => {
+                                println!("[storage-challenge] ❌ Invalid response: {e}");
+                                false
+                            }
+                        }
+                    }
+                }
+            })
+            .collect();
+
+        valid_responses
+    }
+
     /// Erstellt einen neuen Block (auch ohne Dokumente) mit Mempool-TXs und Block-Reward.
     ///
     /// Wird vom Mining-Loop alle `MINING_INTERVAL_SECS` Sekunden aufgerufen.
@@ -1094,6 +1164,72 @@ impl MasterNodeState {
         block.validator_pub_key = validator_wallet.clone();
         block.validator_signature = sig;
 
+        // ── Network Storage Challenges: Challenge andere Nodes ───────────
+        {
+            let chunk_refs = crate::storage_proof::collect_chunk_refs(&chain);
+            if !chunk_refs.is_empty() {
+                // Bekannte Validator-Wallets sammeln
+                let vs = self.validator_set.read().unwrap();
+                let mut known_wallets: Vec<String> = vs.validators.iter()
+                    .filter(|v| v.active)
+                    .filter_map(|v| if v.public_key_hex.is_empty() { None } else { Some(v.public_key_hex.clone()) })
+                    .collect();
+                // Auch Peers' Wallets aus Trust-Registry einbeziehen
+                {
+                    let trust = self.trust_registry.read().unwrap();
+                    for entry in trust.iter() {
+                        if !entry.public_key_hex.is_empty() && !known_wallets.contains(&entry.public_key_hex) {
+                            known_wallets.push(entry.public_key_hex.clone());
+                        }
+                    }
+                }
+
+                let challenges = crate::storage_proof::generate_network_challenges(
+                    &block.previous_hash,
+                    block.index,
+                    &chunk_refs,
+                    &known_wallets,
+                    &validator_wallet,
+                );
+
+                if !challenges.is_empty() {
+                    println!(
+                        "[storage-challenge] 📋 Block #{}: {} Network-Challenges erstellt",
+                        block.index, challenges.len()
+                    );
+                    for c in &challenges {
+                        println!(
+                            "[storage-challenge]   → Node {}… Chunk {}… Offset {} (Deadline: #{})",
+                            &c.target_wallet[..12.min(c.target_wallet.len())],
+                            &c.chunk_hash[..12.min(c.chunk_hash.len())],
+                            c.offset,
+                            c.deadline_block
+                        );
+                    }
+                }
+
+                // Challenges hinzufügen und Block-Hash neu berechnen
+                block.storage_challenges = challenges;
+
+                // Pending ChallengeResponses aus dem Mempool holen
+                // (diese wurden von herausgeforderten Nodes eingereicht)
+                let responses = self.collect_pending_challenge_responses(&chain);
+                if !responses.is_empty() {
+                    println!(
+                        "[storage-challenge] ✅ {} Challenge-Responses in Block #{} aufgenommen",
+                        responses.len(), block.index
+                    );
+                }
+                block.challenge_responses = responses;
+
+                // Block-Hash neu berechnen (weil storage_challenges den Hash beeinflusst)
+                block.hash = crate::blockchain::calculate_hash(&block);
+                block.signature = crate::blockchain::sign_hash(&self.cluster_key, &block.hash);
+                let new_sig = sign_block(&signing_key, &block.hash);
+                block.validator_signature = new_sig;
+            }
+        }
+
         println!(
             "[mining] ⛏️  Block #{} vorbereitet – {} TXs, Reward: {} STONE → {}",
             block.index,
@@ -1225,6 +1361,28 @@ impl MasterNodeState {
             block.transactions.len(),
             &validator_wallet[..16.min(validator_wallet.len())],
         );
+
+        // ── Auto-Snapshot (alle SNAPSHOT_INTERVAL Blöcke) ─────────────────
+        if crate::snapshot::should_create_snapshot(block.index) {
+            let genesis_hash = {
+                let chain = self.chain.lock().unwrap();
+                chain.blocks.first().map(|b| b.hash.clone()).unwrap_or_default()
+            };
+            let latest_hash = block.hash.clone();
+            let height = block.index;
+            std::thread::spawn(move || {
+                match crate::snapshot::create_snapshot(height, &genesis_hash, &latest_hash) {
+                    Ok((_path, meta)) => {
+                        eprintln!(
+                            "[snapshot] 📸 Auto-Snapshot bei Block #{}: {:.1} MB",
+                            meta.block_height,
+                            meta.archive_size as f64 / 1_048_576.0
+                        );
+                    }
+                    Err(e) => eprintln!("[snapshot] ⚠️  Auto-Snapshot fehlgeschlagen: {e}"),
+                }
+            });
+        }
 
         Ok(())
     }

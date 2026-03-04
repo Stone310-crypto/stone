@@ -2600,6 +2600,14 @@ impl SwarmTask {
     /// Sendet ChainInfo-Anfragen an alle verbundenen Peers per Request/Response.
     /// Zuverlässiger als GossipSub (braucht keinen Mesh).
     fn sync_with_connected_peers(&mut self) {
+        // ── local_chain_count aus chain_ref aktualisieren ──────────────
+        // Damit der Wert auch nach lokal geminteten Blöcken stimmt.
+        if let Some(arc) = &self.chain_ref {
+            if let Ok(chain) = arc.lock() {
+                self.local_chain_count = chain.blocks.len() as u64;
+            }
+        }
+
         let connected: Vec<PeerId> = self.peers.iter()
             .filter(|(_, info)| info.connected)
             .map(|(pid, _)| *pid)
@@ -2609,10 +2617,7 @@ impl SwarmTask {
             return;
         }
 
-        // Aktuelle Chain-Höhe aus chain_ref lesen
-        let actual_local = self.chain_ref.as_ref()
-            .and_then(|arc| arc.lock().ok().map(|c| c.blocks.len() as u64))
-            .unwrap_or(self.local_chain_count);
+        // local_chain_count ist jetzt aktuell (oben refreshed)
 
         // Nur syncen wenn wir möglicherweise hinterher sind
         // (auch GossipSub-Handshake senden für Peers die hinter UNS sind)
@@ -2638,8 +2643,12 @@ impl SwarmTask {
         let genesis_hash = self.chain_ref.as_ref().and_then(|arc| {
             arc.lock().ok().and_then(|c| c.blocks.first().map(|b| b.hash.clone()))
         });
+        // Aktuelle Höhe aus chain_ref (local_chain_count wird in sync_with_connected_peers aktualisiert)
+        let actual_count = self.chain_ref.as_ref()
+            .and_then(|arc| arc.lock().ok().map(|c| c.blocks.len() as u64))
+            .unwrap_or(self.local_chain_count);
         let msg = SyncHandshake {
-            block_count: self.local_chain_count,
+            block_count: actual_count,
             peer_id: self.swarm.local_peer_id().to_string(),
             genesis_hash,
             protocol_version: Some(STONE_PROTOCOL_VERSION.to_string()),

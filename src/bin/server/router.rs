@@ -72,6 +72,9 @@ use super::handlers::{
     reputation::{
         handle_reputation_status, handle_reputation_nodes, handle_reputation_node,
     },
+    snapshot::{
+        handle_snapshot_meta, handle_snapshot_download, handle_snapshot_create,
+    },
     users::{handle_delete_user, handle_list_users},
     ws::handle_websocket,
 };
@@ -259,6 +262,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/reputation/status", get(handle_reputation_status))
         .route("/api/v1/reputation/nodes", get(handle_reputation_nodes))
         .route("/api/v1/reputation/node/:node_id", get(handle_reputation_node))
+        // ─── Snapshots (Fast Sync) ──────────────────────────────────────────
+        .route("/api/v1/snapshot/meta", get(handle_snapshot_meta))
+        .route("/api/v1/snapshot/download", get(handle_snapshot_download))
+        .route("/api/v1/snapshot/create", post(handle_snapshot_create))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
         .layer(build_cors())
         .with_state(state)

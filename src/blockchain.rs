@@ -238,6 +238,15 @@ pub struct Block {
     /// Geht in den Block-Hash ein und wird bei accept_peer_block verifiziert.
     #[serde(default)]
     pub storage_proof: crate::storage_proof::StorageProof,
+
+    // ─── Network Storage Challenges (Chain-Driven) ──────────────────────
+    /// Vom Block-Ersteller generierte Challenges an andere Nodes im Netzwerk
+    #[serde(default)]
+    pub storage_challenges: Vec<crate::storage_proof::NetworkChallenge>,
+
+    /// Antworten auf frühere Challenges (durch herausgeforderte Nodes eingereicht)
+    #[serde(default)]
+    pub challenge_responses: Vec<crate::storage_proof::ChallengeResponse>,
 }
 
 // ─── Chain ───────────────────────────────────────────────────────────────────
@@ -399,12 +408,9 @@ impl StoneChain {
         cluster_key: &str,
         node_role: NodeRole,
     ) -> Block {
-        // ── Eternal Memorial TX in jeden Block injizieren ─────────────
-        let mut transactions = transactions;
-        let memorial = memorial_tx();
-        if !transactions.iter().any(|tx| tx.tx_type == TxType::Memorial) {
-            transactions.push(memorial);
-        }
+        // Memorial TX wird nur im Genesis-Block gespeichert – nicht in
+        // jedem Block wiederholt (spart Platz, vermeidet doppelte TX-IDs).
+        let transactions = transactions;
 
         let manifest = serde_json::to_vec(&documents).unwrap_or_default();
         let merkle_root = compute_merkle_root(&documents, &tombstones, &transactions);
@@ -441,6 +447,8 @@ impl StoneChain {
             validator_pub_key: String::new(),
             validator_signature: String::new(),
             storage_proof,
+            storage_challenges: Vec::new(),
+            challenge_responses: Vec::new(),
         };
 
         let hash = calculate_hash(&new_block);
@@ -624,13 +632,9 @@ impl StoneChain {
             ));
         }
 
-        // ── Eternal Memorial TX Validierung ───────────────────────────────
-        // Jeder Block (außer Genesis) muss die Memorial-TX enthalten
-        if block.index > 0 && !has_valid_memorial(&block) {
-            return Err(
-                "Block fehlt die Eternal Memorial Transaction (#neverforgetdennis)".to_string()
-            );
-        }
+        // Memorial TX: Ab v0.7.7 nur noch im Genesis-Block.
+        // Alte Blöcke die eine Memorial TX enthalten werden weiterhin akzeptiert
+        // (die Merkle-Root-Prüfung oben validiert die tatsächlichen TXs im Block).
 
         // ── Proof of Storage Verifikation ─────────────────────────────────
         // Jeder Block (außer Genesis) muss einen gültigen Storage-Proof enthalten
@@ -877,6 +881,8 @@ pub fn calculate_hash(block: &Block) -> String {
     h.update(block.signer.as_bytes());
     // Storage-Proof geht in den Block-Hash ein → unveränderlich
     h.update(crate::storage_proof::storage_proof_hash(&block.storage_proof).as_bytes());
+    // Network-Challenges gehen ebenfalls in den Block-Hash ein
+    h.update(crate::storage_proof::network_challenges_hash(&block.storage_challenges).as_bytes());
     format!("{:x}", h.finalize())
 }
 
@@ -999,6 +1005,8 @@ Because Dennis died of cancer and nobody could do anything.
         tombstones: Vec::new(),
         transactions: vec![memorial_tx()],
         node_role: NodeRole::Master,
+        storage_challenges: Vec::new(),
+        challenge_responses: Vec::new(),
         proposal_round: 0,
         validator_pub_key: String::new(),
         validator_signature: String::new(),

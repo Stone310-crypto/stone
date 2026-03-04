@@ -233,6 +233,8 @@ fn load_or_create_genesis() -> Block {
         validator_pub_key: String::new(),
         validator_signature: String::new(),
         storage_proof: Default::default(),
+        storage_challenges: Vec::new(),
+        challenge_responses: Vec::new(),
     };
     let h = calculate_hash(&genesis);
     genesis.hash = h;

@@ -8,6 +8,7 @@ pub mod master_node;
 pub mod network;
 pub mod organization;
 pub mod shard;
+pub mod snapshot;
 pub mod storage;
 pub mod storage_proof;
 pub mod token;

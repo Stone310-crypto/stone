@@ -21,3 +21,12 @@ port    = "22"
 path    = "/opt/stone-node/target/release"
 service = "stone-node"
 bins    = "stone-setup stone-master"
+
+[[node]]
+name    = "VPSServer"
+host    = "212.227.54.241"
+user    = "root"
+port    = "22"
+path    = "/home"
+service = "stone-node"
+bins    = "stone-setup stone-master"

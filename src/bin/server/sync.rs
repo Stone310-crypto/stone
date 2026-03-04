@@ -73,51 +73,120 @@ pub async fn pull_from_peer(node: &Arc<MasterNodeState>, peer_url: &str, api_key
         return;
     }
 
-    // Blöcke abrufen
-    let blocks_url = format!(
-        "{}/api/v1/blocks?per_page=500",
-        peer_url.trim_end_matches('/')
-    );
-    let resp = match client
-        .get(&blocks_url)
-        .header("x-api-key", api_key)
-        .header("x-node-request", "internal")
-        .send()
-        .await
+    // ── Genesis-Check: Block #0 vom Peer holen und vergleichen ──
     {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("[sync] {peer_url} blocks request: {e}");
-            node.set_peer_status(peer_url, PeerStatus::Unreachable);
-            node.metrics.sync_failure.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return;
+        let gen_url = format!(
+            "{}/api/v1/blocks/0",
+            peer_url.trim_end_matches('/')
+        );
+        match client
+            .get(&gen_url)
+            .header("x-api-key", api_key)
+            .header("x-node-request", "internal")
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => {
+                if let Ok(peer_gen) = r.json::<stone::blockchain::Block>().await {
+                    let local_gen_hash = {
+                        let chain = node.chain.lock().unwrap();
+                        chain.blocks.first().map(|b| b.hash.clone()).unwrap_or_default()
+                    };
+                    if !local_gen_hash.is_empty() && local_gen_hash != peer_gen.hash {
+                        eprintln!("[sync] {peer_url}: Genesis-Mismatch – inkompatibler Peer \
+                                   (lokal={}, peer={})",
+                                  &local_gen_hash[..12.min(local_gen_hash.len())],
+                                  &peer_gen.hash[..12.min(peer_gen.hash.len())]);
+                        node.metrics.sync_failure.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return;
+                    }
+                }
+            }
+            _ => {
+                eprintln!("[sync] {peer_url}: Genesis-Block nicht abrufbar – überspringe");
+                node.metrics.sync_failure.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
         }
-    };
+    }
 
-    let val: serde_json::Value = match resp.json().await {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("[sync] {peer_url} parse error: {e}");
-            node.metrics.sync_failure.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return;
+    // ── Blöcke seitenweise abrufen (ab local_height aufsteigend) ──
+    // Die API liefert Blöcke absteigend (.rev()), daher berechnen wir die
+    // richtige Seite, um alle Blöcke ab local_height zu bekommen.
+    let per_page: u64 = 500;
+    let mut all_blocks: Vec<stone::blockchain::Block> = Vec::new();
+
+    // Wir brauchen Blöcke von local_height bis peer_height.
+    // Die API paginiert absteigend: page 0 = neueste per_page Blöcke.
+    // Statt die API umzubauen, holen wir alle Seiten die unseren Bereich abdecken.
+    let total_pages = (peer_height + per_page - 1) / per_page;
+    'page_loop: for page in 0..total_pages {
+        let blocks_url = format!(
+            "{}/api/v1/blocks?per_page={}&page={}",
+            peer_url.trim_end_matches('/'),
+            per_page,
+            page
+        );
+        let resp = match client
+            .get(&blocks_url)
+            .header("x-api-key", api_key)
+            .header("x-node-request", "internal")
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("[sync] {peer_url} blocks request (page {page}): {e}");
+                node.set_peer_status(peer_url, PeerStatus::Unreachable);
+                node.metrics.sync_failure.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+        };
+
+        let val: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("[sync] {peer_url} parse error (page {page}): {e}");
+                node.metrics.sync_failure.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
+        };
+
+        let page_blocks: Vec<stone::blockchain::Block> = match val
+            .get("blocks")
+            .and_then(|b| serde_json::from_value(b.clone()).ok())
+        {
+            Some(b) => b,
+            None => {
+                eprintln!("[sync] {peer_url}: Kein 'blocks' Feld (page {page})");
+                break;
+            }
+        };
+
+        if page_blocks.is_empty() {
+            break;
         }
-    };
 
-    let mut blocks: Vec<stone::blockchain::Block> = match val
-        .get("blocks")
-        .and_then(|b| serde_json::from_value(b.clone()).ok())
-    {
-        Some(b) => b,
-        None => {
-            eprintln!("[sync] {peer_url}: Kein 'blocks' Feld in Antwort: {}", 
-                      &val.to_string()[..200.min(val.to_string().len())]);
-            node.metrics.sync_failure.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return;
+        // Prüfen ob wir bereits alle benötigten Blöcke haben
+        let has_needed = page_blocks.iter().any(|b| b.index >= local_height);
+        all_blocks.extend(page_blocks);
+
+        if has_needed {
+            // Diese Seite enthält Blöcke ab local_height – eventuell brauchen
+            // wir noch ältere Seiten für den Bereich dazwischen.
+            // Prüfe ob wir alles ab local_height lückenlos haben:
+            all_blocks.sort_by_key(|b| b.index);
+            let min_idx = all_blocks.first().map(|b| b.index).unwrap_or(0);
+            if min_idx <= local_height {
+                break 'page_loop; // Wir haben alles ab local_height
+            }
         }
-    };
+    }
 
-    // Aufsteigend nach Index sortieren
-    blocks.sort_by_key(|b| b.index);
+    // Aufsteigend nach Index sortieren + deduplizieren
+    all_blocks.sort_by_key(|b| b.index);
+    all_blocks.dedup_by_key(|b| b.index);
+    let blocks = all_blocks;
 
     let mut added = 0u64;
 
@@ -131,19 +200,6 @@ pub async fn pull_from_peer(node: &Arc<MasterNodeState>, peer_url: &str, api_key
     let (pending_blocks, did_rollback) = {
         let mut chain = node.chain.lock().unwrap();
         let local_len = chain.blocks.len() as u64;
-        let local_gen_hash = chain
-            .blocks
-            .first()
-            .map(|b| b.hash.clone())
-            .unwrap_or_default();
-
-        if let Some(peer_gen) = blocks.first() {
-            if !local_gen_hash.is_empty() && local_gen_hash != peer_gen.hash {
-                eprintln!("[sync] {peer_url}: Genesis-Mismatch – inkompatibler Peer");
-                node.metrics.sync_failure.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return;
-            }
-        }
 
         let mut fork_at: Option<usize> = None;
         for peer_block in &blocks {

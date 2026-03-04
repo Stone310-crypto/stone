@@ -278,6 +278,51 @@ async fn start_full_node(state: SetupState) {
 
     println!("[node] Node-ID: {node_id}");
 
+    // ── Snapshot-Bootstrap: Prüfen ob wir eine frische Node sind ──────────
+    // Wenn die lokale Chain sehr kurz ist (nur Genesis), versuchen wir einen
+    // Snapshot von einem bekannten Peer herunterzuladen statt Block-für-Block zu syncen.
+    {
+        let chain_height = {
+            let tmp_chain = stone::blockchain::StoneChain::load_or_create(&api_key);
+            tmp_chain.blocks.len() as u64
+        };
+        if chain_height <= 1 {
+            let saved_peers = load_peers_from_disk();
+            let local_genesis = {
+                let tmp_chain = stone::blockchain::StoneChain::load_or_create(&api_key);
+                tmp_chain.blocks.first().map(|b| b.hash.clone()).unwrap_or_default()
+            };
+            if !saved_peers.is_empty() {
+                eprintln!("[snapshot] 🔍 Frische Node – suche Snapshot bei {} Peer(s)...", saved_peers.len());
+                let mut snapshot_ok = false;
+                for peer in &saved_peers {
+                    let peer_url = peer.url.clone();
+                    let genesis = local_genesis.clone();
+                    match stone::snapshot::download_snapshot_from_peer(
+                        &peer_url, &genesis, chain_height,
+                    ).await {
+                        Ok(meta) => {
+                            eprintln!(
+                                "[snapshot] ✅ Snapshot von {} geladen: Block #{}, {:.1} MB",
+                                peer_url,
+                                meta.block_height,
+                                meta.archive_size as f64 / 1_048_576.0
+                            );
+                            snapshot_ok = true;
+                            break;
+                        }
+                        Err(e) => {
+                            eprintln!("[snapshot] ℹ️  Kein Snapshot von {peer_url}: {e}");
+                        }
+                    }
+                }
+                if !snapshot_ok {
+                    eprintln!("[snapshot] Kein Snapshot verfügbar – normaler Block-Sync wird verwendet");
+                }
+            }
+        }
+    }
+
     let node = MasterNodeState::new(node_id.clone(), api_key.as_ref().clone(), NodeRole::Master);
 
     // Peers laden

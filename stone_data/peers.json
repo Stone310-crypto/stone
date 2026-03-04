@@ -34,7 +34,7 @@
   },
   {
     "url": "http://212.227.54.241:8080",
-    "name": "12D3KooWAq97",
+    "name": null,
     "ca": null,
     "status": "Unreachable",
     "last_seen": 0,
@@ -45,7 +45,7 @@
   },
   {
     "url": "http://172.18.0.1:8080",
-    "name": "12D3KooWAq97",
+    "name": null,
     "ca": null,
     "status": "Unreachable",
     "last_seen": 0,
@@ -56,13 +56,13 @@
   },
   {
     "url": "http://100.98.163.71:8080",
-    "name": "12D3KooWLqik",
+    "name": null,
     "ca": null,
     "status": "Healthy",
-    "last_seen": 1772582836,
-    "last_hash": "963dcbd3559d2f606dc8042ccb9230cc780be84f8d8b1c722ff2271c99f066c6",
-    "block_height": 24,
-    "latency_ms": 1,
+    "last_seen": 1772647703,
+    "last_hash": "a995ea9a6e530de1bba1a9d14424e444d07e9ea988bb4e88898345df63b92232",
+    "block_height": 107,
+    "latency_ms": 4,
     "sync_failures": 0
   }
 ]

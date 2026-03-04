@@ -12,6 +12,7 @@ pub mod p2p;
 pub mod peers;
 pub mod poa;
 pub mod reputation;
+pub mod snapshot;
 pub mod status;
 pub mod token;
 pub mod trust;
