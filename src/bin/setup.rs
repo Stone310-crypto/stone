@@ -413,6 +413,20 @@ async fn start_full_node(state: SetupState) {
                 }
                 // Network-Handle speichern
                 *state.network.write().await = Some(handle.clone());
+
+                // ── Mining → Gossip Bridge: geminete Blöcke broadcasten ──
+                {
+                    let (broadcast_tx, mut broadcast_rx) =
+                        tokio::sync::mpsc::unbounded_channel::<stone::blockchain::Block>();
+                    *node.block_broadcast_tx.lock().unwrap() = Some(broadcast_tx);
+                    let net_bc = handle.clone();
+                    tokio::spawn(async move {
+                        while let Some(block) = broadcast_rx.recv().await {
+                            net_bc.broadcast_block(block).await;
+                        }
+                    });
+                }
+
                 Some(handle)
             } else {
                 None
@@ -648,7 +662,9 @@ async fn handle_p2p_event(
                     None // PoA bei Sync überspringen
                 } else {
                     let vs = node.validator_set.read().unwrap();
-                    if vs.validators.is_empty() { None }
+                    // Kein sinnvolles PoA möglich wenn ValidatorSet leer ist
+                    // oder nur den eigenen Validator enthält
+                    if vs.validators.is_empty() || vs.active_count() <= 1 { None }
                     else {
                         let prev_hash = {
                             let chain = node.chain.lock().unwrap();

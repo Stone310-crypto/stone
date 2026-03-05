@@ -545,7 +545,7 @@ async fn handle_p2p_event(
                 if syncing { None }
                 else {
                     let vs = node.validator_set.read().unwrap();
-                    if vs.validators.is_empty() { None }
+                    if vs.validators.is_empty() || vs.active_count() <= 1 { None }
                     else {
                         let prev_hash = {
                             let chain = node.chain.lock().unwrap();
@@ -1005,10 +1005,23 @@ fn spawn_log_watcher(
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     dotenvy::dotenv().ok();
 
+    // UPnP-Panic abfangen (libp2p-upnp 0.3 Bug: panicked wenn Sender dropped wird)
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let msg = info.to_string();
+        if msg.contains("sender shouldn't have been dropped") || msg.contains("upnp") {
+            eprintln!("[p2p] ⚠ UPnP-Hintergrund-Task beendet (harmlos)");
+            return;
+        }
+        default_hook(info);
+    }));
+
     // ── Argumente parsen ────────────────────────────────────────────────
     let args: Vec<String> = std::env::args().collect();
     let mut wallet_arg: Option<String> = None;
     let mut headless = false;
+    let mut port_arg: Option<u16> = None;
+    let mut p2p_port_arg: Option<u16> = None;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -1021,6 +1034,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 }
             }
+            "--port" | "-p" => {
+                if i + 1 < args.len() {
+                    port_arg = args[i + 1].parse().ok();
+                    i += 2;
+                } else {
+                    eprintln!("Fehler: --port benötigt eine Portnummer");
+                    std::process::exit(1);
+                }
+            }
+            "--p2p-port" => {
+                if i + 1 < args.len() {
+                    p2p_port_arg = args[i + 1].parse().ok();
+                    i += 2;
+                } else {
+                    eprintln!("Fehler: --p2p-port benötigt eine Portnummer");
+                    std::process::exit(1);
+                }
+            }
             "--headless" => { headless = true; i += 1; }
             "--help" | "-h" => {
                 println!("stone-miner — StoneChain Standalone Miner mit Web-Dashboard");
@@ -1029,13 +1060,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("  stone-miner                        Start mit Web-Dashboard");
                 println!("  stone-miner --wallet <ADRESSE>     Wallet direkt angeben");
                 println!("  stone-miner --headless             Ohne Dashboard (Log-Modus)");
+                println!("  stone-miner --port 8081            Node-API-Port (Default: 8081)");
+                println!("  stone-miner --p2p-port 4002        P2P-Port (Default: 4002)");
                 println!();
                 println!("Optionen:");
-                println!("  -w, --wallet <ADDR>  Payout-Wallet-Adresse (64 Hex-Zeichen)");
-                println!("      --headless       Log-Modus ohne Web-Dashboard");
-                println!("  -h, --help           Diese Hilfe anzeigen");
+                println!("  -w, --wallet <ADDR>    Payout-Wallet-Adresse (64 Hex-Zeichen)");
+                println!("  -p, --port <PORT>      Node-API-Port (Default: 8081)");
+                println!("      --p2p-port <PORT>  P2P-Netzwerk-Port (Default: 4002)");
+                println!("      --headless         Log-Modus ohne Web-Dashboard");
+                println!("  -h, --help             Diese Hilfe anzeigen");
                 println!();
-                println!("Dashboard: http://localhost:<port>/ui (Default: 8081)");
+                println!("Dashboard: http://localhost:<port>/ui (Default: 6969)");
                 std::process::exit(0);
             }
             _ => { i += 1; }
@@ -1154,12 +1189,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // P2P starten
+    // P2P starten – Miner verwendet Port 4002 (statt 4001 wie stone-setup)
+    // damit beide gleichzeitig laufen können.
+    let miner_p2p_port = p2p_port_arg
+        .or_else(|| std::env::var("STONE_MINER_P2P_PORT").ok()?.parse().ok())
+        .unwrap_or(4002u16);
+
     let network_handle: Option<NetworkHandle> =
         if std::env::var("STONE_P2P_DISABLED").as_deref() == Ok("1") {
             None
         } else {
-            match start_network(None).await {
+            // Custom P2P-Config: eigener Port, damit kein Konflikt mit stone-setup
+            let mut p2p_config = stone::network::P2pConfig::load_or_default();
+            p2p_config.merge_env();
+            // Miner-spezifischen Port setzen (überschreibt STONE_P2P_PORT aus .env)
+            p2p_config.listen_addr = format!("/ip4/0.0.0.0/tcp/{miner_p2p_port}");
+            match start_network(Some(p2p_config)).await {
                 Ok(handle) => {
                     let count = node.chain.lock().unwrap().blocks.len() as u64;
                     handle.set_chain_count(count).await;
@@ -1175,6 +1220,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         });
                     }
+
+                    // ── Mining → Gossip Bridge: geminete Blöcke broadcasten ──
+                    {
+                        let (broadcast_tx, mut broadcast_rx) =
+                            tokio::sync::mpsc::unbounded_channel::<stone::blockchain::Block>();
+                        *node.block_broadcast_tx.lock().unwrap() = Some(broadcast_tx);
+                        let net_bc = handle.clone();
+                        tokio::spawn(async move {
+                            while let Some(block) = broadcast_rx.recv().await {
+                                net_bc.broadcast_block(block).await;
+                            }
+                        });
+                    }
+
                     Some(handle)
                 }
                 Err(e) => { eprintln!("[miner] P2P-Fehler: {e}"); None }
@@ -1274,9 +1333,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Main node API (no miner UI routes)
     let node_router = main_router;
 
-    let http_port = std::env::var("STONE_PORT")
-        .ok()
-        .and_then(|v| v.parse::<u16>().ok())
+    // Miner verwendet eigene Port-ENV-Variablen, damit kein Konflikt mit stone-setup:
+    //   STONE_MINER_PORT (default 8081) statt STONE_PORT (default 8080)
+    //   STONE_DASHBOARD_PORT (default 6969)
+    let http_port = port_arg
+        .or_else(|| std::env::var("STONE_MINER_PORT").ok()?.parse().ok())
         .unwrap_or(config.http_port);
 
     let dashboard_port = std::env::var("STONE_DASHBOARD_PORT")
@@ -1284,20 +1345,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .and_then(|v| v.parse::<u16>().ok())
         .unwrap_or(config.dashboard_port);
 
-    let http_addr = std::net::SocketAddr::from(([0, 0, 0, 0], http_port));
-    let dashboard_addr = std::net::SocketAddr::from(([0, 0, 0, 0], dashboard_port));
+    // Graceful Port-Binding: versuche konfigurierten Port, sonst Fallback
+    let node_listener = try_bind_port(http_port, "Node-API").await?;
+    let actual_http_port = node_listener.local_addr()?.port();
 
-    // Start Node-API HTTP server (port 8081)
-    let node_listener = tokio::net::TcpListener::bind(http_addr).await?;
-
-    // Start Dashboard HTTP server (port 6969)
-    let dashboard_listener = tokio::net::TcpListener::bind(dashboard_addr).await?;
+    let dashboard_listener = try_bind_port(dashboard_port, "Dashboard").await?;
+    let actual_dashboard_port = dashboard_listener.local_addr()?.port();
 
     miner_state.add_log(format!("Node: {node_id}"));
     miner_state.add_log(format!("Mining Wallet: {}...", &validator_wallet[..16.min(validator_wallet.len())]));
     miner_state.add_log(format!("Payout Wallet: {}...", &config.payout_wallet[..16.min(config.payout_wallet.len())]));
-    miner_state.add_log(format!("Node-API auf Port {http_port}"));
-    miner_state.add_log(format!("Dashboard auf Port {dashboard_port}"));
+    miner_state.add_log(format!("Node-API auf Port {actual_http_port}"));
+    miner_state.add_log(format!("Dashboard auf Port {actual_dashboard_port}"));
+    miner_state.add_log(format!("P2P auf Port {miner_p2p_port}"));
     if network_handle.is_some() {
         miner_state.add_log("P2P-Netzwerk aktiv".into());
     }
@@ -1310,8 +1370,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  Payout:   {}...", &config.payout_wallet[..16.min(config.payout_wallet.len())]);
     if !headless {
         println!();
-        println!("  \x1b[36;1mDashboard: http://localhost:{dashboard_port}/ui\x1b[0m");
-        println!("  \x1b[2mNode-API:  http://localhost:{http_port}\x1b[0m");
+        println!("  \x1b[36;1mDashboard: http://localhost:{actual_dashboard_port}/ui\x1b[0m");
+        println!("  \x1b[2mNode-API:  http://localhost:{actual_http_port}\x1b[0m");
+        println!("  \x1b[2mP2P-Port:  {miner_p2p_port}\x1b[0m");
     }
     println!("  -------------------------------------");
     println!();
@@ -1319,7 +1380,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if headless {
         // === HEADLESS MODUS ===
         println!("[miner] Headless-Modus (kein Dashboard)");
-        println!("[miner] Node-API auf Port {http_port}, Dashboard auf Port {dashboard_port}");
+        println!("[miner] Node-API auf Port {actual_http_port}, Dashboard auf Port {actual_dashboard_port}, P2P auf Port {miner_p2p_port}");
 
         // Node-API im Hintergrund
         tokio::spawn(async move {
@@ -1397,6 +1458,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 // ─── Hilfsfunktionen ────────────────────────────────────────────────────────
+
+/// Versucht an `port` zu binden. Falls belegt, versuche port+1, port+2, ...
+/// bis maximal port+10. Gibt den TcpListener zurück.
+async fn try_bind_port(
+    port: u16,
+    label: &str,
+) -> Result<tokio::net::TcpListener, Box<dyn std::error::Error>> {
+    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+    match tokio::net::TcpListener::bind(addr).await {
+        Ok(listener) => Ok(listener),
+        Err(e) => {
+            eprintln!("[miner] ⚠ {label}-Port {port} belegt: {e}");
+            // Fallback: nächste 10 Ports durchprobieren
+            for offset in 1..=10 {
+                let fallback_port = port + offset;
+                let fallback_addr = std::net::SocketAddr::from(([0, 0, 0, 0], fallback_port));
+                if let Ok(listener) = tokio::net::TcpListener::bind(fallback_addr).await {
+                    eprintln!("[miner] ℹ {label}: verwende Port {fallback_port} statt {port}");
+                    return Ok(listener);
+                }
+            }
+            Err(format!("{label}-Port {port} und Fallbacks {}-{} alle belegt", port + 1, port + 10).into())
+        }
+    }
+}
 
 fn print_banner() {
     eprintln!("\x1b[36;1m");

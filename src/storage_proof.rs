@@ -656,6 +656,26 @@ pub fn storage_proof_hash(proof: &StorageProof) -> String {
 mod tests {
     use super::*;
 
+    // ─── Hilfsfunktionen ─────────────────────────────────────────────────
+
+    fn make_chunk_refs(n: usize) -> Vec<ChunkRef> {
+        (0..n).map(|i| {
+            let hash = format!("{:064x}", i + 1);
+            ChunkRef { hash, size: 8192, shards: vec![], ec_k: 0, ec_m: 0 }
+        }).collect()
+    }
+
+    fn make_wallets(n: usize) -> Vec<String> {
+        (0..n).map(|i| format!("{:064x}", 0xA000 + i)).collect()
+    }
+
+    fn make_signing_key() -> ed25519_dalek::SigningKey {
+        use ed25519_dalek::SigningKey;
+        SigningKey::from_bytes(&[42u8; 32])
+    }
+
+    // ─── Block-Level Challenges ──────────────────────────────────────────
+
     #[test]
     fn test_empty_proof() {
         let proof = StorageProof::empty();
@@ -665,13 +685,7 @@ mod tests {
 
     #[test]
     fn test_challenge_determinism() {
-        // Gleiche Inputs → gleiche Challenges
-        let refs = vec![
-            ChunkRef { hash: "a".repeat(64), size: 8192, shards: vec![], ec_k: 0, ec_m: 0 },
-            ChunkRef { hash: "b".repeat(64), size: 16384, shards: vec![], ec_k: 0, ec_m: 0 },
-            ChunkRef { hash: "c".repeat(64), size: 4096, shards: vec![], ec_k: 0, ec_m: 0 },
-        ];
-
+        let refs = make_chunk_refs(3);
         let c1 = generate_challenges("abc123", 42, &refs);
         let c2 = generate_challenges("abc123", 42, &refs);
 
@@ -693,7 +707,6 @@ mod tests {
         let c1 = generate_challenges("abc123", 1, &refs);
         let c2 = generate_challenges("abc123", 2, &refs);
 
-        // Sehr unwahrscheinlich, dass alle Challenges identisch sind
         let all_same = c1.iter().zip(c2.iter())
             .all(|(a, b)| a.chunk_hash == b.chunk_hash && a.offset == b.offset);
         assert!(!all_same, "Challenges für verschiedene Blöcke sollten verschieden sein");
@@ -721,6 +734,332 @@ mod tests {
         let h1 = storage_proof_hash(&proof);
         let h2 = storage_proof_hash(&proof);
         assert_eq!(h1, h2);
-        assert_eq!(h1.len(), 64); // SHA-256 hex
+        assert_eq!(h1.len(), 64);
+    }
+
+    // ─── Network Challenge Generation ────────────────────────────────────
+
+    #[test]
+    fn test_network_challenge_generation_basic() {
+        let refs = make_chunk_refs(5);
+        let wallets = make_wallets(3);
+        let own_wallet = "own_wallet_not_in_list".to_string();
+
+        let challenges = generate_network_challenges("prevhash", 10, &refs, &wallets, &own_wallet);
+
+        assert_eq!(challenges.len(), NETWORK_CHALLENGES_PER_BLOCK);
+        for c in &challenges {
+            assert_eq!(c.block_index, 10);
+            assert_eq!(c.deadline_block, 10 + CHALLENGE_DEADLINE_BLOCKS);
+            assert_ne!(c.target_wallet, own_wallet, "Eigene Wallet darf nicht gechallenged werden");
+            assert!(wallets.contains(&c.target_wallet), "Target muss aus known_wallets stammen");
+            assert!(!c.challenge_id.is_empty());
+            assert!(!c.chunk_hash.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_network_challenge_excludes_own_wallet() {
+        let refs = make_chunk_refs(3);
+        let wallets = vec!["only_wallet".to_string()];
+        let own_wallet = "only_wallet".to_string();
+
+        // Eigene Wallet ist die einzige → keine Targets → keine Challenges
+        let challenges = generate_network_challenges("prev", 1, &refs, &wallets, &own_wallet);
+        assert!(challenges.is_empty(), "Keine Challenges wenn nur eigene Wallet bekannt");
+    }
+
+    #[test]
+    fn test_network_challenge_empty_chunks() {
+        let refs: Vec<ChunkRef> = vec![];
+        let wallets = make_wallets(3);
+
+        let challenges = generate_network_challenges("prev", 1, &refs, &wallets, "me");
+        assert!(challenges.is_empty(), "Keine Challenges ohne Chunks");
+    }
+
+    #[test]
+    fn test_network_challenge_empty_wallets() {
+        let refs = make_chunk_refs(3);
+        let wallets: Vec<String> = vec![];
+
+        let challenges = generate_network_challenges("prev", 1, &refs, &wallets, "me");
+        assert!(challenges.is_empty(), "Keine Challenges ohne bekannte Wallets");
+    }
+
+    #[test]
+    fn test_network_challenge_determinism() {
+        let refs = make_chunk_refs(10);
+        let wallets = make_wallets(5);
+
+        let c1 = generate_network_challenges("hash42", 100, &refs, &wallets, "me");
+        let c2 = generate_network_challenges("hash42", 100, &refs, &wallets, "me");
+
+        assert_eq!(c1.len(), c2.len());
+        for (a, b) in c1.iter().zip(c2.iter()) {
+            assert_eq!(a.challenge_id, b.challenge_id);
+            assert_eq!(a.target_wallet, b.target_wallet);
+            assert_eq!(a.chunk_hash, b.chunk_hash);
+            assert_eq!(a.offset, b.offset);
+        }
+    }
+
+    #[test]
+    fn test_network_challenge_different_blocks_differ() {
+        let refs = make_chunk_refs(10);
+        let wallets = make_wallets(5);
+
+        let c1 = generate_network_challenges("hash", 1, &refs, &wallets, "me");
+        let c2 = generate_network_challenges("hash", 2, &refs, &wallets, "me");
+
+        let all_same = c1.iter().zip(c2.iter())
+            .all(|(a, b)| a.challenge_id == b.challenge_id);
+        assert!(!all_same, "Verschiedene Blöcke sollten verschiedene Challenges produzieren");
+    }
+
+    #[test]
+    fn test_network_challenge_unique_ids() {
+        let refs = make_chunk_refs(10);
+        let wallets = make_wallets(10);
+
+        let challenges = generate_network_challenges("hash", 1, &refs, &wallets, "me");
+        let ids: std::collections::HashSet<_> = challenges.iter().map(|c| &c.challenge_id).collect();
+        assert_eq!(ids.len(), challenges.len(), "Challenge-IDs müssen eindeutig sein");
+    }
+
+    // ─── Challenge Response + Verification ───────────────────────────────
+
+    #[test]
+    fn test_challenge_response_creation_and_verification() {
+        // Tempdir für ChunkStore
+        let tmp = std::env::temp_dir().join(format!("stone_test_chunks_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+
+        // Test-Chunk-Daten schreiben
+        let chunk_data = vec![0xABu8; 8192];
+        let chunk_hash = format!("{:x}", Sha256::digest(&chunk_data));
+        std::fs::write(tmp.join(&chunk_hash), &chunk_data).unwrap();
+
+        // ChunkStore mit Temp-Dir
+        let store = ChunkStore::with_dir(tmp.clone()).unwrap();
+
+        let signing_key = make_signing_key();
+        let wallet = hex::encode(signing_key.verifying_key().as_bytes());
+
+        let challenge = NetworkChallenge {
+            challenge_id: "test_challenge_001".to_string(),
+            block_index: 5,
+            target_wallet: wallet.clone(),
+            chunk_hash: chunk_hash.clone(),
+            chunk_size: 8192,
+            offset: 0,
+            deadline_block: 15,
+        };
+
+        // Response erstellen
+        let response = create_challenge_response(&challenge, &store, &wallet, &signing_key, 6);
+        assert!(response.is_some(), "Response sollte erstellt werden können");
+        let response = response.unwrap();
+
+        assert_eq!(response.challenge_id, "test_challenge_001");
+        assert_eq!(response.responder_wallet, wallet);
+        assert!(!response.proof_hash.is_empty());
+        assert!(!response.signature.is_empty());
+
+        // Verifizierung
+        let result = verify_challenge_response(&challenge, &response, Some(&store), 6);
+        assert!(result.is_ok(), "Gültige Response sollte verifiziert werden: {:?}", result);
+
+        // Cleanup
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn test_challenge_response_wrong_wallet_rejected() {
+        let challenge = NetworkChallenge {
+            challenge_id: "test".to_string(),
+            block_index: 1,
+            target_wallet: "correct_wallet".to_string(),
+            chunk_hash: "a".repeat(64),
+            chunk_size: 4096,
+            offset: 0,
+            deadline_block: 10,
+        };
+
+        let response = ChallengeResponse {
+            challenge_id: "test".to_string(),
+            responder_wallet: "wrong_wallet".to_string(),
+            proof_hash: "b".repeat(64),
+            response_block: 2,
+            signature: String::new(),
+        };
+
+        let result = verify_challenge_response(&challenge, &response, None, 2);
+        assert!(result.is_err(), "Falsche Wallet sollte abgelehnt werden");
+        assert!(result.unwrap_err().contains("Wallet mismatch"));
+    }
+
+    #[test]
+    fn test_challenge_response_deadline_expired() {
+        let challenge = NetworkChallenge {
+            challenge_id: "test".to_string(),
+            block_index: 1,
+            target_wallet: "wallet_a".to_string(),
+            chunk_hash: "a".repeat(64),
+            chunk_size: 4096,
+            offset: 0,
+            deadline_block: 10,
+        };
+
+        let response = ChallengeResponse {
+            challenge_id: "test".to_string(),
+            responder_wallet: "wallet_a".to_string(),
+            proof_hash: "b".repeat(64),
+            response_block: 11,
+            signature: String::new(),
+        };
+
+        // current_block > deadline → abgelehnt
+        let result = verify_challenge_response(&challenge, &response, None, 11);
+        assert!(result.is_err(), "Abgelaufene Deadline sollte abgelehnt werden");
+        assert!(result.unwrap_err().contains("Deadline"));
+    }
+
+    #[test]
+    fn test_challenge_response_missing_chunk() {
+        let tmp = std::env::temp_dir().join(format!("stone_test_no_chunk_{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let store = ChunkStore::with_dir(tmp.clone()).unwrap();
+
+        let signing_key = make_signing_key();
+        let wallet = hex::encode(signing_key.verifying_key().as_bytes());
+
+        let challenge = NetworkChallenge {
+            challenge_id: "missing_chunk".to_string(),
+            block_index: 1,
+            target_wallet: wallet.clone(),
+            chunk_hash: "nonexistent".repeat(4) + &"0".repeat(24),
+            chunk_size: 4096,
+            offset: 0,
+            deadline_block: 10,
+        };
+
+        // Chunk existiert nicht → None
+        let response = create_challenge_response(&challenge, &store, &wallet, &signing_key, 2);
+        assert!(response.is_none(), "Fehlender Chunk sollte None zurückgeben");
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ─── Network Challenges Hash ─────────────────────────────────────────
+
+    #[test]
+    fn test_network_challenges_hash_determinism() {
+        let challenges = vec![
+            NetworkChallenge {
+                challenge_id: "id1".to_string(),
+                block_index: 1,
+                target_wallet: "w1".to_string(),
+                chunk_hash: "c1".to_string(),
+                chunk_size: 4096,
+                offset: 100,
+                deadline_block: 11,
+            },
+        ];
+
+        let h1 = network_challenges_hash(&challenges);
+        let h2 = network_challenges_hash(&challenges);
+        assert_eq!(h1, h2);
+        assert_eq!(h1.len(), 64);
+    }
+
+    #[test]
+    fn test_network_challenges_hash_empty() {
+        let h = network_challenges_hash(&[]);
+        assert_eq!(h.len(), 64, "Leere Challenges sollten trotzdem einen Hash produzieren");
+    }
+
+    // ─── Offset-Berechnung Edge Cases ─────────────────────────────────────
+
+    #[test]
+    fn test_challenge_small_chunk_offset_zero() {
+        // Chunk kleiner als PROOF_WINDOW → Offset muss 0 sein
+        let refs = vec![
+            ChunkRef { hash: "a".repeat(64), size: 100, shards: vec![], ec_k: 0, ec_m: 0 },
+        ];
+
+        let challenges = generate_challenges("hash", 1, &refs);
+        assert!(!challenges.is_empty());
+        assert_eq!(challenges[0].offset, 0, "Kleiner Chunk → Offset 0");
+    }
+
+    #[test]
+    fn test_challenge_offset_within_bounds() {
+        let refs = vec![
+            ChunkRef { hash: "a".repeat(64), size: 1_000_000, shards: vec![], ec_k: 0, ec_m: 0 },
+        ];
+
+        // Über viele Blöcke testen dass Offset immer im gültigen Bereich liegt
+        for block_idx in 0..100 {
+            let challenges = generate_challenges("hash", block_idx, &refs);
+            for c in &challenges {
+                let max_valid = (c.chunk_size as usize).saturating_sub(PROOF_WINDOW);
+                assert!(c.offset <= max_valid,
+                    "Offset {} > max {} bei Block {}", c.offset, max_valid, block_idx);
+            }
+        }
+    }
+
+    // ─── Stress-Tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn test_many_challenges_no_panic() {
+        let refs = make_chunk_refs(1000);
+        let wallets = make_wallets(100);
+
+        // 1000 Blöcke durchsimulieren
+        for block_idx in 0..1000u64 {
+            let prev_hash = format!("{:064x}", block_idx);
+            let challenges = generate_network_challenges(&prev_hash, block_idx, &refs, &wallets, "own");
+            assert!(challenges.len() <= NETWORK_CHALLENGES_PER_BLOCK);
+
+            for c in &challenges {
+                assert!(c.deadline_block == block_idx + CHALLENGE_DEADLINE_BLOCKS);
+                assert!(!c.challenge_id.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn test_challenge_coverage_distribution() {
+        // Verifiziere, dass Challenges über verschiedene Wallets verteilt werden
+        let refs = make_chunk_refs(20);
+        let wallets = make_wallets(10);
+
+        let mut wallet_hit_count: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+
+        for block_idx in 0..500u64 {
+            let prev_hash = format!("{:064x}", block_idx);
+            let challenges = generate_network_challenges(&prev_hash, block_idx, &refs, &wallets, "own");
+            for c in &challenges {
+                *wallet_hit_count.entry(c.target_wallet.clone()).or_default() += 1;
+            }
+        }
+
+        // Alle Wallets sollten mindestens einmal getroffen worden sein
+        for w in &wallets {
+            assert!(
+                wallet_hit_count.get(w).copied().unwrap_or(0) > 0,
+                "Wallet {} wurde nie gechallenged – Distribution-Fehler", &w[..16]
+            );
+        }
+
+        // Kein Wallet sollte > 50% aller Challenges bekommen (bei 10 Wallets)
+        let total: u32 = wallet_hit_count.values().sum();
+        for (w, count) in &wallet_hit_count {
+            let pct = (*count as f64 / total as f64) * 100.0;
+            assert!(pct < 50.0,
+                "Wallet {}… hat {:.1}% aller Challenges – unfair!", &w[..16], pct);
+        }
     }
 }

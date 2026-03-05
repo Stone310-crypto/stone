@@ -391,6 +391,12 @@ pub struct ChunkStore {
 }
 
 impl ChunkStore {
+    /// Erstellt einen ChunkStore mit benutzerdefiniertem Pfad (für Tests).
+    pub fn with_dir(base_dir: PathBuf) -> Result<Self, StorageError> {
+        std::fs::create_dir_all(&base_dir)?;
+        Ok(Self { base_dir })
+    }
+
     /// Erstellt einen ChunkStore (legt Verzeichnis an falls nötig).
     pub fn new() -> Result<Self, StorageError> {
         let base_dir = PathBuf::from(chunk_dir());
@@ -1169,6 +1175,8 @@ mod tests {
             validator_pub_key: String::new(),
             validator_signature: String::new(),
             storage_proof: Default::default(),
+            storage_challenges: Vec::new(),
+            challenge_responses: Vec::new(),
         }
     }
 

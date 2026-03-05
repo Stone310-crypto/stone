@@ -3426,8 +3426,14 @@ impl NetworkHandle {
 pub async fn start_network(
     config_override: Option<P2pConfig>,
 ) -> Result<NetworkHandle, Box<dyn std::error::Error>> {
-    let mut config = config_override.unwrap_or_else(P2pConfig::load_or_default);
-    config.merge_env();
+    let config = match config_override {
+        Some(c) => c, // Caller hat schon konfiguriert – merge_env() nicht nochmal aufrufen
+        None => {
+            let mut c = P2pConfig::load_or_default();
+            c.merge_env();
+            c
+        }
+    };
 
     let keypair = load_or_create_keypair();
     let local_peer_id = PeerId::from_public_key(&keypair.public()).to_string();

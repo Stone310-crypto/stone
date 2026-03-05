@@ -430,6 +430,9 @@ pub struct MasterNodeState {
     /// Pending ChallengeResponses: Nodes schicken ihre Proofs hierher,
     /// werden im nächsten Block aufgenommen und belohnt.
     pub pending_challenge_responses: Mutex<Vec<crate::storage_proof::ChallengeResponse>>,
+    /// Kanal um geminete Blöcke an das P2P-Netzwerk zu broadcasten.
+    /// Wird von setup.rs gesetzt nachdem das Netzwerk gestartet ist.
+    pub block_broadcast_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<Block>>>,
 }
 
 #[derive(Default)]
@@ -516,6 +519,7 @@ impl MasterNodeState {
             chat_policy: RwLock::new(chat_policy),
             mining_wallet: RwLock::new(Self::load_mining_wallet()),
             pending_challenge_responses: Mutex::new(Vec::new()),
+            block_broadcast_tx: Mutex::new(None),
         });
 
         // Wenn die Chain bereits > 10 Blöcke hat (Restart einer synced Node),
@@ -1469,6 +1473,15 @@ impl MasterNodeState {
                             Self::post_block_reputation(&state, &block);
                             Self::post_block_chat_policy(&state, &block, None);
                             Self::post_block_checkpoint(&state, &block).await;
+
+                            // ── Block via P2P-Gossipsub an alle Peers senden ──
+                            {
+                                let tx = state.block_broadcast_tx.lock().unwrap();
+                                if let Some(ref sender) = *tx {
+                                    let _ = sender.send(block.clone());
+                                }
+                            }
+
                             let _ = block;
                         }
                         Err(e) => {
@@ -1701,6 +1714,14 @@ impl MasterNodeState {
                                         Self::post_block_reputation(&state, &block);
                                         Self::post_block_chat_policy(&state, &block, None);
                                         Self::post_block_checkpoint(&state, &block).await;
+
+                                        // ── Block via P2P-Gossipsub broadcasten ──
+                                        {
+                                            let tx = state.block_broadcast_tx.lock().unwrap();
+                                            if let Some(ref sender) = *tx {
+                                                let _ = sender.send(block.clone());
+                                            }
+                                        }
                                     }
                                     Err(e) => eprintln!("[consensus] Commit fehlgeschlagen: {e}"),
                                 }
