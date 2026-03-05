@@ -4,6 +4,7 @@ use hmac::{Hmac, Mac};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::fs;
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -301,5 +302,379 @@ pub fn validate_local_token(token: &str, cluster_key: &str) -> Option<LocalToken
     }
 
     Some(claims)
+}
+
+// ─── Challenge-Response Authentifizierung (Cross-Platform Login) ─────────────
+
+/// Ein vom Server generierter Challenge-Nonce für die Wallet-basierte Authentifizierung.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthChallenge {
+    /// Zufälliger 32-Byte Nonce (hex-codiert)
+    pub nonce: String,
+    /// Wallet-Adresse für die dieser Challenge gilt
+    pub wallet_address: String,
+    /// Erstellungszeitpunkt (Unix-Sekunden)
+    pub created_at: u64,
+    /// Ablaufzeitpunkt (Unix-Sekunden) — Standard: 5 Minuten
+    pub expires_at: u64,
+}
+
+impl AuthChallenge {
+    pub fn is_expired(&self) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        now > self.expires_at
+    }
+}
+
+/// In-Memory Store für aktive Challenges. Thread-safe via Arc<Mutex<>>.
+#[derive(Clone)]
+pub struct ChallengeStore {
+    inner: Arc<Mutex<HashMap<String, AuthChallenge>>>,
+}
+
+/// Challenge-Gültigkeit in Sekunden (5 Minuten)
+pub const CHALLENGE_TTL_SECS: u64 = 300;
+/// Session-Token-Gültigkeit in Sekunden (24 Stunden)
+pub const SESSION_TOKEN_TTL_SECS: u64 = 86400;
+
+impl ChallengeStore {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Erzeugt einen neuen Challenge-Nonce für eine Wallet-Adresse.
+    /// Ein vorheriger Challenge für dieselbe Wallet wird überschrieben.
+    pub fn create_challenge(&self, wallet_address: &str) -> AuthChallenge {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let mut nonce_bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+
+        let challenge = AuthChallenge {
+            nonce: hex::encode(nonce_bytes),
+            wallet_address: wallet_address.to_string(),
+            created_at: now,
+            expires_at: now + CHALLENGE_TTL_SECS,
+        };
+
+        let mut map = self.inner.lock().unwrap();
+        // Aufräumen: abgelaufene Challenges entfernen
+        map.retain(|_, c| !c.is_expired());
+        map.insert(wallet_address.to_string(), challenge.clone());
+        challenge
+    }
+
+    /// Konsumiert und validiert einen Challenge für eine Wallet-Adresse.
+    /// Gibt `Some(challenge)` zurück wenn gültig, `None` wenn abgelaufen oder unbekannt.
+    /// Der Challenge wird nach einmaliger Nutzung gelöscht (Replay-Schutz).
+    pub fn consume_challenge(&self, wallet_address: &str) -> Option<AuthChallenge> {
+        let mut map = self.inner.lock().unwrap();
+        let challenge = map.remove(wallet_address)?;
+        if challenge.is_expired() {
+            return None;
+        }
+        Some(challenge)
+    }
+}
+
+impl Default for ChallengeStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Verifiziert eine Ed25519-Signatur des Challenge-Nonce gegen die bekannte Wallet-Adresse.
+///
+/// - `wallet_address`: Hex-codierter Ed25519 Public Key (64 Zeichen)
+/// - `nonce`: Der vom Server ausgegebene Challenge-Nonce (hex)
+/// - `signature`: Hex-codierte Ed25519-Signatur des Nonce
+///
+/// Gibt `true` zurück wenn die Signatur gültig ist.
+pub fn verify_challenge_signature(
+    wallet_address: &str,
+    nonce: &str,
+    signature: &str,
+) -> bool {
+    use ed25519_dalek::{Signature, VerifyingKey};
+
+    // Wallet-Adresse (= Public Key) dekodieren
+    let Ok(pubkey_bytes) = hex::decode(wallet_address) else {
+        return false;
+    };
+    let Ok(pubkey_array): Result<[u8; 32], _> = pubkey_bytes.try_into() else {
+        return false;
+    };
+    let Ok(verifying_key) = VerifyingKey::from_bytes(&pubkey_array) else {
+        return false;
+    };
+
+    // Signatur dekodieren
+    let Ok(sig_bytes) = hex::decode(signature) else {
+        return false;
+    };
+    let Ok(sig_array): Result<[u8; 64], _> = sig_bytes.try_into() else {
+        return false;
+    };
+    let sig = Signature::from_bytes(&sig_array);
+
+    // Verifizierung: Nonce-Bytes als Message
+    use ed25519_dalek::Verifier;
+    verifying_key.verify(nonce.as_bytes(), &sig).is_ok()
+}
+
+// ─── Session-Token (für authentifizierte Cross-Platform Sessions) ────────────
+
+/// Claims für einen Session-Token (nach erfolgreichem Challenge-Response).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionClaims {
+    /// User-ID
+    pub user_id: String,
+    /// Wallet-Adresse
+    pub wallet_address: String,
+    /// Ausstellungszeitpunkt (Unix-Sekunden)
+    pub issued_at: u64,
+    /// Ablaufzeitpunkt (Unix-Sekunden)
+    pub expires_at: u64,
+    /// Zufälliger Nonce (Replay-Schutz)
+    pub nonce: String,
+}
+
+impl SessionClaims {
+    pub fn is_expired(&self) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        now > self.expires_at
+    }
+}
+
+/// Erzeugt einen HMAC-signierten Session-Token nach erfolgreichem Challenge-Response.
+///
+/// Format: `base64(json_claims).base64(hmac_sha256_signature)`
+/// Der `cluster_key` wird als HMAC-Schlüssel verwendet.
+pub fn generate_session_token(
+    user_id: &str,
+    wallet_address: &str,
+    cluster_key: &str,
+    ttl_secs: u64,
+) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let mut nonce_bytes = [0u8; 16];
+    rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+
+    let claims = SessionClaims {
+        user_id: user_id.to_string(),
+        wallet_address: wallet_address.to_string(),
+        issued_at: now,
+        expires_at: now + ttl_secs,
+        nonce: hex::encode(nonce_bytes),
+    };
+
+    let claims_json = serde_json::to_string(&claims).unwrap_or_default();
+    let claims_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .encode(claims_json.as_bytes());
+
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(cluster_key.as_bytes())
+        .expect("HMAC akzeptiert beliebige Schlüssellängen");
+    mac.update(claims_b64.as_bytes());
+    let sig = mac.finalize().into_bytes();
+    let sig_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(sig);
+
+    format!("{claims_b64}.{sig_b64}")
+}
+
+/// Validiert einen Session-Token und gibt die Claims zurück.
+pub fn validate_session_token(token: &str, cluster_key: &str) -> Option<SessionClaims> {
+    let parts: Vec<&str> = token.splitn(2, '.').collect();
+    if parts.len() != 2 {
+        return None;
+    }
+    let claims_b64 = parts[0];
+    let sig_b64 = parts[1];
+
+    // HMAC-Signatur prüfen
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(cluster_key.as_bytes()).ok()?;
+    mac.update(claims_b64.as_bytes());
+    let expected_sig = mac.finalize().into_bytes();
+    let expected_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(expected_sig);
+    if expected_b64 != sig_b64 {
+        return None;
+    }
+
+    // Claims dekodieren
+    let claims_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(claims_b64)
+        .ok()?;
+    let claims: SessionClaims = serde_json::from_slice(&claims_bytes).ok()?;
+
+    if claims.is_expired() {
+        return None;
+    }
+
+    Some(claims)
+}
+
+// ─── QR-Code Login (Cross-Device Authentifizierung) ──────────────────────────
+//
+// Flow:
+//   1. Website/Desktop → POST /auth/qr/create → erhält { login_token, expires_in }
+//   2. Website zeigt QR-Code mit login_token (+ server URL)
+//   3. Website pollt → GET /auth/qr/status/:token → wartet auf Freigabe
+//   4. iOS App scannt QR → FaceID → POST /auth/qr/approve { login_token }
+//      (mit Bearer-Token des bereits eingeloggten iOS-Users)
+//   5. Server markiert QR-Session als "approved" mit session_token + user
+//   6. Website erhält beim nächsten Poll: { approved, session_token, user }
+
+/// QR-Login-Session Gültigkeit in Sekunden (3 Minuten)
+pub const QR_LOGIN_TTL_SECS: u64 = 180;
+
+/// Status einer QR-Login-Session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum QrLoginStatus {
+    /// QR-Code angezeigt, wartet auf Scan
+    Pending,
+    /// iOS App hat QR gescannt, Benutzer bestätigt per FaceID
+    Approved,
+    /// Abgelaufen oder ungültig
+    Expired,
+}
+
+/// Eine QR-Login-Session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QrLoginSession {
+    /// Eindeutiger Login-Token (wird im QR-Code codiert)
+    pub login_token: String,
+    /// Status der Session
+    pub status: QrLoginStatus,
+    /// Erstellungszeitpunkt (Unix-Sekunden)
+    pub created_at: u64,
+    /// Ablaufzeitpunkt (Unix-Sekunden)
+    pub expires_at: u64,
+    /// Session-Token (wird nach Genehmigung gesetzt)
+    pub session_token: Option<String>,
+    /// User-Daten (wird nach Genehmigung gesetzt)
+    pub approved_user_id: Option<String>,
+    pub approved_user_name: Option<String>,
+    pub approved_wallet: Option<String>,
+    pub approved_account_type: Option<String>,
+}
+
+impl QrLoginSession {
+    pub fn is_expired(&self) -> bool {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        now > self.expires_at
+    }
+}
+
+/// In-Memory Store für aktive QR-Login-Sessions. Thread-safe via Arc<Mutex<>>.
+#[derive(Clone)]
+pub struct QrLoginStore {
+    inner: Arc<Mutex<HashMap<String, QrLoginSession>>>,
+}
+
+impl QrLoginStore {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Erzeugt eine neue QR-Login-Session.
+    /// Gibt den `login_token` zurück, der im QR-Code codiert wird.
+    pub fn create_session(&self) -> QrLoginSession {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        let mut token_bytes = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut token_bytes);
+
+        let session = QrLoginSession {
+            login_token: hex::encode(token_bytes),
+            status: QrLoginStatus::Pending,
+            created_at: now,
+            expires_at: now + QR_LOGIN_TTL_SECS,
+            session_token: None,
+            approved_user_id: None,
+            approved_user_name: None,
+            approved_wallet: None,
+            approved_account_type: None,
+        };
+
+        let mut map = self.inner.lock().unwrap();
+        // Aufräumen: abgelaufene Sessions entfernen
+        map.retain(|_, s| !s.is_expired());
+        map.insert(session.login_token.clone(), session.clone());
+        session
+    }
+
+    /// Fragt den Status einer QR-Login-Session ab.
+    /// Gibt `None` zurück wenn unbekannt oder abgelaufen.
+    pub fn get_status(&self, login_token: &str) -> Option<QrLoginSession> {
+        let mut map = self.inner.lock().unwrap();
+        // Aufräumen
+        map.retain(|_, s| !s.is_expired());
+        map.get(login_token).cloned()
+    }
+
+    /// Genehmigt eine QR-Login-Session (vom iOS-App-User).
+    /// Setzt session_token + user-daten. Gibt `true` zurück bei Erfolg.
+    pub fn approve_session(
+        &self,
+        login_token: &str,
+        session_token: String,
+        user: &User,
+    ) -> bool {
+        let mut map = self.inner.lock().unwrap();
+        if let Some(session) = map.get_mut(login_token) {
+            if session.is_expired() || session.status != QrLoginStatus::Pending {
+                return false;
+            }
+            session.status = QrLoginStatus::Approved;
+            session.session_token = Some(session_token);
+            session.approved_user_id = Some(user.id.clone());
+            session.approved_user_name = Some(user.name.clone());
+            session.approved_wallet = Some(user.wallet_address.clone());
+            session.approved_account_type = Some(user.account_type.clone());
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Konsumiert eine genehmigte Session (Website holt das Token ab).
+    /// Nach dem Abruf wird die Session gelöscht (einmalig verwendbar).
+    pub fn consume_approved(&self, login_token: &str) -> Option<QrLoginSession> {
+        let mut map = self.inner.lock().unwrap();
+        let session = map.get(login_token)?;
+        if session.status != QrLoginStatus::Approved {
+            return None;
+        }
+        map.remove(login_token)
+    }
+}
+
+impl Default for QrLoginStore {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 

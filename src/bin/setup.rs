@@ -626,6 +626,8 @@ async fn start_full_node(state: SetupState) {
             }
             Arc::new(std::sync::Mutex::new(idx))
         },
+        challenge_store: stone::auth::ChallengeStore::new(),
+        qr_login_store: stone::auth::QrLoginStore::new(),
     };
 
     *state.node_state.write().await = Some(node_app_state);

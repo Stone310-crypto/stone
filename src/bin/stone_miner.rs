@@ -1313,6 +1313,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Arc::new(std::sync::Mutex::new(idx))
         },
+        challenge_store: stone::auth::ChallengeStore::new(),
+        qr_login_store: stone::auth::QrLoginStore::new(),
     };
 
     // Main node API

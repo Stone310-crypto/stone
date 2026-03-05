@@ -694,16 +694,20 @@ impl StoneStore {
 ///
 /// Strategie:
 /// - Holt die Liste der verbundenen Peers
-/// - Weist Shards per Round-Robin an Peers zu (assign_shards_to_peers)
+/// - Weist Shards per XOR-Distance an Peers zu (assign_shards_to_peers)
 /// - Sendet jeden zugewiesenen Shard via `store_shard_on_peer()`
-/// - Wartet NICHT auf Bestätigung (fire-and-forget; Bestätigungen kommen als NetworkEvent)
+/// - Wartet auf Bestätigungen (ShardStored Events) mit Timeout
+/// - Nur bestätigte Peers werden als Holder in den ChunkRefs vermerkt
 ///
-/// Gibt die aktualisierten ChunkRefs zurück mit den Holder-Infos.
+/// Gibt die aktualisierten ChunkRefs zurück mit den **bestätigten** Holder-Infos.
 pub async fn distribute_shards(
     chunk_refs: &[ChunkRef],
     shard_store: &ShardStore,
     network: &crate::network::NetworkHandle,
 ) -> Vec<ChunkRef> {
+    use std::collections::HashSet;
+    use tokio::sync::broadcast;
+
     // Verbundene Peers holen
     let peers = network.connected_peers().await;
     if peers.is_empty() {
@@ -718,11 +722,15 @@ pub async fn distribute_shards(
         peer_ids.iter().map(|p| &p[..8.min(p.len())]).collect::<Vec<_>>()
     );
 
+    // Event-Listener BEVOR Shards gesendet werden (damit keine Events verpasst werden)
+    let mut event_rx = network.subscribe();
+
+    // Sammle alle Sends: (chunk_hash, shard_index, target_peer_id)
+    let mut pending_confirmations: HashSet<(String, u8, String)> = HashSet::new();
     let mut updated_refs = Vec::with_capacity(chunk_refs.len());
 
     for chunk_ref in chunk_refs {
         if chunk_ref.shards.is_empty() || chunk_ref.ec_k == 0 {
-            // Nicht erasure-coded → überspringen
             updated_refs.push(chunk_ref.clone());
             continue;
         }
@@ -738,7 +746,7 @@ pub async fn distribute_shards(
             m,
         );
 
-        let mut updated_shards = chunk_ref.shards.clone();
+        let updated_shards = chunk_ref.shards.clone();
 
         for (shard_index, target_peer_id) in &assignments {
             // Shard lokal lesen
@@ -753,10 +761,8 @@ pub async fn distribute_shards(
                 }
             };
 
-            // Shard-Hash für Integrität
             let hash = shard::shard_hash(&shard_data);
 
-            // PeerId parsen
             let peer_id: libp2p::PeerId = match target_peer_id.parse() {
                 Ok(id) => id,
                 Err(e) => {
@@ -773,7 +779,6 @@ pub async fn distribute_shards(
                 &target_peer_id[..8.min(target_peer_id.len())]
             );
 
-            // An Peer senden (fire-and-forget)
             network
                 .store_shard_on_peer(
                     peer_id,
@@ -784,18 +789,11 @@ pub async fn distribute_shards(
                 )
                 .await;
 
-            // Holder in den ShardRefs aktualisieren
-            if let Some(sr) = updated_shards
-                .iter_mut()
-                .find(|s| s.shard_index == *shard_index)
-            {
-                // Zusätzlichen Holder vermerken (Komma-getrennt)
-                if !sr.holder.is_empty() {
-                    sr.holder = format!("{},{}", sr.holder, target_peer_id);
-                } else {
-                    sr.holder = target_peer_id.clone();
-                }
-            }
+            pending_confirmations.insert((
+                chunk_ref.hash.clone(),
+                *shard_index,
+                target_peer_id.clone(),
+            ));
         }
 
         updated_refs.push(ChunkRef {
@@ -807,9 +805,113 @@ pub async fn distribute_shards(
         });
     }
 
+    // ── Auf Bestätigungen warten (Timeout: 15 Sekunden) ─────────────────────
+    // Nur bestätigte Peers werden als Holder vermerkt.
+    let total_pending = pending_confirmations.len();
+    if total_pending == 0 {
+        return updated_refs;
+    }
+
+    let mut confirmed: HashSet<(String, u8, String)> = HashSet::new();
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(15);
+
+    loop {
+        if confirmed.len() >= total_pending {
+            break; // Alle bestätigt
+        }
+
+        let now = tokio::time::Instant::now();
+        let remaining = if deadline > now { deadline - now } else { break };
+
+        match tokio::time::timeout(remaining, event_rx.recv()).await {
+            Ok(Ok(crate::network::NetworkEvent::ShardStored {
+                chunk_hash,
+                shard_index,
+                peer_id,
+                success,
+                error,
+            })) => {
+                let key = (chunk_hash.clone(), shard_index, peer_id.clone());
+                if pending_confirmations.contains(&key) {
+                    if success {
+                        println!(
+                            "[sharding] ✓ Bestätigt: {}[{}] auf {}",
+                            &chunk_hash[..8.min(chunk_hash.len())],
+                            shard_index,
+                            &peer_id[..8.min(peer_id.len())]
+                        );
+                        confirmed.insert(key);
+                    } else {
+                        eprintln!(
+                            "[sharding] ✗ Abgelehnt: {}[{}] auf {}: {}",
+                            &chunk_hash[..8.min(chunk_hash.len())],
+                            shard_index,
+                            &peer_id[..8.min(peer_id.len())],
+                            error.as_deref().unwrap_or("unbekannt")
+                        );
+                        // Nicht als Holder vermerken
+                        pending_confirmations.remove(&key);
+                    }
+                }
+            }
+            Ok(Ok(crate::network::NetworkEvent::ShardRequestFailed {
+                chunk_hash,
+                shard_index,
+                peer_id,
+                error,
+            })) => {
+                let key = (chunk_hash.clone(), shard_index, peer_id.clone());
+                if pending_confirmations.contains(&key) {
+                    eprintln!(
+                        "[sharding] ✗ Fehlgeschlagen: {}[{}] → {}: {error}",
+                        &chunk_hash[..8.min(chunk_hash.len())],
+                        shard_index,
+                        &peer_id[..8.min(peer_id.len())]
+                    );
+                    pending_confirmations.remove(&key);
+                }
+            }
+            Ok(Ok(_)) => continue, // Anderes Event → ignorieren
+            Ok(Err(broadcast::error::RecvError::Lagged(n))) => {
+                eprintln!("[sharding] ⚠ Event-Buffer übergelaufen ({n} verpasst)");
+                continue;
+            }
+            Ok(Err(_)) => break, // Channel geschlossen
+            Err(_) => break,     // Timeout
+        }
+    }
+
+    let unconfirmed = total_pending - confirmed.len();
+    if unconfirmed > 0 {
+        eprintln!(
+            "[sharding] ⚠ {unconfirmed} von {total_pending} Shard-Transfers nicht bestätigt (Timeout)"
+        );
+    }
+
+    // ── Holder-Listen aktualisieren: NUR bestätigte Peers eintragen ─────────
+    for chunk_ref in &mut updated_refs {
+        for sr in &mut chunk_ref.shards {
+            let confirmed_peers: Vec<&str> = confirmed
+                .iter()
+                .filter(|(ch, si, _)| ch == &chunk_ref.hash && *si == sr.shard_index)
+                .map(|(_, _, pid)| pid.as_str())
+                .collect();
+
+            for pid in confirmed_peers {
+                if sr.holder.is_empty() {
+                    sr.holder = pid.to_string();
+                } else if !sr.holder.split(',').any(|h| h == pid) {
+                    sr.holder = format!("{},{}", sr.holder, pid);
+                }
+            }
+        }
+    }
+
     println!(
-        "[sharding] ✅ Verteilung für {} Chunk(s) abgeschlossen",
-        updated_refs.len()
+        "[sharding] ✅ Verteilung: {} bestätigt, {} unbestätigt von {} Transfers",
+        confirmed.len(),
+        unconfirmed,
+        total_pending
     );
     updated_refs
 }

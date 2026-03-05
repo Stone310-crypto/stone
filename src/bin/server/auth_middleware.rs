@@ -1,4 +1,5 @@
-//! API-Key authentication helpers: extract_api_key, require_user, require_admin.
+//! API-Key & Session-Token authentication helpers.
+//! Supports both `x-api-key` header (legacy) and `Authorization: Bearer <token>` (challenge-response).
 
 use axum::{
     http::{HeaderMap, StatusCode},
@@ -6,7 +7,7 @@ use axum::{
 };
 use serde_json::json;
 use std::sync::{Arc, Mutex};
-use stone::auth::User;
+use stone::auth::{validate_session_token, User};
 
 use super::state::AppState;
 
@@ -28,6 +29,16 @@ pub fn extract_api_key(headers: &HeaderMap) -> Option<String> {
         .get("x-api-key")
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string())
+}
+
+/// Extrahiert einen Bearer-Token aus dem `Authorization`-Header.
+/// Format: `Authorization: Bearer <session_token>`
+pub fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer ").or_else(|| s.strip_prefix("bearer ")))
+        .map(|s| s.trim().to_string())
 }
 
 pub fn resolve_user_by_key(
@@ -54,21 +65,42 @@ pub fn resolve_user_by_key(
     guard.iter().find(|u| constant_time_eq(&u.api_key, key)).cloned()
 }
 
+/// Löst einen User anhand eines Session-Tokens auf (Challenge-Response Auth).
+fn resolve_user_by_session_token(
+    token: &str,
+    users: &Arc<Mutex<Vec<User>>>,
+    cluster_key: &str,
+) -> Option<User> {
+    let claims = validate_session_token(token, cluster_key)?;
+    let guard = users.lock().unwrap();
+    guard.iter().find(|u| u.wallet_address == claims.wallet_address).cloned()
+}
+
 pub fn require_user(headers: &HeaderMap, state: &AppState) -> Result<User, Response> {
-    let key = extract_api_key(headers).ok_or_else(|| {
-        (
+    // 1. Versuche x-api-key (Legacy/Admin)
+    if let Some(key) = extract_api_key(headers) {
+        if let Some(user) = resolve_user_by_key(&key, &state.users, &state.api_key, &state.admin_key) {
+            return Ok(user);
+        }
+    }
+
+    // 2. Versuche Authorization: Bearer <session_token> (Challenge-Response)
+    if let Some(token) = extract_bearer_token(headers) {
+        if let Some(user) = resolve_user_by_session_token(&token, &state.users, &state.api_key) {
+            return Ok(user);
+        }
+        return Err((
             StatusCode::UNAUTHORIZED,
-            axum::Json(json!({"error": "x-api-key Header fehlt"})),
+            axum::Json(json!({"error": "Session-Token ungültig oder abgelaufen"})),
         )
-            .into_response()
-    })?;
-    resolve_user_by_key(&key, &state.users, &state.api_key, &state.admin_key).ok_or_else(|| {
-        (
-            StatusCode::UNAUTHORIZED,
-            axum::Json(json!({"error": "Ungültiger API-Key"})),
-        )
-            .into_response()
-    })
+            .into_response());
+    }
+
+    Err((
+        StatusCode::UNAUTHORIZED,
+        axum::Json(json!({"error": "Authentifizierung erforderlich (x-api-key Header oder Authorization: Bearer Token)"})),
+    )
+        .into_response())
 }
 
 pub fn require_admin(headers: &HeaderMap, state: &AppState) -> Result<(), Response> {

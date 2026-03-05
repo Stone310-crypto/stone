@@ -1,7 +1,7 @@
-//! Auth handlers: signup, login, sync-users, push_user_to_peers.
+//! Auth handlers: signup, login, sync-users, push_user_to_peers, challenge-response, QR-login.
 
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
@@ -9,11 +9,14 @@ use serde::Deserialize;
 use serde_json::json;
 use std::time::Duration;
 use stone::{
-    auth::{create_user_with_phrase, resolve_phrase, save_users, User},
+    auth::{
+        create_user_with_phrase, generate_session_token, resolve_phrase, save_users,
+        verify_challenge_signature, User, QR_LOGIN_TTL_SECS, SESSION_TOKEN_TTL_SECS,
+    },
     master_node::PeerInfo,
 };
 
-use super::super::auth_middleware::require_admin;
+use super::super::auth_middleware::{require_admin, require_user};
 use super::super::state::AppState;
 
 #[derive(Deserialize)]
@@ -306,4 +309,306 @@ pub async fn handle_wallet_claim(
             "already_claimed": false,
         })),
     )
+}
+
+// ─── Challenge-Response Auth (Cross-Platform Login) ──────────────────────────
+
+#[derive(Deserialize)]
+pub struct ChallengeRequest {
+    pub wallet_address: String,
+}
+
+#[derive(Deserialize)]
+pub struct VerifyChallengeRequest {
+    pub wallet_address: String,
+    pub signature: String,
+}
+
+/// POST /api/v1/auth/challenge
+///
+/// Erzeugt einen Challenge-Nonce für Wallet-basierte Authentifizierung.
+/// Der Client signiert den Nonce mit seinem privaten Schlüssel (aus der Seed-Phrase).
+///
+/// Body: `{ "wallet_address": "hex_ed25519_pubkey" }`
+/// Antwort: `{ "challenge": "hex_nonce", "expires_in": 300 }`
+pub async fn handle_request_challenge(
+    State(state): State<AppState>,
+    axum::Json(req): axum::Json<ChallengeRequest>,
+) -> impl IntoResponse {
+    let wallet = req.wallet_address.trim();
+
+    if wallet.is_empty() || wallet.len() != 64 {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"error": "Ungültige Wallet-Adresse (64 Hex-Zeichen erwartet)"})),
+        );
+    }
+
+    // Prüfe ob ein User mit dieser Wallet existiert
+    {
+        let users = state.users.lock().unwrap();
+        if !users.iter().any(|u| u.wallet_address == wallet) {
+            return (
+                StatusCode::NOT_FOUND,
+                axum::Json(json!({"error": "Keine Registrierung für diese Wallet-Adresse gefunden"})),
+            );
+        }
+    }
+
+    let challenge = state.challenge_store.create_challenge(wallet);
+    (
+        StatusCode::OK,
+        axum::Json(json!({
+            "challenge": challenge.nonce,
+            "expires_in": stone::auth::CHALLENGE_TTL_SECS,
+        })),
+    )
+}
+
+/// POST /api/v1/auth/verify
+///
+/// Verifiziert die signierte Challenge und gibt einen Session-Token zurück.
+/// Der Client signiert den Challenge-Nonce mit dem Ed25519 Private Key,
+/// der aus der Seed-Phrase abgeleitet wird.
+///
+/// Body: `{ "wallet_address": "hex_pubkey", "signature": "hex_ed25519_sig" }`
+/// Antwort: `{ "session_token": "…", "user": { … }, "expires_in": 86400 }`
+pub async fn handle_verify_challenge(
+    State(state): State<AppState>,
+    axum::Json(req): axum::Json<VerifyChallengeRequest>,
+) -> impl IntoResponse {
+    let wallet = req.wallet_address.trim().to_string();
+    let signature = req.signature.trim().to_string();
+
+    if wallet.is_empty() || wallet.len() != 64 {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"error": "Ungültige Wallet-Adresse"})),
+        );
+    }
+
+    // Challenge konsumieren (einmalig verwendbar)
+    let challenge = match state.challenge_store.consume_challenge(&wallet) {
+        Some(c) => c,
+        None => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                axum::Json(json!({"error": "Kein gültiger Challenge vorhanden – bitte zuerst /auth/challenge aufrufen"})),
+            );
+        }
+    };
+
+    // Ed25519-Signatur des Nonce verifizieren
+    if !verify_challenge_signature(&wallet, &challenge.nonce, &signature) {
+        return (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"error": "Signaturprüfung fehlgeschlagen – falscher Private Key?"})),
+        );
+    }
+
+    // User anhand der Wallet-Adresse finden
+    let user = {
+        let users = state.users.lock().unwrap();
+        users.iter().find(|u| u.wallet_address == wallet).cloned()
+    };
+
+    let Some(user) = user else {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(json!({"error": "User nicht gefunden"})),
+        );
+    };
+
+    // Session-Token erzeugen (HMAC-signiert, 24h gültig)
+    let token = generate_session_token(
+        &user.id,
+        &wallet,
+        &state.api_key,
+        SESSION_TOKEN_TTL_SECS,
+    );
+
+    println!(
+        "[auth] 🔑 Challenge-Response Login erfolgreich: {} ({})",
+        user.name,
+        &wallet[..16]
+    );
+
+    (
+        StatusCode::OK,
+        axum::Json(json!({
+            "session_token": token,
+            "expires_in": SESSION_TOKEN_TTL_SECS,
+            "user": {
+                "id": user.id,
+                "name": user.name,
+                "wallet_address": user.wallet_address,
+                "account_type": user.account_type,
+            },
+        })),
+    )
+}
+
+// ─── QR-Code Login (Cross-Device Authentifizierung) ──────────────────────────
+
+#[derive(Deserialize)]
+pub struct QrApproveRequest {
+    pub login_token: String,
+}
+
+/// POST /api/v1/auth/qr/create
+///
+/// Erzeugt eine neue QR-Login-Session. Die Website zeigt den `login_token` als QR-Code.
+/// Kein Auth erforderlich (die Website ist noch nicht eingeloggt).
+///
+/// Antwort: `{ "login_token": "hex", "expires_in": 180 }`
+pub async fn handle_qr_create(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let session = state.qr_login_store.create_session();
+
+    println!(
+        "[auth] 📱 QR-Login-Session erstellt: {}…",
+        &session.login_token[..16]
+    );
+
+    (
+        StatusCode::OK,
+        axum::Json(json!({
+            "login_token": session.login_token,
+            "expires_in": QR_LOGIN_TTL_SECS,
+        })),
+    )
+}
+
+/// GET /api/v1/auth/qr/status/:token
+///
+/// Pollt den Status einer QR-Login-Session.
+/// Die Website ruft diesen Endpoint wiederholt auf, bis `status == "approved"`.
+///
+/// Antwort (pending): `{ "status": "pending" }`
+/// Antwort (approved): `{ "status": "approved", "session_token": "…", "user": {…}, "api_key": "…" }`
+/// Antwort (expired): `{ "status": "expired" }`
+pub async fn handle_qr_status(
+    State(state): State<AppState>,
+    Path(login_token): Path<String>,
+) -> impl IntoResponse {
+    let Some(session) = state.qr_login_store.get_status(&login_token) else {
+        return (
+            StatusCode::NOT_FOUND,
+            axum::Json(json!({"status": "expired", "error": "QR-Session nicht gefunden oder abgelaufen"})),
+        );
+    };
+
+    match session.status {
+        stone::auth::QrLoginStatus::Pending => {
+            (
+                StatusCode::OK,
+                axum::Json(json!({"status": "pending"})),
+            )
+        }
+        stone::auth::QrLoginStatus::Approved => {
+            // Session konsumieren (einmalig abrufbar)
+            if let Some(approved) = state.qr_login_store.consume_approved(&login_token) {
+                // api_key des Users für Legacy-Kompatibilität mitgeben
+                let api_key = {
+                    let users = state.users.lock().unwrap();
+                    approved.approved_wallet.as_ref()
+                        .and_then(|w| users.iter().find(|u| &u.wallet_address == w))
+                        .map(|u| u.api_key.clone())
+                        .unwrap_or_default()
+                };
+
+                (
+                    StatusCode::OK,
+                    axum::Json(json!({
+                        "status": "approved",
+                        "session_token": approved.session_token,
+                        "expires_in": SESSION_TOKEN_TTL_SECS,
+                        "api_key": api_key,
+                        "user": {
+                            "id": approved.approved_user_id,
+                            "name": approved.approved_user_name,
+                            "wallet_address": approved.approved_wallet,
+                            "account_type": approved.approved_account_type,
+                        },
+                    })),
+                )
+            } else {
+                (
+                    StatusCode::GONE,
+                    axum::Json(json!({"status": "expired", "error": "QR-Session bereits abgerufen"})),
+                )
+            }
+        }
+        stone::auth::QrLoginStatus::Expired => {
+            (
+                StatusCode::GONE,
+                axum::Json(json!({"status": "expired"})),
+            )
+        }
+    }
+}
+
+/// POST /api/v1/auth/qr/approve
+///
+/// Die iOS App genehmigt eine QR-Login-Session.
+/// Erfordert einen gültigen Bearer-Token (der User muss in der App eingeloggt sein).
+/// Nach FaceID-Bestätigung sendet die App diesen Request.
+///
+/// Body: `{ "login_token": "hex" }`
+/// Antwort: `{ "ok": true }`
+pub async fn handle_qr_approve(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::Json(req): axum::Json<QrApproveRequest>,
+) -> impl IntoResponse {
+    // Der User muss authentifiziert sein (Bearer Token aus der App)
+    let user = match require_user(&headers, &state) {
+        Ok(u) => u,
+        Err(resp) => return resp,
+    };
+
+    let login_token = req.login_token.trim();
+    if login_token.is_empty() || login_token.len() != 64 {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"error": "Ungültiger login_token (64 Hex-Zeichen erwartet)"})),
+        )
+            .into_response();
+    }
+
+    // Neuen Session-Token für das Website-Login generieren
+    let session_token = generate_session_token(
+        &user.id,
+        &user.wallet_address,
+        &state.api_key,
+        SESSION_TOKEN_TTL_SECS,
+    );
+
+    if state.qr_login_store.approve_session(login_token, session_token, &user) {
+        println!(
+            "[auth] 📱✅ QR-Login genehmigt von {} ({}) für Token {}…",
+            user.name,
+            &user.wallet_address.get(..16).unwrap_or(&user.wallet_address),
+            &login_token[..16]
+        );
+
+        (
+            StatusCode::OK,
+            axum::Json(json!({
+                "ok": true,
+                "message": "QR-Login erfolgreich genehmigt",
+            })),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({
+                "ok": false,
+                "error": "QR-Session ungültig, abgelaufen oder bereits genehmigt",
+            })),
+        )
+            .into_response()
+    }
 }

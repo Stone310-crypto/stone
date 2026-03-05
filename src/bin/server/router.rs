@@ -10,7 +10,9 @@ use tower_http::cors::{Any, CorsLayer};
 
 use super::state::{AppState, MAX_UPLOAD_BYTES};
 use super::handlers::{
-    auth::{handle_login, handle_signup, handle_sync_users, handle_wallet_claim},
+    auth::{handle_login, handle_signup, handle_sync_users, handle_wallet_claim,
+           handle_request_challenge, handle_verify_challenge,
+           handle_qr_create, handle_qr_status, handle_qr_approve},
     blocks::{handle_get_block, handle_list_blocks},
     chunks::handle_get_chunk,
     documents::{
@@ -157,6 +159,13 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/auth/signup", post(handle_signup))
         .route("/api/v1/auth/login", post(handle_login))
         .route("/api/v1/auth/wallet-claim", post(handle_wallet_claim))
+        // Challenge-Response Auth (Cross-Platform Login)
+        .route("/api/v1/auth/challenge", post(handle_request_challenge))
+        .route("/api/v1/auth/verify", post(handle_verify_challenge))
+        // QR-Code Login (Cross-Device: iOS App → Website/Desktop)
+        .route("/api/v1/auth/qr/create", post(handle_qr_create))
+        .route("/api/v1/auth/qr/status/:token", get(handle_qr_status))
+        .route("/api/v1/auth/qr/approve", post(handle_qr_approve))
         // Admin: User-Sync zwischen Nodes
         .route("/api/v1/admin/sync-users", post(handle_sync_users))
         // PoA: Validators

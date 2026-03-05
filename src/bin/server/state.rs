@@ -6,7 +6,7 @@ use std::{
     time::Duration,
 };
 use stone::{
-    auth::User,
+    auth::{User, ChallengeStore, QrLoginStore},
     blockchain::{ChunkRef, data_dir, CHUNK_SIZE, Document},
     chat::ChatIndex,
     master_node::{MasterNodeState, PeerInfo, TrustEntry, TrustVote},
@@ -46,6 +46,10 @@ pub struct AppState {
     pub orgs: Arc<Mutex<Vec<Organization>>>,
     /// Globaler Chat-Index
     pub chat_index: Arc<Mutex<ChatIndex>>,
+    /// Challenge-Store für Wallet-basierte Authentifizierung (Cross-Platform Login)
+    pub challenge_store: ChallengeStore,
+    /// QR-Login-Store für Cross-Device Authentifizierung (iOS App → Website)
+    pub qr_login_store: QrLoginStore,
 }
 
 // ─── API-Key laden ────────────────────────────────────────────────────────────

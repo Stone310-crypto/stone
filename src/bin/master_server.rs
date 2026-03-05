@@ -468,7 +468,53 @@ async fn main() {
                                     });
                                 }
 
-                                _ => {} // PeerDisconnected, Listening etc.
+                                // ── Peer getrennt → Registry bereinigen + Repair ──
+                                NetworkEvent::PeerDisconnected { peer_id } => {
+                                    eprintln!("[master] ⚡ Peer getrennt: {}", &peer_id[..12.min(peer_id.len())]);
+                                    // Holder aus Shard-Registry entfernen
+                                    node_bg.shard_registry.remove_holder(&peer_id);
+                                    node_bg.shard_registry.persist();
+
+                                    // Verzögerten Repair-Check starten:
+                                    // Nach 30 Sek prüfen ob degradierte Chunks repariert werden müssen
+                                    let node_repair = node_bg.clone();
+                                    let handle_repair = handle_bg.clone();
+                                    tokio::spawn(async move {
+                                        // Warten, damit kurze Reconnects keinen unnötigen Repair triggern
+                                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+
+                                        // Prüfen ob der Peer inzwischen wieder da ist
+                                        let still_gone = !handle_repair.connected_peers().await
+                                            .iter().any(|p| p.peer_id == peer_id);
+                                        if !still_gone {
+                                            println!("[repair] Peer {} ist wieder da – kein Repair nötig",
+                                                &peer_id[..12.min(peer_id.len())]);
+                                            return;
+                                        }
+
+                                        // Degradierte Chunks finden und Shards an verbleibende Peers re-verteilen
+                                        let local_peer_id = handle_repair.local_peer_id.clone();
+                                        let shard_store = match stone::shard::ShardStore::new() {
+                                            Ok(s) => s,
+                                            Err(e) => {
+                                                eprintln!("[repair] ShardStore: {e}");
+                                                return;
+                                            }
+                                        };
+                                        let (migrated, failed) = stone::storage::rebalance_shards(
+                                            &shard_store,
+                                            &node_repair.shard_registry,
+                                            &handle_repair,
+                                            &local_peer_id,
+                                        ).await;
+                                        if migrated > 0 || failed > 0 {
+                                            println!("[repair] 🔧 Repair nach Peer-Verlust: {} migriert, {} fehlgeschlagen",
+                                                migrated, failed);
+                                        }
+                                    });
+                                }
+
+                                _ => {} // Listening etc.
                                 }
                             }
                         });
@@ -493,6 +539,74 @@ async fn main() {
             loop {
                 interval.tick().await;
                 rl.cleanup_all();
+            }
+        });
+    }
+
+    // ── Periodischer Shard-Health-Check (alle 5 Minuten) ─────────────────────
+    // Prüft ob Shards degradiert/kritisch sind und repariert automatisch
+    // durch Re-Verteilung an verfügbare Peers.
+    if let Some(ref network) = network_handle {
+        let node_health = node.clone();
+        let handle_health = network.clone();
+        tokio::spawn(async move {
+            // Erst 2 Minuten nach Start warten (P2P muss sich stabilisieren)
+            tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+            let mut health_interval = tokio::time::interval(std::time::Duration::from_secs(300));
+            loop {
+                health_interval.tick().await;
+
+                let connected = handle_health.connected_peers().await;
+                if connected.is_empty() {
+                    continue; // Keine Peers → nichts zu tun
+                }
+
+                // Alle Chunks in der Registry durchgehen
+                let chunks = node_health.shard_registry.all_chunks();
+                let ec_k = stone::shard::DEFAULT_EC_K;
+                let mut healthy = 0u64;
+                let mut degraded = 0u64;
+                let mut critical = 0u64;
+
+                for chunk_hash in &chunks {
+                    let (status, _count) = node_health.shard_registry.chunk_health(chunk_hash, ec_k);
+                    match status {
+                        "healthy" => healthy += 1,
+                        "degraded" => degraded += 1,
+                        "critical" => critical += 1,
+                        _ => {}
+                    }
+                }
+
+                if degraded > 0 || critical > 0 {
+                    eprintln!(
+                        "[health] ⚠ Shard-Status: {} healthy, {} degraded, {} critical – starte Repair",
+                        healthy, degraded, critical
+                    );
+
+                    let local_peer_id = handle_health.local_peer_id.clone();
+                    let shard_store = match stone::shard::ShardStore::new() {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("[health] ShardStore: {e}");
+                            continue;
+                        }
+                    };
+                    let (migrated, failed) = stone::storage::rebalance_shards(
+                        &shard_store,
+                        &node_health.shard_registry,
+                        &handle_health,
+                        &local_peer_id,
+                    ).await;
+                    if migrated > 0 || failed > 0 {
+                        println!(
+                            "[health] 🔧 Auto-Repair: {} migriert, {} fehlgeschlagen",
+                            migrated, failed
+                        );
+                    }
+                } else if !chunks.is_empty() {
+                    println!("[health] ✅ Alle {} Chunks healthy", healthy);
+                }
             }
         });
     }
@@ -523,6 +637,8 @@ async fn main() {
             }
             Arc::new(std::sync::Mutex::new(idx))
         },
+        challenge_store: stone::auth::ChallengeStore::new(),
+        qr_login_store: stone::auth::QrLoginStore::new(),
     };
 
     let router = build_router(state);
