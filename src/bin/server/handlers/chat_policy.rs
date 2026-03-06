@@ -14,7 +14,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::json;
-use stone::chat_policy::{self, ReportCategory, messenger_min_stake};
+use stone::chat_policy::{self, ReportCategory};
 
 use super::super::auth_middleware::require_user;
 use super::super::state::AppState;
@@ -65,8 +65,8 @@ pub async fn handle_chat_policy_status(
             "total_slashed": summary.total_slashed.to_string(),
         },
         "stake_gate": {
-            "min_stake_required": messenger_min_stake().to_string(),
-            "description": "Mindest-Stake um den Messenger nutzen zu dürfen",
+            "min_stake_required": "0",
+            "description": "Kein Mindest-Stake erforderlich",
         },
     })))
 }

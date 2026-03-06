@@ -935,11 +935,14 @@ impl MasterNodeState {
     }
 
     /// Sammelt pending ChallengeResponses und validiert sie gegen offene Challenges in der Chain.
+    ///
+    /// Gibt gültige Responses zurück, OHNE sie aus dem Pending-Buffer zu entfernen.
+    /// Erst nach erfolgreichem Block-Commit sollen sie via `clear_committed_responses()` entfernt werden.
     fn collect_pending_challenge_responses(
         &self,
         chain: &StoneChain,
     ) -> Vec<crate::storage_proof::ChallengeResponse> {
-        let mut pending = self.pending_challenge_responses.lock().unwrap();
+        let pending = self.pending_challenge_responses.lock().unwrap();
         if pending.is_empty() {
             return Vec::new();
         }
@@ -966,7 +969,7 @@ impl MasterNodeState {
         let store = crate::storage::ChunkStore::new().ok();
 
         let valid_responses: Vec<crate::storage_proof::ChallengeResponse> = pending
-            .drain(..)
+            .iter()
             .filter(|resp| {
                 // Challenge existiert und ist offen?
                 let challenge = open_challenges.iter().find(|c| c.challenge_id == resp.challenge_id);
@@ -995,9 +998,21 @@ impl MasterNodeState {
                     }
                 }
             })
+            .cloned()
             .collect();
 
         valid_responses
+    }
+
+    /// Entfernt bereits committete Challenge-Responses aus dem Pending-Buffer.
+    /// Wird nach erfolgreichem Block-Commit aufgerufen.
+    fn clear_committed_responses(&self, committed_ids: &[String]) {
+        if committed_ids.is_empty() {
+            return;
+        }
+        let id_set: std::collections::HashSet<&str> = committed_ids.iter().map(|s| s.as_str()).collect();
+        let mut pending = self.pending_challenge_responses.lock().unwrap();
+        pending.retain(|r| !id_set.contains(r.challenge_id.as_str()));
     }
 
     /// Erstellt einen neuen Block (auch ohne Dokumente) mit Mempool-TXs und Block-Reward.
@@ -1149,14 +1164,20 @@ impl MasterNodeState {
         }
 
         // Reward-TX hinzufügen (falls Reward > 0)
+        let has_user_txs = !pending_txs.is_empty();
         if reward_amount > Decimal::ZERO {
             let reward_tx = Self::create_reward_tx(&reward_wallet, reward_amount, next_index);
             pending_txs.push(reward_tx);
         }
 
-        // Nichts zu tun? (kein Reward UND keine pending TXs)
-        if pending_txs.is_empty() {
-            return Err("Mining: Kein Reward und keine pending TXs – übersprungen".into());
+        // Prüfe ob es Pending-Challenge-Responses gibt (rechtfertigt einen Block auch ohne User-TXs)
+        let has_pending_responses = !self.pending_challenge_responses.lock().unwrap().is_empty();
+
+        // Leere Blöcke vermeiden: nur Reward-TX ohne User-TXs oder Challenge-Responses → überspringen.
+        // Das verhindert, dass die Chain alle 30s mit leeren Blöcken aufgebläht wird.
+        if !has_user_txs && !has_pending_responses {
+            // Reward-TX wieder zurücknehmen — sie wird beim nächsten sinnvollen Block erstellt
+            return Err("Mining: Keine User-TXs oder Challenge-Responses – Block übersprungen".into());
         }
 
         // ── Block vorbereiten (ohne Commit in die Chain) ──────────────────
@@ -1232,6 +1253,53 @@ impl MasterNodeState {
                         "[storage-challenge] ✅ {} Challenge-Responses in Block #{} aufgenommen",
                         responses.len(), block.index
                     );
+
+                    // Challenge-Reward-TXs: Jede gültige Response bekommt CHALLENGE_REWARD STONE
+                    let challenge_reward: Decimal = crate::storage_proof::CHALLENGE_REWARD
+                        .parse().unwrap_or(Decimal::new(5, 1)); // 0.5 STONE Fallback
+                    let pool_balance = {
+                        let ledger = self.token_ledger.read().unwrap();
+                        ledger.balance("pool:storage_rewards")
+                    };
+                    let mut challenge_rewards_total = Decimal::ZERO;
+                    for resp in &responses {
+                        if challenge_rewards_total + challenge_reward > pool_balance {
+                            println!(
+                                "[storage-challenge] ⚠ Reward-Pool reicht nicht für weitere Challenge-Rewards"
+                            );
+                            break;
+                        }
+                        let chain_id = std::env::var("STONE_NETWORK")
+                            .map(|n| if n == "mainnet" || n == "main" { "stone-mainnet".to_string() } else { "stone-testnet".to_string() })
+                            .unwrap_or_else(|_| "stone-testnet".to_string());
+                        let mut reward_tx = TokenTx {
+                            tx_id: String::new(),
+                            tx_type: TxType::Reward,
+                            from: "pool:storage_rewards".to_string(),
+                            to: resp.responder_wallet.clone(),
+                            amount: challenge_reward,
+                            fee: Decimal::ZERO,
+                            nonce: 0,
+                            timestamp: Utc::now().timestamp(),
+                            signature: String::new(),
+                            memo: format!("Storage Challenge Reward ({})", &resp.challenge_id[..12.min(resp.challenge_id.len())]),
+                            chain_id,
+                            fee_tier: crate::token::FeeTier::Express,
+                        };
+                        reward_tx.tx_id = compute_tx_id(&reward_tx);
+                        block.transactions.push(reward_tx);
+                        challenge_rewards_total += challenge_reward;
+                    }
+                    if challenge_rewards_total > Decimal::ZERO {
+                        // Merkle-Root muss wegen neuer TXs neu berechnet werden
+                        block.merkle_root = crate::blockchain::compute_merkle_root(
+                            &block.documents, &block.tombstones, &block.transactions,
+                        );
+                        println!(
+                            "[storage-challenge] 💰 {} STONE Challenge-Rewards in Block #{}",
+                            challenge_rewards_total, block.index
+                        );
+                    }
                 }
                 block.challenge_responses = responses;
 
@@ -1494,6 +1562,11 @@ impl MasterNodeState {
                     // ═══ SINGLE-NODE MODUS: Sofort committen (wie bisher) ═══
                     match state.mint_block() {
                         Ok(block) => {
+                            // Committete Challenge-Responses aus Pending-Buffer entfernen
+                            let committed_ids: Vec<String> = block.challenge_responses
+                                .iter().map(|r| r.challenge_id.clone()).collect();
+                            state.clear_committed_responses(&committed_ids);
+
                             Self::post_block_staking(&state, &block);
                             Self::post_block_slashing(&state, &block);
                             Self::post_block_reputation(&state, &block);
@@ -1735,6 +1808,11 @@ impl MasterNodeState {
                                 );
                                 match state.commit_mining_block(block.clone()) {
                                     Ok(()) => {
+                                        // Committete Challenge-Responses aus Pending-Buffer entfernen
+                                        let committed_ids: Vec<String> = block.challenge_responses
+                                            .iter().map(|r| r.challenge_id.clone()).collect();
+                                        state.clear_committed_responses(&committed_ids);
+
                                         Self::post_block_staking(&state, &block);
                                         Self::post_block_slashing(&state, &block);
                                         Self::post_block_reputation(&state, &block);

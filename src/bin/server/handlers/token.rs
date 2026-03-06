@@ -603,10 +603,13 @@ pub async fn handle_wallet_rotations(
 #[derive(Deserialize)]
 pub struct SendRequest {
     /// BIP39-Mnemonic (12 oder 24 Wörter) des Absenders
+    #[serde(default, alias = "phrase")]
     pub mnemonic: String,
     /// Empfänger-Adresse (Public-Key-Hex, 64 Zeichen)
+    #[serde(default)]
     pub to: String,
     /// Betrag in STONE
+    #[serde(default)]
     pub amount: String,
     /// Absender-Adresse zur Validierung (muss mit Mnemonic übereinstimmen)
     #[serde(default)]
@@ -629,8 +632,19 @@ pub async fn handle_token_send(
 ) -> impl IntoResponse {
     use stone::token::Wallet;
 
+    // Mnemonic prüfen
+    if req.mnemonic.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "Mnemonic fehlt",
+            })),
+        );
+    }
+
     // Empfänger-Adresse validieren
-    if req.to.len() != 64 || !req.to.chars().all(|c| c.is_ascii_hexdigit()) {
+    if req.to.is_empty() || req.to.len() != 64 || !req.to.chars().all(|c| c.is_ascii_hexdigit()) {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -790,14 +804,17 @@ pub async fn handle_token_send(
 #[derive(Deserialize)]
 pub struct SendAuthenticatedRequest {
     /// Empfänger-Adresse (Public-Key-Hex, 64 Zeichen)
+    #[serde(default)]
     pub to: String,
     /// Betrag in STONE
+    #[serde(default)]
     pub amount: String,
     /// Fee-Tier: "express", "priority", "standard"
     #[serde(default = "default_fee_tier")]
     pub fee_tier: String,
     /// Mnemonic — wird vom Flask-Proxy aus der verschlüsselten Session injiziert
     /// (nie vom Browser direkt gesendet!)
+    #[serde(default, alias = "phrase")]
     pub mnemonic: String,
 }
 
@@ -816,8 +833,20 @@ pub async fn handle_token_send_authenticated(
 ) -> impl IntoResponse {
     use stone::token::Wallet;
 
+    // Mnemonic prüfen (wird vom Flask-Proxy injiziert)
+    if req.mnemonic.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "Nicht authentifiziert — bitte erneut einloggen",
+                "login_required": true,
+            })),
+        );
+    }
+
     // Empfänger validieren
-    if req.to.len() != 64 || !req.to.chars().all(|c| c.is_ascii_hexdigit()) {
+    if req.to.is_empty() || req.to.len() != 64 || !req.to.chars().all(|c| c.is_ascii_hexdigit()) {
         return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({

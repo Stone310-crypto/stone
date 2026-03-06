@@ -646,6 +646,57 @@ impl StoneChain {
             }
         }
 
+        // ── Challenge-Response Verifikation ────────────────────────────────
+        // Responses im Block müssen gegen offene Challenges in der Chain validiert werden
+        if !block.challenge_responses.is_empty() && block.index > 0 {
+            let lookback = crate::storage_proof::CHALLENGE_DEADLINE_BLOCKS as usize + 5;
+            let start = self.blocks.len().saturating_sub(lookback);
+
+            // Offene Challenges sammeln
+            let open_challenges: Vec<&crate::storage_proof::NetworkChallenge> = self.blocks[start..]
+                .iter()
+                .flat_map(|b| b.storage_challenges.iter())
+                .collect();
+
+            // Schon beantwortete Challenge-IDs
+            let answered: std::collections::HashSet<&str> = self.blocks[start..]
+                .iter()
+                .flat_map(|b| b.challenge_responses.iter())
+                .map(|r| r.challenge_id.as_str())
+                .collect();
+
+            let store = crate::storage::ChunkStore::new().ok();
+
+            for resp in &block.challenge_responses {
+                // Response referenziert eine existierende Challenge?
+                let challenge = open_challenges.iter()
+                    .find(|c| c.challenge_id == resp.challenge_id);
+                match challenge {
+                    None => {
+                        return Err(format!(
+                            "Challenge-Response für unbekannte Challenge {}",
+                            &resp.challenge_id[..12.min(resp.challenge_id.len())]
+                        ));
+                    }
+                    Some(challenge) => {
+                        // Nicht doppelt beantworten
+                        if answered.contains(resp.challenge_id.as_str()) {
+                            return Err(format!(
+                                "Challenge {} wurde bereits beantwortet",
+                                &resp.challenge_id[..12.min(resp.challenge_id.len())]
+                            ));
+                        }
+                        // Kryptographische Verifikation (Signatur + Proof)
+                        if let Err(e) = crate::storage_proof::verify_challenge_response(
+                            challenge, resp, store.as_ref(), block.index,
+                        ) {
+                            return Err(format!("Challenge-Response ungültig: {e}"));
+                        }
+                    }
+                }
+            }
+        }
+
         // ── Timestamp-Plausibilität ───────────────────────────────────────
         if block.index > 0 {
             let now = Utc::now().timestamp();
@@ -885,6 +936,8 @@ pub fn calculate_hash(block: &Block) -> String {
     h.update(crate::storage_proof::storage_proof_hash(&block.storage_proof).as_bytes());
     // Network-Challenges gehen ebenfalls in den Block-Hash ein
     h.update(crate::storage_proof::network_challenges_hash(&block.storage_challenges).as_bytes());
+    // Challenge-Responses sind ebenfalls Teil des Block-Hashes → manipulationssicher
+    h.update(crate::storage_proof::challenge_responses_hash(&block.challenge_responses).as_bytes());
     format!("{:x}", h.finalize())
 }
 

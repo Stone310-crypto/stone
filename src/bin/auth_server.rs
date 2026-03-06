@@ -118,8 +118,6 @@ struct CertReq {
     name: String,
     #[serde(default)]
     san: Vec<String>,
-    #[serde(default)]
-    url: Option<String>,
 }
 
 async fn warn_if_clock_skew(time_url: &str, max_skew: Duration) {
@@ -737,12 +735,7 @@ async fn pki_root_stub(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 #[derive(Deserialize)]
-struct CsrStub {
-    #[serde(default)]
-    csr_pem: Option<String>,
-    #[serde(default)]
-    node: Option<String>,
-}
+struct CsrStub {}
 
 async fn pki_csr_stub(Json(_body): Json<CsrStub>) -> impl IntoResponse {
     let cert = "-----BEGIN CERTIFICATE-----\nSTUB\n-----END CERTIFICATE-----\n";

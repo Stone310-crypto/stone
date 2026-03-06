@@ -204,6 +204,7 @@ pub fn generate_network_challenges(
 
     let n = NETWORK_CHALLENGES_PER_BLOCK.min(target_wallets.len()).min(chunk_refs.len());
     let mut challenges = Vec::with_capacity(n);
+    let mut used_wallets = std::collections::HashSet::new();
 
     for i in 0..n {
         // Deterministischer Seed
@@ -214,10 +215,23 @@ pub fn generate_network_challenges(
         seed_hasher.update((i as u64).to_le_bytes());
         let seed = seed_hasher.finalize();
 
-        // Wallet-Auswahl
+        // Wallet-Auswahl — bevorzuge noch nicht gechallenged Wallets
         let wallet_idx = u64::from_le_bytes(seed[0..8].try_into().unwrap()) as usize
             % target_wallets.len();
-        let target_wallet = target_wallets[wallet_idx].clone();
+        let mut target_wallet = target_wallets[wallet_idx].clone();
+
+        // Falls Wallet schon gechallenged und genug Alternativen vorhanden: nächste wählen
+        if used_wallets.contains(&target_wallet) && target_wallets.len() > used_wallets.len() {
+            for offset in 1..target_wallets.len() {
+                let alt_idx = (wallet_idx + offset) % target_wallets.len();
+                let alt = target_wallets[alt_idx].clone();
+                if !used_wallets.contains(&alt) {
+                    target_wallet = alt;
+                    break;
+                }
+            }
+        }
+        used_wallets.insert(target_wallet.clone());
 
         // Chunk-Auswahl
         let chunk_idx = u64::from_le_bytes(seed[8..16].try_into().unwrap()) as usize
@@ -324,29 +338,30 @@ pub fn verify_challenge_response(
         ));
     }
 
-    // 3. Signatur verifizieren
-    if response.signature.len() == 128 {
-        if let (Ok(pub_bytes), Ok(sig_bytes)) = (
-            hex::decode(&response.responder_wallet),
-            hex::decode(&response.signature),
-        ) {
-            if pub_bytes.len() == 32 {
-                if let Ok(verifying_key) = ed25519_dalek::VerifyingKey::from_bytes(
-                    pub_bytes.as_slice().try_into().unwrap_or(&[0u8; 32]),
-                ) {
-                    let sig = ed25519_dalek::Signature::from_bytes(
-                        sig_bytes.as_slice().try_into().unwrap_or(&[0u8; 64]),
-                    );
-                    use ed25519_dalek::Verifier;
-                    let mut verify_data = Vec::new();
-                    verify_data.extend_from_slice(response.challenge_id.as_bytes());
-                    verify_data.extend_from_slice(response.proof_hash.as_bytes());
-                    if verifying_key.verify(&verify_data, &sig).is_err() {
-                        return Err("Ungültige Signatur".into());
-                    }
-                }
-            }
-        }
+    // 3. Signatur verifizieren (PFLICHT — ohne gültige Signatur wird abgelehnt)
+    if response.signature.len() != 128 {
+        return Err("Signatur fehlt oder hat ungültige Länge (erwartet: 128 Hex-Zeichen)".into());
+    }
+    let pub_bytes = hex::decode(&response.responder_wallet)
+        .map_err(|_| "Wallet-Adresse ist kein gültiger Hex-String".to_string())?;
+    let sig_bytes = hex::decode(&response.signature)
+        .map_err(|_| "Signatur ist kein gültiger Hex-String".to_string())?;
+    if pub_bytes.len() != 32 {
+        return Err(format!("Wallet-Key ungültige Länge: {} (erwartet: 32)", pub_bytes.len()));
+    }
+    let verifying_key = ed25519_dalek::VerifyingKey::from_bytes(
+        pub_bytes.as_slice().try_into().map_err(|_| "Wallet-Key konvertierung fehlgeschlagen")?,
+    ).map_err(|_| "Ungültiger Ed25519 Public Key")?;
+    let sig = ed25519_dalek::Signature::from_bytes(
+        sig_bytes.as_slice().try_into().map_err(|_| "Signatur konvertierung fehlgeschlagen")?,
+    );
+    {
+        use ed25519_dalek::Verifier;
+        let mut verify_data = Vec::new();
+        verify_data.extend_from_slice(response.challenge_id.as_bytes());
+        verify_data.extend_from_slice(response.proof_hash.as_bytes());
+        verifying_key.verify(&verify_data, &sig)
+            .map_err(|_| "Ungültige Ed25519 Signatur")?;
     }
 
     // 4. Lokale Verifikation (optional)
@@ -377,6 +392,20 @@ pub fn network_challenges_hash(challenges: &[NetworkChallenge]) -> String {
         h.update(c.chunk_hash.as_bytes());
         h.update(c.offset.to_le_bytes());
         h.update(c.deadline_block.to_le_bytes());
+    }
+    format!("{:x}", h.finalize())
+}
+
+/// Hash über alle ChallengeResponses eines Blocks (geht in den Block-Hash ein)
+pub fn challenge_responses_hash(responses: &[ChallengeResponse]) -> String {
+    let mut h = Sha256::new();
+    h.update((responses.len() as u64).to_le_bytes());
+    for r in responses {
+        h.update(r.challenge_id.as_bytes());
+        h.update(r.responder_wallet.as_bytes());
+        h.update(r.proof_hash.as_bytes());
+        h.update(r.response_block.to_le_bytes());
+        h.update(r.signature.as_bytes());
     }
     format!("{:x}", h.finalize())
 }

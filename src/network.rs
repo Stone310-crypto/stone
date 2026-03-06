@@ -65,7 +65,6 @@ use libp2p::{
     kad::{self, store::MemoryStore},
     mdns,
     noise,
-    quic,
     relay,
     request_response::{self, ProtocolSupport},
     swarm::SwarmEvent,
@@ -2417,7 +2416,6 @@ impl SwarmTask {
     /// Räumt verwaiste Einträge in Rate-Limitern, Penalty-Map und Storage-Announcements auf.
     /// Wird alle 5 Minuten vom Cleanup-Ticker aufgerufen.
     fn periodic_cleanup(&mut self) {
-        let now = Instant::now();
         let connected: HashSet<PeerId> = self.swarm.connected_peers().cloned().collect();
 
         // 1. Rate-Limiter: Einträge für Peers entfernen die seit >10 Minuten nicht verbunden sind

@@ -22,12 +22,16 @@ use super::super::state::AppState;
 #[derive(Deserialize)]
 pub struct SendChatRequest {
     /// Mnemonic (BIP39) des Senders – wird NICHT gespeichert
+    #[serde(default)]
     pub mnemonic: String,
     /// Empfänger: Wallet-Adresse (64 Hex) oder User-ID (UUID)
+    #[serde(default)]
     pub to: String,
     /// AES-256-GCM verschlüsselter Nachrichteninhalt (base64)
+    #[serde(default)]
     pub encrypted_content: String,
     /// AES-256-GCM Nonce (base64, 12 Bytes)
+    #[serde(default)]
     pub nonce: String,
     /// Nachrichten-TTL: "30" (30 Tage) oder "90" (90 Tage). Default: 30
     #[serde(default)]
@@ -62,6 +66,15 @@ pub async fn handle_chat_send(
         Ok(u) => u,
         Err(e) => return e.into_response(),
     };
+
+    // Pflichtfelder prüfen
+    if req.mnemonic.is_empty() || req.to.is_empty() || req.encrypted_content.is_empty() || req.nonce.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"ok": false, "error": "Fehlende Pflichtfelder (to, encrypted_content, nonce)"})),
+        )
+            .into_response();
+    }
 
     // Sender-Wallet aus Mnemonic rekonstruieren
     let wallet = match Wallet::from_mnemonic(&req.mnemonic) {
@@ -848,10 +861,13 @@ pub async fn handle_remove_contact(
 #[derive(Deserialize)]
 pub struct ChatSendCoinsRequest {
     /// Mnemonic (BIP39) des Senders
+    #[serde(default)]
     pub mnemonic: String,
     /// Empfänger: Wallet-Adresse oder User-ID
+    #[serde(default)]
     pub to: String,
     /// Betrag in STONE (z.B. "10.5")
+    #[serde(default)]
     pub amount: String,
     /// Optionale Nachricht zum Transfer
     #[serde(default)]
@@ -861,10 +877,13 @@ pub struct ChatSendCoinsRequest {
 #[derive(Deserialize)]
 pub struct ChatRequestCoinsRequest {
     /// Mnemonic (BIP39) des Anfordernden
+    #[serde(default)]
     pub mnemonic: String,
     /// Von wem angefordert: Wallet-Adresse oder User-ID
+    #[serde(default)]
     pub from: String,
     /// Angeforderter Betrag in STONE
+    #[serde(default)]
     pub amount: String,
     /// Optionale Nachricht zur Anforderung
     #[serde(default)]

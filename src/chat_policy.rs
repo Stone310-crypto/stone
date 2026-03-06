@@ -28,9 +28,6 @@ use crate::blockchain::data_dir;
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /// Minimum-Stake um den Messenger nutzen zu dürfen (in STONE)
-pub fn messenger_min_stake() -> Decimal {
-    Decimal::new(5, 0)
-}
 
 /// Standard-TTL für Nachrichten (30 Tage in Sekunden)
 pub const TTL_30_DAYS: i64 = 30 * 24 * 3600;
@@ -550,14 +547,6 @@ impl ChatPolicyStore {
     ///
     /// Gibt `Ok(staked_amount)` zurück wenn der Stake ausreicht,
     /// sonst `Err(fehlender_betrag)`.
-    pub fn check_messenger_access(staked_amount: Decimal) -> Result<Decimal, Decimal> {
-        let min = messenger_min_stake();
-        if staked_amount >= min {
-            Ok(staked_amount)
-        } else {
-            Err(min - staked_amount)
-        }
-    }
 
     // ─── Query-Methoden ───────────────────────────────────────────────────
 
@@ -593,7 +582,7 @@ impl ChatPolicyStore {
             total_reports_accepted: self.total_reports_accepted,
             active_reports: active_reports as u64,
             total_slashed: self.total_slashed,
-            messenger_min_stake: messenger_min_stake(),
+
         }
     }
 
@@ -657,7 +646,6 @@ pub struct ChatPolicySummary {
     pub total_reports_accepted: u64,
     pub active_reports: u64,
     pub total_slashed: Decimal,
-    pub messenger_min_stake: Decimal,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -733,16 +721,6 @@ pub fn gc_expired_messages(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_stake_gate() {
-        // Unter Minimum
-        assert!(ChatPolicyStore::check_messenger_access(Decimal::new(3, 0)).is_err());
-        // Genau Minimum
-        assert!(ChatPolicyStore::check_messenger_access(Decimal::new(5, 0)).is_ok());
-        // Über Minimum
-        assert!(ChatPolicyStore::check_messenger_access(Decimal::new(100, 0)).is_ok());
-    }
 
     #[test]
     fn test_ttl_defaults() {

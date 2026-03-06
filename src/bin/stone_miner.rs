@@ -16,6 +16,7 @@
 //!   stone-miner --headless            # Ohne Dashboard (Log-Modus)
 //!   stone-miner --port 3030           # Dashboard-Port ändern (Default: 8081)
 
+#[allow(dead_code)]
 #[path = "server/mod.rs"]
 mod server;
 
@@ -28,7 +29,7 @@ use std::{
 use axum::{
     extract::{Query, State},
     http::{header, StatusCode},
-    response::{Html, IntoResponse},
+    response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
@@ -39,15 +40,14 @@ use sysinfo::{Disks, System};
 
 use stone::{
     auth::load_users,
-    blockchain::{data_dir, NodeRole, StoneChain},
-    consensus::{load_or_create_validator_key, local_validator_pubkey_hex, sign_block},
+    blockchain::{data_dir, NodeRole},
+    consensus::{load_or_create_validator_key, local_validator_pubkey_hex},
     master_node::{
-        MasterNodeState, PeerInfo, HALVING_INTERVAL, INITIAL_BLOCK_REWARD,
+        MasterNodeState, PeerInfo, HALVING_INTERVAL,
         MINING_INTERVAL_SECS,
     },
     network::{start_network, NetworkEvent, NetworkHandle},
     storage::ChunkStore,
-    storage_proof,
     token::transaction::{create_signed_tx, TxType},
 };
 

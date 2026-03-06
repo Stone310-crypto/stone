@@ -319,12 +319,13 @@ impl StakingPool {
             return Decimal::ZERO;
         }
 
-        // Sicherstellen dass nicht mehr verteilt wird als im Reward-Pool vorhanden
-        let capped_reward = if epoch_reward > reward_pool_balance {
-            reward_pool_balance
-        } else {
-            epoch_reward
-        };
+        // Sicherstellen dass nicht mehr verteilt wird als im Reward-Pool vorhanden.
+        // Staking darf pro Epoch maximal 20% des verbleibenden Pools nutzen,
+        // damit der Mining-Reward (Halving-Schema) nicht ausgehungert wird.
+        let max_staking_draw = (reward_pool_balance * Decimal::new(20, 2)).round_dp(8); // 20%
+        let capped_reward = epoch_reward
+            .min(reward_pool_balance)
+            .min(max_staking_draw);
 
         if capped_reward <= Decimal::ZERO {
             self.last_epoch_block = current_block;
