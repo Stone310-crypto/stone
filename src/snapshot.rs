@@ -97,9 +97,14 @@ pub fn create_snapshot(
     let dd = data_dir();
     let snap_dir = snapshot_dir();
 
+    // Alte .tmp-Dateien bereinigen (Überreste abgebrochener Snapshots)
+    cleanup_tmp_files(&snap_dir);
+
     let genesis_prefix = &genesis_hash[..12.min(genesis_hash.len())];
     let filename = format!("snapshot_{block_height}_{genesis_prefix}.tar.zst");
     let archive_path = snap_dir.join(&filename);
+    // Atomic write: erst in .tmp schreiben, dann umbenennen
+    let tmp_archive_path = snap_dir.join(format!("{filename}.tmp"));
 
     // Temporäres Verzeichnis für den RocksDB-Checkpoint
     let tmp_checkpoint = snap_dir.join(format!("_tmp_cp_{block_height}"));
@@ -107,7 +112,7 @@ pub fn create_snapshot(
         fs::remove_dir_all(&tmp_checkpoint)?;
     }
 
-    // RocksDB-Checkpoint erstellen (konsistent, ohne DB-Lock)
+    // RocksDB-Checkpoint erstellen (read-only open, kein Lock-Konflikt)
     {
         let chain_db_path = format!("{}/chain_db", dd);
         let chain_cp_dst = tmp_checkpoint.join("chain_db");
@@ -123,13 +128,11 @@ pub fn create_snapshot(
         }
     }
 
-    // JSON-Dateien kopieren (klein, atomar lesbar)
+    // JSON-Dateien kopieren (nur chain-relevante, KEINE node-spezifischen wie p2p_config/peers)
     let json_files = [
         "checkpoints.json",
         "validator_set.json",
         "shard_holders.json",
-        "p2p_config.json",
-        "peers.json",
     ];
     for fname in &json_files {
         let src = format!("{}/{}", dd, fname);
@@ -139,9 +142,9 @@ pub fn create_snapshot(
         }
     }
 
-    // tar.zst erstellen
+    // tar.zst in temporäre Datei erstellen
     eprintln!("[snapshot] 📦 Erstelle Snapshot bei Block #{block_height}...");
-    let archive_file = fs::File::create(&archive_path)?;
+    let archive_file = fs::File::create(&tmp_archive_path)?;
     let zst_encoder = zstd::Encoder::new(archive_file, 3)?;
     let mut tar_builder = tar::Builder::new(zst_encoder);
 
@@ -152,6 +155,9 @@ pub fn create_snapshot(
 
     // Aufräumen: temporäres Checkpoint-Verzeichnis löschen
     fs::remove_dir_all(&tmp_checkpoint)?;
+
+    // Atomar: temporäre Datei zum finalen Pfad umbenennen
+    fs::rename(&tmp_archive_path, &archive_path)?;
 
     // SHA-256 über das Archiv berechnen
     let archive_hash = sha256_file(&archive_path)?;
@@ -168,12 +174,18 @@ pub fn create_snapshot(
         filename: filename.clone(),
     };
 
-    // Metadaten schreiben
+    // Metadaten atomar schreiben (tmp + rename)
     let meta_path = snap_dir.join(format!("snapshot_{block_height}_{genesis_prefix}.json"));
-    fs::write(&meta_path, serde_json::to_string_pretty(&meta)?)?;
+    let meta_json = serde_json::to_string_pretty(&meta)?;
+    let tmp_meta = meta_path.with_extension("json.tmp");
+    fs::write(&tmp_meta, &meta_json)?;
+    fs::rename(&tmp_meta, &meta_path)?;
 
-    // latest.json aktualisieren
-    fs::write(latest_snapshot_meta_path(), serde_json::to_string_pretty(&meta)?)?;
+    // latest.json atomar aktualisieren
+    let latest_path = latest_snapshot_meta_path();
+    let tmp_latest = latest_path.with_extension("json.tmp");
+    fs::write(&tmp_latest, &meta_json)?;
+    fs::rename(&tmp_latest, &latest_path)?;
 
     eprintln!(
         "[snapshot] ✅ Snapshot erstellt: {} ({:.1} MB, Block #{block_height})",
@@ -190,7 +202,7 @@ pub fn create_snapshot(
 /// Erstellt einen RocksDB-Checkpoint (hardlinks, sehr schnell).
 ///
 /// WICHTIG: `dst_path` darf NICHT existieren — RocksDB erstellt es selbst.
-/// Bei Lock-Konflikten (DB von anderem Thread geöffnet) wird bis zu 3× mit Backoff versucht.
+/// Öffnet die DB im Read-Only Modus um Lock-Konflikte mit dem laufenden Node zu vermeiden.
 fn create_rocksdb_checkpoint(db_path: &str, dst_path: &Path) -> Result<(), SnapshotError> {
     use rocksdb::{Options, DB};
 
@@ -203,65 +215,33 @@ fn create_rocksdb_checkpoint(db_path: &str, dst_path: &Path) -> Result<(), Snaps
         fs::remove_dir_all(dst_path)?;
     }
 
-    // Retry-Logik: DB könnte kurzzeitig von anderem Thread gelockt sein
-    let max_retries = 3;
-    let mut last_err = String::new();
+    let mut opts = Options::default();
+    opts.create_if_missing(false);
 
-    for attempt in 0..max_retries {
-        if attempt > 0 {
-            // Exponentieller Backoff: 500ms, 1500ms
-            std::thread::sleep(std::time::Duration::from_millis(500 * (1 << (attempt - 1))));
-            eprintln!("[snapshot] 🔄 Retry #{attempt} für RocksDB-Checkpoint ({db_path})");
-            // dst_path nochmals bereinigen (falls vorheriger Versuch Reste hinterließ)
-            if dst_path.exists() {
-                let _ = fs::remove_dir_all(dst_path);
-            }
-        }
-
-        let mut opts = Options::default();
-        opts.create_if_missing(false);
-        opts.create_missing_column_families(true);
-
-        // chain_db hat 3 CFs, token_db hat nur "default"
-        let db_result = if db_path.ends_with("chain_db") {
-            let cf_blocks = rocksdb::ColumnFamilyDescriptor::new("blocks", Options::default());
-            let cf_meta = rocksdb::ColumnFamilyDescriptor::new("meta", Options::default());
-            let cf_index = rocksdb::ColumnFamilyDescriptor::new("index", Options::default());
-            DB::open_cf_descriptors(&opts, db_path, vec![cf_blocks, cf_meta, cf_index])
-        } else {
-            DB::open(&opts, db_path)
-        };
-
-        let db = match db_result {
-            Ok(db) => db,
-            Err(e) => {
-                last_err = format!("RocksDB open {db_path}: {e}");
-                continue; // Nächster Versuch
-            }
-        };
-
-        let cp = match rocksdb::checkpoint::Checkpoint::new(&db) {
-            Ok(cp) => cp,
-            Err(e) => {
-                last_err = format!("Checkpoint new: {e}");
-                continue;
-            }
-        };
-
-        // KEIN create_dir_all hier! RocksDB erstellt das Verzeichnis selbst.
-        match cp.create_checkpoint(dst_path) {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                last_err = format!("Checkpoint create: {e}");
-                continue;
-            }
-        }
-    }
-
-    Err(SnapshotError::Io(std::io::Error::new(
+    // Read-Only Open: kein Lock-Konflikt mit dem laufenden Node-Prozess
+    let db = if db_path.ends_with("chain_db") {
+        // chain_db hat 3 CFs + default
+        DB::open_cf_for_read_only(&opts, db_path, ["default", "blocks", "meta", "index"], false)
+    } else {
+        DB::open_for_read_only(&opts, db_path, false)
+    }.map_err(|e| SnapshotError::Io(std::io::Error::new(
         std::io::ErrorKind::Other,
-        format!("RocksDB-Checkpoint fehlgeschlagen nach {max_retries} Versuchen: {last_err}"),
-    )))
+        format!("RocksDB read-only open {db_path}: {e}"),
+    )))?;
+
+    let cp = rocksdb::checkpoint::Checkpoint::new(&db)
+        .map_err(|e| SnapshotError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("Checkpoint::new {db_path}: {e}"),
+        )))?;
+
+    cp.create_checkpoint(dst_path)
+        .map_err(|e| SnapshotError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("Checkpoint create {}: {e}", dst_path.display()),
+        )))?;
+
+    Ok(())
 }
 
 // ─── Snapshot wiederherstellen ───────────────────────────────────────────────
@@ -442,9 +422,9 @@ pub async fn download_snapshot_from_peer(
         meta.archive_size as f64 / 1_048_576.0
     );
 
-    // 4. Archiv herunterladen
+    // 4. Archiv herunterladen (chunked — kein vollständiges Laden in RAM)
     let dl_url = format!("{}/api/v1/snapshot/download", peer_url.trim_end_matches('/'));
-    let dl_resp = client.get(&dl_url).send().await
+    let mut dl_resp = client.get(&dl_url).send().await
         .map_err(|e| SnapshotError::Network(format!("Snapshot-Download: {e}")))?;
 
     if !dl_resp.status().is_success() {
@@ -453,13 +433,20 @@ pub async fn download_snapshot_from_peer(
         ));
     }
 
-    let archive_bytes = dl_resp.bytes().await
-        .map_err(|e| SnapshotError::Network(format!("Snapshot-Download lesen: {e}")))?;
-
-    // In Datei schreiben
+    // In Datei streamen (chunk-weise, nicht alles in RAM)
     let snap_dir = snapshot_dir();
+    let tmp_archive_path = snap_dir.join(format!("{}.tmp", &meta.filename));
     let archive_path = snap_dir.join(&meta.filename);
-    fs::write(&archive_path, &archive_bytes)?;
+    {
+        let mut file = fs::File::create(&tmp_archive_path)?;
+        while let Some(chunk) = dl_resp.chunk().await
+            .map_err(|e| SnapshotError::Network(format!("Snapshot-Download lesen: {e}")))?
+        {
+            std::io::Write::write_all(&mut file, &chunk)?;
+        }
+    }
+    // Atomar: tmp → final
+    fs::rename(&tmp_archive_path, &archive_path)?;
 
     // 5. Hash verifizieren
     let actual_hash = sha256_file(&archive_path)?;
@@ -513,6 +500,24 @@ fn sha256_file(path: &Path) -> Result<String, SnapshotError> {
         hasher.update(&buf[..n]);
     }
     Ok(hex::encode(hasher.finalize()))
+}
+
+/// Bereinigt .tmp-Dateien und _tmp_cp-Verzeichnisse im Snapshot-Verzeichnis.
+fn cleanup_tmp_files(dir: &Path) {
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = path.file_name().map(|f| f.to_string_lossy().to_string()).unwrap_or_default();
+            if name.ends_with(".tmp") || name.starts_with("_tmp_cp_") {
+                if path.is_dir() {
+                    let _ = fs::remove_dir_all(&path);
+                } else {
+                    let _ = fs::remove_file(&path);
+                }
+                eprintln!("[snapshot] 🗑️  Stale tmp bereinigt: {name}");
+            }
+        }
+    }
 }
 
 /// Bereinigt alte Snapshots, behält nur die neuesten `keep` Stück.
@@ -597,7 +602,7 @@ mod tests {
     fn test_should_create_snapshot() {
         assert!(!should_create_snapshot(0));
         assert!(!should_create_snapshot(49));
-        assert!(!should_create_snapshot(100)); // Unter MIN_SNAPSHOT_HEIGHT? Nein, 100 >= 50
+        assert!(!should_create_snapshot(100)); // 100 >= 50 aber 100 % 200 != 0
         assert!(should_create_snapshot(200));
         assert!(should_create_snapshot(400));
         assert!(!should_create_snapshot(201));

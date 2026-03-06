@@ -54,7 +54,7 @@ use super::handlers::{
         handle_resolve_fork, handle_set_validator_active, handle_slashing_info,
         handle_slashing_validator, handle_validator_self,
     },
-    status::{handle_health, handle_info, handle_metrics, handle_network_stats, handle_shard_health, handle_status, handle_verify},
+    status::{handle_health, handle_info, handle_metrics, handle_network_stats, handle_node_list, handle_shard_health, handle_status, handle_verify},
     token::{
         handle_token_accounts, handle_token_faucet, handle_token_history,
         handle_token_pending, handle_token_send, handle_token_send_authenticated,
@@ -89,6 +89,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/health", get(handle_health))
         // Öffentliche Node-Info (kein Auth, für Peer-Discovery)
         .route("/api/v1/info", get(handle_info))
+        // Node-Liste für Client-Discovery (kein Auth)
+        .route("/api/v1/nodes", get(handle_node_list))
         // Status & Metriken (Admin)
         .route("/api/v1/status", get(handle_status))
         .route("/api/v1/metrics", get(handle_metrics))

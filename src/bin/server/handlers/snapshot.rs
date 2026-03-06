@@ -1,16 +1,19 @@
 //! Snapshot HTTP handlers.
 //!
 //! - `GET /api/v1/snapshot/meta`     — Snapshot-Metadaten abrufen
-//! - `GET /api/v1/snapshot/download` — Snapshot-Archiv herunterladen
+//! - `GET /api/v1/snapshot/download` — Snapshot-Archiv herunterladen (streaming)
 //! - `POST /api/v1/snapshot/create`  — Snapshot manuell erstellen (Admin)
 
 use axum::{
+    body::Body,
     extract::State,
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
 use serde_json::json;
+use tokio_util::io::ReaderStream;
 
+use super::super::auth_middleware::require_admin;
 use super::super::state::AppState;
 
 /// GET /api/v1/snapshot/meta — Gibt Metadaten des neuesten Snapshots zurück.
@@ -42,7 +45,7 @@ pub async fn handle_snapshot_meta(
     }
 }
 
-/// GET /api/v1/snapshot/download — Streamt das Snapshot-Archiv.
+/// GET /api/v1/snapshot/download — Streamt das Snapshot-Archiv (chunked, kein volles Laden in RAM).
 pub async fn handle_snapshot_download(
     State(_state): State<AppState>,
 ) -> Result<impl IntoResponse, Response> {
@@ -61,12 +64,15 @@ pub async fn handle_snapshot_download(
         ).into_response());
     }
 
-    let data = tokio::fs::read(&archive_path).await.map_err(|e| {
+    let file = tokio::fs::File::open(&archive_path).await.map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             axum::Json(json!({"error": format!("Lesefehler: {e}")})),
         ).into_response()
     })?;
+
+    let stream = ReaderStream::new(file);
+    let body = Body::from_stream(stream);
 
     let content_disposition = format!("attachment; filename=\"{}\"", meta.filename);
     Ok((
@@ -74,15 +80,19 @@ pub async fn handle_snapshot_download(
         [
             (header::CONTENT_TYPE, "application/zstd".to_string()),
             (header::CONTENT_DISPOSITION, content_disposition),
+            (header::CONTENT_LENGTH, meta.archive_size.to_string()),
         ],
-        data,
+        body,
     ))
 }
 
 /// POST /api/v1/snapshot/create — Erstellt einen neuen Snapshot (Admin-Aktion).
 pub async fn handle_snapshot_create(
+    headers: HeaderMap,
     State(state): State<AppState>,
-) -> impl IntoResponse {
+) -> Result<impl IntoResponse, Response> {
+    require_admin(&headers, &state)?;
+
     let (height, genesis, latest) = {
         let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
         let h = chain.blocks.last().map(|b| b.index).unwrap_or(0);
@@ -92,12 +102,12 @@ pub async fn handle_snapshot_create(
     };
 
     if height < stone::snapshot::MIN_SNAPSHOT_HEIGHT {
-        return (
+        return Err((
             StatusCode::BAD_REQUEST,
             axum::Json(json!({
                 "error": format!("Chain zu kurz für Snapshot (min. {} Blöcke)", stone::snapshot::MIN_SNAPSHOT_HEIGHT)
             })),
-        ).into_response();
+        ).into_response());
     }
 
     // Snapshot im Blocking-Thread erstellen (IO-intensiv)
@@ -106,7 +116,7 @@ pub async fn handle_snapshot_create(
     }).await;
 
     match result {
-        Ok(Ok((_path, meta))) => (
+        Ok(Ok((_path, meta))) => Ok((
             StatusCode::OK,
             axum::Json(json!({
                 "success": true,
@@ -114,14 +124,14 @@ pub async fn handle_snapshot_create(
                 "archive_size": meta.archive_size,
                 "filename": meta.filename,
             })),
-        ).into_response(),
-        Ok(Err(e)) => (
+        ).into_response()),
+        Ok(Err(e)) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             axum::Json(json!({"error": format!("Snapshot-Fehler: {e}")})),
-        ).into_response(),
-        Err(e) => (
+        ).into_response()),
+        Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             axum::Json(json!({"error": format!("Task-Fehler: {e}")})),
-        ).into_response(),
+        ).into_response()),
     }
 }

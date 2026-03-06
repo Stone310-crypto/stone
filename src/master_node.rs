@@ -503,7 +503,16 @@ impl MasterNodeState {
             events: EventBus::new(256),
             metrics: {
                 let m = MasterMetrics::default();
-                m.mining_throttle_pct.store(100, Ordering::Relaxed);
+                // STONE_MINING_THROTTLE env var (0-100, default 100)
+                let initial_throttle: u64 = std::env::var("STONE_MINING_THROTTLE")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(100)
+                    .min(100);
+                m.mining_throttle_pct.store(initial_throttle, Ordering::Relaxed);
+                if initial_throttle < 100 {
+                    println!("[mining] ⚠ Initiale Throttle via STONE_MINING_THROTTLE: {initial_throttle}%");
+                }
                 m
             },
             started_at,
@@ -1418,6 +1427,23 @@ impl MasterNodeState {
                     // Timeout: kein Peer hat mehr Blöcke oder kein Peer verbunden
                     println!("[mining] ⏰ Initial-Sync Timeout (60s) – starte Mining");
                     state.metrics.initial_sync_done.store(true, Ordering::Relaxed);
+
+                    // Token-Ledger vollständig aus der (jetzt synced) Chain neu aufbauen.
+                    // Während des P2P-Sync konnten TXs wegen falscher Nonce-Reihenfolge
+                    // übersprungen worden sein – der Rebuild korrigiert das.
+                    {
+                        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+                        if chain.blocks.len() > 1 {
+                            let rebuilt = crate::token::TokenLedger::rebuild_from_chain(&chain.blocks);
+                            let mut ledger = state.token_ledger.write().unwrap_or_else(|e| e.into_inner());
+                            *ledger = rebuilt;
+                            println!(
+                                "[token] 🔄 Ledger nach Initial-Sync rebuilt: {} Accounts, Supply: {}",
+                                ledger.account_count(),
+                                ledger.total_supply()
+                            );
+                        }
+                    }
                 }
 
                 // Mining-Throttle: Leistungsbegrenzung prüfen

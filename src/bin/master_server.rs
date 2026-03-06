@@ -337,6 +337,8 @@ async fn main() {
                                                 .ok()
                                                 .and_then(|v| v.parse::<u16>().ok())
                                                 .unwrap_or(8080);
+                                            // Eigene öffentliche IP ermitteln, um Resync-an-sich-selbst zu vermeiden
+                                            let own_public_ip = std::env::var("STONE_PUBLIC_IP").unwrap_or_default();
                                             let mut resolved_url: Option<String> = None;
 
                                             let net_peers = handle_bg.get_peers().await;
@@ -355,6 +357,11 @@ async fn main() {
                                                                     || ip.starts_with("192.168.")
                                                                     || ip.starts_with("169.254.")
                                                                 {
+                                                                    continue;
+                                                                }
+                                                                // Eigene öffentliche IP nicht als Peer-URL verwenden
+                                                                if !own_public_ip.is_empty() && *ip == own_public_ip.as_str() {
+                                                                    eprintln!("[sync] ⚠ Überspringe eigene IP {ip} bei Peer-URL-Auflösung");
                                                                     continue;
                                                                 }
                                                                 resolved_url = Some(format!("http://{}:{}", ip, http_port));
@@ -376,6 +383,10 @@ async fn main() {
                                                                         && *ip != "0.0.0.0"
                                                                         && !ip.starts_with("172.")
                                                                     {
+                                                                        // Auch hier eigene IP ausschließen
+                                                                        if !own_public_ip.is_empty() && *ip == own_public_ip.as_str() {
+                                                                            continue;
+                                                                        }
                                                                         resolved_url = Some(format!("http://{}:{}", ip, http_port));
                                                                         break;
                                                                     }

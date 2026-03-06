@@ -973,6 +973,13 @@ impl TokenLedger {
     /// Chain mit Token-TXs vorhanden ist.
     pub fn rebuild_from_chain(blocks: &[crate::blockchain::Block]) -> Self {
         let mut ledger = TokenLedger::new();
+
+        // Genesis-Allokation anwenden (Mint-TXs sind nicht im Genesis-Block
+        // gespeichert, sondern werden beim ersten Start separat erstellt)
+        if let Err(e) = crate::token::apply_genesis(&mut ledger) {
+            eprintln!("[token] ⚠️  Genesis-Fehler beim Rebuild: {e}");
+        }
+
         for block in blocks {
             if !block.transactions.is_empty() {
                 ledger.apply_block_txs(&block.transactions, block.index);

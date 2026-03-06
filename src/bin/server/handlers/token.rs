@@ -25,7 +25,7 @@ use axum::{
 use serde::Deserialize;
 
 use stone::token::{
-    AccountInfo, SupplyInfo, TokenTx, TxType,
+    AccountInfo, SupplyInfo, TokenTx, TxType, compute_tx_id, default_chain_id,
 };
 
 use super::super::auth_middleware::{require_admin, require_user};
@@ -167,6 +167,18 @@ pub async fn handle_token_transfer(
             Json(serde_json::json!({
                 "ok": false,
                 "error": "Nur Transfer-, Burn- und RotateKey-Transaktionen können über diesen Endpoint eingereicht werden. Für Staking nutze /api/v1/mining/stake bzw. /unstake.",
+            })),
+        );
+    }
+
+    // Pool-Konten dürfen nicht über den öffentlichen Endpoint genutzt werden.
+    // Pool-Transfers werden nur serverseitig erstellt (z.B. Faucet).
+    if tx.from.starts_with("pool:") {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "Pool-Konten können nicht über diesen Endpoint transferieren.",
             })),
         );
     }
@@ -362,33 +374,71 @@ pub async fn handle_token_faucet(
         }
     }
 
-    // Direkt im Ledger: Transfer von Community-Pool → Empfänger
-    let result = {
-        let mut ledger = state.node.token_ledger.write().unwrap_or_else(|e| e.into_inner());
+    // ── Mint-TX erstellen (wird durch Mempool + P2P gesynct) ──
+    // Pool-Balance prüfen
+    {
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
         let available = ledger.balance(pool);
         if available < amount {
-            Err(format!("Community-Pool hat nur {} STONE verfügbar", available))
-        } else {
-            ledger.transfer(pool, &req.address, amount, rust_decimal::Decimal::ZERO)
-                .map_err(|e| format!("{e}"))
-                .and_then(|_| {
-                    ledger.persist().map_err(|e| format!("{e}"))?;
-                    Ok(())
-                })
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!("Community-Pool hat nur {} STONE verfügbar", available),
+                })),
+            );
         }
+    }
+
+    // Nonce aus Ledger holen (pool:community)
+    let nonce = {
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
+        ledger.nonce(pool)
+    };
+
+    // TokenTx mit TxType::Transfer erstellen – Pool-Signatur wird übersprungen
+    let mut tx = TokenTx {
+        tx_id: String::new(),
+        tx_type: TxType::Transfer,
+        from: pool.to_string(),
+        to: req.address.clone(),
+        amount,
+        fee: rust_decimal::Decimal::ZERO,
+        nonce,
+        timestamp: chrono::Utc::now().timestamp(),
+        signature: "system-faucet".to_string(),
+        memo: "Testnet Faucet".to_string(),
+        chain_id: default_chain_id(),
+        fee_tier: stone::token::FeeTier::Standard,
+    };
+    tx.tx_id = compute_tx_id(&tx);
+
+    // In Mempool aufnehmen (mit Ledger Pre-Check)
+    let result = {
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
+        state.node.mempool.add_tx(tx.clone(), Some(&ledger))
     };
 
     match result {
         Ok(()) => {
-            let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
+            // P2P Broadcast an alle Peers
+            if let Some(ref net) = state.network {
+                let net = net.clone();
+                let tx_clone = tx.clone();
+                tokio::spawn(async move {
+                    net.broadcast_tx(tx_clone).await;
+                });
+            }
+
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
                     "ok": true,
+                    "status": "pending",
+                    "tx_id": tx.tx_id,
                     "amount": FAUCET_AMOUNT,
                     "to": req.address,
-                    "new_balance": ledger.balance(&req.address).to_string(),
-                    "pool_remaining": ledger.balance(pool).to_string(),
+                    "message": "Faucet-TX im Mempool – wird beim nächsten Block verarbeitet und an Peers gesynct",
                 })),
             )
         }
@@ -397,7 +447,7 @@ pub async fn handle_token_faucet(
                 StatusCode::BAD_REQUEST,
                 Json(serde_json::json!({
                     "ok": false,
-                    "error": e,
+                    "error": format!("{e}"),
                 })),
             )
         }
@@ -1049,10 +1099,18 @@ pub async fn handle_staker_info(
             })),
         ),
         None => (
-            StatusCode::NOT_FOUND,
+            StatusCode::OK,
             Json(serde_json::json!({
-                "ok": false,
-                "error": "Adresse hat keinen aktiven Stake",
+                "ok": true,
+                "staker": {
+                    "address": address,
+                    "staked_amount": "0",
+                    "pending_rewards": "0",
+                    "total_rewards": "0",
+                    "staked_since": 0,
+                    "unstake_requests": [],
+                    "share_percent": "0",
+                },
             })),
         ),
     }

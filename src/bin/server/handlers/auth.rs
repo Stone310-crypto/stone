@@ -233,6 +233,62 @@ pub async fn handle_login(
         if needs_save {
             save_users(&users);
         }
+
+        // ── Auto-Register on-chain falls noch nicht registriert ───────────
+        // Benutzer hat sich eingeloggt → wir haben seine Phrase → können die
+        // AccountRegister TX erstellen falls noch nicht on-chain.
+        if !wallet_addr.is_empty() {
+            let is_registered = {
+                let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
+                ledger.all_registered_accounts().contains_key(&wallet_addr)
+            };
+            if !is_registered {
+                let user_name = users[idx].name.clone();
+                let api_key_hash = users[idx].api_key.clone();
+                let node = state.node.clone();
+                let phrase = req.phrase.clone();
+                let w = wallet_addr.clone();
+                tokio::spawn(async move {
+                    if let Ok(mnemonic) = bip39::Mnemonic::parse_in(bip39::Language::English, &phrase) {
+                        let entropy = mnemonic.to_entropy();
+                        let key_bytes: [u8; 32] = if entropy.len() == 32 {
+                            entropy.try_into().unwrap()
+                        } else {
+                            use sha2::{Digest, Sha256};
+                            let hash: [u8; 32] = Sha256::digest(&entropy).into();
+                            hash
+                        };
+                        let signing_key = ed25519_dalek::SigningKey::from_bytes(&key_bytes);
+                        let nonce = {
+                            let ledger = node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
+                            ledger.nonce(&w)
+                        };
+                        let memo = serde_json::json!({
+                            "name": user_name,
+                            "api_key_hash": api_key_hash,
+                        }).to_string();
+                        if let Ok(tx) = stone::token::create_signed_tx(
+                            &signing_key,
+                            stone::token::TxType::AccountRegister,
+                            w.clone(),
+                            w.clone(),
+                            rust_decimal::Decimal::ZERO,
+                            rust_decimal::Decimal::ZERO,
+                            nonce,
+                            memo,
+                        ) {
+                            if let Err(e) = node.mempool.add_tx(tx.clone(), None) {
+                                eprintln!("[auth] Auto-Register TX fehlgeschlagen für {user_name}: {e}");
+                            } else {
+                                println!("[auth] 📝 Auto-Register TX für '{}' (Login): {}",
+                                    user_name, &tx.tx_id[..12]);
+                            }
+                        }
+                    }
+                });
+            }
+        }
+
         return (StatusCode::OK, axum::Json(resp));
     }
     drop(users);
@@ -460,6 +516,8 @@ pub async fn handle_verify_challenge(
 #[derive(Deserialize)]
 pub struct QrApproveRequest {
     pub login_token: String,
+    /// Optionale Mnemonic-Phrase für Chat-Signierung im QR-Login
+    pub phrase: Option<String>,
 }
 
 /// POST /api/v1/auth/qr/create
@@ -531,8 +589,7 @@ pub async fn handle_qr_status(
                         "status": "approved",
                         "session_token": approved.session_token,
                         "expires_in": SESSION_TOKEN_TTL_SECS,
-                        "api_key": api_key,
-                        "user": {
+                        "api_key": api_key,                        "phrase": approved.approved_phrase,                        "user": {
                             "id": approved.approved_user_id,
                             "name": approved.approved_user_name,
                             "wallet_address": approved.approved_wallet,
@@ -592,7 +649,7 @@ pub async fn handle_qr_approve(
         SESSION_TOKEN_TTL_SECS,
     );
 
-    if state.qr_login_store.approve_session(login_token, session_token, &user) {
+    if state.qr_login_store.approve_session(login_token, session_token, &user, req.phrase.clone()) {
         println!(
             "[auth] 📱✅ QR-Login genehmigt von {} ({}) für Token {}…",
             user.name,

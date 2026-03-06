@@ -122,12 +122,16 @@ pub const DEFAULT_P2P_PORT: u16 = 7654;
 /// TCP und QUIC (UDP) Adressen – QUIC wird für NAT-Traversal bevorzugt.
 ///
 /// WICHTIG: Die Reihenfolge bestimmt die Verbindungs-Priorität.
-/// Der VPS (212.227.54.241) ist der primäre Bootstrap und muss immer zuerst stehen.
+/// VPS1 (212.227.54.241) ist der primäre Bootstrap und muss immer zuerst stehen.
+/// VPS2 (69.48.200.255) ist der sekundäre Bootstrap (Redundanz).
 const SEED_NODES: &[&str] = &[
-    // ── VPS (212.227.54.241) – primärer Bootstrap + Relay, immer online ───
+    // ── VPS1 (212.227.54.241) – primärer Bootstrap + Relay, immer online ───
     // Dieser Node hat Port 4001 offen und ist der zentrale Relay für NAT-Nodes.
     "/ip4/212.227.54.241/tcp/4001/p2p/12D3KooWNz9GTNsFks567mHaQLKR4Ai6MCiw5WUDWAgvny1ow4tJ",
     "/ip4/212.227.54.241/udp/4001/quic-v1/p2p/12D3KooWNz9GTNsFks567mHaQLKR4Ai6MCiw5WUDWAgvny1ow4tJ",
+    // ── VPS2 (69.48.200.255) – sekundärer Bootstrap + Relay ───
+    "/ip4/69.48.200.255/tcp/7654/p2p/12D3KooWQ4yo42uYwihPAJx1qXm85rTVVXEbH5oWu4GHrrNMs564",
+    "/ip4/69.48.200.255/udp/7654/quic-v1/p2p/12D3KooWQ4yo42uYwihPAJx1qXm85rTVVXEbH5oWu4GHrrNMs564",
 ];
 
 /// Gibt das aktive Daten-Verzeichnis zurück.

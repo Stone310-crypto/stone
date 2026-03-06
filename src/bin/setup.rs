@@ -283,16 +283,14 @@ async fn start_full_node(state: SetupState) {
     // Wenn die lokale Chain sehr kurz ist (nur Genesis), versuchen wir einen
     // Snapshot von einem bekannten Peer herunterzuladen statt Block-für-Block zu syncen.
     {
-        let chain_height = {
+        let (chain_height, local_genesis) = {
             let tmp_chain = stone::blockchain::StoneChain::load_or_create(&api_key);
-            tmp_chain.blocks.len() as u64
+            let h = tmp_chain.blocks.len() as u64;
+            let g = tmp_chain.blocks.first().map(|b| b.hash.clone()).unwrap_or_default();
+            (h, g)
         };
         if chain_height <= 1 {
             let saved_peers = load_peers_from_disk();
-            let local_genesis = {
-                let tmp_chain = stone::blockchain::StoneChain::load_or_create(&api_key);
-                tmp_chain.blocks.first().map(|b| b.hash.clone()).unwrap_or_default()
-            };
             if !saved_peers.is_empty() {
                 eprintln!("[snapshot] 🔍 Frische Node – suche Snapshot bei {} Peer(s)...", saved_peers.len());
                 let mut snapshot_ok = false;

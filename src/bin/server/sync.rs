@@ -234,8 +234,7 @@ pub async fn pull_from_peer(node: &Arc<MasterNodeState>, peer_url: &str, api_key
         let did_rollback = if let Some(fork_idx) = fork_at {
             let peer_len = blocks.len() as u64;
 
-            // ── Stake-gewichtete Fork-Choice ──
-            // Nicht nur Länge vergleichen, sondern auch kumulatives Stake-Gewicht
+            // ── Stake-gewichtete Fork-Choice mit Hash-Tiebreaker ──
             let (stakes, _jailed, wallet_map) = node.build_selection_context();
             let local_stake = stone::consensus::cumulative_stake_weight(
                 &chain.blocks, fork_idx, &stakes, &wallet_map,
@@ -244,8 +243,18 @@ pub async fn pull_from_peer(node: &Arc<MasterNodeState>, peer_url: &str, api_key
                 &blocks, fork_idx, &stakes, &wallet_map,
             );
 
-            let (prefer_peer, reason) = stone::consensus::should_prefer_peer_chain(
+            // Hash am Fork-Punkt für deterministischen Tiebreak
+            let local_fork_hash = chain.blocks.get(fork_idx)
+                .map(|b| b.hash.as_str())
+                .unwrap_or("");
+            let peer_fork_hash = blocks.iter()
+                .find(|b| b.index as usize == fork_idx)
+                .map(|b| b.hash.as_str())
+                .unwrap_or("");
+
+            let (prefer_peer, reason) = stone::consensus::should_prefer_peer_chain_with_hashes(
                 local_len, peer_len, local_stake, peer_stake,
+                local_fork_hash, peer_fork_hash,
             );
 
             if prefer_peer {
@@ -292,6 +301,19 @@ pub async fn pull_from_peer(node: &Arc<MasterNodeState>, peer_url: &str, api_key
     };
 
     if did_rollback {
+        // Token-Ledger aus der (jetzt getrunkten) Chain komplett neu aufbauen,
+        // damit der Ledger-State konsistent mit der neuen Chain wird.
+        {
+            let chain = node.chain.lock().unwrap_or_else(|e| e.into_inner());
+            let rebuilt = stone::token::TokenLedger::rebuild_from_chain(&chain.blocks);
+            let mut ledger = node.token_ledger.write().unwrap_or_else(|e| e.into_inner());
+            *ledger = rebuilt;
+            eprintln!(
+                "[sync] Token-Ledger nach Rollback neu aufgebaut: {} Accounts, Supply: {}",
+                ledger.account_count(),
+                ledger.total_supply()
+            );
+        }
         eprintln!(
             "[sync] {peer_url}: Rollback abgeschlossen, übernehme {} neue Blöcke",
             pending_blocks.len()

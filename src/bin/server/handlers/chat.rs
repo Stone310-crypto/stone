@@ -11,7 +11,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::json;
-use stone::chat_policy::{ChatPolicyStore, MessageTtl, messenger_min_stake};
+use stone::chat_policy::MessageTtl;
 use stone::token::{transaction::TxType, Wallet};
 
 use super::super::auth_middleware::require_user;
@@ -105,39 +105,25 @@ pub async fn handle_chat_send(
             .into_response();
     }
 
-    // ── Stake-Gate: Messenger erfordert Minimum-Stake ─────────────────────
-    {
-        let pool = state.node.staking_pool.read().unwrap_or_else(|e| e.into_inner());
-        let staked = pool.stakers.get(&wallet.address())
-            .map(|s| s.staked_amount)
-            .unwrap_or(rust_decimal::Decimal::ZERO);
-        if let Err(missing) = ChatPolicyStore::check_messenger_access(staked) {
-            return (
-                StatusCode::FORBIDDEN,
-                axum::Json(json!({
-                    "ok": false,
-                    "error": format!(
-                        "Messenger erfordert mindestens {} STONE Stake. Du hast {} gestaked, es fehlen {} STONE.",
-                        messenger_min_stake(), staked, missing
-                    ),
-                    "required_stake": messenger_min_stake().to_string(),
-                    "current_stake": staked.to_string(),
-                    "missing": missing.to_string(),
-                })),
-            )
-                .into_response();
-        }
-    }
-
     // Prüfen: Empfänger muss ein registrierter Account sein
+    // Primär: On-Chain Registry (account_names aus AccountRegister TXs)
+    // Fallback: users.json (für Accounts die vor der Chain-Registrierung erstellt wurden)
     {
         let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
-        if !ledger.all_registered_accounts().contains_key(&to_wallet) {
-            return (
-                StatusCode::NOT_FOUND,
-                axum::Json(json!({"ok": false, "error": "Empfänger hat kein registriertes Konto"})),
-            )
-                .into_response();
+        let on_chain = ledger.all_registered_accounts().contains_key(&to_wallet);
+        if !on_chain {
+            // Fallback: User in der lokalen User-Datenbank suchen
+            let in_users = state.users.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .any(|u| u.wallet_address == to_wallet);
+            if !in_users {
+                return (
+                    StatusCode::NOT_FOUND,
+                    axum::Json(json!({"ok": false, "error": "Empfänger hat kein registriertes Konto"})),
+                )
+                    .into_response();
+            }
         }
     }
 
@@ -1143,26 +1129,6 @@ pub async fn handle_chat_request_coins(
             StatusCode::BAD_REQUEST,
             axum::Json(json!({"ok": false, "error": "Betrag muss positiv sein"})),
         ).into_response();
-    }
-
-    // Stake-Gate prüfen
-    {
-        let pool = state.node.staking_pool.read().unwrap_or_else(|e| e.into_inner());
-        let staked = pool.stakers.get(&wallet.address())
-            .map(|s| s.staked_amount)
-            .unwrap_or(rust_decimal::Decimal::ZERO);
-        if let Err(missing) = stone::chat_policy::ChatPolicyStore::check_messenger_access(staked) {
-            return (
-                StatusCode::FORBIDDEN,
-                axum::Json(json!({
-                    "ok": false,
-                    "error": format!(
-                        "Messenger erfordert mindestens {} STONE Stake. Es fehlen {} STONE.",
-                        messenger_min_stake(), missing
-                    ),
-                })),
-            ).into_response();
-        }
     }
 
     let msg_text = req.message.unwrap_or_default();

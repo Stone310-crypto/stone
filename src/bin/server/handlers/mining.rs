@@ -229,17 +229,26 @@ pub async fn handle_mining_withdraw(
         Err(e) => return e.into_response(),
     };
 
-    // ── Account-Bindung prüfen: Nur der Reward-Wallet-Owner darf withdrawen ──
+    // ── Berechtigung prüfen ─────────────────────────────────────────────
+    //  Erlaubt wenn:
+    //   1) Admin (Cluster-API-Key)
+    //   2) Reward-Wallet-Owner (user.wallet == effective_reward_wallet)
+    //   3) Jeder authentifizierte User — aber NUR an die eigene Wallet
+    //      (= "Claim Rewards to my wallet")
     let reward_wallet = state.node.effective_reward_wallet();
-    if user.wallet_address != reward_wallet {
+    let is_admin = super::super::auth_middleware::require_admin(&headers, &state).is_ok();
+    let is_reward_owner = !user.wallet_address.is_empty() && user.wallet_address == reward_wallet;
+    let is_withdraw_to_own_wallet = !user.wallet_address.is_empty() && req.to_wallet == user.wallet_address;
+
+    if !is_reward_owner && !is_admin && !is_withdraw_to_own_wallet {
         return (
             StatusCode::FORBIDDEN,
             axum::Json(json!({
                 "ok": false,
-                "error": "Nur der Mining-Wallet-Besitzer darf Rewards abheben",
+                "error": "Du kannst Mining-Rewards nur auf deine eigene Wallet abheben",
                 "your_wallet": user.wallet_address,
                 "mining_wallet": reward_wallet,
-                "hint": "Binde deine Wallet zuerst mit POST /api/v1/mining/bind-wallet",
+                "hint": "Setze to_wallet auf deine eigene Wallet-Adresse",
             })),
         ).into_response();
     }

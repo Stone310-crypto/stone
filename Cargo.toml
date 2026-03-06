@@ -54,6 +54,7 @@ base64  = "0.21"
 
 # Async-Runtime
 tokio   = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }
 bytes   = "1.0"
 
 # HTTP-Server (axum – Master Node API + Auth Server)

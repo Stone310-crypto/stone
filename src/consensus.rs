@@ -1266,7 +1266,8 @@ pub fn resolve_fork(
 /// Kriterien (in dieser Reihenfolge):
 /// 1. Längere Chain gewinnt
 /// 2. Bei gleicher Länge: höheres kumulatives Stake-Gewicht
-/// 3. Bei Gleichstand: Peer-Chain wird NICHT übernommen (lokale Chain behält Vorrang)
+/// 3. Bei Gleichstand: deterministischer Tiebreak über Block-Hash am Fork-Punkt
+///    (lexikographisch kleinerer Hash gewinnt, damit alle Nodes konvergieren)
 pub fn should_prefer_peer_chain(
     local_len: u64,
     peer_len: u64,
@@ -1283,8 +1284,38 @@ pub fn should_prefer_peer_chain(
     if peer_cumulative_stake > local_cumulative_stake {
         return (true, "Gleiche Länge, Peer hat mehr Stake-Gewicht");
     }
-    // Bei Gleichstand oder wenn Peer weniger Stake hat → lokal behalten
-    (false, "Gleiche Länge, lokale Chain hat Vorrang (gleicher oder höherer Stake)")
+    if peer_cumulative_stake < local_cumulative_stake {
+        return (false, "Gleiche Länge, lokaler Stake höher");
+    }
+    // Bei exakt gleichem Stake+Länge → Caller muss Hash-Tiebreaker nutzen
+    (false, "Gleiche Länge und Stake – Hash-Tiebreak nötig")
+}
+
+/// Erweiterte Fork-Choice mit Hash-Tiebreaker.
+///
+/// Wenn `should_prefer_peer_chain` bei Gleichstand endet, vergleicht diese
+/// Funktion die Block-Hashes am Fork-Punkt: der lexikographisch kleinere Hash
+/// gewinnt, damit alle Nodes zum selben Ergebnis kommen.
+pub fn should_prefer_peer_chain_with_hashes(
+    local_len: u64,
+    peer_len: u64,
+    local_cumulative_stake: u64,
+    peer_cumulative_stake: u64,
+    local_fork_hash: &str,
+    peer_fork_hash: &str,
+) -> (bool, &'static str) {
+    let (prefer, reason) = should_prefer_peer_chain(
+        local_len, peer_len, local_cumulative_stake, peer_cumulative_stake,
+    );
+    // Wenn das Ergebnis eindeutig ist, nutze es
+    if local_len != peer_len || local_cumulative_stake != peer_cumulative_stake {
+        return (prefer, reason);
+    }
+    // Tiebreak: lexikographisch kleinerer Block-Hash am Fork-Punkt gewinnt
+    if peer_fork_hash < local_fork_hash {
+        return (true, "Hash-Tiebreak: Peer-Block hat kleineren Hash");
+    }
+    (false, "Hash-Tiebreak: lokaler Block hat kleineren/gleichen Hash")
 }
 
 /// Berechnet das kumulative Stake-Gewicht einer Chain ab einem bestimmten Index.

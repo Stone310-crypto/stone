@@ -178,7 +178,7 @@ pub struct TokenTx {
 }
 
 /// Default Chain-ID: liest aus STONE_NETWORK ENV, Fallback "stone-testnet"
-fn default_chain_id() -> String {
+pub fn default_chain_id() -> String {
     let mode = std::env::var("STONE_NETWORK")
         .unwrap_or_default()
         .to_lowercase();
@@ -348,6 +348,12 @@ pub fn verify_tx_signature(tx: &TokenTx) -> Result<(), TxError> {
     // System-/Pool-Transaktionen: Signatur wird nicht gegen einen Public-Key geprüft
     if tx.tx_type == TxType::Mint || tx.tx_type == TxType::Reward {
         // Reward kommt aus pool:storage_rewards, Mint aus system – beides System-TXs
+        return Ok(());
+    }
+
+    // Pool-Konten (pool:community, pool:staking, etc.) haben keine privaten Schlüssel.
+    // Transfers von Pool-Konten werden nur serverseitig erstellt (z.B. Faucet).
+    if tx.from.starts_with("pool:") {
         return Ok(());
     }
 

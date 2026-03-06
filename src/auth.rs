@@ -571,6 +571,9 @@ pub struct QrLoginSession {
     pub approved_user_name: Option<String>,
     pub approved_wallet: Option<String>,
     pub approved_account_type: Option<String>,
+    /// Mnemonic-Phrase (wird nach Genehmigung gesetzt, nur für QR-Login Chat)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approved_phrase: Option<String>,
 }
 
 impl QrLoginSession {
@@ -617,6 +620,7 @@ impl QrLoginStore {
             approved_user_name: None,
             approved_wallet: None,
             approved_account_type: None,
+            approved_phrase: None,
         };
 
         let mut map = self.inner.lock().unwrap();
@@ -636,12 +640,13 @@ impl QrLoginStore {
     }
 
     /// Genehmigt eine QR-Login-Session (vom iOS-App-User).
-    /// Setzt session_token + user-daten. Gibt `true` zurück bei Erfolg.
+    /// Setzt session_token + user-daten + optional phrase. Gibt `true` zurück bei Erfolg.
     pub fn approve_session(
         &self,
         login_token: &str,
         session_token: String,
         user: &User,
+        phrase: Option<String>,
     ) -> bool {
         let mut map = self.inner.lock().unwrap();
         if let Some(session) = map.get_mut(login_token) {
@@ -654,6 +659,7 @@ impl QrLoginStore {
             session.approved_user_name = Some(user.name.clone());
             session.approved_wallet = Some(user.wallet_address.clone());
             session.approved_account_type = Some(user.account_type.clone());
+            session.approved_phrase = phrase;
             true
         } else {
             false

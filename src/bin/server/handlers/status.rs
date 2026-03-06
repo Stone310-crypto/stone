@@ -393,3 +393,101 @@ pub async fn handle_shard_health(
         "documents": doc_details,
     })))
 }
+
+// ─── Node Discovery ──────────────────────────────────────────────────────────
+
+/// Hardcodierte öffentliche Nodes – wird als Basis für die Node-Liste verwendet.
+/// Clients (iOS-App, Web) bekommen diese immer zurück + dynamisch entdeckte Peers.
+const PUBLIC_BOOTSTRAP_NODES: &[(&str, &str)] = &[
+    ("http://212.227.54.241:8080", "VPS1-EU"),
+    ("http://69.48.200.255:8080",  "VPS2-US"),
+];
+
+/// GET /api/v1/nodes — Öffentliche Node-Liste für Client-Discovery (kein Auth)
+///
+/// Gibt alle bekannten öffentlichen Nodes zurück, inklusive:
+/// - Hardcoded Bootstrap-Nodes (immer enthalten)
+/// - Dynamisch entdeckte Peers mit öffentlicher IP
+///
+/// Clients sollen:
+/// 1. Alle Nodes parallel pingen (`/api/v1/health`)
+/// 2. Den schnellsten gesunden Node als primären API-Server verwenden
+/// 3. Bei Ausfall automatisch auf den nächsten wechseln
+pub async fn handle_node_list(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let summary = state.node.chain_summary();
+    let uptime = (chrono::Utc::now().timestamp() - state.node.started_at) as u64;
+
+    // Diesen Node selbst (mit public_ip wenn bekannt)
+    let self_url = std::env::var("STONE_PUBLIC_URL").ok()
+        .or_else(|| std::env::var("STONE_PUBLIC_IP").ok().map(|ip| {
+            let port = std::env::var("STONE_PORT").unwrap_or_else(|_| "8080".into());
+            format!("http://{}:{}", ip, port)
+        }));
+
+    let mut nodes: Vec<serde_json::Value> = Vec::new();
+
+    // 1) Hardcoded Bootstrap-Nodes
+    for (url, name) in PUBLIC_BOOTSTRAP_NODES {
+        nodes.push(json!({
+            "url":  url,
+            "name": name,
+            "type": "bootstrap",
+        }));
+    }
+
+    // 2) Dynamisch entdeckte Peers mit öffentlicher IP (kein 10.x, 172.x, 192.168.x, 100.x Tailscale)
+    for peer in state.node.get_peers() {
+        let url = &peer.url;
+        // Nur öffentliche IPs, keine lokalen/Tailscale
+        if is_public_url(url) && !nodes.iter().any(|n| n["url"].as_str() == Some(url)) {
+            nodes.push(json!({
+                "url":    url,
+                "name":   peer.name,
+                "type":   "discovered",
+                "status": format!("{:?}", peer.status),
+                "block_height": peer.block_height,
+            }));
+        }
+    }
+
+    (StatusCode::OK, axum::Json(json!({
+        "ok": true,
+        "self": {
+            "node_id":      state.node.node_id,
+            "url":          self_url,
+            "block_height": summary.block_height,
+            "uptime_secs":  uptime,
+        },
+        "nodes": nodes,
+    })))
+}
+
+/// Prüft ob eine URL eine öffentliche (internet-routbare) IP hat.
+fn is_public_url(url: &str) -> bool {
+    // URL parsen, Host extrahieren
+    let host = url
+        .strip_prefix("http://").or_else(|| url.strip_prefix("https://"))
+        .and_then(|s| s.split(':').next())
+        .unwrap_or("");
+
+    // IPv4 parsen
+    if let Ok(ip) = host.parse::<std::net::Ipv4Addr>() {
+        return !ip.is_loopback()           // 127.x
+            && !ip.is_private()             // 10.x, 172.16-31.x, 192.168.x
+            && !ip.is_link_local()          // 169.254.x
+            && !ip.is_unspecified()         // 0.0.0.0
+            && !is_cgnat(ip)               // 100.64-127.x (Tailscale)
+            && ip.octets()[0] != 0;         // 0.x
+    }
+
+    // Domain-Namen gelten als öffentlich
+    !host.is_empty() && !host.contains("localhost") && !host.contains("internal")
+}
+
+/// CGNAT/Tailscale range: 100.64.0.0/10
+fn is_cgnat(ip: std::net::Ipv4Addr) -> bool {
+    let o = ip.octets();
+    o[0] == 100 && (o[1] & 0xC0) == 64
+}
