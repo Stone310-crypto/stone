@@ -6,3 +6,4 @@ pub mod rate_limiter;
 pub mod router;
 pub mod state;
 pub mod sync;
+pub mod sync_router;

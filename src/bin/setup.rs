@@ -43,6 +43,7 @@ use stone::{
 use server::{
     rate_limiter::RateLimits,
     router::build_router,
+    sync_router::build_sync_router,
     state::{
         load_api_key, load_admin_key, load_peers_from_disk, load_trust_from_disk,
         AppState as NodeAppState, HEARTBEAT_INTERVAL,
@@ -626,11 +627,33 @@ async fn start_full_node(state: SetupState) {
             }
             Arc::new(std::sync::Mutex::new(idx))
         },
+        contacts: Arc::new(std::sync::Mutex::new(stone::chat::load_contacts())),
         challenge_store: stone::auth::ChallengeStore::new(),
         qr_login_store: stone::auth::QrLoginStore::new(),
     };
 
-    *state.node_state.write().await = Some(node_app_state);
+    *state.node_state.write().await = Some(node_app_state.clone());
+
+    // ── Public Sync Port starten (kein Auth, Node-zu-Node) ──────────────
+    let sync_port: u16 = std::env::var("STONE_SYNC_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4002);
+    let sync_router = build_sync_router(node_app_state);
+    match tokio::net::TcpListener::bind(std::net::SocketAddr::from(([0, 0, 0, 0], sync_port))).await {
+        Ok(sync_listener) => {
+            println!("[node] 🌐 Sync-Port auf 0.0.0.0:{sync_port} (öffentlich, kein Auth)");
+            tokio::spawn(async move {
+                axum::serve(sync_listener, sync_router)
+                    .await
+                    .expect("Sync-Server Fehler");
+            });
+        }
+        Err(e) => {
+            eprintln!("[node] ⚠ Sync-Port {sync_port} konnte nicht gebunden werden: {e}");
+        }
+    }
+
     println!("[node] ✅ Full-Node aktiv — API via Fallback-Handler erreichbar");
 }
 

@@ -84,6 +84,34 @@ pub async fn handle_list_users(
     ))
 }
 
+/// GET /api/v1/users/public – Öffentliche User-Liste (Name, ID, Wallet).
+/// Kein Auth nötig – für Peer-to-Peer User-Sync zwischen Nodes mit
+/// unterschiedlichen Admin-Keys.
+pub async fn handle_list_users_public(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let users = state.users.lock().unwrap();
+
+    let list: Vec<serde_json::Value> = users
+        .iter()
+        .map(|u| {
+            json!({
+                "id": u.id,
+                "name": u.name,
+                "wallet_address": u.wallet_address,
+            })
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        axum::Json(json!({
+            "total": list.len(),
+            "users": list,
+        })),
+    )
+}
+
 /// DELETE /api/v1/users/:user_id – Nutzer löschen (Admin)
 pub async fn handle_delete_user(
     headers: HeaderMap,

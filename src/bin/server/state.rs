@@ -8,7 +8,7 @@ use std::{
 use stone::{
     auth::{User, ChallengeStore, QrLoginStore},
     blockchain::{ChunkRef, data_dir, CHUNK_SIZE, Document},
-    chat::ChatIndex,
+    chat::{ChatIndex, ContactList},
     master_node::{MasterNodeState, PeerInfo, TrustEntry, TrustVote},
     network::NetworkHandle,
     organization::Organization,
@@ -46,6 +46,8 @@ pub struct AppState {
     pub orgs: Arc<Mutex<Vec<Organization>>>,
     /// Globaler Chat-Index
     pub chat_index: Arc<Mutex<ChatIndex>>,
+    /// Kontaktliste (Adding-Funktion)
+    pub contacts: Arc<Mutex<ContactList>>,
     /// Challenge-Store für Wallet-basierte Authentifizierung (Cross-Platform Login)
     pub challenge_store: ChallengeStore,
     /// QR-Login-Store für Cross-Device Authentifizierung (iOS App → Website)

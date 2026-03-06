@@ -28,7 +28,9 @@ use super::handlers::{
     },
     chat::{
         handle_chat_conversations, handle_chat_messages, handle_chat_pending,
-        handle_chat_resolve, handle_chat_send,
+        handle_chat_resolve, handle_chat_resolve_public, handle_chat_send,
+        handle_add_contact, handle_list_contacts, handle_remove_contact,
+        handle_chat_send_coins, handle_chat_request_coins,
     },
     chat_policy::{
         handle_chat_policy_status, handle_chat_policy_message,
@@ -77,7 +79,7 @@ use super::handlers::{
     snapshot::{
         handle_snapshot_meta, handle_snapshot_download, handle_snapshot_create,
     },
-    users::{handle_delete_user, handle_list_users},
+    users::{handle_delete_user, handle_list_users, handle_list_users_public},
     ws::handle_websocket,
 };
 
@@ -154,7 +156,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/p2p/precommit", post(handle_p2p_precommit))
         // Nutzer (Admin)
         .route("/api/v1/users", get(handle_list_users))
+        .route("/api/v1/users/public", get(handle_list_users_public))
         .route("/api/v1/users/:user_id", delete(handle_delete_user))
+        // Alias: Frontend ruft /api/v1/users/:id/documents statt /api/v1/documents/user/:id
+        .route("/api/v1/users/:user_id/documents", get(handle_list_user_documents))
         // Auth
         .route("/api/v1/auth/signup", post(handle_signup))
         .route("/api/v1/auth/login", post(handle_login))
@@ -236,6 +241,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/updates/config", post(handle_update_config))
         // ─── Organisationen ──────────────────────────────────────────────────
         .route("/api/v1/orgs", get(handle_list_orgs).post(handle_create_org))
+        // Aliases: Frontend ruft /orgs/list und /orgs/create statt GET/POST /orgs
+        .route("/api/v1/orgs/list", get(handle_list_orgs))
+        .route("/api/v1/orgs/create", post(handle_create_org))
         .route("/api/v1/orgs/invites", get(handle_my_invites))
         .route("/api/v1/orgs/invites/:invite_id/accept", post(handle_accept_invite))
         .route("/api/v1/orgs/invites/:invite_id/decline", post(handle_decline_invite))
@@ -253,7 +261,14 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/chat/messages/:peer_wallet", get(handle_chat_messages))
         .route("/api/v1/chat/pending", get(handle_chat_pending))
         .route("/api/v1/chat/resolve/:identifier", get(handle_chat_resolve))
-        // ─── Chat Policy (Self-Destruct, Reports, Stake-Gate) ──────────────
+        // Öffentlicher Resolve – für Peer-to-Peer User-Suche (kein Auth nötig)
+        .route("/api/v1/chat/resolve-public/:identifier", get(handle_chat_resolve_public))
+        // ─── Chat Kontakte (Adding) ─────────────────────────────────
+        .route("/api/v1/chat/contacts", get(handle_list_contacts).post(handle_add_contact))
+        .route("/api/v1/chat/contacts/:wallet", delete(handle_remove_contact))
+        // ─── Stonecoins im Chat senden & anfragen ───────────────────
+        .route("/api/v1/chat/send-coins", post(handle_chat_send_coins))
+        .route("/api/v1/chat/request-coins", post(handle_chat_request_coins))        // ─── Chat Policy (Self-Destruct, Reports, Stake-Gate) ──────────────
         .route("/api/v1/chat/policy/status", get(handle_chat_policy_status))
         .route("/api/v1/chat/policy/message/:msg_id", get(handle_chat_policy_message))
         .route("/api/v1/chat/report", post(handle_chat_report))

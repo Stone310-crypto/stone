@@ -309,68 +309,44 @@ pub async fn handle_chat_messages(
         .into_response()
 }
 
-/// GET /api/v1/chat/resolve/:identifier — User-ID / Name → Wallet-Adresse auflösen
-pub async fn handle_chat_resolve(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(identifier): Path<String>,
-) -> impl IntoResponse {
-    let _user = match require_user(&headers, &state) {
-        Ok(u) => u,
-        Err(e) => return e.into_response(),
-    };
-
+/// Lokale Suche: state.users + on-chain account_names.
+/// Gibt Vec<serde_json::Value> mit {user_id, name, wallet} zurück.
+fn resolve_local(identifier: &str, state: &AppState) -> Vec<serde_json::Value> {
     let users = state.users.lock().unwrap();
 
     // 1) Exakte User-ID
     if let Some(u) = users.iter().find(|u| u.id == identifier) {
         if !u.wallet_address.is_empty() {
-            return (
-                StatusCode::OK,
-                axum::Json(json!({
-                    "ok": true,
-                    "user_id": u.id,
-                    "name": u.name,
-                    "wallet": u.wallet_address,
-                })),
-            )
-                .into_response();
+            return vec![json!({
+                "user_id": u.id,
+                "name": u.name,
+                "wallet": u.wallet_address,
+            })];
         }
     }
 
     // 2) Wallet-Adresse direkt
     if identifier.len() == 64 && identifier.chars().all(|c| c.is_ascii_hexdigit()) {
         if let Some(u) = users.iter().find(|u| u.wallet_address == identifier) {
-            return (
-                StatusCode::OK,
-                axum::Json(json!({
-                    "ok": true,
-                    "user_id": u.id,
-                    "name": u.name,
-                    "wallet": u.wallet_address,
-                })),
-            )
-                .into_response();
+            return vec![json!({
+                "user_id": u.id,
+                "name": u.name,
+                "wallet": u.wallet_address,
+            })];
         }
-        // Wallet ohne User – trotzdem gültig wenn im Ledger
         let ledger = state.node.token_ledger.read().unwrap();
-        if ledger.all_registered_accounts().contains_key(&identifier) {
-            return (
-                StatusCode::OK,
-                axum::Json(json!({
-                    "ok": true,
-                    "user_id": "",
-                    "name": "Unbekannt",
-                    "wallet": identifier,
-                })),
-            )
-                .into_response();
+        if ledger.all_registered_accounts().contains_key(identifier) {
+            return vec![json!({
+                "user_id": "",
+                "name": "Unbekannt",
+                "wallet": identifier,
+            })];
         }
     }
 
-    // 3) Name-Suche (case-insensitive, substring)
+    // 3) Name-Suche (case-insensitive, substring) — lokale Users
     let lower = identifier.to_lowercase();
-    let matches: Vec<_> = users
+    let mut matches: Vec<serde_json::Value> = users
         .iter()
         .filter(|u| !u.wallet_address.is_empty() && u.name.to_lowercase().contains(&lower))
         .map(|u| {
@@ -382,6 +358,144 @@ pub async fn handle_chat_resolve(
         })
         .collect();
 
+    // 4) On-Chain Account-Registry (andere Nodes)
+    {
+        let known_wallets: std::collections::HashSet<String> = matches
+            .iter()
+            .filter_map(|m| m["wallet"].as_str().map(|s| s.to_string()))
+            .collect();
+        let ledger = state.node.token_ledger.read().unwrap();
+        for (wallet, name) in ledger.all_registered_accounts() {
+            if known_wallets.contains(wallet) {
+                continue;
+            }
+            if name.to_lowercase().contains(&lower) {
+                let user_id = users.iter()
+                    .find(|u| u.wallet_address == *wallet)
+                    .map(|u| u.id.clone())
+                    .unwrap_or_default();
+                matches.push(json!({
+                    "user_id": user_id,
+                    "name": name,
+                    "wallet": wallet,
+                }));
+            }
+        }
+    }
+
+    matches
+}
+
+/// Peer-Nodes nach einem User fragen (parallel, Timeout 3s).
+/// Nutzt den öffentlichen Sync-Port (4002) statt die Admin-API.
+async fn resolve_from_peers(identifier: &str, state: &AppState) -> Vec<serde_json::Value> {
+    let peers = state.node.get_peers();
+    if peers.is_empty() {
+        return vec![];
+    }
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .danger_accept_invalid_certs(true)
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return vec![],
+    };
+
+    let mut handles = Vec::new();
+    for peer in &peers {
+        let sync_url = crate::server::sync::to_sync_url(&peer.url);
+        let url = format!(
+            "{}/resolve/{}",
+            sync_url,
+            identifier
+        );
+        let c = client.clone();
+        handles.push(tokio::spawn(async move {
+            match c.get(&url).send().await {
+                Ok(r) if r.status().is_success() => r.json::<serde_json::Value>().await.ok(),
+                _ => None,
+            }
+        }));
+    }
+
+    let mut all: Vec<serde_json::Value> = Vec::new();
+    let mut seen_wallets: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for h in handles {
+        if let Ok(Some(body)) = h.await {
+            if let Some(results) = body.get("results").and_then(|v| v.as_array()) {
+                for r in results {
+                    let w = r["wallet"].as_str().unwrap_or_default().to_string();
+                    if !w.is_empty() && seen_wallets.insert(w) {
+                        all.push(r.clone());
+                    }
+                }
+            }
+        }
+    }
+    all
+}
+
+/// GET /api/v1/chat/resolve/:identifier — User-ID / Name → Wallet-Adresse auflösen
+///
+/// Sucht erst lokal + on-chain, dann als Fallback auf allen Peer-Nodes.
+pub async fn handle_chat_resolve(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(identifier): Path<String>,
+) -> impl IntoResponse {
+    let _user = match require_user(&headers, &state) {
+        Ok(u) => u,
+        Err(e) => return e.into_response(),
+    };
+
+    let mut matches = resolve_local(&identifier, &state);
+
+    // 5) Peer-Fallback: Wenn lokal nichts gefunden, Peer-Nodes fragen
+    if matches.is_empty() {
+        let peer_results = resolve_from_peers(&identifier, &state).await;
+        // Deduplizieren gegen lokale Ergebnisse
+        let known: std::collections::HashSet<String> = matches
+            .iter()
+            .filter_map(|m| m["wallet"].as_str().map(|s| s.to_string()))
+            .collect();
+        for r in peer_results {
+            let w = r["wallet"].as_str().unwrap_or_default().to_string();
+            if !w.is_empty() && !known.contains(&w) {
+                matches.push(r);
+            }
+        }
+    }
+
+    if matches.is_empty() {
+        (
+            StatusCode::NOT_FOUND,
+            axum::Json(json!({"ok": false, "error": "Kein User gefunden"})),
+        )
+            .into_response()
+    } else {
+        (
+            StatusCode::OK,
+            axum::Json(json!({
+                "ok": true,
+                "results": matches,
+            })),
+        )
+            .into_response()
+    }
+}
+
+/// GET /api/v1/chat/resolve-public/:identifier — Öffentliche User-Suche (kein Auth)
+///
+/// Wird von Peer-Nodes aufgerufen um User cross-node aufzulösen.
+/// Gibt nur lokale + on-chain Ergebnisse zurück (keine Peer-Weiterleitung,
+/// um Endlos-Schleifen zu vermeiden).
+pub async fn handle_chat_resolve_public(
+    State(state): State<AppState>,
+    Path(identifier): Path<String>,
+) -> impl IntoResponse {
+    let matches = resolve_local(&identifier, &state);
     if matches.is_empty() {
         (
             StatusCode::NOT_FOUND,
@@ -532,5 +646,592 @@ fn index_new_blocks_if_needed(state: &AppState) {
             let _ = stone::chat::save_chat_index(&idx);
             let _ = policy.persist();
         }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Kontakte (Adding-Funktion)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Deserialize)]
+pub struct AddContactRequest {
+    /// Wallet-Adresse oder User-ID oder Name des Kontakts
+    pub identifier: String,
+    /// Optionaler Spitzname
+    #[serde(default)]
+    pub nickname: Option<String>,
+}
+
+/// POST /api/v1/chat/contacts — Kontakt hinzufügen
+pub async fn handle_add_contact(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::Json(req): axum::Json<AddContactRequest>,
+) -> impl IntoResponse {
+    let user = match require_user(&headers, &state) {
+        Ok(u) => u,
+        Err(e) => return e.into_response(),
+    };
+
+    if user.wallet_address.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"ok": false, "error": "Kein Wallet registriert"})),
+        )
+            .into_response();
+    }
+
+    // Kontakt auflösen (Wallet, User-ID oder Name)
+    let (contact_wallet, contact_user_id, contact_name) = {
+        let users = state.users.lock().unwrap();
+        let identifier = req.identifier.trim();
+
+        // 1) Direkte Wallet-Adresse (64 hex)
+        if identifier.len() == 64 && identifier.chars().all(|c| c.is_ascii_hexdigit()) {
+            let info = users.iter()
+                .find(|u| u.wallet_address == identifier)
+                .map(|u| (u.id.clone(), u.name.clone()));
+            match info {
+                Some((uid, name)) => (identifier.to_string(), uid, name),
+                None => {
+                    // Im Ledger nachschauen
+                    let ledger = state.node.token_ledger.read().unwrap();
+                    let name = ledger.account_name(identifier)
+                        .unwrap_or("Unbekannt").to_string();
+                    (identifier.to_string(), String::new(), name)
+                }
+            }
+        }
+        // 2) User-ID
+        else if let Some(u) = users.iter().find(|u| u.id == identifier) {
+            if u.wallet_address.is_empty() {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(json!({"ok": false, "error": "User hat kein Wallet"})),
+                ).into_response();
+            }
+            (u.wallet_address.clone(), u.id.clone(), u.name.clone())
+        }
+        // 3) Name-Suche (exakt, case-insensitive)
+        else {
+            let lower = identifier.to_lowercase();
+            let found = users.iter()
+                .find(|u| !u.wallet_address.is_empty() && u.name.to_lowercase() == lower);
+            match found {
+                Some(u) => (u.wallet_address.clone(), u.id.clone(), u.name.clone()),
+                None => {
+                    // Fallback: On-Chain Ledger
+                    let ledger = state.node.token_ledger.read().unwrap();
+                    let chain_match = ledger.all_registered_accounts().iter()
+                        .find(|(_, name)| name.to_lowercase() == lower)
+                        .map(|(w, n)| (w.clone(), n.clone()));
+                    match chain_match {
+                        Some((wallet, name)) => (wallet, String::new(), name),
+                        None => return (
+                            StatusCode::NOT_FOUND,
+                            axum::Json(json!({"ok": false, "error": "Kontakt nicht gefunden"})),
+                        ).into_response(),
+                    }
+                }
+            }
+        }
+    };
+
+    if contact_wallet == user.wallet_address {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"ok": false, "error": "Du kannst dich nicht selbst hinzufügen"})),
+        ).into_response();
+    }
+
+    let nickname = req.nickname.unwrap_or_else(|| contact_name.clone());
+
+    let mut contacts = state.contacts.lock().unwrap();
+    if contacts.add_contact(&user.wallet_address, &contact_wallet, &contact_user_id, &nickname) {
+        stone::chat::save_contacts(&contacts);
+        (
+            StatusCode::CREATED,
+            axum::Json(json!({
+                "ok": true,
+                "contact": {
+                    "wallet": contact_wallet,
+                    "user_id": contact_user_id,
+                    "nickname": nickname,
+                    "name": contact_name,
+                },
+                "message": format!("{} wurde zu deinen Kontakten hinzugefügt", contact_name),
+            })),
+        ).into_response()
+    } else {
+        (
+            StatusCode::CONFLICT,
+            axum::Json(json!({"ok": false, "error": "Kontakt bereits vorhanden"})),
+        ).into_response()
+    }
+}
+
+/// GET /api/v1/chat/contacts — Kontaktliste abrufen
+pub async fn handle_list_contacts(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let user = match require_user(&headers, &state) {
+        Ok(u) => u,
+        Err(e) => return e.into_response(),
+    };
+
+    if user.wallet_address.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"ok": false, "error": "Kein Wallet registriert"})),
+        ).into_response();
+    }
+
+    let contacts = state.contacts.lock().unwrap();
+    let my_contacts = contacts.get_contacts(&user.wallet_address);
+
+    // Kontakte mit aktuellen User-Daten anreichern
+    let users = state.users.lock().unwrap();
+    let enriched: Vec<_> = my_contacts.iter().map(|c| {
+        let current_name = users.iter()
+            .find(|u| u.wallet_address == c.wallet)
+            .map(|u| u.name.clone())
+            .unwrap_or_else(|| {
+                // Fallback: Ledger
+                let ledger = state.node.token_ledger.read().unwrap();
+                ledger.account_name(&c.wallet)
+                    .unwrap_or("Unbekannt").to_string()
+            });
+        json!({
+            "wallet": c.wallet,
+            "user_id": c.user_id,
+            "nickname": c.nickname,
+            "name": current_name,
+            "added_at": c.added_at,
+            "is_contact": true,
+        })
+    }).collect();
+
+    (
+        StatusCode::OK,
+        axum::Json(json!({
+            "ok": true,
+            "contacts": enriched,
+            "count": enriched.len(),
+        })),
+    ).into_response()
+}
+
+/// DELETE /api/v1/chat/contacts/:wallet — Kontakt entfernen
+pub async fn handle_remove_contact(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(contact_wallet): Path<String>,
+) -> impl IntoResponse {
+    let user = match require_user(&headers, &state) {
+        Ok(u) => u,
+        Err(e) => return e.into_response(),
+    };
+
+    if user.wallet_address.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"ok": false, "error": "Kein Wallet registriert"})),
+        ).into_response();
+    }
+
+    let mut contacts = state.contacts.lock().unwrap();
+    if contacts.remove_contact(&user.wallet_address, &contact_wallet) {
+        stone::chat::save_contacts(&contacts);
+        (
+            StatusCode::OK,
+            axum::Json(json!({"ok": true, "message": "Kontakt entfernt"})),
+        ).into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            axum::Json(json!({"ok": false, "error": "Kontakt nicht gefunden"})),
+        ).into_response()
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Stonecoin im Chat senden & anfragen
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[derive(Deserialize)]
+pub struct ChatSendCoinsRequest {
+    /// Mnemonic (BIP39) des Senders
+    pub mnemonic: String,
+    /// Empfänger: Wallet-Adresse oder User-ID
+    pub to: String,
+    /// Betrag in STONE (z.B. "10.5")
+    pub amount: String,
+    /// Optionale Nachricht zum Transfer
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct ChatRequestCoinsRequest {
+    /// Mnemonic (BIP39) des Anfordernden
+    pub mnemonic: String,
+    /// Von wem angefordert: Wallet-Adresse oder User-ID
+    pub from: String,
+    /// Angeforderter Betrag in STONE
+    pub amount: String,
+    /// Optionale Nachricht zur Anforderung
+    #[serde(default)]
+    pub message: Option<String>,
+}
+
+/// POST /api/v1/chat/send-coins — Stonecoins im Chat senden
+///
+/// Kombiniert einen Token-Transfer mit einer Chat-Benachrichtigung.
+/// Der Empfänger sieht im Chat eine Nachricht mit dem Transfer-Details.
+pub async fn handle_chat_send_coins(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::Json(req): axum::Json<ChatSendCoinsRequest>,
+) -> impl IntoResponse {
+    let user = match require_user(&headers, &state) {
+        Ok(u) => u,
+        Err(e) => return e.into_response(),
+    };
+
+    // Sender-Wallet rekonstruieren
+    let wallet = match Wallet::from_mnemonic(&req.mnemonic) {
+        Ok(w) => w,
+        Err(e) => return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"ok": false, "error": format!("Wallet-Fehler: {e}")})),
+        ).into_response(),
+    };
+
+    if wallet.address() != user.wallet_address {
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(json!({"ok": false, "error": "Wallet stimmt nicht mit dem User überein"})),
+        ).into_response();
+    }
+
+    // Empfänger auflösen
+    let to_wallet = match resolve_recipient(&req.to, &state) {
+        Some(w) => w,
+        None => return (
+            StatusCode::NOT_FOUND,
+            axum::Json(json!({"ok": false, "error": "Empfänger nicht gefunden"})),
+        ).into_response(),
+    };
+
+    if to_wallet == wallet.address() {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"ok": false, "error": "Du kannst dir nicht selbst Coins senden"})),
+        ).into_response();
+    }
+
+    // Betrag parsen
+    let amount: rust_decimal::Decimal = match req.amount.parse() {
+        Ok(a) => a,
+        Err(_) => return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"ok": false, "error": "Ungültiger Betrag"})),
+        ).into_response(),
+    };
+
+    if amount <= rust_decimal::Decimal::ZERO {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"ok": false, "error": "Betrag muss positiv sein"})),
+        ).into_response();
+    }
+
+    // Balance prüfen
+    {
+        let ledger = state.node.token_ledger.read().unwrap();
+        let balance = ledger.balance(&wallet.address());
+        if balance < amount {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(json!({
+                    "ok": false,
+                    "error": format!("Nicht genügend Guthaben. Balance: {} STONE, angefordert: {} STONE", balance, amount),
+                    "balance": balance.to_string(),
+                    "requested": amount.to_string(),
+                })),
+            ).into_response();
+        }
+    }
+
+    // Nonce für Transfer-TX
+    let nonce = {
+        let ledger = state.node.token_ledger.read().unwrap();
+        ledger.nonce(&wallet.address())
+    };
+
+    let msg_text = req.message.unwrap_or_default();
+
+    // 1) Token-Transfer TX erstellen
+    let transfer_memo = json!({
+        "type": "chat_coin_transfer",
+        "from_name": user.name,
+        "message": msg_text,
+    }).to_string();
+
+    let transfer_tx = match wallet.sign_tx(
+        TxType::Transfer,
+        to_wallet.clone(),
+        amount,
+        rust_decimal::Decimal::ZERO, // Fee
+        nonce,
+        transfer_memo,
+    ) {
+        Ok(t) => t,
+        Err(e) => return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({"ok": false, "error": format!("Transfer-TX fehlgeschlagen: {e}")})),
+        ).into_response(),
+    };
+
+    // In Mempool
+    let transfer_result = {
+        let ledger = state.node.token_ledger.read().unwrap();
+        state.node.mempool.add_tx(transfer_tx.clone(), Some(&ledger))
+    };
+
+    if let Err(e) = transfer_result {
+        return (
+            StatusCode::CONFLICT,
+            axum::Json(json!({"ok": false, "error": format!("Transfer fehlgeschlagen: {e}")})),
+        ).into_response();
+    }
+
+    // 2) Chat-Benachrichtigung als ChatMessage TX
+    let chat_nonce = {
+        let ledger = state.node.token_ledger.read().unwrap();
+        ledger.nonce(&wallet.address())
+    };
+
+    let msg_id = uuid::Uuid::new_v4().to_string();
+    let chat_memo = json!({
+        "msg_id": msg_id,
+        "encrypted": format!("💰 {} STONE gesendet{}", amount, if msg_text.is_empty() { String::new() } else { format!(" — {}", msg_text) }),
+        "nonce": "",
+        "from_user_id": user.id,
+        "from_name": user.name,
+        "msg_type": "coin_transfer",
+        "amount": amount.to_string(),
+        "transfer_tx_id": transfer_tx.tx_id,
+    }).to_string();
+
+    let chat_tx = match wallet.sign_tx(
+        TxType::ChatMessage,
+        to_wallet.clone(),
+        rust_decimal::Decimal::ZERO,
+        rust_decimal::Decimal::ZERO,
+        chat_nonce,
+        chat_memo,
+    ) {
+        Ok(t) => t,
+        Err(e) => {
+            // Transfer ist schon im Mempool, Chat-Nachricht ist nice-to-have
+            eprintln!("[chat] Chat-Benachrichtigung fehlgeschlagen: {e}");
+            return (
+                StatusCode::ACCEPTED,
+                axum::Json(json!({
+                    "ok": true,
+                    "transfer_tx_id": transfer_tx.tx_id,
+                    "amount": amount.to_string(),
+                    "to": to_wallet,
+                    "warning": "Transfer erfolgreich, aber Chat-Benachrichtigung fehlgeschlagen",
+                })),
+            ).into_response();
+        }
+    };
+
+    // Chat-TX in Mempool
+    let _ = {
+        let ledger = state.node.token_ledger.read().unwrap();
+        state.node.mempool.add_tx(chat_tx.clone(), Some(&ledger))
+    };
+
+    // P2P broadcast (beide TXs)
+    if let Some(ref net) = state.network {
+        let net = net.clone();
+        let tt = transfer_tx.clone();
+        let ct = chat_tx.clone();
+        tokio::spawn(async move {
+            net.broadcast_tx(tt).await;
+            net.broadcast_tx(ct).await;
+        });
+    }
+
+    (
+        StatusCode::ACCEPTED,
+        axum::Json(json!({
+            "ok": true,
+            "transfer_tx_id": transfer_tx.tx_id,
+            "chat_tx_id": chat_tx.tx_id,
+            "msg_id": msg_id,
+            "from": wallet.address(),
+            "to": to_wallet,
+            "amount": amount.to_string(),
+            "status": "pending",
+            "message": format!("{} STONE an {} gesendet", amount, to_wallet),
+        })),
+    ).into_response()
+}
+
+/// POST /api/v1/chat/request-coins — Stonecoins im Chat anfordern
+///
+/// Sendet eine Chat-Nachricht mit einer Coin-Anforderung an einen anderen User.
+/// Der Empfänger kann daraufhin über /api/v1/chat/send-coins die Coins senden.
+pub async fn handle_chat_request_coins(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::Json(req): axum::Json<ChatRequestCoinsRequest>,
+) -> impl IntoResponse {
+    let user = match require_user(&headers, &state) {
+        Ok(u) => u,
+        Err(e) => return e.into_response(),
+    };
+
+    // Wallet rekonstruieren
+    let wallet = match Wallet::from_mnemonic(&req.mnemonic) {
+        Ok(w) => w,
+        Err(e) => return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"ok": false, "error": format!("Wallet-Fehler: {e}")})),
+        ).into_response(),
+    };
+
+    if wallet.address() != user.wallet_address {
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(json!({"ok": false, "error": "Wallet stimmt nicht mit dem User überein"})),
+        ).into_response();
+    }
+
+    // Empfänger auflösen (von wem angefordert)
+    let from_wallet = match resolve_recipient(&req.from, &state) {
+        Some(w) => w,
+        None => return (
+            StatusCode::NOT_FOUND,
+            axum::Json(json!({"ok": false, "error": "User nicht gefunden"})),
+        ).into_response(),
+    };
+
+    if from_wallet == wallet.address() {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"ok": false, "error": "Du kannst nicht von dir selbst anfordern"})),
+        ).into_response();
+    }
+
+    // Betrag parsen
+    let amount: rust_decimal::Decimal = match req.amount.parse() {
+        Ok(a) => a,
+        Err(_) => return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"ok": false, "error": "Ungültiger Betrag"})),
+        ).into_response(),
+    };
+
+    if amount <= rust_decimal::Decimal::ZERO {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"ok": false, "error": "Betrag muss positiv sein"})),
+        ).into_response();
+    }
+
+    // Stake-Gate prüfen
+    {
+        let pool = state.node.staking_pool.read().unwrap();
+        let staked = pool.stakers.get(&wallet.address())
+            .map(|s| s.staked_amount)
+            .unwrap_or(rust_decimal::Decimal::ZERO);
+        if let Err(missing) = stone::chat_policy::ChatPolicyStore::check_messenger_access(staked) {
+            return (
+                StatusCode::FORBIDDEN,
+                axum::Json(json!({
+                    "ok": false,
+                    "error": format!(
+                        "Messenger erfordert mindestens {} STONE Stake. Es fehlen {} STONE.",
+                        messenger_min_stake(), missing
+                    ),
+                })),
+            ).into_response();
+        }
+    }
+
+    let msg_text = req.message.unwrap_or_default();
+
+    // Chat-Nachricht als Coin-Request senden
+    let nonce = {
+        let ledger = state.node.token_ledger.read().unwrap();
+        ledger.nonce(&wallet.address())
+    };
+
+    let msg_id = uuid::Uuid::new_v4().to_string();
+    let memo = json!({
+        "msg_id": msg_id,
+        "encrypted": format!("🔔 {} STONE angefordert{}", amount, if msg_text.is_empty() { String::new() } else { format!(" — {}", msg_text) }),
+        "nonce": "",
+        "from_user_id": user.id,
+        "from_name": user.name,
+        "msg_type": "coin_request",
+        "amount": amount.to_string(),
+    }).to_string();
+
+    let tx = match wallet.sign_tx(
+        TxType::ChatMessage,
+        from_wallet.clone(),
+        rust_decimal::Decimal::ZERO,
+        rust_decimal::Decimal::ZERO,
+        nonce,
+        memo,
+    ) {
+        Ok(t) => t,
+        Err(e) => return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            axum::Json(json!({"ok": false, "error": format!("TX-Erstellung fehlgeschlagen: {e}")})),
+        ).into_response(),
+    };
+
+    // In Mempool
+    let result = {
+        let ledger = state.node.token_ledger.read().unwrap();
+        state.node.mempool.add_tx(tx.clone(), Some(&ledger))
+    };
+
+    match result {
+        Ok(()) => {
+            if let Some(ref net) = state.network {
+                let net = net.clone();
+                let tx_clone = tx.clone();
+                tokio::spawn(async move {
+                    net.broadcast_tx(tx_clone).await;
+                });
+            }
+            (
+                StatusCode::ACCEPTED,
+                axum::Json(json!({
+                    "ok": true,
+                    "msg_id": msg_id,
+                    "tx_id": tx.tx_id,
+                    "from": wallet.address(),
+                    "to": from_wallet,
+                    "amount": amount.to_string(),
+                    "status": "pending",
+                    "msg_type": "coin_request",
+                    "message": format!("{} STONE von {} angefordert", amount, from_wallet),
+                })),
+            ).into_response()
+        }
+        Err(e) => (
+            StatusCode::CONFLICT,
+            axum::Json(json!({"ok": false, "error": format!("Mempool-Fehler: {e}")})),
+        ).into_response(),
     }
 }

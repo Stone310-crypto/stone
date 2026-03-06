@@ -154,8 +154,8 @@ pub async fn handle_sync_users(
     .into_response()
 }
 
-/// Pusht einen einzelnen Nutzer an alle bekannten HTTP-Peers.
-pub async fn push_user_to_peers(user: &User, peers: &[PeerInfo], api_key: &str) {
+/// Pusht einen einzelnen Nutzer an alle bekannten HTTP-Peers via Sync-Port.
+pub async fn push_user_to_peers(user: &User, peers: &[PeerInfo], _api_key: &str) {
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .danger_accept_invalid_certs(
@@ -168,17 +168,24 @@ pub async fn push_user_to_peers(user: &User, peers: &[PeerInfo], api_key: &str) 
         Ok(c) => c,
         Err(_) => return,
     };
+
+    let sync_user = serde_json::json!([{
+        "id": user.id,
+        "name": user.name,
+        "wallet_address": user.wallet_address,
+    }]);
+
     for peer in peers {
-        let url = format!("{}/api/v1/admin/sync-users", peer.url.trim_end_matches('/'));
+        let sync_url = crate::server::sync::to_sync_url(&peer.url);
+        let url = format!("{}/sync-users", sync_url);
         match client
             .post(&url)
-            .header("x-api-key", api_key)
-            .json(&vec![user])
+            .json(&sync_user)
             .send()
             .await
         {
             Ok(r) if r.status().is_success() => {
-                println!("[auth] Nutzer '{}' an Peer {} gepusht", user.name, peer.url);
+                println!("[auth] Nutzer '{}' an Peer {} gepusht (sync-port)", user.name, peer.url);
             }
             Ok(r) => {
                 eprintln!("[auth] Peer {} sync-users: HTTP {}", peer.url, r.status());

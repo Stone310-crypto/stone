@@ -13,6 +13,27 @@ use stone::{
 
 use super::state::AUTO_SYNC_INTERVAL;
 
+/// Wandelt eine Peer-URL (z.B. http://1.2.3.4:8080) in die Sync-Port-URL um.
+/// Der Sync-Port ist standardmäßig 4002, konfigurierbar via STONE_SYNC_PORT.
+pub fn to_sync_url(peer_url: &str) -> String {
+    let sync_port = std::env::var("STONE_SYNC_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(4002);
+
+    let base = peer_url.trim_end_matches('/');
+    // http://1.2.3.4:8080 → http://1.2.3.4:4002
+    if let Some(pos) = base.rfind(':') {
+        // Prüfen ob nach dem letzten : eine Portnummer steht
+        let after = &base[pos + 1..];
+        if after.parse::<u16>().is_ok() {
+            return format!("{}:{}", &base[..pos], sync_port);
+        }
+    }
+    // Kein Port in URL → einfach anhängen
+    format!("{}:{}", base, sync_port)
+}
+
 pub async fn pull_from_peer(node: &Arc<MasterNodeState>, peer_url: &str, api_key: &str) {
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -457,21 +478,82 @@ pub fn spawn_auto_sync_task(
 ) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(AUTO_SYNC_INTERVAL);
+        let mut chain_sync_counter: u64 = 0;
         loop {
             interval.tick().await;
             let peers = node.get_peers();
-            for peer in peers {
+            for peer in &peers {
                 pull_from_peer(&node, &peer.url, &api_key).await;
                 pull_users_from_peer(&peer.url, &api_key, &users).await;
+            }
+            // Push eigene User an alle erreichbaren Peers (wichtig wenn wir
+            // hinter NAT sind und Peers uns nicht pullen können)
+            push_all_users_to_peers(&peers.iter().map(|p| p.url.clone()).collect::<Vec<_>>(), &users).await;
+            // Alle 2 Minuten: Chain-registrierte Accounts in lokale User-Liste mergen
+            chain_sync_counter += 1;
+            if chain_sync_counter % 4 == 0 {
+                sync_chain_accounts_to_users(&node, &users);
             }
         }
     });
 }
 
-/// Holt die Nutzerliste von einem Peer und merged sie lokal.
+/// Pusht die gesamte lokale User-Liste an alle erreichbaren Peers via Sync-Port.
+/// Damit funktioniert die Sync auch wenn der Peer uns nicht erreichen kann (NAT).
+pub async fn push_all_users_to_peers(
+    peer_urls: &[String],
+    users: &Arc<Mutex<Vec<User>>>,
+) {
+    let user_list: Vec<serde_json::Value> = {
+        let local = users.lock().unwrap();
+        local
+            .iter()
+            .filter(|u| !u.name.is_empty())
+            .map(|u| {
+                serde_json::json!({
+                    "id": u.id,
+                    "name": u.name,
+                    "wallet_address": u.wallet_address,
+                })
+            })
+            .collect()
+    };
+
+    if user_list.is_empty() {
+        return;
+    }
+
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .danger_accept_invalid_certs(
+            std::env::var("STONE_INSECURE_SSL")
+                .map(|v| v == "1")
+                .unwrap_or(false),
+        )
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    for peer_url in peer_urls {
+        let sync_url = to_sync_url(peer_url);
+        let url = format!("{}/sync-users", sync_url);
+        match client.post(&url).json(&user_list).send().await {
+            Ok(r) if r.status().is_success() => {
+                // Leise — wird alle 30s aufgerufen
+            }
+            Ok(_) | Err(_) => {
+                // Peer nicht erreichbar — überspringen
+            }
+        }
+    }
+}
+
+/// Holt die Nutzerliste von einem Peer via Sync-Port (kein Auth nötig).
 pub async fn pull_users_from_peer(
     peer_url: &str,
-    api_key: &str,
+    _api_key: &str,
     users: &Arc<Mutex<Vec<User>>>,
 ) {
     let client = match reqwest::Client::builder()
@@ -487,36 +569,138 @@ pub async fn pull_users_from_peer(
         Err(_) => return,
     };
 
-    let url = format!("{}/api/v1/users", peer_url.trim_end_matches('/'));
-    let resp = match client
-        .get(&url)
-        .header("x-api-key", api_key)
-        .send()
-        .await
-    {
+    let sync_url = to_sync_url(peer_url);
+    let url = format!("{}/users", sync_url);
+    let resp = match client.get(&url).send().await {
         Ok(r) => r,
-        Err(_) => return,
+        Err(_) => return, // Peer nicht erreichbar — leise überspringen
     };
 
     if !resp.status().is_success() {
         return;
     }
 
-    let remote_users: Vec<User> = match resp.json().await {
-        Ok(u) => u,
+    let body: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
         Err(_) => return,
+    };
+
+    let remote_users_raw = match body.get("users").and_then(|u| u.as_array()) {
+        Some(arr) => arr,
+        None => return,
     };
 
     let mut local = users.lock().unwrap();
     let mut added = 0usize;
-    for ru in &remote_users {
-        if !local.iter().any(|u| u.id == ru.id) {
-            local.push(ru.clone());
-            added += 1;
+    let mut updated = 0usize;
+
+    for ru in remote_users_raw {
+        let id = ru["id"].as_str().unwrap_or_default().to_string();
+        let name = ru["name"].as_str().unwrap_or_default().to_string();
+        let wallet = ru["wallet_address"].as_str().unwrap_or_default().to_string();
+        if name.is_empty() {
+            continue;
         }
+        // Match by wallet (bevorzugt) oder ID
+        let existing = local.iter_mut().find(|u| {
+            (!u.wallet_address.is_empty() && !wallet.is_empty() && u.wallet_address == wallet)
+                || (!id.is_empty() && u.id == id)
+        });
+        if let Some(ex) = existing {
+            if ex.name != name {
+                ex.name = name;
+                updated += 1;
+            }
+            if ex.wallet_address.is_empty() && !wallet.is_empty() {
+                ex.wallet_address = wallet;
+                updated += 1;
+            }
+            continue;
+        }
+        // Neuer User — minimalen Eintrag anlegen
+        local.push(User {
+            id: if id.is_empty() {
+                format!("u-{}", uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("0000"))
+            } else {
+                id
+            },
+            name,
+            api_key: String::new(),
+            phrase_hash: String::new(),
+            quota_bytes: stone::auth::default_quota_bytes(),
+            wallet_address: wallet,
+            account_type: stone::auth::default_account_type(),
+            org_id: String::new(),
+            org_role: String::new(),
+        });
+        added += 1;
     }
+
+    if added > 0 || updated > 0 {
+        save_users(&local);
+        println!("[sync] {added} neue + {updated} aktualisierte Nutzer von {peer_url}");
+    }
+}
+
+/// Synchronisiert on-chain registrierte Accounts in die lokale User-Liste.
+///
+/// Wird periodisch aufgerufen um sicherzustellen, dass Accounts die via
+/// AccountRegister-TX auf anderen Nodes registriert wurden, auch lokal
+/// auffindbar sind (wichtig für Chat-Resolve und User-Suche).
+pub fn sync_chain_accounts_to_users(
+    node: &Arc<MasterNodeState>,
+    users: &Arc<Mutex<Vec<User>>>,
+) {
+    let ledger = node.token_ledger.read().unwrap();
+    let chain_accounts = ledger.all_registered_accounts();
+    if chain_accounts.is_empty() {
+        return;
+    }
+
+    let mut local = users.lock().unwrap();
+    let mut added = 0usize;
+
+    for (wallet, name) in chain_accounts {
+        // Bereits vorhanden (über Wallet ODER Name+ApiKey)?
+        let exists = local.iter().any(|u| {
+            u.wallet_address == *wallet
+            || (!u.api_key.is_empty()
+                && ledger.account_api_key_hash(wallet).map_or(false, |h| h == u.api_key))
+        });
+        if exists {
+            // Wallet-Adresse nachrüsten falls leer
+            if let Some(u) = local.iter_mut().find(|u| {
+                u.wallet_address.is_empty()
+                    && !u.api_key.is_empty()
+                    && ledger.account_api_key_hash(wallet).map_or(false, |h| h == u.api_key)
+            }) {
+                u.wallet_address = wallet.clone();
+                added += 1; // Zählt als Update
+            }
+            continue;
+        }
+        // Neuen User-Eintrag anlegen
+        let api_key_hash = ledger.account_api_key_hash(wallet)
+            .unwrap_or_default().to_string();
+        let id = format!("u-{}", uuid::Uuid::new_v4().to_string()
+            .split('-').next().unwrap_or("0000"));
+
+        local.push(User {
+            id,
+            name: name.clone(),
+            api_key: api_key_hash.clone(),
+            phrase_hash: api_key_hash,
+            quota_bytes: stone::auth::default_quota_bytes(),
+            wallet_address: wallet.clone(),
+            account_type: stone::auth::default_account_type(),
+            org_id: String::new(),
+            org_role: String::new(),
+        });
+        added += 1;
+    }
+
     if added > 0 {
         save_users(&local);
-        println!("[sync] {added} neue Nutzer von {peer_url} übernommen");
+        println!("[sync] 📋 {added} Chain-Accounts in lokale User-Liste synchronisiert");
     }
 }

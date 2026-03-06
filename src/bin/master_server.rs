@@ -42,6 +42,7 @@ use stone::{
 
 use server::{
     router::build_router,
+    sync_router::build_sync_router,
     rate_limiter::RateLimits,
     state::{load_api_key, load_admin_key, load_peers_from_disk, load_trust_from_disk, AppState, HEARTBEAT_INTERVAL},
     sync::{fetch_missing_chunks, pull_from_peer, spawn_auto_sync_task},
@@ -84,6 +85,64 @@ async fn main() {
     if !saved_peers.is_empty() {
         println!("[master] {} Peer(s) aus Datei geladen", saved_peers.len());
         node.replace_peers(saved_peers);
+    }
+
+    // ── Bootstrap-Nodes laden ─────────────────────────────────────────────────
+    // Quellen (in Priorität):
+    //   1) STONE_BOOTSTRAP_NODES env (komma-separiert: "http://1.2.3.4:8080,http://5.6.7.8:8080")
+    //   2) node_config.json → "bootstrap_nodes": ["http://..."]
+    // Bootstrap-Nodes werden als Peers hinzugefügt (falls nicht schon vorhanden)
+    {
+        let mut bootstrap: Vec<String> = Vec::new();
+
+        // Aus Env
+        if let Ok(env_val) = std::env::var("STONE_BOOTSTRAP_NODES") {
+            for url in env_val.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+                bootstrap.push(url);
+            }
+        }
+
+        // Aus node_config.json
+        if bootstrap.is_empty() {
+            let config_path = format!("{}/../../node_config.json", stone::blockchain::data_dir());
+            let config_path2 = "node_config.json".to_string();
+            for path in &[&config_path, &config_path2] {
+                if let Ok(data) = std::fs::read_to_string(path) {
+                    if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&data) {
+                        if let Some(nodes) = cfg.get("bootstrap_nodes").and_then(|v| v.as_array()) {
+                            for n in nodes {
+                                if let Some(url) = n.as_str() {
+                                    bootstrap.push(url.to_string());
+                                }
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+
+        if !bootstrap.is_empty() {
+            let existing_urls: std::collections::HashSet<String> = node
+                .get_peers()
+                .iter()
+                .map(|p| p.url.clone())
+                .collect();
+
+            let mut added = 0;
+            for url in &bootstrap {
+                if !existing_urls.contains(url) {
+                    let peer = stone::master_node::PeerInfo::new(url);
+                    node.upsert_peer(peer);
+                    added += 1;
+                }
+            }
+            println!(
+                "[master] 🌍 Bootstrap-Nodes: {} konfiguriert, {} neu hinzugefügt",
+                bootstrap.len(),
+                added
+            );
+        }
     }
 
     // Trust-Registry laden
@@ -637,11 +696,12 @@ async fn main() {
             }
             Arc::new(std::sync::Mutex::new(idx))
         },
+        contacts: Arc::new(std::sync::Mutex::new(stone::chat::load_contacts())),
         challenge_store: stone::auth::ChallengeStore::new(),
         qr_login_store: stone::auth::QrLoginStore::new(),
     };
 
-    let router = build_router(state);
+    let router = build_router(state.clone());
 
     let preferred_port: u16 = std::env::var("STONE_HTTP_PORT")
         .or_else(|_| std::env::var("STONE_PORT"))
@@ -649,9 +709,24 @@ async fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(8080);
 
+    // ── Public Sync Port (kein Auth, für Node-zu-Node Kommunikation) ─────
+    let sync_port: u16 = std::env::var("STONE_SYNC_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4002);
+
+    let sync_router = build_sync_router(state);
+    let sync_listener = bind_with_fallback(sync_port).await;
+    println!("[master] 🌐 Sync-Port auf 0.0.0.0:{sync_port} (öffentlich, kein Auth)");
+    tokio::spawn(async move {
+        axum::serve(sync_listener, sync_router)
+            .await
+            .expect("Sync-Server Fehler");
+    });
+
     let listener = bind_with_fallback(preferred_port).await;
     let bound_port = listener.local_addr().unwrap().port();
-    println!("[master] HTTP auf 0.0.0.0:{bound_port}");
+    println!("[master] HTTP auf 0.0.0.0:{bound_port} (Admin-API)");
     println!("[master] Stone Master Node läuft auf http://0.0.0.0:{bound_port}");
     println!("[master] Web-UI kann sich via ws://0.0.0.0:{bound_port}/ws verbinden");
     axum::serve(listener, router).await.expect("HTTP-Server Fehler");

@@ -266,3 +266,93 @@ pub fn save_chat_index(index: &ChatIndex) {
         let _ = fs::write(chat_index_file(), json);
     }
 }
+
+// ─── Kontaktliste (Adding-Funktion) ─────────────────────────────────────────
+
+fn contacts_file() -> String {
+    format!("{}/contacts.json", data_dir())
+}
+
+/// Ein einzelner Kontakt.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Contact {
+    /// Wallet-Adresse des Kontakts
+    pub wallet: String,
+    /// User-ID (falls bekannt)
+    pub user_id: String,
+    /// Anzeigename (vom User vergeben oder aus Profil)
+    pub nickname: String,
+    /// Zeitpunkt des Hinzufügens (Unix-Timestamp)
+    pub added_at: i64,
+}
+
+/// Kontaktliste: Wallet → Vec<Contact>
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct ContactList {
+    /// Kontakte pro User-Wallet: { "meine_wallet": [Contact, …] }
+    pub contacts: HashMap<String, Vec<Contact>>,
+}
+
+impl ContactList {
+    /// Kontakt hinzufügen. Gibt `false` zurück wenn bereits vorhanden.
+    pub fn add_contact(
+        &mut self,
+        owner_wallet: &str,
+        contact_wallet: &str,
+        user_id: &str,
+        nickname: &str,
+    ) -> bool {
+        let list = self.contacts.entry(owner_wallet.to_string()).or_default();
+        if list.iter().any(|c| c.wallet == contact_wallet) {
+            return false; // bereits vorhanden
+        }
+        list.push(Contact {
+            wallet: contact_wallet.to_string(),
+            user_id: user_id.to_string(),
+            nickname: nickname.to_string(),
+            added_at: chrono::Utc::now().timestamp(),
+        });
+        true
+    }
+
+    /// Kontakt entfernen. Gibt `true` zurück wenn entfernt.
+    pub fn remove_contact(&mut self, owner_wallet: &str, contact_wallet: &str) -> bool {
+        if let Some(list) = self.contacts.get_mut(owner_wallet) {
+            let before = list.len();
+            list.retain(|c| c.wallet != contact_wallet);
+            return list.len() < before;
+        }
+        false
+    }
+
+    /// Kontakte eines Users abrufen.
+    pub fn get_contacts(&self, owner_wallet: &str) -> Vec<&Contact> {
+        self.contacts
+            .get(owner_wallet)
+            .map(|list| list.iter().collect())
+            .unwrap_or_default()
+    }
+
+    /// Prüft ob ein Wallet in den Kontakten ist.
+    pub fn is_contact(&self, owner_wallet: &str, contact_wallet: &str) -> bool {
+        self.contacts
+            .get(owner_wallet)
+            .map(|list| list.iter().any(|c| c.wallet == contact_wallet))
+            .unwrap_or(false)
+    }
+}
+
+pub fn load_contacts() -> ContactList {
+    if let Ok(data) = fs::read_to_string(contacts_file()) {
+        serde_json::from_str(&data).unwrap_or_default()
+    } else {
+        ContactList::default()
+    }
+}
+
+pub fn save_contacts(contacts: &ContactList) {
+    if let Ok(json) = serde_json::to_string_pretty(contacts) {
+        let _ = fs::create_dir_all(data_dir());
+        let _ = fs::write(contacts_file(), json);
+    }
+}

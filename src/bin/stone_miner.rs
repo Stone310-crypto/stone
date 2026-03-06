@@ -1313,6 +1313,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             Arc::new(std::sync::Mutex::new(idx))
         },
+        contacts: Arc::new(std::sync::Mutex::new(stone::chat::load_contacts())),
         challenge_store: stone::auth::ChallengeStore::new(),
         qr_login_store: stone::auth::QrLoginStore::new(),
     };
