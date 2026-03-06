@@ -23,7 +23,7 @@ pub async fn handle_list_blocks(
     Query(q): Query<PaginationQuery>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let chain = state.node.chain.lock().unwrap();
+    let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
     let per_page = q.per_page.unwrap_or(50).min(500) as usize;
     let page = q.page.unwrap_or(0) as usize;
     let total = chain.blocks.len();
@@ -50,7 +50,7 @@ pub async fn handle_get_block(
     Path(index): Path<u64>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, Response> {
-    let chain = state.node.chain.lock().unwrap();
+    let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
     let block = chain.blocks.get(index as usize).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,

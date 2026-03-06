@@ -41,7 +41,7 @@ pub async fn handle_signup(
         );
     }
     let (id, new_user, phrase) = {
-        let mut users = state.users.lock().unwrap();
+        let mut users = state.users.lock().unwrap_or_else(|e| e.into_inner());
         let id = format!("u-{}", uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("0000"));
         let (mut user, phrase) = create_user_with_phrase(req.name.trim());
         user.id = id.clone();
@@ -71,7 +71,7 @@ pub async fn handle_signup(
             let signing_key = ed25519_dalek::SigningKey::from_bytes(&key_bytes);
 
             let nonce = {
-                let ledger = node.token_ledger.read().unwrap();
+                let ledger = node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
                 ledger.nonce(&wallet)
             };
 
@@ -130,7 +130,7 @@ pub async fn handle_sync_users(
     if let Err(e) = require_admin(&headers, &state) {
         return e;
     }
-    let mut users = state.users.lock().unwrap();
+    let mut users = state.users.lock().unwrap_or_else(|e| e.into_inner());
     let mut added = 0usize;
     let mut updated = 0usize;
     for inc in &incoming {
@@ -208,7 +208,7 @@ pub async fn handle_login(
             axum::Json(json!({"error": "Ungültige Wiederherstellungs-Phrase"})),
         );
     };
-    let mut users = state.users.lock().unwrap();
+    let mut users = state.users.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(idx) = users.iter().position(|u| u.phrase_hash == hash) {
         // Wallet-Adresse: entweder gespeichert oder live aus der Phrase ableiten
         let mut needs_save = false;
@@ -262,7 +262,7 @@ pub async fn handle_wallet_claim(
         );
     };
 
-    let mut users = state.users.lock().unwrap();
+    let mut users = state.users.lock().unwrap_or_else(|e| e.into_inner());
     let Some(idx) = users.iter().position(|u| u.phrase_hash == hash) else {
         return (
             StatusCode::NOT_FOUND,
@@ -353,7 +353,7 @@ pub async fn handle_request_challenge(
 
     // Prüfe ob ein User mit dieser Wallet existiert
     {
-        let users = state.users.lock().unwrap();
+        let users = state.users.lock().unwrap_or_else(|e| e.into_inner());
         if !users.iter().any(|u| u.wallet_address == wallet) {
             return (
                 StatusCode::NOT_FOUND,
@@ -415,7 +415,7 @@ pub async fn handle_verify_challenge(
 
     // User anhand der Wallet-Adresse finden
     let user = {
-        let users = state.users.lock().unwrap();
+        let users = state.users.lock().unwrap_or_else(|e| e.into_inner());
         users.iter().find(|u| u.wallet_address == wallet).cloned()
     };
 
@@ -518,7 +518,7 @@ pub async fn handle_qr_status(
             if let Some(approved) = state.qr_login_store.consume_approved(&login_token) {
                 // api_key des Users für Legacy-Kompatibilität mitgeben
                 let api_key = {
-                    let users = state.users.lock().unwrap();
+                    let users = state.users.lock().unwrap_or_else(|e| e.into_inner());
                     approved.approved_wallet.as_ref()
                         .and_then(|w| users.iter().find(|u| &u.wallet_address == w))
                         .map(|u| u.api_key.clone())

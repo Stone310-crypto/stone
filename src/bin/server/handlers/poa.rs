@@ -43,7 +43,7 @@ pub struct CastVoteRequest {
 pub async fn handle_list_validators(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let vs = state.node.validator_set.read().unwrap();
+    let vs = state.node.validator_set.read().unwrap_or_else(|e| e.into_inner());
     (
         StatusCode::OK,
         axum::Json(json!({
@@ -87,7 +87,7 @@ pub async fn handle_add_validator(
 
     let node_id = info.node_id.clone();
     {
-        let mut vs = state.node.validator_set.write().unwrap();
+        let mut vs = state.node.validator_set.write().unwrap_or_else(|e| e.into_inner());
         vs.add(info);
     }
 
@@ -116,7 +116,7 @@ pub async fn handle_remove_validator(
     require_admin(&headers, &state)?;
 
     let removed = {
-        let mut vs = state.node.validator_set.write().unwrap();
+        let mut vs = state.node.validator_set.write().unwrap_or_else(|e| e.into_inner());
         vs.remove(&node_id)
     };
 
@@ -153,7 +153,7 @@ pub async fn handle_set_validator_active(
     let active = body.get("active").and_then(|v| v.as_bool()).unwrap_or(true);
 
     let ok = {
-        let mut vs = state.node.validator_set.write().unwrap();
+        let mut vs = state.node.validator_set.write().unwrap_or_else(|e| e.into_inner());
         vs.set_active(&node_id, active)
     };
 
@@ -201,8 +201,8 @@ pub async fn handle_validator_self(
 pub async fn handle_consensus_status(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let vs = state.node.validator_set.read().unwrap();
-    let voting = state.node.active_voting.lock().unwrap();
+    let vs = state.node.validator_set.read().unwrap_or_else(|e| e.into_inner());
+    let voting = state.node.active_voting.lock().unwrap_or_else(|e| e.into_inner());
 
     let status = if let Some(ref round) = *voting {
         let tally = round.tally(&vs);
@@ -225,9 +225,9 @@ pub async fn handle_consensus_status(
 
     // Nächste Validator-Auswahl mit Stake-Gewichtung
     let (stakes, jailed, wallet_map) = state.node.build_selection_context();
-    let vs = state.node.validator_set.read().unwrap();
+    let vs = state.node.validator_set.read().unwrap_or_else(|e| e.into_inner());
 
-    let chain = state.node.chain.lock().unwrap();
+    let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
     let next_index = chain.blocks.len() as u64;
     let prev_hash = chain.blocks.last()
         .map(|b| b.hash.clone())
@@ -285,7 +285,7 @@ pub async fn handle_cast_vote(
     let pk_hex = local_validator_pubkey_hex(&sk);
 
     let voter_id = {
-        let vs = state.node.validator_set.read().unwrap();
+        let vs = state.node.validator_set.read().unwrap_or_else(|e| e.into_inner());
         vs.validators
             .iter()
             .find(|v| v.public_key_hex == pk_hex)
@@ -303,8 +303,8 @@ pub async fn handle_cast_vote(
     );
 
     let tally = {
-        let vs = state.node.validator_set.read().unwrap();
-        let mut voting = state.node.active_voting.lock().unwrap();
+        let vs = state.node.validator_set.read().unwrap_or_else(|e| e.into_inner());
+        let mut voting = state.node.active_voting.lock().unwrap_or_else(|e| e.into_inner());
 
         if let Some(ref mut round) = *voting {
             round.add_vote(vote, &vs).map_err(|e| {
@@ -349,8 +349,8 @@ pub async fn handle_cast_vote(
 pub async fn handle_detect_forks(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let chain = state.node.chain.lock().unwrap();
-    let vs = state.node.validator_set.read().unwrap();
+    let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
+    let vs = state.node.validator_set.read().unwrap_or_else(|e| e.into_inner());
 
     let mut fork_groups = detect_forks(&chain.blocks);
 
@@ -401,7 +401,7 @@ pub async fn handle_resolve_fork(
             .into_response());
     }
 
-    let vs = state.node.validator_set.read().unwrap();
+    let vs = state.node.validator_set.read().unwrap_or_else(|e| e.into_inner());
     let resolution = resolve_fork(candidates, &vs);
 
     match resolution {
@@ -434,7 +434,7 @@ pub async fn handle_resolve_fork(
 pub async fn handle_list_checkpoints(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let store = state.node.checkpoint_store.read().unwrap();
+    let store = state.node.checkpoint_store.read().unwrap_or_else(|e| e.into_inner());
     let latest_finalized = store.latest_finalized().map(|c| c.block_index);
     (
         StatusCode::OK,
@@ -455,7 +455,7 @@ pub async fn handle_receive_checkpoint(
 ) -> impl IntoResponse {
     // Validierung: Block-Hash muss mit unserer Chain übereinstimmen
     let local_hash = {
-        let chain = state.node.chain.lock().unwrap();
+        let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
         let idx = incoming.block_index as usize;
         if idx < chain.blocks.len() {
             Some(chain.blocks[idx].hash.clone())
@@ -467,7 +467,7 @@ pub async fn handle_receive_checkpoint(
     match local_hash {
         Some(hash) if hash == incoming.block_hash => {
             // Signaturen mergen
-            let mut store = state.node.checkpoint_store.write().unwrap();
+            let mut store = state.node.checkpoint_store.write().unwrap_or_else(|e| e.into_inner());
             let was_finalized_before = store.latest_finalized().map(|c| c.block_index);
             store.add_or_update(incoming.clone());
             let is_now_finalized = store.latest_finalized().map(|c| c.block_index);
@@ -504,7 +504,7 @@ pub async fn handle_receive_checkpoint(
         }
         None => {
             // Block noch nicht vorhanden – speichern wir trotzdem (Peer könnte weiter sein)
-            let mut store = state.node.checkpoint_store.write().unwrap();
+            let mut store = state.node.checkpoint_store.write().unwrap_or_else(|e| e.into_inner());
             store.add_or_update(incoming.clone());
             (
                 StatusCode::ACCEPTED,
@@ -524,7 +524,7 @@ pub async fn handle_receive_checkpoint(
 pub async fn handle_slashing_info(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let store = state.node.slashing_store.read().unwrap();
+    let store = state.node.slashing_store.read().unwrap_or_else(|e| e.into_inner());
     let jailed_validators: Vec<_> = store.jailed.iter()
         .map(|(id, until)| json!({
             "validator_id": id,
@@ -556,7 +556,7 @@ pub async fn handle_slashing_validator(
     State(state): State<AppState>,
     Path(validator_id): Path<String>,
 ) -> impl IntoResponse {
-    let store = state.node.slashing_store.read().unwrap();
+    let store = state.node.slashing_store.read().unwrap_or_else(|e| e.into_inner());
     let records: Vec<_> = store.records.iter()
         .filter(|r| r.validator_id == validator_id)
         .collect();

@@ -102,7 +102,7 @@ pub async fn handle_trust_registry(
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, Response> {
     require_admin(&headers, &state)?;
-    let registry = state.node.trust_registry.read().unwrap().clone();
+    let registry = state.node.trust_registry.read().unwrap_or_else(|e| e.into_inner()).clone();
     Ok((StatusCode::OK, axum::Json(registry)))
 }
 
@@ -208,7 +208,7 @@ pub async fn handle_trust_check(
     Path(peer_id): Path<String>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let registry = state.node.trust_registry.read().unwrap();
+    let registry = state.node.trust_registry.read().unwrap_or_else(|e| e.into_inner());
     match registry.iter().find(|e| e.peer_id == peer_id) {
         Some(entry) => {
             let status_str = match entry.status {

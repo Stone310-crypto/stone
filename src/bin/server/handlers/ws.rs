@@ -32,8 +32,8 @@ pub async fn websocket_handler(
     node: Arc<MasterNodeState>,
 ) {
     let init = {
-        let chain = node.chain.lock().unwrap();
-        let peers = node.peers.read().unwrap();
+        let chain = node.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let peers = node.peers.read().unwrap_or_else(|e| e.into_inner());
         let peers_healthy = peers.iter().filter(|p| p.is_healthy()).count();
         let documents_total = chain.list_all_documents().len() as u64;
         let now = chrono::Utc::now().timestamp();

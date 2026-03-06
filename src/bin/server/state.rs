@@ -185,7 +185,7 @@ struct TrustPersist {
 pub fn save_trust(state: &AppState) {
     let _ = std::fs::create_dir_all(data_dir());
     let data = TrustPersist {
-        registry: state.node.trust_registry.read().unwrap().clone(),
+        registry: state.node.trust_registry.read().unwrap_or_else(|e| e.into_inner()).clone(),
         history: state.node.trust_history_snapshot(),
     };
     if let Ok(json) = serde_json::to_string_pretty(&data) {
@@ -196,8 +196,8 @@ pub fn save_trust(state: &AppState) {
 pub fn load_trust_from_disk(state: &MasterNodeState) {
     if let Ok(raw) = std::fs::read_to_string(trust_file()) {
         if let Ok(data) = serde_json::from_str::<TrustPersist>(&raw) {
-            *state.trust_registry.write().unwrap() = data.registry;
-            *state.trust_history.lock().unwrap() = data.history;
+            *state.trust_registry.write().unwrap_or_else(|e| e.into_inner()) = data.registry;
+            *state.trust_history.lock().unwrap_or_else(|e| e.into_inner()) = data.history;
         }
     }
 }

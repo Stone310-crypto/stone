@@ -29,7 +29,7 @@ use super::state::AppState;
 
 /// GET /health
 async fn sync_health(State(state): State<AppState>) -> impl IntoResponse {
-    let chain = state.node.chain.lock().unwrap();
+    let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
     let height = chain.blocks.len() as u64;
     let latest = chain.latest_hash.clone();
     drop(chain);
@@ -75,7 +75,7 @@ async fn sync_info(State(state): State<AppState>) -> impl IntoResponse {
 
 /// GET /users – Öffentliche User-Liste (Name, ID, Wallet)
 async fn sync_users_list(State(state): State<AppState>) -> impl IntoResponse {
-    let users = state.users.lock().unwrap();
+    let users = state.users.lock().unwrap_or_else(|e| e.into_inner());
     let list: Vec<serde_json::Value> = users
         .iter()
         .map(|u| {
@@ -109,7 +109,7 @@ async fn sync_resolve(
 
     // Lokale User durchsuchen
     {
-        let users = state.users.lock().unwrap();
+        let users = state.users.lock().unwrap_or_else(|e| e.into_inner());
         for u in users.iter() {
             let name_match = u.name.to_lowercase().contains(&lower);
             let id_match = u.id == identifier;
@@ -130,7 +130,7 @@ async fn sync_resolve(
 
     // On-Chain Accounts durchsuchen
     {
-        let ledger = state.node.token_ledger.read().unwrap();
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
         for (wallet, name) in ledger.all_registered_accounts() {
             if seen_wallets.contains(wallet.as_str()) {
                 continue;
@@ -184,7 +184,7 @@ async fn sync_peers(State(state): State<AppState>) -> impl IntoResponse {
 
 /// GET /chain-info
 async fn sync_chain_info(State(state): State<AppState>) -> impl IntoResponse {
-    let chain = state.node.chain.lock().unwrap();
+    let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
     let height = chain.blocks.len() as u64;
     let latest = chain.latest_hash.clone();
     let genesis = chain.blocks.first().map(|b| b.hash.clone()).unwrap_or_default();
@@ -214,7 +214,7 @@ async fn sync_blocks(
     Query(q): Query<BlockQuery>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let chain = state.node.chain.lock().unwrap();
+    let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
     let from = q.from.unwrap_or(0) as usize;
     let limit = q.limit.unwrap_or(50).min(200);
     let total = chain.blocks.len();
@@ -252,7 +252,7 @@ async fn sync_block(
     Path(index): Path<u64>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let chain = state.node.chain.lock().unwrap();
+    let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(block) = chain.blocks.get(index as usize) {
         (
             StatusCode::OK,
@@ -279,7 +279,7 @@ async fn sync_receive_users(
     State(state): State<AppState>,
     axum::Json(incoming): axum::Json<Vec<SyncUser>>,
 ) -> impl IntoResponse {
-    let mut users = state.users.lock().unwrap();
+    let mut users = state.users.lock().unwrap_or_else(|e| e.into_inner());
     let mut added = 0usize;
     let mut updated = 0usize;
 

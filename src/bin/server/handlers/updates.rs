@@ -27,7 +27,7 @@ use super::super::state::AppState;
 pub async fn handle_update_status(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let updater = state.updater.read().unwrap();
+    let updater = state.updater.read().unwrap_or_else(|e| e.into_inner());
     let progress = updater.progress();
     let config = &updater.config;
 
@@ -66,7 +66,7 @@ pub async fn handle_update_chunk(
     State(state): State<AppState>,
     Path(index): Path<usize>,
 ) -> impl IntoResponse {
-    let updater = state.updater.read().unwrap();
+    let updater = state.updater.read().unwrap_or_else(|e| e.into_inner());
 
     match updater.get_chunk(index) {
         Some(data) => (
@@ -110,7 +110,7 @@ pub async fn handle_update_publish(
 
     // Update im Manager speichern
     {
-        let mut updater = state.updater.write().unwrap();
+        let mut updater = state.updater.write().unwrap_or_else(|e| e.into_inner());
         updater
             .publish_update(payload.manifest.clone(), chunk_data)
             .map_err(|e| {
@@ -161,7 +161,7 @@ pub async fn handle_update_install(
 
     // Erst verifizieren & vorbereiten falls nötig
     {
-        let mut updater = state.updater.write().unwrap();
+        let mut updater = state.updater.write().unwrap_or_else(|e| e.into_inner());
 
         if updater.state == stone::updater::UpdateState::Verifying
             || updater.state == stone::updater::UpdateState::Available
@@ -264,7 +264,7 @@ pub async fn handle_update_download(
     require_admin(&headers, &state)?;
 
     let (missing, manifest, peers_urls) = {
-        let updater = state.updater.read().unwrap();
+        let updater = state.updater.read().unwrap_or_else(|e| e.into_inner());
         let missing = updater.missing_chunks();
         let manifest = updater.manifest.clone();
         let peers: Vec<String> = state
@@ -334,7 +334,7 @@ async fn download_missing_chunks(
             match client.get(&url).send().await {
                 Ok(resp) if resp.status().is_success() => {
                     if let Ok(data) = resp.bytes().await {
-                        let mut updater = state.updater.write().unwrap();
+                        let mut updater = state.updater.write().unwrap_or_else(|e| e.into_inner());
                         match updater.store_chunk(chunk_idx, data.to_vec()) {
                             Ok(()) => {
                                 println!(
@@ -367,7 +367,7 @@ async fn download_missing_chunks(
     }
 
     // Prüfen ob alles da ist
-    let mut updater = state.updater.write().unwrap();
+    let mut updater = state.updater.write().unwrap_or_else(|e| e.into_inner());
     if updater.missing_chunks().is_empty() {
         println!("[updater] ✓ Alle Chunks heruntergeladen – verifiziere...");
         match updater.verify_and_prepare() {
@@ -415,7 +415,7 @@ pub async fn handle_update_config(
 ) -> Result<impl IntoResponse, Response> {
     require_admin(&headers, &state)?;
 
-    let mut updater = state.updater.write().unwrap();
+    let mut updater = state.updater.write().unwrap_or_else(|e| e.into_inner());
 
     if let Some(auto_download) = payload.auto_download {
         updater.config.auto_download = auto_download;

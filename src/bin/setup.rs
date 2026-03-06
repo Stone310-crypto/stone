@@ -1480,17 +1480,26 @@ async fn api_network_storage(State(state): State<SetupState>) -> Json<NetworkSto
     })
 }
 
-// ─── Fallback: /api/v1/* und /ws an Node-Router weiterleiten ────────────────
+// ─── Fallback: /api/* und /ws an Node-Router weiterleiten ───────────────────
 
 async fn forward_to_node_api(
     State(state): State<SetupState>,
-    req: Request<Body>,
+    mut req: Request<Body>,
 ) -> Response {
     let path = req.uri().path().to_string();
 
-    // Nur /api/v1/* und /ws weiterleiten
-    if !path.starts_with("/api/v1/") && path != "/ws" {
+    // /api/* und /ws weiterleiten
+    if !path.starts_with("/api/") && path != "/ws" {
         return (StatusCode::NOT_FOUND, "Not Found").into_response();
+    }
+
+    // Compat: /api/xxx → /api/v1/xxx rewrite (Flask/iOS nutzen alte Pfade)
+    if path.starts_with("/api/") && !path.starts_with("/api/v1/") {
+        let new_path = format!("/api/v1/{}", &path[5..]);
+        let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
+        if let Ok(new_uri) = format!("{new_path}{query}").parse() {
+            *req.uri_mut() = new_uri;
+        }
     }
 
     let ns = state.node_state.read().await;

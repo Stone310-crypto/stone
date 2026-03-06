@@ -107,7 +107,7 @@ pub async fn handle_chat_send(
 
     // ── Stake-Gate: Messenger erfordert Minimum-Stake ─────────────────────
     {
-        let pool = state.node.staking_pool.read().unwrap();
+        let pool = state.node.staking_pool.read().unwrap_or_else(|e| e.into_inner());
         let staked = pool.stakers.get(&wallet.address())
             .map(|s| s.staked_amount)
             .unwrap_or(rust_decimal::Decimal::ZERO);
@@ -131,7 +131,7 @@ pub async fn handle_chat_send(
 
     // Prüfen: Empfänger muss ein registrierter Account sein
     {
-        let ledger = state.node.token_ledger.read().unwrap();
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
         if !ledger.all_registered_accounts().contains_key(&to_wallet) {
             return (
                 StatusCode::NOT_FOUND,
@@ -160,7 +160,7 @@ pub async fn handle_chat_send(
 
     // Nonce für die TX
     let nonce = {
-        let ledger = state.node.token_ledger.read().unwrap();
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
         ledger.nonce(&wallet.address())
     };
 
@@ -185,7 +185,7 @@ pub async fn handle_chat_send(
 
     // In Mempool einfügen
     let result = {
-        let ledger = state.node.token_ledger.read().unwrap();
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
         state.node.mempool.add_tx(tx.clone(), Some(&ledger))
     };
 
@@ -243,8 +243,8 @@ pub async fn handle_chat_conversations(
     // Neue Blöcke indexieren
     index_new_blocks_if_needed(&state);
 
-    let users_map = state.users.lock().unwrap().clone();
-    let idx = state.chat_index.lock().unwrap();
+    let users_map = state.users.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let idx = state.chat_index.lock().unwrap_or_else(|e| e.into_inner());
     let convos = idx.conversations_for(&user.wallet_address, &users_map);
 
     (
@@ -280,11 +280,11 @@ pub async fn handle_chat_messages(
     // Neue Blöcke indexieren
     index_new_blocks_if_needed(&state);
 
-    let idx = state.chat_index.lock().unwrap();
+    let idx = state.chat_index.lock().unwrap_or_else(|e| e.into_inner());
     let messages = idx.messages_between(&user.wallet_address, &peer_wallet, query.limit, query.offset);
 
     // Diagnostic info
-    let block_height = state.node.chain.lock().unwrap().blocks.len() as u64;
+    let block_height = state.node.chain.lock().unwrap_or_else(|e| e.into_inner()).blocks.len() as u64;
     let last_indexed = idx.last_indexed_block;
     let mempool_count = state.node.mempool.pending_count();
     let mining_active = state.node.metrics.mining_throttle_pct.load(std::sync::atomic::Ordering::Relaxed) > 0;
@@ -312,7 +312,7 @@ pub async fn handle_chat_messages(
 /// Lokale Suche: state.users + on-chain account_names.
 /// Gibt Vec<serde_json::Value> mit {user_id, name, wallet} zurück.
 fn resolve_local(identifier: &str, state: &AppState) -> Vec<serde_json::Value> {
-    let users = state.users.lock().unwrap();
+    let users = state.users.lock().unwrap_or_else(|e| e.into_inner());
 
     // 1) Exakte User-ID
     if let Some(u) = users.iter().find(|u| u.id == identifier) {
@@ -334,7 +334,7 @@ fn resolve_local(identifier: &str, state: &AppState) -> Vec<serde_json::Value> {
                 "wallet": u.wallet_address,
             })];
         }
-        let ledger = state.node.token_ledger.read().unwrap();
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
         if ledger.all_registered_accounts().contains_key(identifier) {
             return vec![json!({
                 "user_id": "",
@@ -364,7 +364,7 @@ fn resolve_local(identifier: &str, state: &AppState) -> Vec<serde_json::Value> {
             .iter()
             .filter_map(|m| m["wallet"].as_str().map(|s| s.to_string()))
             .collect();
-        let ledger = state.node.token_ledger.read().unwrap();
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
         for (wallet, name) in ledger.all_registered_accounts() {
             if known_wallets.contains(wallet) {
                 continue;
@@ -543,7 +543,7 @@ pub async fn handle_chat_pending(
         })
         .collect();
 
-    let block_height = state.node.chain.lock().unwrap().blocks.len() as u64;
+    let block_height = state.node.chain.lock().unwrap_or_else(|e| e.into_inner()).blocks.len() as u64;
 
     (
         StatusCode::OK,
@@ -569,7 +569,7 @@ fn resolve_recipient(identifier: &str, state: &AppState) -> Option<String> {
         return Some(identifier.to_string());
     }
 
-    let users = state.users.lock().unwrap();
+    let users = state.users.lock().unwrap_or_else(|e| e.into_inner());
 
     // User-ID (UUID)
     if let Some(u) = users.iter().find(|u| u.id == identifier) {
@@ -591,8 +591,8 @@ fn resolve_recipient(identifier: &str, state: &AppState) -> Option<String> {
 /// Erkennt auch Chain-Resets: wenn `last_indexed_block > chain_len`,
 /// wird der Index komplett neu aufgebaut.
 fn index_new_blocks_if_needed(state: &AppState) {
-    let chain = state.node.chain.lock().unwrap();
-    let mut idx = state.chat_index.lock().unwrap();
+    let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
+    let mut idx = state.chat_index.lock().unwrap_or_else(|e| e.into_inner());
 
     let chain_len = chain.blocks.len() as u64;
     let last_idx = idx.last_indexed_block;
@@ -640,7 +640,7 @@ fn index_new_blocks_if_needed(state: &AppState) {
 
     // ── Self-Destruct GC: Abgelaufene Nachrichten-Content löschen ─────────
     {
-        let mut policy = state.node.chat_policy.write().unwrap();
+        let mut policy = state.node.chat_policy.write().unwrap_or_else(|e| e.into_inner());
         let purged = stone::chat_policy::gc_expired_messages(&mut policy, &mut idx);
         if purged > 0 {
             let _ = stone::chat::save_chat_index(&idx);
@@ -683,7 +683,7 @@ pub async fn handle_add_contact(
 
     // Kontakt auflösen (Wallet, User-ID oder Name)
     let (contact_wallet, contact_user_id, contact_name) = {
-        let users = state.users.lock().unwrap();
+        let users = state.users.lock().unwrap_or_else(|e| e.into_inner());
         let identifier = req.identifier.trim();
 
         // 1) Direkte Wallet-Adresse (64 hex)
@@ -695,7 +695,7 @@ pub async fn handle_add_contact(
                 Some((uid, name)) => (identifier.to_string(), uid, name),
                 None => {
                     // Im Ledger nachschauen
-                    let ledger = state.node.token_ledger.read().unwrap();
+                    let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
                     let name = ledger.account_name(identifier)
                         .unwrap_or("Unbekannt").to_string();
                     (identifier.to_string(), String::new(), name)
@@ -721,7 +721,7 @@ pub async fn handle_add_contact(
                 Some(u) => (u.wallet_address.clone(), u.id.clone(), u.name.clone()),
                 None => {
                     // Fallback: On-Chain Ledger
-                    let ledger = state.node.token_ledger.read().unwrap();
+                    let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
                     let chain_match = ledger.all_registered_accounts().iter()
                         .find(|(_, name)| name.to_lowercase() == lower)
                         .map(|(w, n)| (w.clone(), n.clone()));
@@ -746,7 +746,7 @@ pub async fn handle_add_contact(
 
     let nickname = req.nickname.unwrap_or_else(|| contact_name.clone());
 
-    let mut contacts = state.contacts.lock().unwrap();
+    let mut contacts = state.contacts.lock().unwrap_or_else(|e| e.into_inner());
     if contacts.add_contact(&user.wallet_address, &contact_wallet, &contact_user_id, &nickname) {
         stone::chat::save_contacts(&contacts);
         (
@@ -787,18 +787,18 @@ pub async fn handle_list_contacts(
         ).into_response();
     }
 
-    let contacts = state.contacts.lock().unwrap();
+    let contacts = state.contacts.lock().unwrap_or_else(|e| e.into_inner());
     let my_contacts = contacts.get_contacts(&user.wallet_address);
 
     // Kontakte mit aktuellen User-Daten anreichern
-    let users = state.users.lock().unwrap();
+    let users = state.users.lock().unwrap_or_else(|e| e.into_inner());
     let enriched: Vec<_> = my_contacts.iter().map(|c| {
         let current_name = users.iter()
             .find(|u| u.wallet_address == c.wallet)
             .map(|u| u.name.clone())
             .unwrap_or_else(|| {
                 // Fallback: Ledger
-                let ledger = state.node.token_ledger.read().unwrap();
+                let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
                 ledger.account_name(&c.wallet)
                     .unwrap_or("Unbekannt").to_string()
             });
@@ -840,7 +840,7 @@ pub async fn handle_remove_contact(
         ).into_response();
     }
 
-    let mut contacts = state.contacts.lock().unwrap();
+    let mut contacts = state.contacts.lock().unwrap_or_else(|e| e.into_inner());
     if contacts.remove_contact(&user.wallet_address, &contact_wallet) {
         stone::chat::save_contacts(&contacts);
         (
@@ -949,7 +949,7 @@ pub async fn handle_chat_send_coins(
 
     // Balance prüfen
     {
-        let ledger = state.node.token_ledger.read().unwrap();
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
         let balance = ledger.balance(&wallet.address());
         if balance < amount {
             return (
@@ -966,7 +966,7 @@ pub async fn handle_chat_send_coins(
 
     // Nonce für Transfer-TX
     let nonce = {
-        let ledger = state.node.token_ledger.read().unwrap();
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
         ledger.nonce(&wallet.address())
     };
 
@@ -996,7 +996,7 @@ pub async fn handle_chat_send_coins(
 
     // In Mempool
     let transfer_result = {
-        let ledger = state.node.token_ledger.read().unwrap();
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
         state.node.mempool.add_tx(transfer_tx.clone(), Some(&ledger))
     };
 
@@ -1009,7 +1009,7 @@ pub async fn handle_chat_send_coins(
 
     // 2) Chat-Benachrichtigung als ChatMessage TX
     let chat_nonce = {
-        let ledger = state.node.token_ledger.read().unwrap();
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
         ledger.nonce(&wallet.address())
     };
 
@@ -1052,7 +1052,7 @@ pub async fn handle_chat_send_coins(
 
     // Chat-TX in Mempool
     let _ = {
-        let ledger = state.node.token_ledger.read().unwrap();
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
         state.node.mempool.add_tx(chat_tx.clone(), Some(&ledger))
     };
 
@@ -1147,7 +1147,7 @@ pub async fn handle_chat_request_coins(
 
     // Stake-Gate prüfen
     {
-        let pool = state.node.staking_pool.read().unwrap();
+        let pool = state.node.staking_pool.read().unwrap_or_else(|e| e.into_inner());
         let staked = pool.stakers.get(&wallet.address())
             .map(|s| s.staked_amount)
             .unwrap_or(rust_decimal::Decimal::ZERO);
@@ -1169,7 +1169,7 @@ pub async fn handle_chat_request_coins(
 
     // Chat-Nachricht als Coin-Request senden
     let nonce = {
-        let ledger = state.node.token_ledger.read().unwrap();
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
         ledger.nonce(&wallet.address())
     };
 
@@ -1201,7 +1201,7 @@ pub async fn handle_chat_request_coins(
 
     // In Mempool
     let result = {
-        let ledger = state.node.token_ledger.read().unwrap();
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
         state.node.mempool.add_tx(tx.clone(), Some(&ledger))
     };
 

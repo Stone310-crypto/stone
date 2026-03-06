@@ -78,7 +78,7 @@ pub async fn handle_mining_status(
 
     // Staking-Infos
     let (total_staked, total_staked_dec, staker_count) = {
-        let pool = state.node.staking_pool.read().unwrap();
+        let pool = state.node.staking_pool.read().unwrap_or_else(|e| e.into_inner());
         (pool.total_staked.to_string(), pool.total_staked, pool.stakers.len())
     };
 
@@ -86,7 +86,7 @@ pub async fn handle_mining_status(
     let (total_supply, circulating, validator_balance, pool_balance, validator_wallet) = {
         let signing_key = load_or_create_validator_key();
         let vw = local_validator_pubkey_hex(&signing_key);
-        let ledger = state.node.token_ledger.read().unwrap();
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
         let ts = ledger.total_supply();
         let pool_bal = ledger.balance("pool:storage_rewards");
         let circ = ts - total_staked_dec - pool_bal;
@@ -101,7 +101,7 @@ pub async fn handle_mining_status(
 
     // PoA Validator-Status
     let (is_validator, validator_count) = {
-        let vs = state.node.validator_set.read().unwrap();
+        let vs = state.node.validator_set.read().unwrap_or_else(|e| e.into_inner());
         (
             vs.is_active_validator(&state.node.node_id),
             vs.validators.len(),
@@ -290,7 +290,7 @@ pub async fn handle_mining_withdraw(
     // Balance und Nonce atomar mit Mempool-Pending-State lesen, um Race
     // Conditions bei gleichzeitigen Requests zu vermeiden.
     let (balance, nonce) = {
-        let ledger = state.node.token_ledger.read().unwrap();
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
         let base_nonce = ledger.nonce(&source_wallet);
         let pending_count = state.node.mempool.sender_pending_count(&source_wallet);
         (ledger.balance(&source_wallet), base_nonce + pending_count)
@@ -350,7 +350,7 @@ pub async fn handle_mining_withdraw(
 
     // In Mempool einfügen (mit Ledger-Pre-Check)
     let submit_result = {
-        let ledger = state.node.token_ledger.read().unwrap();
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
         state.node.mempool.add_tx(tx, Some(&ledger))
     };
 
@@ -425,7 +425,7 @@ pub async fn handle_mining_stake(
 
     // Balance und Nonce atomar berechnen (inkl. Pending-TXs im Mempool)
     let (balance, nonce) = {
-        let ledger = state.node.token_ledger.read().unwrap();
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
         let base_nonce = ledger.nonce(&user_wallet);
         let pending_count = state.node.mempool.sender_pending_count(&user_wallet);
         (ledger.balance(&user_wallet), base_nonce + pending_count)
@@ -466,7 +466,7 @@ pub async fn handle_mining_stake(
     let tx_id = tx.tx_id.clone();
 
     let submit_result = {
-        let ledger = state.node.token_ledger.read().unwrap();
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
         state.node.mempool.add_tx(tx, Some(&ledger))
     };
 
@@ -533,7 +533,7 @@ pub async fn handle_mining_unstake(
 
     // Staking-Status der User-Wallet prüfen
     {
-        let pool = state.node.staking_pool.read().unwrap();
+        let pool = state.node.staking_pool.read().unwrap_or_else(|e| e.into_inner());
         match pool.staker_info(&user_wallet) {
             Some(info) => {
                 if info.staked_amount < amount {
@@ -556,7 +556,7 @@ pub async fn handle_mining_unstake(
 
     // Nonce atomar berechnen (inkl. Pending-TXs im Mempool)
     let nonce = {
-        let ledger = state.node.token_ledger.read().unwrap();
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
         let base_nonce = ledger.nonce(&user_wallet);
         base_nonce + state.node.mempool.sender_pending_count(&user_wallet)
     };
@@ -586,7 +586,7 @@ pub async fn handle_mining_unstake(
     let tx_id = tx.tx_id.clone();
 
     let submit_result = {
-        let ledger = state.node.token_ledger.read().unwrap();
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
         state.node.mempool.add_tx(tx, Some(&ledger))
     };
 
@@ -672,7 +672,7 @@ pub async fn handle_bind_mining_wallet(
     let is_current_owner = user.wallet_address == current_reward_wallet;
 
     // Prüfen ob bereits eine Mining-Wallet gebunden ist
-    let has_binding = state.node.mining_wallet.read().unwrap().is_some();
+    let has_binding = state.node.mining_wallet.read().unwrap_or_else(|e| e.into_inner()).is_some();
 
     if has_binding && !is_admin && !is_current_owner {
         return (
@@ -688,7 +688,7 @@ pub async fn handle_bind_mining_wallet(
     // Wallet binden
     let new_wallet = Some(req.wallet.clone());
     {
-        let mut mw = state.node.mining_wallet.write().unwrap();
+        let mut mw = state.node.mining_wallet.write().unwrap_or_else(|e| e.into_inner());
         *mw = new_wallet.clone();
     }
     stone::master_node::MasterNodeState::save_mining_wallet(&new_wallet);
@@ -722,11 +722,11 @@ pub async fn handle_mining_wallet_info(
 
     let signing_key = load_or_create_validator_key();
     let validator_wallet = local_validator_pubkey_hex(&signing_key);
-    let mining_wallet = state.node.mining_wallet.read().unwrap().clone();
+    let mining_wallet = state.node.mining_wallet.read().unwrap_or_else(|e| e.into_inner()).clone();
     let effective = state.node.effective_reward_wallet();
 
     let balance = {
-        let ledger = state.node.token_ledger.read().unwrap();
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
         ledger.balance(&effective).to_string()
     };
 

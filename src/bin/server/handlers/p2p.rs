@@ -198,7 +198,7 @@ pub async fn handle_p2p_proposal(
     axum::Json(proposal): axum::Json<BlockProposal>,
 ) -> impl IntoResponse {
     // 1. Validator-Set laden
-    let vs = state.node.validator_set.read().unwrap().clone();
+    let vs = state.node.validator_set.read().unwrap_or_else(|e| e.into_inner()).clone();
 
     // 2. Proposer-Signatur prüfen
     if !proposal.verify_proposer(&vs) {
@@ -220,7 +220,7 @@ pub async fn handle_p2p_proposal(
 
     // 3. Prüfen ob der Proposer der ausgewählte Validator für diesen Slot ist
     let (prev_hash, expected_index) = {
-        let chain = state.node.chain.lock().unwrap();
+        let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
         let ph = chain.blocks.last()
             .map(|b| b.hash.clone())
             .unwrap_or_else(|| "genesis".to_string());
@@ -320,7 +320,7 @@ pub async fn handle_p2p_proposal(
 
     // 6. Auto-Registrierung: Proposer als Validator hinzufügen falls unbekannt
     {
-        let mut vs_w = state.node.validator_set.write().unwrap();
+        let mut vs_w = state.node.validator_set.write().unwrap_or_else(|e| e.into_inner());
         if vs_w.get(&proposal.proposer_id).is_none() {
             let pub_key_hex = proposal.block.validator_pub_key.clone();
             let mut vi = stone::consensus::ValidatorInfo::new(
@@ -352,7 +352,7 @@ pub async fn handle_p2p_precommit(
     State(state): State<AppState>,
     axum::Json(pcr): axum::Json<PreCommitRequest>,
 ) -> impl IntoResponse {
-    let vs = state.node.validator_set.read().unwrap().clone();
+    let vs = state.node.validator_set.read().unwrap_or_else(|e| e.into_inner()).clone();
     let signing_key = load_or_create_validator_key();
 
     // 1. Pre-Votes verifizieren: jede Signatur muss gültig sein
@@ -396,7 +396,7 @@ pub async fn handle_p2p_precommit(
 
     // 3. Block-Hash mit lokaler Chain abgleichen
     let (prev_hash, expected_index) = {
-        let chain = state.node.chain.lock().unwrap();
+        let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
         let ph = chain.blocks.last()
             .map(|b| b.hash.clone())
             .unwrap_or_else(|| "genesis".to_string());

@@ -20,15 +20,15 @@ use super::super::state::AppState;
 pub async fn handle_reputation_status(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let registry = state.node.reputation_registry.read().unwrap();
+    let registry = state.node.reputation_registry.read().unwrap_or_else(|e| e.into_inner());
 
     let pool_balance = {
-        let ledger = state.node.token_ledger.read().unwrap();
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
         ledger.balance(reputation::NODE_OPERATOR_POOL)
     };
 
     let chain_height = {
-        let chain = state.node.chain.lock().unwrap();
+        let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
         chain.blocks.len() as u64
     };
 
@@ -66,7 +66,7 @@ pub async fn handle_reputation_status(
 pub async fn handle_reputation_nodes(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let registry = state.node.reputation_registry.read().unwrap();
+    let registry = state.node.reputation_registry.read().unwrap_or_else(|e| e.into_inner());
     let mut nodes = registry.all_nodes_info();
     // Absteigend nach Score sortieren
     nodes.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
@@ -85,7 +85,7 @@ pub async fn handle_reputation_node(
     State(state): State<AppState>,
     Path(node_id): Path<String>,
 ) -> impl IntoResponse {
-    let registry = state.node.reputation_registry.read().unwrap();
+    let registry = state.node.reputation_registry.read().unwrap_or_else(|e| e.into_inner());
 
     match registry.node_info(&node_id) {
         Some(info) => (

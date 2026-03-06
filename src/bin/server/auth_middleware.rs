@@ -61,7 +61,7 @@ pub fn resolve_user_by_key(
             org_role: String::new(),
         });
     }
-    let guard = users.lock().unwrap();
+    let guard = users.lock().unwrap_or_else(|e| e.into_inner());
     guard.iter().find(|u| constant_time_eq(&u.api_key, key)).cloned()
 }
 
@@ -72,7 +72,7 @@ fn resolve_user_by_session_token(
     cluster_key: &str,
 ) -> Option<User> {
     let claims = validate_session_token(token, cluster_key)?;
-    let guard = users.lock().unwrap();
+    let guard = users.lock().unwrap_or_else(|e| e.into_inner());
     guard.iter().find(|u| u.wallet_address == claims.wallet_address).cloned()
 }
 

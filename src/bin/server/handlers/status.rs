@@ -159,7 +159,7 @@ pub async fn handle_network_stats(
 
     let m = state.node.snapshot_metrics();
     let block_count = {
-        let chain = state.node.chain.lock().unwrap();
+        let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
         chain.blocks.len() as u64
     };
 
@@ -211,7 +211,7 @@ pub fn format_uptime(secs: u64) -> String {
 pub async fn handle_verify(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let chain = state.node.chain.lock().unwrap();
+    let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
     let cluster_key = &state.node.cluster_key;
     let valid = chain.verify(cluster_key);
 
@@ -296,7 +296,7 @@ pub async fn handle_shard_health(
 
     // 2. Aus der Blockchain: alle Dokumente mit EC-Shards analysieren
     //    Nutzt die Shard-Holder-Registry als Source-of-Truth für Verfügbarkeit
-    let chain = state.node.chain.lock().unwrap();
+    let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
     let registry = &state.node.shard_registry;
     let mut total_docs_ec = 0u64;
     let mut total_chunks_ec = 0u64;

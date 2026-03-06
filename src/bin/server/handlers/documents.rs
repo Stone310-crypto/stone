@@ -190,7 +190,7 @@ pub async fn handle_list_documents(
     Query(q): Query<DocQuery>,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let chain = state.node.chain.lock().unwrap();
+    let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
     let per_page = q.per_page.unwrap_or(50).min(500) as usize;
     let page = q.page.unwrap_or(0) as usize;
 
@@ -244,7 +244,7 @@ pub async fn handle_list_user_documents(
             .into_response());
     }
 
-    let chain = state.node.chain.lock().unwrap();
+    let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
     let per_page = q.per_page.unwrap_or(50).min(500) as usize;
     let page = q.page.unwrap_or(0) as usize;
 
@@ -274,7 +274,7 @@ pub async fn handle_get_document(
     Path(doc_id): Path<String>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, Response> {
-    let chain = state.node.chain.lock().unwrap();
+    let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
     let (doc, block_index) = chain.find_document(&doc_id).ok_or_else(|| {
         (
             StatusCode::NOT_FOUND,
@@ -298,7 +298,7 @@ pub async fn handle_document_history(
     Path(doc_id): Path<String>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, Response> {
-    let chain = state.node.chain.lock().unwrap();
+    let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
 
     let history: Vec<_> = chain
         .document_history(&doc_id)
@@ -344,7 +344,7 @@ pub async fn handle_get_document_data(
 ) -> Result<Response, Response> {
     let user = require_user(&headers, &state)?;
     let (doc_owned, content_type) = {
-        let chain = state.node.chain.lock().unwrap();
+        let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
         let (doc, _) = chain.find_document(&doc_id).ok_or_else(|| {
             (
                 StatusCode::NOT_FOUND,
@@ -602,7 +602,7 @@ pub async fn handle_upload_document(
     };
 
     let current_usage = {
-        let chain = state.node.chain.lock().unwrap();
+        let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
         chain.user_usage_bytes(&user.id)
     };
     if current_usage + file_bytes.len() as u64 > user.quota_bytes {
@@ -718,7 +718,7 @@ pub async fn handle_upload_document(
     };
 
     let version = {
-        let chain = state.node.chain.lock().unwrap();
+        let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(id) = &doc_id {
             chain
                 .find_document(id)
@@ -778,7 +778,7 @@ pub async fn handle_upload_document(
     if let Some(ref network) = state.network {
         let block_clone = block.clone();
         let network_clone = network.clone();
-        let chain_count = state.node.chain.lock().unwrap().blocks.len() as u64;
+        let chain_count = state.node.chain.lock().unwrap_or_else(|e| e.into_inner()).blocks.len() as u64;
 
         // Block an alle Peers broadcasten (Shards wurden bereits oben verteilt)
         tokio::spawn(async move {
@@ -816,7 +816,7 @@ pub async fn handle_delete_document(
     let user = require_user(&headers, &state)?;
 
     {
-        let chain = state.node.chain.lock().unwrap();
+        let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
         let (doc, _) = chain.find_document(&doc_id).ok_or_else(|| {
             (
                 StatusCode::NOT_FOUND,
@@ -870,7 +870,7 @@ pub async fn handle_patch_document(
     let user = require_user(&headers, &state)?;
 
     let updated_doc = {
-        let chain = state.node.chain.lock().unwrap();
+        let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
         let (doc, _) = chain.find_document(&doc_id).ok_or_else(|| {
             (
                 StatusCode::NOT_FOUND,
@@ -971,7 +971,7 @@ pub async fn handle_transfer_document(
     }
 
     let current_doc: Document = {
-        let chain = state.node.chain.lock().unwrap();
+        let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
         let maybe = chain.find_document(&doc_id).map(|(d, _)| d.clone());
         drop(chain);
         maybe.ok_or_else(|| {
@@ -1017,7 +1017,7 @@ pub async fn handle_transfer_document(
 
     // Wallet-Adresse des Senders ermitteln
     let sender_wallet = {
-        let users = state.users.lock().unwrap();
+        let users = state.users.lock().unwrap_or_else(|e| e.into_inner());
         users.iter()
             .find(|u| u.id == caller.id)
             .map(|u| u.wallet_address.clone())
@@ -1027,7 +1027,7 @@ pub async fn handle_transfer_document(
     if !sender_wallet.is_empty() {
         // Zufälligen aktiven Validator auswählen
         let validator_wallet = {
-            let vs = state.node.validator_set.read().unwrap();
+            let vs = state.node.validator_set.read().unwrap_or_else(|e| e.into_inner());
             let active: Vec<_> = vs.validators.iter()
                 .filter(|v| v.active)
                 .collect();
@@ -1047,7 +1047,7 @@ pub async fn handle_transfer_document(
 
         if let Some(ref vw) = validator_wallet {
             // Versuche Fee abzubuchen
-            let mut ledger = state.node.token_ledger.write().unwrap();
+            let mut ledger = state.node.token_ledger.write().unwrap_or_else(|e| e.into_inner());
             let balance = ledger.balance(&sender_wallet);
             if balance >= transfer_fee {
                 match ledger.transfer(&sender_wallet, vw, transfer_fee, rust_decimal::Decimal::ZERO) {
@@ -1232,7 +1232,7 @@ pub async fn handle_transfer_document(
     if let Some(ref network) = state.network {
         let block_clone = block.clone();
         let network_clone = network.clone();
-        let chain_count = state.node.chain.lock().unwrap().blocks.len() as u64;
+        let chain_count = state.node.chain.lock().unwrap_or_else(|e| e.into_inner()).blocks.len() as u64;
         tokio::spawn(async move {
             network_clone.broadcast_block(block_clone).await;
             network_clone.set_chain_count(chain_count).await;
@@ -1274,7 +1274,7 @@ pub async fn handle_search_documents(
     let page = q.page.unwrap_or(0) as usize;
     let query_text = q.q.as_deref().unwrap_or("").to_lowercase();
 
-    let chain = state.node.chain.lock().unwrap();
+    let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
 
     let mut docs: Vec<stone::master_node::DocumentResponse> = chain
         .list_all_documents()

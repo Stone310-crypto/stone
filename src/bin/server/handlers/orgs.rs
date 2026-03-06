@@ -95,14 +95,14 @@ pub async fn handle_create_org(
     let org_id = org.id.clone();
 
     {
-        let mut orgs = state.orgs.lock().unwrap();
+        let mut orgs = state.orgs.lock().unwrap_or_else(|e| e.into_inner());
         orgs.push(org.clone());
         save_orgs(&orgs);
     }
 
     // User-Profil aktualisieren
     {
-        let mut users = state.users.lock().unwrap();
+        let mut users = state.users.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(u) = users.iter_mut().find(|u| u.id == user.id) {
             u.account_type = "organization".to_string();
             u.org_id = org_id.clone();
@@ -146,7 +146,7 @@ pub async fn handle_list_orgs(
         Err(e) => return e.into_response(),
     };
 
-    let orgs = state.orgs.lock().unwrap();
+    let orgs = state.orgs.lock().unwrap_or_else(|e| e.into_inner());
     let my_orgs: Vec<serde_json::Value> = orgs
         .iter()
         .filter(|o| o.is_member(&user.id))
@@ -179,7 +179,7 @@ pub async fn handle_get_org(
         Err(e) => return e.into_response(),
     };
 
-    let orgs = state.orgs.lock().unwrap();
+    let orgs = state.orgs.lock().unwrap_or_else(|e| e.into_inner());
     let Some(org) = orgs.iter().find(|o| o.id == org_id) else {
         return (
             StatusCode::NOT_FOUND,
@@ -272,7 +272,7 @@ pub async fn handle_invite(
 
     // Prüfe ob der Ziel-User existiert
     {
-        let users = state.users.lock().unwrap();
+        let users = state.users.lock().unwrap_or_else(|e| e.into_inner());
         if !users.iter().any(|u| u.id == req.target_user_id) {
             return (
                 StatusCode::NOT_FOUND,
@@ -282,7 +282,7 @@ pub async fn handle_invite(
         }
     }
 
-    let mut orgs = state.orgs.lock().unwrap();
+    let mut orgs = state.orgs.lock().unwrap_or_else(|e| e.into_inner());
     let Some(org) = orgs.iter_mut().find(|o| o.id == org_id) else {
         return (
             StatusCode::NOT_FOUND,
@@ -331,7 +331,7 @@ pub async fn handle_my_invites(
         Err(e) => return e.into_response(),
     };
 
-    let orgs = state.orgs.lock().unwrap();
+    let orgs = state.orgs.lock().unwrap_or_else(|e| e.into_inner());
     let mut invites: Vec<serde_json::Value> = Vec::new();
 
     for org in orgs.iter() {
@@ -366,7 +366,7 @@ pub async fn handle_accept_invite(
         Err(e) => return e.into_response(),
     };
 
-    let mut orgs = state.orgs.lock().unwrap();
+    let mut orgs = state.orgs.lock().unwrap_or_else(|e| e.into_inner());
     let org = orgs.iter_mut().find(|o| {
         o.invites
             .iter()
@@ -391,7 +391,7 @@ pub async fn handle_accept_invite(
 
             // User-Profil aktualisieren
             {
-                let mut users = state.users.lock().unwrap();
+                let mut users = state.users.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(u) = users.iter_mut().find(|u| u.id == user.id) {
                     u.org_id = org_id.clone();
                     u.org_role = "member".to_string();
@@ -433,7 +433,7 @@ pub async fn handle_decline_invite(
         Err(e) => return e.into_response(),
     };
 
-    let mut orgs = state.orgs.lock().unwrap();
+    let mut orgs = state.orgs.lock().unwrap_or_else(|e| e.into_inner());
     let org = orgs.iter_mut().find(|o| {
         o.invites
             .iter()
@@ -472,7 +472,7 @@ pub async fn handle_leave_org(
         Err(e) => return e.into_response(),
     };
 
-    let mut orgs = state.orgs.lock().unwrap();
+    let mut orgs = state.orgs.lock().unwrap_or_else(|e| e.into_inner());
     let Some(org) = orgs.iter_mut().find(|o| o.id == org_id) else {
         return (
             StatusCode::NOT_FOUND,
@@ -488,7 +488,7 @@ pub async fn handle_leave_org(
 
             // User-Profil bereinigen
             {
-                let mut users = state.users.lock().unwrap();
+                let mut users = state.users.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(u) = users.iter_mut().find(|u| u.id == user.id) {
                     if u.org_id == org_id {
                         u.org_id.clear();
@@ -522,7 +522,7 @@ pub async fn handle_remove_member(
         Err(e) => return e.into_response(),
     };
 
-    let mut orgs = state.orgs.lock().unwrap();
+    let mut orgs = state.orgs.lock().unwrap_or_else(|e| e.into_inner());
     let Some(org) = orgs.iter_mut().find(|o| o.id == org_id) else {
         return (
             StatusCode::NOT_FOUND,
@@ -538,7 +538,7 @@ pub async fn handle_remove_member(
 
             // Entfernten User bereinigen
             {
-                let mut users = state.users.lock().unwrap();
+                let mut users = state.users.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(u) = users.iter_mut().find(|u| u.id == req.user_id) {
                     if u.org_id == org_id {
                         u.org_id.clear();
@@ -576,7 +576,7 @@ pub async fn handle_set_role(
 
     let new_role = OrgRole::from_str(&req.role);
 
-    let mut orgs = state.orgs.lock().unwrap();
+    let mut orgs = state.orgs.lock().unwrap_or_else(|e| e.into_inner());
     let Some(org) = orgs.iter_mut().find(|o| o.id == org_id) else {
         return (
             StatusCode::NOT_FOUND,
@@ -597,7 +597,7 @@ pub async fn handle_set_role(
 
             // User-Profil aktualisieren
             {
-                let mut users = state.users.lock().unwrap();
+                let mut users = state.users.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(u) = users.iter_mut().find(|u| u.id == req.user_id) {
                     u.org_role = role_str.clone();
                 }
@@ -638,7 +638,7 @@ pub async fn handle_create_channel(
             .into_response();
     }
 
-    let mut orgs = state.orgs.lock().unwrap();
+    let mut orgs = state.orgs.lock().unwrap_or_else(|e| e.into_inner());
     let Some(org) = orgs.iter_mut().find(|o| o.id == org_id) else {
         return (
             StatusCode::NOT_FOUND,
@@ -699,7 +699,7 @@ pub async fn handle_send_message(
         deleted: false,
     };
 
-    let mut orgs = state.orgs.lock().unwrap();
+    let mut orgs = state.orgs.lock().unwrap_or_else(|e| e.into_inner());
     let Some(org) = orgs.iter_mut().find(|o| o.id == org_id) else {
         return (
             StatusCode::NOT_FOUND,
@@ -740,7 +740,7 @@ pub async fn handle_get_chat(
         Err(e) => return e.into_response(),
     };
 
-    let orgs = state.orgs.lock().unwrap();
+    let orgs = state.orgs.lock().unwrap_or_else(|e| e.into_inner());
     let Some(org) = orgs.iter().find(|o| o.id == org_id) else {
         return (
             StatusCode::NOT_FOUND,

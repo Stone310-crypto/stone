@@ -37,7 +37,7 @@ use super::super::state::AppState;
 pub async fn handle_token_supply(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let ledger = state.node.token_ledger.read().unwrap();
+    let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
     let pending = state.node.mempool.pending_count();
     let stats = state.node.mempool.stats();
     let info = SupplyInfo::from_ledger(&ledger);
@@ -58,7 +58,7 @@ pub async fn handle_wallet_balance(
     State(state): State<AppState>,
     Path(address): Path<String>,
 ) -> impl IntoResponse {
-    let ledger = state.node.token_ledger.read().unwrap();
+    let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
     let balance = ledger.balance(&address);
     let nonce = ledger.nonce(&address);
     Json(serde_json::json!({
@@ -74,7 +74,7 @@ pub async fn handle_wallet_info(
     State(state): State<AppState>,
     Path(address): Path<String>,
 ) -> impl IntoResponse {
-    let ledger = state.node.token_ledger.read().unwrap();
+    let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
     let info = AccountInfo {
         address: address.clone(),
         balance: ledger.balance(&address),
@@ -96,7 +96,7 @@ pub async fn handle_token_accounts(
     if let Err(e) = require_admin(&headers, &state) {
         return e.into_response();
     }
-    let ledger = state.node.token_ledger.read().unwrap();
+    let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
     let accounts = ledger.all_accounts();
     Json(serde_json::json!({
         "ok": true,
@@ -193,7 +193,7 @@ pub async fn handle_token_transfer(
     // ── Mainnet Guards: Sicherheits-Limits für irreversible Operationen ──
     let network = stone::token::NetworkMode::from_env();
     if !network.is_testnet() {
-        let ledger = state.node.token_ledger.read().unwrap();
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
         let sender_balance = ledger.balance(&tx.from);
 
         // Burn-Limit: max. 10% des Guthabens pro TX im Mainnet
@@ -232,7 +232,7 @@ pub async fn handle_token_transfer(
 
     // In Mempool aufnehmen (mit Ledger Pre-Check)
     let result = {
-        let ledger = state.node.token_ledger.read().unwrap();
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
         state.node.mempool.add_tx(tx.clone(), Some(&ledger))
     };
 
@@ -343,7 +343,7 @@ pub async fn handle_token_faucet(
 
     // Max-per-Address Schutz: prüfen ob Adresse schon zu viel bekommen hat
     {
-        let ledger = state.node.token_ledger.read().unwrap();
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
         let current_balance = ledger.balance(&req.address);
         if current_balance + amount > max_per_addr {
             return (
@@ -364,7 +364,7 @@ pub async fn handle_token_faucet(
 
     // Direkt im Ledger: Transfer von Community-Pool → Empfänger
     let result = {
-        let mut ledger = state.node.token_ledger.write().unwrap();
+        let mut ledger = state.node.token_ledger.write().unwrap_or_else(|e| e.into_inner());
         let available = ledger.balance(pool);
         if available < amount {
             Err(format!("Community-Pool hat nur {} STONE verfügbar", available))
@@ -380,7 +380,7 @@ pub async fn handle_token_faucet(
 
     match result {
         Ok(()) => {
-            let ledger = state.node.token_ledger.read().unwrap();
+            let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -491,7 +491,7 @@ pub async fn handle_token_history(
     State(state): State<AppState>,
     Path(address): Path<String>,
 ) -> impl IntoResponse {
-    let chain = state.node.chain.lock().unwrap();
+    let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
 
     let mut txs: Vec<serde_json::Value> = Vec::new();
     for block in &chain.blocks {
@@ -531,7 +531,7 @@ pub async fn handle_wallet_rotations(
     State(state): State<AppState>,
     Path(address): Path<String>,
 ) -> impl IntoResponse {
-    let ledger = state.node.token_ledger.read().unwrap();
+    let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
 
     let is_rotated = ledger.is_key_rotated(&address);
     let active_key = ledger.resolve_active_key(&address);
@@ -650,7 +650,7 @@ pub async fn handle_token_send(
 
     // Nonce aus dem Ledger holen
     let nonce = {
-        let ledger = state.node.token_ledger.read().unwrap();
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
         ledger.nonce(&wallet.address())
     };
 
@@ -689,7 +689,7 @@ pub async fn handle_token_send(
 
     // In Mempool aufnehmen
     let result = {
-        let ledger = state.node.token_ledger.read().unwrap();
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
         state.node.mempool.add_tx(tx.clone(), Some(&ledger))
     };
 
@@ -830,7 +830,7 @@ pub async fn handle_token_send_authenticated(
 
     // Nonce
     let nonce = {
-        let ledger = state.node.token_ledger.read().unwrap();
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
         ledger.nonce(&wallet.address())
     };
 
@@ -852,7 +852,7 @@ pub async fn handle_token_send_authenticated(
 
     // In Mempool
     let result = {
-        let ledger = state.node.token_ledger.read().unwrap();
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
         state.node.mempool.add_tx(tx.clone(), Some(&ledger))
     };
 
@@ -912,7 +912,7 @@ pub async fn handle_token_stake(
 
     // In Mempool aufnehmen
     let result = {
-        let ledger = state.node.token_ledger.read().unwrap();
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
         state.node.mempool.add_tx(tx.clone(), Some(&ledger))
     };
 
@@ -962,7 +962,7 @@ pub async fn handle_token_unstake(
     }
 
     let result = {
-        let ledger = state.node.token_ledger.read().unwrap();
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
         state.node.mempool.add_tx(tx.clone(), Some(&ledger))
     };
 
@@ -999,9 +999,9 @@ pub async fn handle_token_unstake(
 pub async fn handle_staking_info(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let pool = state.node.staking_pool.read().unwrap();
+    let pool = state.node.staking_pool.read().unwrap_or_else(|e| e.into_inner());
     let reward_pool_balance = {
-        let ledger = state.node.token_ledger.read().unwrap();
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
         ledger.balance("pool:storage_rewards")
     };
 
@@ -1015,9 +1015,9 @@ pub async fn handle_staking_info(
 pub async fn handle_staking_pool(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let pool = state.node.staking_pool.read().unwrap();
+    let pool = state.node.staking_pool.read().unwrap_or_else(|e| e.into_inner());
     let reward_pool_balance = {
-        let ledger = state.node.token_ledger.read().unwrap();
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
         ledger.balance("pool:storage_rewards")
     };
 
@@ -1038,7 +1038,7 @@ pub async fn handle_staker_info(
     State(state): State<AppState>,
     Path(address): Path<String>,
 ) -> impl IntoResponse {
-    let pool = state.node.staking_pool.read().unwrap();
+    let pool = state.node.staking_pool.read().unwrap_or_else(|e| e.into_inner());
 
     match pool.staker_info(&address) {
         Some(info) => (

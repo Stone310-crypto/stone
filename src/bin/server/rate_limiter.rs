@@ -59,7 +59,7 @@ impl RateLimiter {
         let now = Instant::now();
         let window = std::time::Duration::from_secs(self.window_secs);
 
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         let timestamps = entries.entry(key.to_string()).or_default();
 
         // Alte Einträge außerhalb des Fensters entfernen
@@ -78,7 +78,7 @@ impl RateLimiter {
         let now = Instant::now();
         let window = std::time::Duration::from_secs(self.window_secs);
 
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         let timestamps = entries.entry(key.to_string()).or_default();
         timestamps.retain(|ts| now.duration_since(*ts) < window);
 
@@ -92,7 +92,7 @@ impl RateLimiter {
         let now = Instant::now();
         let window = std::time::Duration::from_secs(self.window_secs);
 
-        let entries = self.entries.lock().unwrap();
+        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(timestamps) = entries.get(key) {
             if let Some(oldest) = timestamps.first() {
                 let elapsed = now.duration_since(*oldest);
@@ -111,7 +111,7 @@ impl RateLimiter {
         let now = Instant::now();
         let window = std::time::Duration::from_secs(self.window_secs);
 
-        let mut entries = self.entries.lock().unwrap();
+        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         entries.retain(|_, timestamps| {
             timestamps.retain(|ts| now.duration_since(*ts) < window);
             !timestamps.is_empty()
@@ -120,7 +120,7 @@ impl RateLimiter {
 
     /// Aktuelle Anzahl getrackter Keys (für Monitoring).
     pub fn tracked_keys(&self) -> usize {
-        self.entries.lock().unwrap().len()
+        self.entries.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 }
 

@@ -76,17 +76,17 @@ pub async fn pull_from_peer(node: &Arc<MasterNodeState>, peer_url: &str, api_key
     };
 
     let local_height = {
-        let chain = node.chain.lock().unwrap();
+        let chain = node.chain.lock().unwrap_or_else(|e| e.into_inner());
         chain.blocks.len() as u64
     };
 
     if peer_height <= local_height {
         let latency = start.elapsed().as_millis();
         let local_hash = {
-            let chain = node.chain.lock().unwrap();
+            let chain = node.chain.lock().unwrap_or_else(|e| e.into_inner());
             chain.latest_hash.clone()
         };
-        let mut peers = node.peers.write().unwrap();
+        let mut peers = node.peers.write().unwrap_or_else(|e| e.into_inner());
         if let Some(p) = peers.iter_mut().find(|p| p.url == peer_url) {
             p.mark_healthy(local_hash, local_height, latency);
         }
@@ -110,7 +110,7 @@ pub async fn pull_from_peer(node: &Arc<MasterNodeState>, peer_url: &str, api_key
             Ok(r) if r.status().is_success() => {
                 if let Ok(peer_gen) = r.json::<stone::blockchain::Block>().await {
                     let local_gen_hash = {
-                        let chain = node.chain.lock().unwrap();
+                        let chain = node.chain.lock().unwrap_or_else(|e| e.into_inner());
                         chain.blocks.first().map(|b| b.hash.clone()).unwrap_or_default()
                     };
                     if !local_gen_hash.is_empty() && local_gen_hash != peer_gen.hash {
@@ -219,7 +219,7 @@ pub async fn pull_from_peer(node: &Arc<MasterNodeState>, peer_url: &str, api_key
 
     // Fork-Erkennung + Rollback
     let (pending_blocks, did_rollback) = {
-        let mut chain = node.chain.lock().unwrap();
+        let mut chain = node.chain.lock().unwrap_or_else(|e| e.into_inner());
         let local_len = chain.blocks.len() as u64;
 
         let mut fork_at: Option<usize> = None;
@@ -251,7 +251,7 @@ pub async fn pull_from_peer(node: &Arc<MasterNodeState>, peer_url: &str, api_key
             if prefer_peer {
                 // ── Checkpoint-Schutz: Reorg über finalisierte Checkpoints verhindern ──
                 {
-                    let cp_store = node.checkpoint_store.read().unwrap();
+                    let cp_store = node.checkpoint_store.read().unwrap_or_else(|e| e.into_inner());
                     if let Err(cp_reason) = cp_store.check_reorg_allowed(fork_idx as u64) {
                         eprintln!(
                             "[sync] {peer_url}: Fork bei Index {fork_idx} ABGELEHNT – {cp_reason}"
@@ -333,7 +333,7 @@ pub async fn pull_from_peer(node: &Arc<MasterNodeState>, peer_url: &str, api_key
 
     // Blöcke in Chain eintragen + Token-TXs verarbeiten (mit Validierung)
     {
-        let mut chain = node.chain.lock().unwrap();
+        let mut chain = node.chain.lock().unwrap_or_else(|e| e.into_inner());
         for block in pending_blocks {
             let idx = block.index;
             let block_txs = block.transactions.clone();
@@ -344,7 +344,7 @@ pub async fn pull_from_peer(node: &Arc<MasterNodeState>, peer_url: &str, api_key
                 Ok(_) => {
                     // Token-TXs im Ledger verarbeiten
                     if !block_txs.is_empty() {
-                        let mut ledger = node.token_ledger.write().unwrap();
+                        let mut ledger = node.token_ledger.write().unwrap_or_else(|e| e.into_inner());
                         let receipts = ledger.apply_block_txs(&block_txs, idx);
                         if !receipts.is_empty() {
                             if let Err(e) = ledger.persist() {
@@ -381,10 +381,10 @@ pub async fn pull_from_peer(node: &Arc<MasterNodeState>, peer_url: &str, api_key
 
     let latency = start.elapsed().as_millis();
     let latest_hash = {
-        let chain = node.chain.lock().unwrap();
+        let chain = node.chain.lock().unwrap_or_else(|e| e.into_inner());
         chain.latest_hash.clone()
     };
-    let mut peers = node.peers.write().unwrap();
+    let mut peers = node.peers.write().unwrap_or_else(|e| e.into_inner());
     if let Some(p) = peers.iter_mut().find(|p| p.url == peer_url) {
         p.mark_healthy(latest_hash, local_height + added, latency);
     }
@@ -505,7 +505,7 @@ pub async fn push_all_users_to_peers(
     users: &Arc<Mutex<Vec<User>>>,
 ) {
     let user_list: Vec<serde_json::Value> = {
-        let local = users.lock().unwrap();
+        let local = users.lock().unwrap_or_else(|e| e.into_inner());
         local
             .iter()
             .filter(|u| !u.name.is_empty())
@@ -590,7 +590,7 @@ pub async fn pull_users_from_peer(
         None => return,
     };
 
-    let mut local = users.lock().unwrap();
+    let mut local = users.lock().unwrap_or_else(|e| e.into_inner());
     let mut added = 0usize;
     let mut updated = 0usize;
 
@@ -651,13 +651,13 @@ pub fn sync_chain_accounts_to_users(
     node: &Arc<MasterNodeState>,
     users: &Arc<Mutex<Vec<User>>>,
 ) {
-    let ledger = node.token_ledger.read().unwrap();
+    let ledger = node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
     let chain_accounts = ledger.all_registered_accounts();
     if chain_accounts.is_empty() {
         return;
     }
 
-    let mut local = users.lock().unwrap();
+    let mut local = users.lock().unwrap_or_else(|e| e.into_inner());
     let mut added = 0usize;
 
     for (wallet, name) in chain_accounts {

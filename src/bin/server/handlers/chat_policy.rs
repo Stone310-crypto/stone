@@ -48,7 +48,7 @@ pub struct VoteRequest {
 pub async fn handle_chat_policy_status(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let policy = state.node.chat_policy.read().unwrap();
+    let policy = state.node.chat_policy.read().unwrap_or_else(|e| e.into_inner());
     let summary = policy.summary();
 
     (StatusCode::OK, Json(json!({
@@ -78,7 +78,7 @@ pub async fn handle_chat_policy_message(
     State(state): State<AppState>,
     Path(msg_id): Path<String>,
 ) -> impl IntoResponse {
-    let policy = state.node.chat_policy.read().unwrap();
+    let policy = state.node.chat_policy.read().unwrap_or_else(|e| e.into_inner());
 
     match policy.message_ttl_info(&msg_id) {
         Some(entry) => {
@@ -135,7 +135,7 @@ pub async fn handle_chat_report(
 
     // Reported wallet ermitteln (die andere Seite der Konversation)
     let reported_wallet = {
-        let policy = state.node.chat_policy.read().unwrap();
+        let policy = state.node.chat_policy.read().unwrap_or_else(|e| e.into_inner());
         match policy.message_ttl_info(&req.msg_id) {
             Some(entry) => {
                 if entry.from_wallet == user.wallet_address {
@@ -165,11 +165,11 @@ pub async fn handle_chat_report(
     };
 
     let total_validators = {
-        let vs = state.node.validator_set.read().unwrap();
+        let vs = state.node.validator_set.read().unwrap_or_else(|e| e.into_inner());
         vs.active_count() as u32
     };
 
-    let mut policy = state.node.chat_policy.write().unwrap();
+    let mut policy = state.node.chat_policy.write().unwrap_or_else(|e| e.into_inner());
     match policy.file_report(
         &req.msg_id,
         &user.wallet_address,
@@ -182,7 +182,7 @@ pub async fn handle_chat_report(
         Ok((report_id, is_mutual)) => {
             if is_mutual {
                 // Bei Mutual Report: Content sofort im Chat-Index löschen
-                let mut idx = state.chat_index.lock().unwrap();
+                let mut idx = state.chat_index.lock().unwrap_or_else(|e| e.into_inner());
                 chat_policy::purge_message_content(&mut idx, &req.msg_id);
                 stone::chat::save_chat_index(&idx);
                 drop(idx);
@@ -228,7 +228,7 @@ pub async fn handle_chat_report(
 pub async fn handle_chat_reports(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let policy = state.node.chat_policy.read().unwrap();
+    let policy = state.node.chat_policy.read().unwrap_or_else(|e| e.into_inner());
     let reports: Vec<_> = policy.active_reports().into_iter().map(|r| {
         json!({
             "report_id": r.report_id,
@@ -263,7 +263,7 @@ pub async fn handle_chat_report_vote(
 
     // Prüfe ob Node ein aktiver Validator ist
     {
-        let vs = state.node.validator_set.read().unwrap();
+        let vs = state.node.validator_set.read().unwrap_or_else(|e| e.into_inner());
         if !vs.is_active_validator(&node_id) {
             return (
                 StatusCode::FORBIDDEN,
@@ -273,7 +273,7 @@ pub async fn handle_chat_report_vote(
         }
     }
 
-    let mut policy = state.node.chat_policy.write().unwrap();
+    let mut policy = state.node.chat_policy.write().unwrap_or_else(|e| e.into_inner());
 
     // Vote abgeben
     if let Err(e) = policy.cast_vote(&report_id, &node_id, req.approve) {
@@ -288,14 +288,14 @@ pub async fn handle_chat_report_vote(
     if let Some((accepted, msg_id, reported_wallet)) = policy.try_finalize_report(&report_id) {
         if accepted {
             // Content im Chat-Index löschen
-            let mut idx = state.chat_index.lock().unwrap();
+            let mut idx = state.chat_index.lock().unwrap_or_else(|e| e.into_inner());
             chat_policy::purge_message_content(&mut idx, &msg_id);
             stone::chat::save_chat_index(&idx);
             drop(idx);
 
             // Slash des Reported Users
             let slash_amount = {
-                let pool = state.node.staking_pool.read().unwrap();
+                let pool = state.node.staking_pool.read().unwrap_or_else(|e| e.into_inner());
                 let staked = pool.stakers.get(&reported_wallet)
                     .map(|s| s.staked_amount)
                     .unwrap_or(rust_decimal::Decimal::ZERO);
@@ -304,12 +304,12 @@ pub async fn handle_chat_report_vote(
             };
 
             if slash_amount > rust_decimal::Decimal::ZERO {
-                let mut pool = state.node.staking_pool.write().unwrap();
+                let mut pool = state.node.staking_pool.write().unwrap_or_else(|e| e.into_inner());
                 let actual = pool.slash(&reported_wallet, slash_amount);
                 policy.record_slash(&report_id, actual);
 
                 // Slash-Betrag in pool:node_operators
-                let mut ledger = state.node.token_ledger.write().unwrap();
+                let mut ledger = state.node.token_ledger.write().unwrap_or_else(|e| e.into_inner());
                 ledger.credit_to_operator_pool(actual);
 
                 let _ = ledger.persist();

@@ -30,8 +30,8 @@ pub async fn handle_list_users(
 ) -> Result<impl IntoResponse, Response> {
     require_admin(&headers, &state)?;
 
-    let users = state.users.lock().unwrap().clone();
-    let chain = state.node.chain.lock().unwrap();
+    let users = state.users.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
 
     let search = q.q.as_deref().unwrap_or("").to_lowercase();
     let per_page = q.per_page.unwrap_or(50).min(500);
@@ -90,7 +90,7 @@ pub async fn handle_list_users(
 pub async fn handle_list_users_public(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let users = state.users.lock().unwrap();
+    let users = state.users.lock().unwrap_or_else(|e| e.into_inner());
 
     let list: Vec<serde_json::Value> = users
         .iter()
@@ -128,7 +128,7 @@ pub async fn handle_delete_user(
             .into_response());
     }
 
-    let mut users = state.users.lock().unwrap();
+    let mut users = state.users.lock().unwrap_or_else(|e| e.into_inner());
     let before = users.len();
     users.retain(|u| u.id != user_id);
     if users.len() == before {
