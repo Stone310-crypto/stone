@@ -282,6 +282,31 @@ a{color:var(--cyan);text-decoration:none}
     </div>
   </div>
 
+  <!-- Shard Repair -->
+  <div class="card">
+    <h2><span class="icon">🔧</span> Shard Repair</h2>
+    <div class="stat-row">
+      <span class="stat-label">Repariert</span>
+      <span class="stat-value green" id="repairsCompleted">0</span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">Fehlgeschlagen</span>
+      <span class="stat-value red" id="repairsFailed">0</span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">Übersprungen (gesund)</span>
+      <span class="stat-value" id="repairsSkipped">0</span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">Repair-Rewards</span>
+      <span class="stat-value yellow" id="repairRewards">0 STONE</span>
+    </div>
+    <div class="stat-row">
+      <span class="stat-label">Letzte Reparatur</span>
+      <span class="stat-value" id="lastRepair">—</span>
+    </div>
+  </div>
+
   <!-- Wallet -->
   <div class="card">
     <h2><span class="icon">👛</span> Wallet</h2>
@@ -485,6 +510,13 @@ function updateUI() {
   document.getElementById('chainChallengesMissed').textContent = s.chain_challenges_missed||0;
   document.getElementById('chainRewards').textContent = (s.chain_rewards_earned||'0')+' STONE';
   document.getElementById('pendingChallenges').textContent = s.pending_challenges||0;
+
+  // Shard Repair
+  document.getElementById('repairsCompleted').textContent = s.repairs_completed||0;
+  document.getElementById('repairsFailed').textContent = s.repairs_failed||0;
+  document.getElementById('repairsSkipped').textContent = s.repairs_skipped||0;
+  document.getElementById('repairRewards').textContent = (s.repair_rewards_earned||'0')+' STONE';
+  document.getElementById('lastRepair').textContent = s.last_repair_human||'—';
 
   // Wallet
   document.getElementById('miningAddr').textContent = shortAddr(w.mining_address);

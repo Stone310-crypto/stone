@@ -128,10 +128,10 @@ pub fn create_snapshot(
         }
     }
 
-    // JSON-Dateien kopieren (nur chain-relevante, KEINE node-spezifischen wie p2p_config/peers)
+    // JSON-Dateien kopieren (chain-relevante Dateien, KEINE node-spezifischen wie p2p_config)
     let json_files = [
         "checkpoints.json",
-        "validator_set.json",
+        "validators.json",
         "shard_holders.json",
     ];
     for fname in &json_files {

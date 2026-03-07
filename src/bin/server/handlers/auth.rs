@@ -72,7 +72,8 @@ pub async fn handle_signup(
 
             let nonce = {
                 let ledger = node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
-                ledger.nonce(&wallet)
+                let base = ledger.nonce(&wallet);
+                base + node.mempool.sender_pending_count(&wallet)
             };
 
             let memo = serde_json::json!({
@@ -261,7 +262,8 @@ pub async fn handle_login(
                         let signing_key = ed25519_dalek::SigningKey::from_bytes(&key_bytes);
                         let nonce = {
                             let ledger = node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
-                            ledger.nonce(&w)
+                            let base = ledger.nonce(&w);
+                            base + node.mempool.sender_pending_count(&w)
                         };
                         let memo = serde_json::json!({
                             "name": user_name,

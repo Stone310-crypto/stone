@@ -36,14 +36,16 @@ use std::time::Duration;
 // ─── Mining-Konstanten ───────────────────────────────────────────────────────
 
 /// Block-Intervall in Sekunden (wie oft ein neuer Block erzeugt wird)
-pub const MINING_INTERVAL_SECS: u64 = 30;
+/// 120s = 2 Minuten — genug Zeit für Shard-Repairs und Challenge-Responses,
+/// ohne die Chain mit leeren Blöcken zu fluten.
+pub const MINING_INTERVAL_SECS: u64 = 120;
 
 /// Initialer Block-Reward in STONE (vor erstem Halving)
 pub const INITIAL_BLOCK_REWARD: &str = "10.0";
 
 /// Alle N Blöcke halbiert sich der Reward
-/// 210.000 Blöcke × 30s = ~72.9 Tage pro Halving-Epoche
-pub const HALVING_INTERVAL: u64 = 210_000;
+/// 52.500 Blöcke × 120s = ~73 Tage pro Halving-Epoche (selber Rhythmus wie vorher)
+pub const HALVING_INTERVAL: u64 = 52_500;
 
 /// Maximale Supply (aus Genesis-Config, hier als Fallback)
 pub const MAX_SUPPLY: &str = "50000000";
@@ -430,6 +432,9 @@ pub struct MasterNodeState {
     /// Pending ChallengeResponses: Nodes schicken ihre Proofs hierher,
     /// werden im nächsten Block aufgenommen und belohnt.
     pub pending_challenge_responses: Mutex<Vec<crate::storage_proof::ChallengeResponse>>,
+    /// Pending Shard-Repair-Rewards: Miner melden reparierte Shards,
+    /// werden im nächsten Block als Reward-TX aufgenommen.
+    pub pending_repair_rewards: Mutex<Vec<crate::storage_proof::RepairReward>>,
     /// Kanal um geminete Blöcke an das P2P-Netzwerk zu broadcasten.
     /// Wird von setup.rs gesetzt nachdem das Netzwerk gestartet ist.
     pub block_broadcast_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<Block>>>,
@@ -527,16 +532,43 @@ impl MasterNodeState {
             chat_policy: RwLock::new(chat_policy),
             mining_wallet: RwLock::new(Self::load_mining_wallet()),
             pending_challenge_responses: Mutex::new(Vec::new()),
+            pending_repair_rewards: Mutex::new(Vec::new()),
             block_broadcast_tx: Mutex::new(None),
         });
 
-        // Wenn die Chain bereits > 10 Blöcke hat (Restart einer synced Node),
-        // Mining sofort erlauben (kein Initial-Sync nötig)
+        // Nach Restart: Prüfen ob die lokale Chain aktuell genug ist.
+        // Wenn der letzte Block jünger als 3 Mining-Intervalle (6 Min) ist,
+        // war die Node erst kürzlich online und kann sofort minen.
+        // Ansonsten: Initial-Sync abwarten (max 240s), damit wir nicht
+        // auf einem veralteten Fork minen.
         {
-            let chain_len = state.chain.lock().unwrap().blocks.len();
-            if chain_len > 10 {
+            let chain = state.chain.lock().unwrap();
+            let chain_len = chain.blocks.len();
+            let last_block_age = chain.blocks.last()
+                .map(|b| {
+                    let now = Utc::now().timestamp();
+                    (now - b.timestamp).max(0) as u64
+                })
+                .unwrap_or(u64::MAX);
+            drop(chain);
+
+            let max_age = MINING_INTERVAL_SECS * 3; // 6 Minuten
+            if chain_len > 1 && last_block_age < max_age {
+                // Chain ist aktuell — Node war kürzlich online, kein Sync nötig
                 state.metrics.initial_sync_done.store(true, Ordering::Relaxed);
-                println!("[mining] Chain hat {chain_len} Blöcke – Initial-Sync übersprungen");
+                println!(
+                    "[mining] Chain hat {chain_len} Blöcke, letzter Block vor {last_block_age}s – Initial-Sync übersprungen"
+                );
+            } else if chain_len <= 1 {
+                println!(
+                    "[mining] Frische Node (nur Genesis) – warte auf Initial-Sync (max {}s)",
+                    MINING_INTERVAL_SECS * 2
+                );
+            } else {
+                println!(
+                    "[mining] Chain hat {chain_len} Blöcke, letzter Block vor {last_block_age}s – warte auf Initial-Sync (max {}s)",
+                    MINING_INTERVAL_SECS * 2
+                );
             }
         }
 
@@ -569,6 +601,38 @@ impl MasterNodeState {
             }
         }
 
+        // ── Validator Auto-Discovery aus bestehender Chain ───────────────
+        // Beim Start: Nur aus den LETZTEN 20 Block-Signern Validatoren
+        // registrieren. Verhindert dass tote Nodes aus alten Blöcken
+        // die Validator-Rotation stören.
+        {
+            let chain = state.chain.lock().unwrap();
+            let mut vs = state.validator_set.write().unwrap();
+            let mut discovered = 0u32;
+            let start = chain.blocks.len().saturating_sub(20);
+            for block in &chain.blocks[start..] {
+                if !block.signer.is_empty()
+                    && !block.validator_pub_key.is_empty()
+                    && block.signer != node_id
+                    && vs.get(&block.signer).is_none()
+                {
+                    use crate::consensus::ValidatorInfo;
+                    let info = ValidatorInfo::new(
+                        block.signer.clone(),
+                        block.validator_pub_key.clone(),
+                    );
+                    vs.add(info);
+                    discovered += 1;
+                }
+            }
+            if discovered > 0 {
+                println!(
+                    "[consensus] 🔗 {} Validator(en) aus letzten {} Blöcken auto-discovered (gesamt: {})",
+                    discovered, chain.blocks.len().min(20), vs.active_count()
+                );
+            }
+        }
+
         state
     }
 
@@ -595,9 +659,17 @@ impl MasterNodeState {
             ss.jailed.keys().cloned().collect()
         };
 
-        // Wallet-Map: Momentan kennen wir nur unsere eigene Wallet
-        // In Zukunft wird hier die Trust-Registry/P2P-Handshake-Info genutzt
+        // Wallet-Map: Alle bekannten Validatoren → public_key_hex als Wallet
         let mut wallet_map = HashMap::new();
+        {
+            let vs = self.validator_set.read().unwrap();
+            for v in &vs.validators {
+                if v.active && !v.public_key_hex.is_empty() {
+                    wallet_map.insert(v.node_id.clone(), v.public_key_hex.clone());
+                }
+            }
+        }
+        // Explizite ENV-Variable hat Vorrang (für Custom-Wallet-Setup)
         if let Ok(wallet) = std::env::var("STONE_NODE_WALLET") {
             wallet_map.insert(self.node_id.clone(), wallet);
         }
@@ -691,7 +763,10 @@ impl MasterNodeState {
             // Token-TXs im Ledger verarbeiten (chain → ledger: korrekte Reihenfolge)
             if !block.transactions.is_empty() {
                 let mut ledger = self.token_ledger.write().unwrap();
+                // Block ist soeben gemined → replay_mode (Chain ist Wahrheit)
+                ledger.replay_mode = true;
                 let receipts = ledger.apply_block_txs(&block.transactions, block.index);
+                ledger.replay_mode = false;
                 if !receipts.is_empty() {
                     if let Err(e) = ledger.persist() {
                         eprintln!("[token] Ledger-Persistierung nach Block #{} fehlgeschlagen: {e}", block.index);
@@ -1128,13 +1203,70 @@ impl MasterNodeState {
                 let (stakes, jailed, wallet_map) = self.build_selection_context();
 
                 if !vs.is_selected_validator_weighted(&self.node_id, &chain_prev_hash, chain_next_index, &stakes, &jailed, &wallet_map) {
-                    let selected = vs.select_validator_weighted(&chain_prev_hash, chain_next_index, &stakes, &jailed, &wallet_map)
-                        .map(|v| v.node_id.clone())
-                        .unwrap_or_else(|| "?".into());
-                    return Err(format!(
-                        "Mining: Node '{}' nicht ausgewählt für Block #{chain_next_index} (→ '{selected}')",
-                        self.node_id
-                    ));
+                    // ── Backup-Proposer: Wenn der primäre Validator keinen Block
+                    // produziert hat, darf der nächste Validator einspringen.
+                    // Grace-Period: MINING_INTERVAL_SECS pro Backup-Rang.
+                    let last_block_age = {
+                        let chain = self.chain.lock().unwrap();
+                        chain.blocks.last()
+                            .map(|b| (Utc::now().timestamp() - b.timestamp) as u64)
+                            .unwrap_or(u64::MAX)
+                    };
+
+                    let backup_rank = vs.backup_proposer_rank(
+                        &self.node_id, &chain_prev_hash, chain_next_index,
+                        &stakes, &jailed, &wallet_map,
+                    );
+
+                    // Backup-Proposer darf erst nach (rank * MINING_INTERVAL_SECS) Sekunden
+                    // Beispiel: Backup #1 nach 120s, Backup #2 nach 240s, usw.
+                    let grace_secs = match backup_rank {
+                        Some(rank) => (rank as u64) * MINING_INTERVAL_SECS,
+                        None => {
+                            // ── Stall-Recovery Fallback ──────────────────────
+                            // Kein Backup-Rang vorhanden (z.B. einziger Validator
+                            // oder wallet_map-Fehler). Nach 5× MINING_INTERVAL
+                            // trotzdem Mining erlauben mit deterministischem Delay.
+                            let stall_threshold = MINING_INTERVAL_SECS * 5;
+                            if last_block_age >= stall_threshold {
+                                use sha2::{Sha256 as S256, Digest as D256};
+                                let mut h = S256::new();
+                                h.update(chain_prev_hash.as_bytes());
+                                h.update(chain_next_index.to_le_bytes());
+                                h.update(self.node_id.as_bytes());
+                                let hash = h.finalize();
+                                let slot = (hash[0] as u64) % 5; // 0-4
+                                let delay = slot * 30; // 0, 30, 60, 90, 120s
+                                if last_block_age >= stall_threshold + delay {
+                                    println!(
+                                        "[mining] 🚨 Stall-Recovery für Block #{}: Chain seit {}s stalled, slot={slot}",
+                                        chain_next_index, last_block_age
+                                    );
+                                    0 // grace_secs = 0 → sofort erlaubt (stall_threshold check hat bestanden)
+                                } else {
+                                    u64::MAX // noch warten
+                                }
+                            } else {
+                                u64::MAX // Kein Backup → noch nicht stalled genug
+                            }
+                        }
+                    };
+
+                    if last_block_age < MINING_INTERVAL_SECS + grace_secs {
+                        let selected = vs.select_validator_weighted(&chain_prev_hash, chain_next_index, &stakes, &jailed, &wallet_map)
+                            .map(|v| v.node_id.clone())
+                            .unwrap_or_else(|| "?".into());
+                        return Err(format!(
+                            "Mining: Node '{}' nicht ausgewählt für Block #{chain_next_index} (→ '{selected}')",
+                            self.node_id
+                        ));
+                    }
+
+                    // Backup-Proposer springt ein!
+                    println!(
+                        "[mining] ⚡ Backup-Proposer #{} für Block #{}: Primärer Validator hat {}s nicht produziert",
+                        backup_rank.unwrap_or(0), chain_next_index, last_block_age
+                    );
                 }
             }
         }
@@ -1169,14 +1301,17 @@ impl MasterNodeState {
             pending_txs.push(reward_tx);
         }
 
-        // Prüfe ob es Pending-Challenge-Responses gibt (rechtfertigt einen Block auch ohne User-TXs)
-        let has_pending_responses = !self.pending_challenge_responses.lock().unwrap().is_empty();
-
-        // Leere Blöcke vermeiden: nur Reward-TX ohne User-TXs oder Challenge-Responses → überspringen.
-        // Das verhindert, dass die Chain alle 30s mit leeren Blöcken aufgebläht wird.
-        if !has_user_txs && !has_pending_responses {
-            // Reward-TX wieder zurücknehmen — sie wird beim nächsten sinnvollen Block erstellt
-            return Err("Mining: Keine User-TXs oder Challenge-Responses – Block übersprungen".into());
+        // Blöcke werden IMMER erzeugt — auch ohne User-TXs.
+        // Der Block-Reward, Network-Challenges und Shard-Repair-Rewards
+        // sind allein schon Grund genug einen Block zu minen.
+        // Leere Blöcke treiben die Chain voran und ermöglichen:
+        //  - Regelmäßige Storage-Challenges
+        //  - Repair-Reward-Auszahlung
+        //  - Konsistente Block-Time für das Netzwerk
+        if !has_user_txs {
+            println!(
+                "[mining] Block #{next_index}: keine User-TXs → Reward-only Block"
+            );
         }
 
         // ── Block vorbereiten (ohne Commit in die Chain) ──────────────────
@@ -1247,6 +1382,7 @@ impl MasterNodeState {
                 // Pending ChallengeResponses aus dem Mempool holen
                 // (diese wurden von herausgeforderten Nodes eingereicht)
                 let responses = self.collect_pending_challenge_responses(&chain);
+                let mut challenge_rewards_total = Decimal::ZERO;
                 if !responses.is_empty() {
                     println!(
                         "[storage-challenge] ✅ {} Challenge-Responses in Block #{} aufgenommen",
@@ -1260,7 +1396,6 @@ impl MasterNodeState {
                         let ledger = self.token_ledger.read().unwrap();
                         ledger.balance("pool:storage_rewards")
                     };
-                    let mut challenge_rewards_total = Decimal::ZERO;
                     for resp in &responses {
                         if challenge_rewards_total + challenge_reward > pool_balance {
                             println!(
@@ -1301,6 +1436,62 @@ impl MasterNodeState {
                     }
                 }
                 block.challenge_responses = responses;
+
+                // ── Shard-Repair-Rewards: Miner die degradierte Shards repariert haben ──
+                let pending_repairs: Vec<crate::storage_proof::RepairReward> = {
+                    let mut repairs = self.pending_repair_rewards.lock().unwrap();
+                    std::mem::take(&mut *repairs)
+                };
+                if !pending_repairs.is_empty() {
+                    let repair_reward: Decimal = crate::storage_proof::REPAIR_REWARD
+                        .parse().unwrap_or(Decimal::new(25, 2)); // 0.25 STONE Fallback
+                    let pool_balance_now = {
+                        let ledger = self.token_ledger.read().unwrap();
+                        ledger.balance("pool:storage_rewards")
+                    };
+                    let mut repair_rewards_total = Decimal::ZERO;
+                    for repair in &pending_repairs {
+                        if repair_rewards_total + repair_reward > pool_balance_now - challenge_rewards_total {
+                            println!(
+                                "[shard-repair] ⚠ Reward-Pool reicht nicht für weitere Repair-Rewards"
+                            );
+                            break;
+                        }
+                        let chain_id = std::env::var("STONE_NETWORK")
+                            .map(|n| if n == "mainnet" || n == "main" { "stone-mainnet".to_string() } else { "stone-testnet".to_string() })
+                            .unwrap_or_else(|_| "stone-testnet".to_string());
+                        let mut reward_tx = TokenTx {
+                            tx_id: String::new(),
+                            tx_type: TxType::Reward,
+                            from: "pool:storage_rewards".to_string(),
+                            to: repair.repairer_wallet.clone(),
+                            amount: repair_reward,
+                            fee: Decimal::ZERO,
+                            nonce: 0,
+                            timestamp: Utc::now().timestamp(),
+                            signature: String::new(),
+                            memo: format!(
+                                "Shard Repair Reward ({}[{}])",
+                                &repair.chunk_hash[..12.min(repair.chunk_hash.len())],
+                                repair.shard_index
+                            ),
+                            chain_id,
+                            fee_tier: crate::token::FeeTier::Express,
+                        };
+                        reward_tx.tx_id = compute_tx_id(&reward_tx);
+                        block.transactions.push(reward_tx);
+                        repair_rewards_total += repair_reward;
+                    }
+                    if repair_rewards_total > Decimal::ZERO {
+                        block.merkle_root = crate::blockchain::compute_merkle_root(
+                            &block.documents, &block.tombstones, &block.transactions,
+                        );
+                        println!(
+                            "[shard-repair] 🔧 {} STONE Repair-Rewards in Block #{} ({} Shards repariert)",
+                            repair_rewards_total, block.index, pending_repairs.len()
+                        );
+                    }
+                }
 
                 // Block-Hash neu berechnen (weil storage_challenges den Hash beeinflusst)
                 block.hash = crate::blockchain::calculate_hash(&block);
@@ -1346,7 +1537,10 @@ impl MasterNodeState {
             let mut ledger = self.token_ledger.write().unwrap();
             // Fee-Split: Validator-Wallet setzen BEVOR TXs verarbeitet werden
             ledger.set_current_validator(Some(validator_wallet.clone()));
+            // Block ist committed → replay_mode (Chain ist Wahrheit)
+            ledger.replay_mode = true;
             let receipts = ledger.apply_block_txs(&block.transactions, block.index);
+            ledger.replay_mode = false;
             ledger.set_current_validator(None);
 
             // ── Staking-TXs im StakingPool verarbeiten ────────────────────
@@ -1487,14 +1681,22 @@ impl MasterNodeState {
 
                 // ── Initial-Sync abwarten ─────────────────────────────────
                 // Erst nach abgeschlossenem Peer-Sync starten, damit keine
-                // Fork-Blöcke erzeugt werden. Timeout: 60s nach Node-Start.
+                // Fork-Blöcke erzeugt werden.
+                //
+                // Timeout: 2× MINING_INTERVAL_SECS (240s) nach Node-Start.
+                // Das gibt dem P2P-Netzwerk genug Zeit für:
+                //   - NAT-Traversal / Relay-Aufbau (~30-60s)
+                //   - Kademlia-Bootstrap + Peer-Discovery (~30s)
+                //   - Block-Range-Sync (~30-60s)
+                // Erst danach fängt Mining an.
                 if !state.metrics.initial_sync_done.load(Ordering::Relaxed) {
                     let uptime = Utc::now().timestamp() - state.started_at;
-                    if uptime < 60 {
+                    let sync_timeout = (MINING_INTERVAL_SECS * 2) as i64; // 240s
+                    if uptime < sync_timeout {
                         continue; // Warte auf Sync
                     }
                     // Timeout: kein Peer hat mehr Blöcke oder kein Peer verbunden
-                    println!("[mining] ⏰ Initial-Sync Timeout (60s) – starte Mining");
+                    println!("[mining] ⏰ Initial-Sync Timeout ({}s) – starte Mining", sync_timeout);
                     state.metrics.initial_sync_done.store(true, Ordering::Relaxed);
 
                     // Token-Ledger vollständig aus der (jetzt synced) Chain neu aufbauen.
@@ -1536,13 +1738,16 @@ impl MasterNodeState {
                 }
 
                 // Prüfen ob der letzte Block alt genug ist (verhindert Doppel-Blocks
-                // wenn commit_documents kurz vorher einen Block erstellt hat)
+                // wenn commit_documents oder ein Peer-Block kurz vorher einen Block
+                // zur Chain hinzugefügt hat). Der nächste Block darf frühestens nach
+                // MINING_INTERVAL_SECS gemint werden — nicht nach der Hälfte.
+                // Sonst erzeugen mehrere Nodes parallel Blöcke für denselben Slot.
                 {
                     let chain = state.chain.lock().unwrap();
                     if let Some(last) = chain.blocks.last() {
                         let age = Utc::now().timestamp() - last.timestamp;
-                        if age < (MINING_INTERVAL_SECS as i64 / 2) {
-                            continue; // Zu früh – letzter Block noch frisch
+                        if age < (MINING_INTERVAL_SECS as i64 - 5) {
+                            continue; // Zu früh – nächster Block-Slot noch nicht erreicht
                         }
                     }
                 }
@@ -1551,6 +1756,23 @@ impl MasterNodeState {
                 let evicted = state.mempool.evict_expired();
                 if evicted > 0 {
                     println!("[mining] 🧹 {} abgelaufene TXs aus Mempool entfernt", evicted);
+                }
+
+                // ── Stall-Warnung: pending TXs + alte Chain ──────────────
+                {
+                    let pending = state.mempool.pending_count();
+                    if pending > 0 {
+                        let chain = state.chain.lock().unwrap();
+                        if let Some(last) = chain.blocks.last() {
+                            let age = Utc::now().timestamp() - last.timestamp;
+                            if age > (MINING_INTERVAL_SECS as i64 * 3) {
+                                println!(
+                                    "[mining] ⚠ Stall: {} pending TXs, letzter Block vor {}s ({}x Intervall)",
+                                    pending, age, age / MINING_INTERVAL_SECS as i64
+                                );
+                            }
+                        }
+                    }
                 }
 
                 // ── Hybrid Consensus: Single-Node vs. Multi-Node ──────────

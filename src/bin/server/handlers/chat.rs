@@ -157,10 +157,12 @@ pub async fn handle_chat_send(
     })
     .to_string();
 
-    // Nonce für die TX
+    // Nonce für die TX (Ledger-Nonce + pending TXs im Mempool vom selben Sender)
     let nonce = {
         let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
-        ledger.nonce(&wallet.address())
+        let base = ledger.nonce(&wallet.address());
+        let pending = state.node.mempool.sender_pending_count(&wallet.address());
+        base + pending
     };
 
     // TX signieren (amount=0, fee=0 für Chat – ChatMessages sind gebührenfrei)
@@ -969,10 +971,11 @@ pub async fn handle_chat_send_coins(
         }
     }
 
-    // Nonce für Transfer-TX
+    // Nonce für Transfer-TX (Ledger + pending TXs im Mempool)
     let nonce = {
         let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
-        ledger.nonce(&wallet.address())
+        let base = ledger.nonce(&wallet.address());
+        base + state.node.mempool.sender_pending_count(&wallet.address())
     };
 
     let msg_text = req.message.unwrap_or_default();
@@ -1012,10 +1015,11 @@ pub async fn handle_chat_send_coins(
         ).into_response();
     }
 
-    // 2) Chat-Benachrichtigung als ChatMessage TX
+    // 2) Chat-Benachrichtigung als ChatMessage TX (Nonce inkl. pending TXs)
     let chat_nonce = {
         let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
-        ledger.nonce(&wallet.address())
+        let base = ledger.nonce(&wallet.address());
+        base + state.node.mempool.sender_pending_count(&wallet.address())
     };
 
     let msg_id = uuid::Uuid::new_v4().to_string();
@@ -1152,10 +1156,11 @@ pub async fn handle_chat_request_coins(
 
     let msg_text = req.message.unwrap_or_default();
 
-    // Chat-Nachricht als Coin-Request senden
+    // Chat-Nachricht als Coin-Request senden (Nonce inkl. pending TXs)
     let nonce = {
         let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
-        ledger.nonce(&wallet.address())
+        let base = ledger.nonce(&wallet.address());
+        base + state.node.mempool.sender_pending_count(&wallet.address())
     };
 
     let msg_id = uuid::Uuid::new_v4().to_string();

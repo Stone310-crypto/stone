@@ -201,7 +201,7 @@ textarea{resize:vertical;min-height:80px;font-family:monospace;font-size:13px}
 
   <!-- ═══ SETUP STEP 1: PASSWORD ═══ -->
   <div id="view-step1" class="card hidden" style="max-width:480px;margin:60px auto">
-    <div class="steps"><div class="step active"></div><div class="step"></div><div class="step"></div><div class="step"></div></div>
+    <div class="steps"><div class="step active"></div><div class="step"></div><div class="step"></div></div>
     <h2>Schritt 1 — Passwort festlegen</h2>
     <p class="sub">Dieses Passwort schützt den Zugang zum Node-Dashboard.</p>
     <label>Passwort</label>
@@ -221,7 +221,7 @@ textarea{resize:vertical;min-height:80px;font-family:monospace;font-size:13px}
 
   <!-- ═══ SETUP STEP 2: NODE NAME + WALLET ═══ -->
   <div id="view-step2" class="card hidden" style="max-width:480px;margin:60px auto">
-    <div class="steps"><div class="step done"></div><div class="step active"></div><div class="step"></div><div class="step"></div></div>
+    <div class="steps"><div class="step done"></div><div class="step active"></div><div class="step"></div></div>
     <h2>Schritt 2 — Node benennen</h2>
     <p class="sub">Gib deinem Node einen Namen. Eine StoneCoin-Wallet wird automatisch generiert.</p>
     <label>Node-Name</label>
@@ -238,35 +238,17 @@ textarea{resize:vertical;min-height:80px;font-family:monospace;font-size:13px}
     <button class="btn btn-green btn-block hidden" id="btn-step2-next" onclick="goStep3()">Weiter zu Schritt 3 →</button>
   </div>
 
-  <!-- ═══ SETUP STEP 3: STORAGE ═══ -->
+  <!-- ═══ SETUP STEP 3: PEERS ═══ -->
   <div id="view-step3" class="card hidden" style="max-width:480px;margin:60px auto">
-    <div class="steps"><div class="step done"></div><div class="step done"></div><div class="step active"></div><div class="step"></div></div>
-    <h2>Schritt 3 — Speicher bereitstellen</h2>
-    <p class="sub">Wie viel Speicher stellst du dem Netzwerk zur Verfügung? Du erhältst dafür STONE-Token als Belohnung.</p>
-    <label>Bereitgestellter Speicher (GB)</label>
-    <input type="number" id="storage-gb" placeholder="z.B. 100" min="1" oninput="previewReward()">
-    <div class="reward-preview" id="reward-preview">
-      <div class="rp-row"><span>Pro Tag</span><span class="rp-val" id="rp-day">—</span></div>
-      <div class="rp-row"><span>Pro Monat</span><span class="rp-val" id="rp-month">—</span></div>
-    </div>
-    <p class="sub" style="margin-top:12px;margin-bottom:0;font-size:12px">
-      Staffelung: 1-10 GB → 0.5 STONE/GB/Tag · 11-100 GB → 1.0 · 101-1000 GB → 2.0 · 1001+ GB → 3.0
-    </p>
-    <div class="error" id="step3-error"></div>
-    <button class="btn btn-primary btn-block" onclick="submitStorage()">Weiter →</button>
-  </div>
-
-  <!-- ═══ SETUP STEP 4: PEERS ═══ -->
-  <div id="view-step4" class="card hidden" style="max-width:480px;margin:60px auto">
-    <div class="steps"><div class="step done"></div><div class="step done"></div><div class="step done"></div><div class="step active"></div></div>
-    <h2>Schritt 4 — Seed-Peers</h2>
+    <div class="steps"><div class="step done"></div><div class="step done"></div><div class="step active"></div></div>
+    <h2>Schritt 3 — Seed-Peers</h2>
     <p class="sub">Trage bekannte Peer-Adressen ein (eine pro Zeile). Kann auch leer bleiben.</p>
     <label>Seed-Peers (Multiaddr-Format)</label>
     <textarea id="peers-input" placeholder="/ip4/203.0.113.1/tcp/4001/p2p/12D3KooW...">/ip4/100.90.28.68/tcp/4001/p2p/12D3KooWLqikBBCRhCZ2MgSYG3R579BNUgrN5E6dZnYSEYdmAKTd</textarea>
     <p class="sub" style="margin-top:8px;margin-bottom:0;font-size:12px;color:var(--orange)">
       ⚠️ Hinweis: Seed-Peer-Adressen müssen die <strong>öffentliche IP</strong> des Peers verwenden, nicht eine lokale/VPN-IP.
     </p>
-    <div class="error" id="step4-error"></div>
+    <div class="error" id="step3-error"></div>
     <button class="btn btn-green btn-block" onclick="finishSetup()">✅ Setup abschließen</button>
   </div>
 
@@ -295,9 +277,9 @@ textarea{resize:vertical;min-height:80px;font-family:monospace;font-size:13px}
         <div class="sub-val" id="dash-mempool"></div>
       </div>
       <div class="stat">
-        <div class="label">Reward / Tag</div>
-        <div class="value orange" id="dash-reward">—</div>
-        <div class="sub-val" id="dash-reward-month"></div>
+        <div class="label">Netzwerk I/O</div>
+        <div class="value accent" id="dash-net-io">—</div>
+        <div class="sub-val" id="dash-net-bw"></div>
       </div>
     </div>
 
@@ -530,10 +512,6 @@ textarea{resize:vertical;min-height:80px;font-family:monospace;font-size:13px}
           <input type="text" id="set-name">
         </div>
         <div>
-          <label>Bereitgestellter Speicher (GB)</label>
-          <input type="number" id="set-storage" min="1">
-        </div>
-        <div>
           <label>HTTP-Port</label>
           <input type="number" id="set-http">
         </div>
@@ -579,7 +557,7 @@ async function api(url, method, body) {
 }
 
 function show(id) {
-  ['view-login','view-step1','view-step2','view-step3','view-step4','view-dashboard','view-settings'].forEach(v => {
+  ['view-login','view-step1','view-step2','view-step3','view-dashboard','view-settings'].forEach(v => {
     document.getElementById(v).classList.add('hidden');
   });
   document.getElementById(id).classList.remove('hidden');
@@ -613,10 +591,8 @@ async function init() {
       showNavbar(false); show('view-step1');
     } else if (!data.has_node_name) {
       showNavbar(false); show('view-step2');
-    } else if (!data.has_storage) {
-      showNavbar(false); show('view-step3');
     } else {
-      showNavbar(false); show('view-step4');
+      showNavbar(false); show('view-step3');
     }
   } catch(e) { showNavbar(false); show('view-step1'); }
 }
@@ -659,36 +635,14 @@ async function submitNode() {
 }
 function goStep3() { show('view-step3'); }
 
-// ── Step 3: Storage ──
-let rewardTimer = null;
-function previewReward() {
-  clearTimeout(rewardTimer);
-  rewardTimer = setTimeout(async () => {
-    const gb = parseInt(document.getElementById('storage-gb').value) || 0;
-    if (gb < 1) { document.getElementById('reward-preview').style.display='none'; return; }
-    const { data } = await api('/api/reward-preview', 'POST', { gb });
-    document.getElementById('rp-day').textContent = data.reward_per_day.toFixed(2) + ' STONE';
-    document.getElementById('rp-month').textContent = data.reward_per_month.toFixed(2) + ' STONE';
-    document.getElementById('reward-preview').style.display='block';
-  }, 300);
-}
-async function submitStorage() {
-  hideError('step3-error');
-  const gb = parseInt(document.getElementById('storage-gb').value) || 0;
-  if (gb < 1) { showError('step3-error', 'Mindestens 1 GB angeben'); return; }
-  const { data } = await api('/api/setup/storage', 'POST', { offered_gb: gb });
-  if (!data.ok) { showError('step3-error', data.error); return; }
-  show('view-step4');
-}
-
-// ── Step 4: Peers + Finish ──
+// ── Step 3: Peers + Finish ──
 async function finishSetup() {
-  hideError('step4-error');
+  hideError('step3-error');
   const raw = document.getElementById('peers-input').value;
   const peers = raw.split('\n').map(l=>l.trim()).filter(l=>l.length>0);
   await api('/api/setup/peers', 'POST', { seed_peers: peers });
   const { data } = await api('/api/setup/finish', 'POST');
-  if (!data.ok) { showError('step4-error', data.error); return; }
+  if (!data.ok) { showError('step3-error', data.error); return; }
   showNavbar(true);
   navTo('dashboard');
   // Node startet im Hintergrund — Status wird per Auto-Refresh aktualisiert
@@ -732,8 +686,12 @@ async function refreshDashboard() {
     document.getElementById('dash-peers').textContent = data.peers_connected;
     document.getElementById('dash-blocks').textContent = data.block_count;
     document.getElementById('dash-mempool').textContent = data.mempool_size > 0 ? data.mempool_size + ' TX pending' : '';
-    document.getElementById('dash-reward').textContent = data.reward_per_day.toFixed(2) + ' ⛏';
-    document.getElementById('dash-reward-month').textContent = '≈ ' + (data.reward_per_day*30).toFixed(1) + ' STONE/Monat';
+    // Network I/O
+    if (data.network_metrics) {
+      const nm = data.network_metrics;
+      document.getElementById('dash-net-io').textContent = humanBytes(nm.bytes_in + nm.bytes_out);
+      document.getElementById('dash-net-bw').textContent = '⬇ ' + humanBytes(nm.avg_bytes_in_per_sec) + '/s · ⬆ ' + humanBytes(nm.avg_bytes_out_per_sec) + '/s';
+    }
     // Storage
     const s = data.storage;
     document.getElementById('dash-storage-summary').textContent = s.usage_pct.toFixed(1) + '% belegt';
@@ -918,7 +876,6 @@ async function loadSettings() {
   const { data } = await api('/api/settings', 'GET');
   if (!data.ok) return;
   document.getElementById('set-name').value = data.node_name;
-  document.getElementById('set-storage').value = data.storage_offered_gb;
   document.getElementById('set-http').value = data.http_port;
   document.getElementById('set-p2p').value = data.p2p_port;
   document.getElementById('set-datadir').value = data.data_dir;
@@ -931,7 +888,6 @@ async function saveSettings() {
   document.getElementById('set-success').style.display = 'none';
   const body = {
     node_name: document.getElementById('set-name').value,
-    storage_offered_gb: parseInt(document.getElementById('set-storage').value) || 1,
     http_port: parseInt(document.getElementById('set-http').value) || 8080,
     p2p_port: parseInt(document.getElementById('set-p2p').value) || 4001,
     data_dir: document.getElementById('set-datadir').value,

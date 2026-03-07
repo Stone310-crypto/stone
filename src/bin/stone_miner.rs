@@ -47,6 +47,7 @@ use stone::{
         MINING_INTERVAL_SECS,
     },
     network::{start_network, NetworkEvent, NetworkHandle},
+    shard::ShardStore,
     storage::ChunkStore,
     token::transaction::{create_signed_tx, TxType},
 };
@@ -74,6 +75,12 @@ const STORAGE_AUDIT_INTERVAL_SECS: u64 = 300; // alle 5 Minuten
 
 /// Anzahl Chunks die pro Audit geprüft werden
 const AUDIT_CHUNKS_PER_ROUND: usize = 10;
+
+/// Interval in Sekunden für automatische Shard-Reparatur
+const SHARD_REPAIR_INTERVAL_SECS: u64 = 600; // alle 10 Minuten
+
+/// Maximale Anzahl Shards die pro Reparatur-Runde repariert werden
+const REPAIR_SHARDS_PER_ROUND: usize = 20;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct MinerConfig {
@@ -154,6 +161,13 @@ struct StorageMetrics {
     chain_challenges_missed: u64,
     chain_rewards_earned: String,
     pending_challenges: usize,
+    // Shard-Repair stats
+    repairs_completed: u64,
+    repairs_failed: u64,
+    repairs_skipped: u64,
+    repair_rewards_earned: String,
+    last_repair: String,
+    last_repair_human: String,
 }
 
 // ─── System Metrics ──────────────────────────────────────────────────────────
@@ -568,6 +582,8 @@ async fn handle_p2p_event(
                 } else {
                     let txs = block.transactions.clone();
                     let idx = block.index;
+                    let block_signer = block.signer.clone();
+                    let block_validator_pk = block.validator_pub_key.clone();
                     match chain.accept_peer_block(*block, poa_ok) {
                         Ok(_) => {
                             if !txs.is_empty() {
@@ -577,6 +593,28 @@ async fn handle_p2p_event(
                                 for tx in &txs {
                                     node.mempool.mark_known(&tx.tx_id);
                                     node.mempool.remove_tx(&tx.tx_id);
+                                }
+                            }
+                            // Validator Auto-Discovery: Nur nach Initial-Sync
+                            let sync_done = node.metrics.initial_sync_done.load(
+                                std::sync::atomic::Ordering::Relaxed
+                            );
+                            if sync_done
+                                && !block_signer.is_empty()
+                                && !block_validator_pk.is_empty()
+                                && block_signer != node.node_id
+                            {
+                                let mut vs = node.validator_set.write().unwrap();
+                                if vs.get(&block_signer).is_none() {
+                                    let info = stone::consensus::ValidatorInfo::new(
+                                        block_signer.clone(),
+                                        block_validator_pk.clone(),
+                                    );
+                                    vs.add(info);
+                                    println!(
+                                        "[consensus] 🔗 Validator '{}' auto-discovered via Block #{}",
+                                        &block_signer, idx,
+                                    );
                                 }
                             }
                             BlockResult::Accepted(chain.blocks.len() as u64)
@@ -601,6 +639,79 @@ async fn handle_p2p_event(
                     });
                 }
                 _ => {}
+            }
+        }
+
+        // ── Range-Sync Batch (Fork-Reorg) ─────────────────────────────────
+        NetworkEvent::RangeSyncReceived { blocks, from_peer } => {
+            let mut sorted = blocks;
+            sorted.sort_by_key(|b| b.index);
+
+            let reorg_result: Option<(u64, u64)> = {
+                let mut chain = node.chain.lock().unwrap();
+                let local_len = chain.blocks.len();
+
+                let mut fork_at = 0usize;
+                for block in &sorted {
+                    let idx = block.index as usize;
+                    if idx < local_len {
+                        if chain.blocks[idx].hash == block.hash {
+                            fork_at = idx + 1;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        fork_at = local_len;
+                        break;
+                    }
+                }
+
+                let peer_new: Vec<_> = sorted.into_iter()
+                    .filter(|b| b.index as usize >= fork_at)
+                    .collect();
+                let our_after_fork = local_len.saturating_sub(fork_at);
+
+                if peer_new.len() > our_after_fork {
+                    println!(
+                        "[sync] 🔄 Fork-Reorg: fork_at={fork_at}, lokal={local_len}, peer hat {} neue Blöcke",
+                        peer_new.len()
+                    );
+                    chain.truncate_to(fork_at as u64);
+
+                    let mut applied = 0u64;
+                    for block in peer_new {
+                        let idx = block.index;
+                        let txs = block.transactions.clone();
+                        let block_signer = block.signer.clone();
+                        let block_validator_pk = block.validator_pub_key.clone();
+                        match chain.accept_peer_block(block, None) {
+                            Ok(_) => {
+                                applied += 1;
+                                if !txs.is_empty() {
+                                    let mut ledger = node.token_ledger.write().unwrap();
+                                    let _ = ledger.apply_block_txs(&txs, idx);
+                                    let _ = ledger.persist();
+                                    for tx in &txs {
+                                        node.mempool.mark_known(&tx.tx_id);
+                                        node.mempool.remove_tx(&tx.tx_id);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("[sync] ✗ Reorg Block #{idx} fehlgeschlagen: {e}");
+                                break;
+                            }
+                        }
+                    }
+                    Some((chain.blocks.len() as u64, applied))
+                } else {
+                    None
+                }
+            }; // chain-Lock hier gedroppt
+
+            if let Some((new_count, applied)) = reorg_result {
+                handle.set_chain_count(new_count).await;
+                println!("[sync] ✓ Fork-Reorg abgeschlossen: {applied} Blöcke applied, Chain-Höhe={new_count}");
             }
         }
 
@@ -882,6 +993,183 @@ fn spawn_challenge_response_worker(
             if responded > 0 || failed > 0 {
                 let _ = log_tx.send(format!(
                     "💾 Chain-Challenges: {responded} beantwortet, {failed} verpasst"
+                ));
+            }
+        }
+    });
+}
+
+// ─── Shard Repair Worker ────────────────────────────────────────────────────
+
+/// Background task: scans for degraded/critical shards and repairs them by
+/// fetching missing shards from peers. Successful repairs earn REPAIR_REWARD.
+fn spawn_shard_repair_worker(
+    node: Arc<MasterNodeState>,
+    net: NetworkHandle,
+    validator_wallet: String,
+    storage_metrics: Arc<std::sync::RwLock<StorageMetrics>>,
+    log_tx: std::sync::mpsc::Sender<String>,
+) {
+    tokio::spawn(async move {
+        // Initial delay — wait for sync and network
+        tokio::time::sleep(Duration::from_secs(30)).await;
+
+        let mut interval = tokio::time::interval(Duration::from_secs(SHARD_REPAIR_INTERVAL_SECS));
+        loop {
+            interval.tick().await;
+
+            // Check we have connected peers
+            let connected_peers = net.connected_peers().await;
+            if connected_peers.is_empty() {
+                continue;
+            }
+
+            let shard_store = match ShardStore::new() {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+
+            // Collect EC chunks from chain
+            let ec_chunks: Vec<(String, u8, u8)> = {
+                let chain = node.chain.lock().unwrap();
+                let mut chunks = Vec::new();
+                for block in &chain.blocks {
+                    for doc in &block.documents {
+                        for chunk in &doc.chunks {
+                            if chunk.ec_k > 0 && !chunk.shards.is_empty() {
+                                chunks.push((chunk.hash.clone(), chunk.ec_k, chunk.ec_m));
+                            }
+                        }
+                    }
+                }
+                chunks
+            };
+
+            if ec_chunks.is_empty() {
+                continue;
+            }
+
+            let local_peer_id = net.local_peer_id.clone();
+            let mut repaired = 0u64;
+            let mut failed = 0u64;
+            let mut skipped = 0u64;
+            let mut total_shards = 0usize;
+
+            for (chunk_hash, ec_k, ec_m) in &ec_chunks {
+                if total_shards >= REPAIR_SHARDS_PER_ROUND {
+                    break;
+                }
+
+                let n = (*ec_k as usize) + (*ec_m as usize);
+                let local_indices = shard_store.local_shard_indices(chunk_hash);
+
+                // Which indices are missing locally?
+                let missing: Vec<u8> = (0..n as u8)
+                    .filter(|i| !local_indices.contains(i))
+                    .collect();
+
+                if missing.is_empty() {
+                    skipped += 1;
+                    continue;
+                }
+
+                // Only repair if degraded or critical
+                let available_count = node.shard_registry.available_shards_for_chunk(chunk_hash);
+                if available_count >= n {
+                    skipped += 1;
+                    continue;
+                }
+
+                for shard_idx in &missing {
+                    if total_shards >= REPAIR_SHARDS_PER_ROUND {
+                        break;
+                    }
+
+                    // Find a peer that holds this shard
+                    let holders = node.shard_registry.holders_for(chunk_hash, *shard_idx);
+                    let remote_holder = holders.iter().find(|h| **h != local_peer_id);
+
+                    let requested = if let Some(holder_id) = remote_holder {
+                        if let Ok(peer_id) = holder_id.parse::<libp2p::PeerId>() {
+                            let is_connected = connected_peers.iter().any(|p| p.peer_id == *holder_id);
+                            if is_connected {
+                                net.request_shard(peer_id, chunk_hash.clone(), *shard_idx).await;
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        // No known holder — try discovery from connected peers
+                        let mut found = false;
+                        for peer in &connected_peers {
+                            if let Ok(pid) = peer.peer_id.parse::<libp2p::PeerId>() {
+                                let peer_shards = net.list_peer_shards(pid.clone(), chunk_hash.clone()).await;
+                                if peer_shards.contains(shard_idx) {
+                                    net.request_shard(pid, chunk_hash.clone(), *shard_idx).await;
+                                    node.shard_registry.add_holder(chunk_hash, *shard_idx, &peer.peer_id);
+                                    found = true;
+                                    break;
+                                }
+                            }
+                        }
+                        found
+                    };
+
+                    if requested {
+                        repaired += 1;
+                        total_shards += 1;
+
+                        // Submit repair reward for inclusion in next block
+                        use sha2::{Digest, Sha256};
+                        let repair_id = format!("{:x}", Sha256::digest(
+                            format!("{}{}{}{}",
+                                validator_wallet, chunk_hash, shard_idx,
+                                Utc::now().timestamp()
+                            ).as_bytes()
+                        ));
+                        node.pending_repair_rewards.lock().unwrap().push(
+                            stone::storage_proof::RepairReward {
+                                repair_id,
+                                repairer_wallet: validator_wallet.clone(),
+                                chunk_hash: chunk_hash.clone(),
+                                shard_index: *shard_idx,
+                                timestamp: Utc::now().timestamp(),
+                            }
+                        );
+
+                        let _ = log_tx.send(format!(
+                            "🔧 Shard {}…[{}] repariert (angefordert)",
+                            &chunk_hash[..8.min(chunk_hash.len())], shard_idx
+                        ));
+                    } else {
+                        failed += 1;
+                    }
+                }
+            }
+
+            // Update metrics
+            {
+                let mut m = storage_metrics.write().unwrap();
+                m.repairs_completed += repaired;
+                m.repairs_failed += failed;
+                m.repairs_skipped += skipped;
+
+                let reward_per: rust_decimal::Decimal = stone::storage_proof::REPAIR_REWARD.parse().unwrap_or_default();
+                let prev: rust_decimal::Decimal = m.repair_rewards_earned.parse().unwrap_or_default();
+                m.repair_rewards_earned = (prev + reward_per * rust_decimal::Decimal::from(repaired)).to_string();
+
+                let now = Utc::now();
+                m.last_repair = now.to_rfc3339();
+                m.last_repair_human = now.with_timezone(&Local).format("%H:%M:%S").to_string();
+            }
+
+            if repaired > 0 || failed > 0 {
+                let _ = log_tx.send(format!(
+                    "🔧 Shard-Repair: {} repariert, {} fehlgeschlagen, {} übersprungen",
+                    repaired, failed, skipped
                 ));
             }
         }
@@ -1270,6 +1558,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         storage_metrics.clone(),
         log_tx.clone(),
     );
+
+    // ── Shard Repair Worker ─────────────────────────────────────────────
+    if let Some(ref net) = network_handle {
+        spawn_shard_repair_worker(
+            node.clone(),
+            net.clone(),
+            validator_wallet.clone(),
+            storage_metrics.clone(),
+            log_tx.clone(),
+        );
+    }
 
     // ── System Metrics Worker ───────────────────────────────────────────
     spawn_system_metrics_worker(system_metrics.clone());

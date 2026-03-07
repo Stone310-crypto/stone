@@ -260,7 +260,7 @@ pub struct StoneChain {
 impl StoneChain {
     /// Lädt die Chain aus RocksDB oder erstellt eine neue mit Genesis-Block.
     pub fn load_or_create(cluster_key: &str) -> Self {
-        use crate::storage::ChainStore;
+        use crate::storage::{ChainStore, chain_db_path};
 
         std::fs::create_dir_all(data_dir()).unwrap_or(());
         std::fs::create_dir_all(chunk_dir()).unwrap_or(());
@@ -268,7 +268,26 @@ impl StoneChain {
         // Erwarteter Genesis-Hash für diesen cluster_key (deterministisch)
         let expected_genesis = genesis_block(cluster_key);
 
-        match ChainStore::open() {
+        // Versuche DB zu öffnen — bei LOCK-Fehler (z.B. nach Crash) einmal retrien
+        let open_result = match ChainStore::open() {
+            ok @ Ok(_) => ok,
+            Err(e) => {
+                let err_msg = format!("{e}");
+                if err_msg.contains("lock") || err_msg.contains("LOCK") {
+                    eprintln!(
+                        "[chain] ⚠️  RocksDB LOCK-Fehler (vermutlich unsauberer Shutdown). \
+                         Entferne stale LOCK und versuche erneut..."
+                    );
+                    let lock_path = format!("{}/LOCK", chain_db_path());
+                    let _ = std::fs::remove_file(&lock_path);
+                    ChainStore::open()
+                } else {
+                    Err(e)
+                }
+            }
+        };
+
+        match open_result {
             Ok(store) if !store.is_empty() => {
                 match store.read_all_blocks() {
                     Ok(blocks) if !blocks.is_empty() => {

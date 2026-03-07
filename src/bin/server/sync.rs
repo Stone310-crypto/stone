@@ -405,6 +405,65 @@ pub async fn pull_from_peer(node: &Arc<MasterNodeState>, peer_url: &str, api_key
         eprintln!("[sync] {peer_url}: {} Blöcke hinzugefügt", added);
     }
 
+    // ── Initial-Sync abschließen ──────────────────────────────────────
+    // Wenn wir erfolgreich mit einem Peer gesynced haben (oder Peer hatte
+    // keine neuen Blöcke → wir sind bereits aktuell), markiere den
+    // Initial-Sync als abgeschlossen. Das erlaubt dem Mining-Loop zu starten.
+    if !node.metrics.initial_sync_done.load(std::sync::atomic::Ordering::Relaxed) {
+        node.metrics.initial_sync_done.store(true, std::sync::atomic::Ordering::Relaxed);
+        eprintln!("[sync] ✅ Initial-Sync abgeschlossen nach Sync mit {peer_url}");
+
+        // Token-Ledger vollständig aus der (jetzt synced) Chain neu aufbauen.
+        // Während des Sync konnten TXs wegen falscher Nonce-Reihenfolge
+        // übersprungen worden sein – der Rebuild korrigiert das.
+        {
+            let chain = node.chain.lock().unwrap_or_else(|e| e.into_inner());
+            if chain.blocks.len() > 1 {
+                let rebuilt = stone::token::TokenLedger::rebuild_from_chain(&chain.blocks);
+                let mut ledger = node.token_ledger.write().unwrap_or_else(|e| e.into_inner());
+                *ledger = rebuilt;
+                eprintln!(
+                    "[token] 🔄 Ledger nach Initial-Sync rebuilt: {} Accounts, Supply: {}",
+                    ledger.account_count(),
+                    ledger.total_supply()
+                );
+            }
+        }
+    }
+
+    // ── Auto-Snapshot nach Sync ─────────────────────────────────────
+    // Snapshot auch nach Sync erstellen (nicht nur nach eigenem Mining).
+    // Damit haben Nodes die per Sync zur richtigen Höhe kommen auch Snapshots.
+    if added > 0 {
+        let chain = node.chain.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(last) = chain.blocks.last() {
+            let height = last.index;
+            if stone::snapshot::should_create_snapshot(height) {
+                let genesis_hash = chain.blocks.first()
+                    .map(|b| b.hash.clone())
+                    .unwrap_or_default();
+                let latest_hash = last.hash.clone();
+                drop(chain);
+                std::thread::spawn(move || {
+                    match stone::snapshot::create_snapshot(height, &genesis_hash, &latest_hash) {
+                        Ok((_path, meta)) => {
+                            eprintln!(
+                                "[snapshot] 📸 Auto-Snapshot nach Sync bei Block #{}: {:.1} MB",
+                                meta.block_height,
+                                meta.archive_size as f64 / 1_048_576.0
+                            );
+                        }
+                        Err(e) => eprintln!("[snapshot] ⚠️  Auto-Snapshot nach Sync fehlgeschlagen: {e}"),
+                    }
+                });
+            } else {
+                drop(chain);
+            }
+        } else {
+            drop(chain);
+        }
+    }
+
     let latency = start.elapsed().as_millis();
     let latest_hash = {
         let chain = node.chain.lock().unwrap_or_else(|e| e.into_inner());

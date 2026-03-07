@@ -391,10 +391,11 @@ pub async fn handle_token_faucet(
         }
     }
 
-    // Nonce aus Ledger holen (pool:community)
+    // Nonce aus Ledger holen + pending TXs (pool:community)
     let nonce = {
         let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
-        ledger.nonce(pool)
+        let base = ledger.nonce(pool);
+        base + state.node.mempool.sender_pending_count(pool)
     };
 
     // TokenTx mit TxType::Transfer erstellen – Pool-Signatur wird übersprungen
@@ -718,10 +719,11 @@ pub async fn handle_token_send(
         );
     }
 
-    // Nonce aus dem Ledger holen
+    // Nonce aus dem Ledger holen (+ pending TXs im Mempool vom selben Sender)
     let nonce = {
         let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
-        ledger.nonce(&wallet.address())
+        let base = ledger.nonce(&wallet.address());
+        base + state.node.mempool.sender_pending_count(&wallet.address())
     };
 
     // Fee-Tier parsen
@@ -913,10 +915,11 @@ pub async fn handle_token_send_authenticated(
         );
     }
 
-    // Nonce
+    // Nonce (Ledger + pending TXs im Mempool)
     let nonce = {
         let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
-        ledger.nonce(&wallet.address())
+        let base = ledger.nonce(&wallet.address());
+        base + state.node.mempool.sender_pending_count(&wallet.address())
     };
 
     // TX signieren

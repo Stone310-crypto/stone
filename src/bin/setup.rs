@@ -197,7 +197,6 @@ async fn main() {
         .route("/api/status", get(api_status))
         .route("/api/setup/password", post(api_set_password))
         .route("/api/setup/node", post(api_set_node))
-        .route("/api/setup/storage", post(api_set_storage))
         .route("/api/setup/peers", post(api_set_peers))
         .route("/api/setup/finish", post(api_finish_setup))
         .route("/api/login", post(api_login))
@@ -205,9 +204,9 @@ async fn main() {
         .route("/api/settings", get(api_get_settings))
         .route("/api/settings", post(api_save_settings))
         .route("/api/send", post(api_send))
-        .route("/api/reward-preview", post(api_reward_preview))
         // OTA Update Dashboard-Endpoints
         .route("/api/updates", get(api_update_status))
+        .route("/api/updates/download", post(api_update_download))
         .route("/api/updates/install", post(api_update_install))
         .route("/api/updates/config", post(api_update_config))
         // Shard Repair
@@ -718,6 +717,8 @@ async fn handle_p2p_event(
                 } else {
                     let idx = block.index;
                     let txs = block.transactions.clone();
+                    let block_signer = block.signer.clone();
+                    let block_validator_pk = block.validator_pub_key.clone();
                     match chain.accept_peer_block(*block, poa_ok) {
                         Ok(_) => {
                             println!("[p2p] ✓ Block #{idx} von {from_peer}");
@@ -728,6 +729,31 @@ async fn handle_p2p_event(
                                 for tx in &txs {
                                     node.mempool.mark_known(&tx.tx_id);
                                     node.mempool.remove_tx(&tx.tx_id);
+                                }
+                            }
+                            // Validator Auto-Discovery: Nur für LIVE Blöcke
+                            // (nicht während Initial-Sync, dort kommen historische
+                            // Blöcke die tote Nodes registrieren würden)
+                            let sync_done = node.metrics.initial_sync_done.load(
+                                std::sync::atomic::Ordering::Relaxed
+                            );
+                            if sync_done
+                                && !block_signer.is_empty()
+                                && !block_validator_pk.is_empty()
+                                && block_signer != node.node_id
+                            {
+                                let mut vs = node.validator_set.write().unwrap();
+                                if vs.get(&block_signer).is_none() {
+                                    let info = stone::consensus::ValidatorInfo::new(
+                                        block_signer.clone(),
+                                        block_validator_pk.clone(),
+                                    );
+                                    vs.add(info);
+                                    println!(
+                                        "[consensus] 🔗 Validator '{}' auto-discovered via Block #{} (Wallet: {}…)",
+                                        &block_signer, idx,
+                                        &block_validator_pk[..16.min(block_validator_pk.len())]
+                                    );
                                 }
                             }
                             BlockResult::Accepted(chain.blocks.len() as u64)
@@ -768,6 +794,81 @@ async fn handle_p2p_event(
                 _ => {}
             }
         }
+
+        // ── Range-Sync Batch (Fork-Reorg) ─────────────────────────────────
+        NetworkEvent::RangeSyncReceived { blocks, from_peer } => {
+            let mut sorted = blocks;
+            sorted.sort_by_key(|b| b.index);
+
+            // Chain-Lock in eigenem Scope → wird vor .await gedroppt
+            let reorg_result: Option<(u64, u64)> = {
+                let mut chain = node.chain.lock().unwrap();
+                let local_len = chain.blocks.len();
+
+                let mut fork_at = 0usize;
+                for block in &sorted {
+                    let idx = block.index as usize;
+                    if idx < local_len {
+                        if chain.blocks[idx].hash == block.hash {
+                            fork_at = idx + 1;
+                        } else {
+                            break;
+                        }
+                    } else {
+                        fork_at = local_len;
+                        break;
+                    }
+                }
+
+                let peer_new: Vec<_> = sorted.into_iter()
+                    .filter(|b| b.index as usize >= fork_at)
+                    .collect();
+                let our_after_fork = local_len.saturating_sub(fork_at);
+
+                if peer_new.len() > our_after_fork {
+                    println!(
+                        "[sync] 🔄 Fork-Reorg: fork_at={fork_at}, lokal={local_len}, peer hat {} neue Blöcke",
+                        peer_new.len()
+                    );
+                    chain.truncate_to(fork_at as u64);
+
+                    let mut applied = 0u64;
+                    for block in peer_new {
+                        let idx = block.index;
+                        let txs = block.transactions.clone();
+                        let block_signer = block.signer.clone();
+                        let block_validator_pk = block.validator_pub_key.clone();
+                        match chain.accept_peer_block(block, None) {
+                            Ok(_) => {
+                                applied += 1;
+                                if !txs.is_empty() {
+                                    let mut ledger = node.token_ledger.write().unwrap();
+                                    let _receipts = ledger.apply_block_txs(&txs, idx);
+                                    let _ = ledger.persist();
+                                    for tx in &txs {
+                                        node.mempool.mark_known(&tx.tx_id);
+                                        node.mempool.remove_tx(&tx.tx_id);
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                eprintln!("[sync] ✗ Reorg Block #{idx} fehlgeschlagen: {e}");
+                                break;
+                            }
+                        }
+                    }
+                    Some((chain.blocks.len() as u64, applied))
+                } else {
+                    None
+                }
+            }; // chain-Lock hier gedroppt
+
+            if let Some((new_count, applied)) = reorg_result {
+                handle.set_chain_count(new_count).await;
+                println!("[sync] ✓ Fork-Reorg abgeschlossen: {applied} Blöcke applied, Chain-Höhe={new_count}");
+            }
+        }
+
         NetworkEvent::TxReceived { tx, from_peer } => {
             let ledger = node.token_ledger.read().unwrap();
             match node.mempool.add_tx(*tx, Some(&ledger)) {
@@ -1261,6 +1362,97 @@ async fn api_update_status(State(state): State<SetupState>) -> Json<UpdateStatus
     }
 }
 
+// ─── API: Update herunterladen ──────────────────────────────────────────────
+
+async fn api_update_download(State(state): State<SetupState>) -> (StatusCode, Json<serde_json::Value>) {
+    let ns = state.node_state.read().await;
+    match ns.as_ref() {
+        Some(ns) => {
+            let (missing, manifest_version) = {
+                let um = ns.updater.read().unwrap();
+                let missing = um.missing_chunks();
+                let version = um.manifest.as_ref().map(|m| m.version.clone());
+                (missing, version)
+            };
+
+            let version = match manifest_version {
+                Some(v) => v,
+                None => return (StatusCode::CONFLICT, Json(serde_json::json!({
+                    "ok": false, "error": "Kein Update-Manifest vorhanden"
+                }))),
+            };
+
+            if missing.is_empty() {
+                // Alle Chunks vorhanden → verifizieren
+                let mut um = ns.updater.write().unwrap();
+                if !matches!(um.state, stone::updater::UpdateState::Ready) {
+                    if let Err(e) = um.verify_and_prepare() {
+                        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                            "ok": false, "error": format!("Verifizierung fehlgeschlagen: {e}")
+                        })));
+                    }
+                }
+                return (StatusCode::OK, Json(serde_json::json!({
+                    "ok": true, "status": "complete", "message": "Alle Chunks vorhanden"
+                })));
+            }
+
+            let chunk_count = missing.len();
+            let peer_urls: Vec<String> = ns.node.get_peers()
+                .iter()
+                .filter(|p| p.is_healthy())
+                .map(|p| p.url.clone())
+                .collect();
+
+            // Download im Hintergrund
+            let updater_clone = ns.updater.clone();
+            tokio::spawn(async move {
+                let client = reqwest::Client::builder()
+                    .danger_accept_invalid_certs(true)
+                    .timeout(std::time::Duration::from_secs(30))
+                    .build()
+                    .unwrap();
+                for idx in missing {
+                    for url in &peer_urls {
+                        let chunk_url = format!(
+                            "{}/api/v1/updates/chunk/{}",
+                            url.trim_end_matches('/'), idx
+                        );
+                        if let Ok(resp) = client.get(&chunk_url).send().await {
+                            if resp.status().is_success() {
+                                if let Ok(data) = resp.bytes().await {
+                                    let mut um = updater_clone.write().unwrap();
+                                    if um.store_chunk(idx, data.to_vec()).is_ok() {
+                                        println!("[updater] ✓ Chunk {idx} heruntergeladen");
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Verifizieren wenn komplett
+                let mut um = updater_clone.write().unwrap();
+                if um.missing_chunks().is_empty() {
+                    println!("[updater] ✓ Alle Chunks heruntergeladen – verifiziere...");
+                    if let Err(e) = um.verify_and_prepare() {
+                        eprintln!("[updater] Verifizierung: {e}");
+                    }
+                }
+            });
+
+            (StatusCode::ACCEPTED, Json(serde_json::json!({
+                "ok": true, "status": "downloading",
+                "version": version,
+                "missing_chunks": chunk_count
+            })))
+        }
+        None => (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+            "ok": false, "error": "Node noch nicht gestartet"
+        }))),
+    }
+}
+
 // ─── API: Update installieren ───────────────────────────────────────────────
 
 async fn api_update_install(State(state): State<SetupState>) -> (StatusCode, Json<serde_json::Value>) {
@@ -1535,7 +1727,6 @@ struct StatusResponse {
     has_password: bool,
     has_node_name: bool,
     has_wallet: bool,
-    has_storage: bool,
     has_peers: bool,
     node_name: String,
 }
@@ -1547,7 +1738,6 @@ async fn api_status(State(state): State<SetupState>) -> Json<StatusResponse> {
         has_password: !cfg.password_hash.is_empty(),
         has_node_name: !cfg.node_name.is_empty(),
         has_wallet: !cfg.wallet_address.is_empty(),
-        has_storage: cfg.storage_offered_gb > 0,
         has_peers: !cfg.seed_peers.is_empty(),
         node_name: cfg.node_name.clone(),
     })
@@ -1632,54 +1822,6 @@ async fn api_set_node(
     (StatusCode::OK, Json(SetNodeResp { ok: true, error: None, wallet_address, mnemonic }))
 }
 
-// ─── API: Set Storage ───────────────────────────────────────────────────────
-
-#[derive(Deserialize)]
-struct SetStorageReq { offered_gb: u64 }
-
-#[derive(Serialize)]
-struct SetStorageResp {
-    ok: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<String>,
-    offered_gb: u64,
-    reward_per_day: f64,
-    reward_per_month: f64,
-}
-
-async fn api_set_storage(
-    State(state): State<SetupState>,
-    Json(body): Json<SetStorageReq>,
-) -> (StatusCode, Json<SetStorageResp>) {
-    if body.offered_gb == 0 {
-        return (StatusCode::BAD_REQUEST, Json(SetStorageResp {
-            ok: false, error: Some("Mindestens 1 GB bereitstellen".into()),
-            offered_gb: 0, reward_per_day: 0.0, reward_per_month: 0.0,
-        }));
-    }
-    let rpd = calc_reward_per_day(body.offered_gb);
-    let mut cfg = state.config.write().await;
-    cfg.storage_offered_gb = body.offered_gb;
-    cfg.reward_per_day = rpd;
-    let _ = cfg.save();
-    (StatusCode::OK, Json(SetStorageResp {
-        ok: true, error: None,
-        offered_gb: body.offered_gb, reward_per_day: rpd, reward_per_month: rpd * 30.0,
-    }))
-}
-
-// ─── API: Reward Preview ────────────────────────────────────────────────────
-
-#[derive(Deserialize)]
-struct RewardPreviewReq { gb: u64 }
-#[derive(Serialize)]
-struct RewardPreviewResp { reward_per_day: f64, reward_per_month: f64 }
-
-async fn api_reward_preview(Json(body): Json<RewardPreviewReq>) -> Json<RewardPreviewResp> {
-    let rpd = calc_reward_per_day(body.gb);
-    Json(RewardPreviewResp { reward_per_day: rpd, reward_per_month: rpd * 30.0 })
-}
-
 // ─── API: Set Peers ─────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]
@@ -1709,6 +1851,9 @@ async fn api_finish_setup(State(state): State<SetupState>) -> Json<ApiResult> {
         }
         cfg.setup_complete = true;
         cfg.mnemonic_once.clear();
+        if cfg.storage_offered_gb == 0 {
+            cfg.storage_offered_gb = 50;
+        }
         let _ = write_env_file(&cfg);
         let _ = cfg.save();
     }

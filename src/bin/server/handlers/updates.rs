@@ -375,27 +375,35 @@ async fn download_missing_chunks(
                 println!("[updater] ✓ Update verifiziert und bereit zur Installation");
                 if updater.config.auto_install {
                     println!("[updater] 🔄 Auto-Install aktiviert – installiere...");
-                    drop(updater);
-                    // Auto-Install in eigenem Task
-                    tokio::spawn(async {
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                        if stone::updater::UpdateManager::is_docker() {
-                            println!("[updater] 🐳 Docker: Beende Prozess für Container-Restart...");
-                            std::process::exit(0);
-                        } else {
-                            let exe = std::env::current_exe().expect("current_exe");
-                            let args: Vec<String> = std::env::args().collect();
-                            #[cfg(unix)]
-                            {
-                                use std::os::unix::process::CommandExt;
-                                let _ = std::process::Command::new(&exe).args(&args[1..]).exec();
-                            }
-                            #[cfg(not(unix))]
-                            {
-                                std::process::exit(0);
-                            }
+                    match updater.install() {
+                        Ok(path) => {
+                            println!("[updater] ✅ Auto-Install: Binary → {}", path.display());
+                            drop(updater);
+                            // Neustart in eigenem Task
+                            tokio::spawn(async {
+                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                if stone::updater::UpdateManager::is_docker() {
+                                    println!("[updater] 🐳 Docker: Beende Prozess für Container-Restart...");
+                                    std::process::exit(0);
+                                } else {
+                                    let exe = std::env::current_exe().expect("current_exe");
+                                    let args: Vec<String> = std::env::args().collect();
+                                    #[cfg(unix)]
+                                    {
+                                        use std::os::unix::process::CommandExt;
+                                        let _ = std::process::Command::new(&exe).args(&args[1..]).exec();
+                                    }
+                                    #[cfg(not(unix))]
+                                    {
+                                        std::process::exit(0);
+                                    }
+                                }
+                            });
                         }
-                    });
+                        Err(e) => {
+                            eprintln!("[updater] ❌ Auto-Install fehlgeschlagen: {e}");
+                        }
+                    }
                 }
             }
             Err(e) => {

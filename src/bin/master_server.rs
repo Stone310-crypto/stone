@@ -290,18 +290,11 @@ async fn main() {
                                                     );
                                                     if !block_txs.is_empty() {
                                                         let mut ledger = node_bg.token_ledger.write().unwrap();
-                                                        // Während Initial-Sync: replay_mode aktivieren
-                                                        // (Nonce/Balance-Checks überspringen, Blöcke sind netzwerk-validiert)
-                                                        let is_syncing = !node_bg.metrics.initial_sync_done.load(
-                                                            std::sync::atomic::Ordering::Relaxed
-                                                        );
-                                                        if is_syncing {
-                                                            ledger.replay_mode = true;
-                                                        }
+                                                        // Block ist bereits in Chain aufgenommen → replay_mode
+                                                        // (Nonce/Balance-Checks überspringen, Block ist finalisiert)
+                                                        ledger.replay_mode = true;
                                                         let receipts = ledger.apply_block_txs(&block_txs, idx);
-                                                        if is_syncing {
-                                                            ledger.replay_mode = false;
-                                                        }
+                                                        ledger.replay_mode = false;
                                                         if !receipts.is_empty() {
                                                             if let Err(e) = ledger.persist() {
                                                                 eprintln!("[token] Ledger-Persist nach Peer-Block #{idx}: {e}");

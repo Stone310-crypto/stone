@@ -346,6 +346,91 @@ impl ValidatorSet {
         }
     }
 
+    /// Bestimmt den Backup-Rang einer Node für einen bestimmten Block-Slot.
+    ///
+    /// Gibt `Some(rank)` zurück wenn die Node als Backup-Proposer infrage kommt:
+    /// - rank=1 → erster Backup (darf nach 1× MINING_INTERVAL einspringen)
+    /// - rank=2 → zweiter Backup (nach 2× MINING_INTERVAL)
+    /// - usw.
+    ///
+    /// Gibt `None` zurück wenn die Node kein aktiver Validator ist oder
+    /// der primäre Proposer ist (rank=0 wäre der primäre).
+    pub fn backup_proposer_rank(
+        &self,
+        node_id: &str,
+        prev_hash: &str,
+        block_index: u64,
+        stakes: &HashMap<String, rust_decimal::Decimal>,
+        jailed: &std::collections::HashSet<String>,
+        wallet_map: &HashMap<String, String>,
+    ) -> Option<usize> {
+        let active: Vec<&ValidatorInfo> = self.validators.iter()
+            .filter(|v| v.active)
+            .filter(|v| !jailed.contains(&v.node_id))
+            .collect();
+        if active.len() <= 1 {
+            return None; // Kein Backup möglich
+        }
+
+        // Gleicher SHA256-Seed wie select_validator_weighted
+        let mut hasher = Sha256::new();
+        hasher.update(prev_hash.as_bytes());
+        hasher.update(block_index.to_le_bytes());
+        let hash = hasher.finalize();
+        let seed = u64::from_le_bytes(hash[24..32].try_into().unwrap());
+
+        let base_weight = rust_decimal::Decimal::ONE;
+        let weights: Vec<u64> = active.iter().map(|v| {
+            let wallet = wallet_map.get(&v.node_id);
+            let stake = wallet
+                .and_then(|w| stakes.get(w))
+                .copied()
+                .unwrap_or(rust_decimal::Decimal::ZERO);
+            let total = stake + base_weight;
+            use rust_decimal::prelude::ToPrimitive;
+            (total * rust_decimal::Decimal::from(1000u64))
+                .to_u64()
+                .unwrap_or(1000)
+        }).collect();
+
+        let total_weight: u64 = weights.iter().sum();
+        if total_weight == 0 {
+            // Fallback: einfache Index-Rotation
+            let primary_idx = (seed % active.len() as u64) as usize;
+            for rank in 1..active.len() {
+                let idx = (primary_idx + rank) % active.len();
+                if active[idx].node_id == node_id {
+                    return Some(rank);
+                }
+            }
+            return None;
+        }
+
+        // Sortierte Reihenfolge nach gewichteter Position:
+        // Primärer Validator = Position im kumulativen Gewicht.
+        // Backup-Reihenfolge = nächste Validatoren in der kumulativen Liste (wraparound).
+        let position = seed % total_weight;
+        let mut cumulative: u64 = 0;
+        let mut primary_idx = active.len() - 1;
+        for (i, &w) in weights.iter().enumerate() {
+            cumulative += w;
+            if position < cumulative {
+                primary_idx = i;
+                break;
+            }
+        }
+
+        // Backup-Rang bestimmen: nächste Validatoren nach dem Primary
+        for rank in 1..active.len() {
+            let idx = (primary_idx + rank) % active.len();
+            if active[idx].node_id == node_id {
+                return Some(rank);
+            }
+        }
+
+        None
+    }
+
     /// Block-Signatur + randomisierte Validator-Auswahl verifizieren.
     ///
     /// Erweiterte Version von `verify_block` die zusätzlich prüft ob der Signer
@@ -368,11 +453,28 @@ impl ValidatorSet {
         if basic == BlockVerifyResult::NoValidatorsConfigured {
             return basic;
         }
-        // Prüfe ob der Signer der ausgewählte Validator für diesen Slot war
-        if !self.is_selected_validator(signer_node_id, prev_hash, block_index) {
-            return BlockVerifyResult::NotSelectedValidator;
+        // Prüfe ob der Signer der ausgewählte Validator für diesen Slot war.
+        // Auch Backup-Proposer (rank 1-3) sind erlaubt — sie springen ein
+        // wenn der primäre Validator seinen Slot verpasst hat.
+        if self.is_selected_validator(signer_node_id, prev_hash, block_index) {
+            return BlockVerifyResult::Valid;
         }
-        BlockVerifyResult::Valid
+        // Prüfe ob der Signer ein Backup-Proposer ist (rank 1..3)
+        let empty_stakes = HashMap::new();
+        let empty_jailed = std::collections::HashSet::new();
+        let wallet_map: HashMap<String, String> = self.validators.iter()
+            .filter(|v| v.active && !v.public_key_hex.is_empty())
+            .map(|v| (v.node_id.clone(), v.public_key_hex.clone()))
+            .collect();
+        if let Some(rank) = self.backup_proposer_rank(
+            signer_node_id, prev_hash, block_index,
+            &empty_stakes, &empty_jailed, &wallet_map,
+        ) {
+            if rank <= 3 {
+                return BlockVerifyResult::Valid;
+            }
+        }
+        BlockVerifyResult::NotSelectedValidator
     }
 }
 
