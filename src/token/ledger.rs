@@ -209,6 +209,11 @@ pub struct TokenLedger {
     total_fees_burned: Decimal,
     /// Aktueller Block-Validator (für Fee-Split, wird vor apply_block_txs gesetzt)
     current_block_validator: Option<String>,
+    /// Letzter Block-Index, der vom Ledger verarbeitet wurde.
+    /// Dient zur Erkennung von Chain/Ledger-Desync beim Startup.
+    last_synced_block: Option<u64>,
+    /// Replay-Modus: überspringt Nonce-/Signatur-Prüfung für vertrauenswürdige Chain-Replays.
+    pub replay_mode: bool,
 }
 
 impl TokenLedger {
@@ -227,6 +232,8 @@ impl TokenLedger {
             vesting_schedules: HashMap::new(),
             total_fees_burned: Decimal::ZERO,
             current_block_validator: None,
+            last_synced_block: None,
+            replay_mode: false,
         }
     }
 
@@ -240,6 +247,18 @@ impl TokenLedger {
     /// Nonce eines Accounts abfragen.
     pub fn nonce(&self, address: &str) -> u64 {
         self.nonces.get(address).copied().unwrap_or(0)
+    }
+
+    /// Nonce nach einer verarbeiteten TX aktualisieren.
+    /// Im Replay-Modus wird die Nonce auf das Maximum gesetzt,
+    /// da Blöcke aus dem Netzwerk ggf. Lücken aufweisen.
+    fn advance_nonce(&mut self, from: &str, tx_nonce: u64) {
+        let entry = self.nonces.entry(from.to_string()).or_insert(0);
+        if self.replay_mode {
+            *entry = (*entry).max(tx_nonce + 1);
+        } else {
+            *entry += 1;
+        }
     }
 
     /// Aktuelles Gesamtangebot.
@@ -346,24 +365,29 @@ impl TokenLedger {
         fee: Decimal,
     ) -> Result<(), LedgerError> {
         let total_debit = amount + fee;
-        let current_balance = self.balance(from);
 
-        if current_balance < total_debit {
-            return Err(LedgerError::InsufficientBalance {
-                account: from.to_string(),
-                available: current_balance,
-                required: total_debit,
-            });
-        }
-
-        // Vesting-Check: bei Pool-Adressen prüfen ob der Betrag freigesetzt ist
-        if let Some(schedule) = self.vesting_schedules.get_mut(from) {
-            let now = chrono::Utc::now().timestamp();
-            if let Err(e) = schedule.withdraw(total_debit, now) {
-                return Err(LedgerError::VestingLocked {
+        // Im Replay-Modus Balance-/Vesting-Checks überspringen:
+        // Die Chain war bereits validiert, und bei unvollständigen Chains
+        // fehlen möglicherweise frühere Gutschriften.
+        if !self.replay_mode {
+            let current_balance = self.balance(from);
+            if current_balance < total_debit {
+                return Err(LedgerError::InsufficientBalance {
                     account: from.to_string(),
-                    message: e,
+                    available: current_balance,
+                    required: total_debit,
                 });
+            }
+
+            // Vesting-Check: bei Pool-Adressen prüfen ob der Betrag freigesetzt ist
+            if let Some(schedule) = self.vesting_schedules.get_mut(from) {
+                let now = chrono::Utc::now().timestamp();
+                if let Err(e) = schedule.withdraw(total_debit, now) {
+                    return Err(LedgerError::VestingLocked {
+                        account: from.to_string(),
+                        message: e,
+                    });
+                }
             }
         }
 
@@ -548,8 +572,10 @@ impl TokenLedger {
     ///
     /// Gibt ein `TxReceipt` mit den neuen Balancen zurück.
     pub fn apply_tx(&mut self, tx: &TokenTx, block_index: u64) -> Result<TxReceipt, LedgerError> {
-        // 1. Strukturelle Validierung
-        validate_tx(tx)?;
+        // 1. Strukturelle Validierung (im Replay-Modus nur TX-ID prüfen, keine Signatur)
+        if !self.replay_mode {
+            validate_tx(tx)?;
+        }
 
         // 2. Duplikat-Prüfung (Memorial-TXs sind in jedem Block identisch → überspringen)
         if tx.tx_type != TxType::Memorial && self.processed_txs.contains(&tx.tx_id) {
@@ -559,10 +585,12 @@ impl TokenLedger {
         }
 
         // 3. Nonce-Prüfung (nur für echte Nutzer-Transaktionen)
+        //    Im Replay-Modus überspringen: Blöcke wurden bereits vom Netzwerk validiert.
         //    Stake/Unstake werden vom Node erstellt (nicht vom User signiert) → Nonce überspringen.
-        if tx.tx_type == TxType::Transfer || tx.tx_type == TxType::Burn || tx.tx_type == TxType::RotateKey
+        if !self.replay_mode
+            && (tx.tx_type == TxType::Transfer || tx.tx_type == TxType::Burn || tx.tx_type == TxType::RotateKey
             || tx.tx_type == TxType::AccountRegister || tx.tx_type == TxType::AccountUpdate
-            || tx.tx_type == TxType::ChatMessage
+            || tx.tx_type == TxType::ChatMessage)
         {
             // Prüfen ob der Key durch Rotation invalidiert wurde
             if let Some(active) = self.resolve_active_key(&tx.from) {
@@ -607,13 +635,11 @@ impl TokenLedger {
             }
             TxType::Transfer => {
                 self.transfer(&tx.from, &tx.to, tx.amount, tx.fee)?;
-                // Nonce erhöhen
-                *self.nonces.entry(tx.from.clone()).or_insert(0) += 1;
+                self.advance_nonce(&tx.from, tx.nonce);
             }
             TxType::Burn => {
                 self.burn(&tx.from, tx.amount)?;
-                // Nonce erhöhen
-                *self.nonces.entry(tx.from.clone()).or_insert(0) += 1;
+                self.advance_nonce(&tx.from, tx.nonce);
             }
             TxType::RotateKey => {
                 // from = alter Key, to = neuer Key
@@ -638,8 +664,7 @@ impl TokenLedger {
                         self.account_api_keys.insert(tx.from.clone(), api_key_hash);
                     }
                 }
-                // Nonce erhöhen
-                *self.nonces.entry(tx.from.clone()).or_insert(0) += 1;
+                self.advance_nonce(&tx.from, tx.nonce);
             }
             TxType::AccountUpdate => {
                 // Account muss existieren
@@ -656,8 +681,7 @@ impl TokenLedger {
                         }
                     }
                 }
-                // Nonce erhöhen
-                *self.nonces.entry(tx.from.clone()).or_insert(0) += 1;
+                self.advance_nonce(&tx.from, tx.nonce);
             }
             TxType::Stake => {
                 // from = Staker-Wallet, to = "pool:staking", amount = Stake-Betrag
@@ -677,8 +701,7 @@ impl TokenLedger {
                 if tx.fee > Decimal::ZERO {
                     self.apply_fee_split(tx.fee);
                 }
-                // Nonce erhöhen
-                *self.nonces.entry(tx.from.clone()).or_insert(0) += 1;
+                self.advance_nonce(&tx.from, tx.nonce);
             }
             TxType::Unstake => {
                 // from = Staker-Wallet, to = "pool:staking", amount = Unstake-Betrag
@@ -704,8 +727,7 @@ impl TokenLedger {
                 // der StakingPool verwaltet die Lock-Periode und gibt frei.
                 // Hier buchen wir den Betrag temporär auf eine Escrow-Adresse.
                 *self.balances.entry(format!("escrow:unstake:{}", tx.from)).or_insert(Decimal::ZERO) += tx.amount;
-                // Nonce erhöhen
-                *self.nonces.entry(tx.from.clone()).or_insert(0) += 1;
+                self.advance_nonce(&tx.from, tx.nonce);
             }
             TxType::Memorial => {
                 // Eternal Memorial TX – keine Balance-Änderung, nur Präsenz im Block
@@ -713,7 +735,7 @@ impl TokenLedger {
             TxType::ChatMessage => {
                 // Verschlüsselte Chat-Nachricht – keine Balance-Änderung.
                 // Die Nachricht wird durch die Aufnahme in den Block validiert.
-                *self.nonces.entry(tx.from.clone()).or_insert(0) += 1;
+                self.advance_nonce(&tx.from, tx.nonce);
             }
         }
 
@@ -755,6 +777,7 @@ impl TokenLedger {
             }
         }
         if !receipts.is_empty() {
+            self.last_synced_block = Some(block_index);
             println!(
                 "[token] Block #{}: {}/{} TXs verarbeitet, Supply: {}",
                 block_index, receipts.len(), txs.len(), self.total_supply
@@ -821,6 +844,12 @@ impl TokenLedger {
         // Kumulative Fee-Burns
         db.put(b"fees_burned", self.total_fees_burned.to_string().as_bytes())
             .map_err(|e| LedgerError::Persistence(format!("put fees_burned: {e}")))?;
+
+        // Letzter verarbeiteter Block-Index
+        if let Some(last_block) = self.last_synced_block {
+            db.put(b"last_synced_block", last_block.to_le_bytes())
+                .map_err(|e| LedgerError::Persistence(format!("put last_synced_block: {e}")))?;
+        }
 
         println!("[token] 💾 Ledger persistiert: {} Accounts, {} Registrierte, {} Key-Rotations, {} Vesting, Supply: {}",
             self.account_count(), self.registered_account_count(), self.key_rotations.len(),
@@ -956,6 +985,13 @@ impl TokenLedger {
             }
         }
 
+        // Letzter verarbeiteter Block-Index
+        if let Ok(Some(val)) = db.get(b"last_synced_block") {
+            if val.len() == 8 {
+                ledger.last_synced_block = Some(u64::from_le_bytes(val[..8].try_into().unwrap()));
+            }
+        }
+
         println!(
             "[token] 📂 Ledger geladen: {} Accounts, {} Registrierte, {} Key-Rotations, {} Vesting, Supply: {}",
             ledger.account_count(),
@@ -973,6 +1009,9 @@ impl TokenLedger {
     /// Chain mit Token-TXs vorhanden ist.
     pub fn rebuild_from_chain(blocks: &[crate::blockchain::Block]) -> Self {
         let mut ledger = TokenLedger::new();
+        // Replay-Modus: Blöcke aus der Chain waren bereits validiert,
+        // daher Nonce-/Signatur-Prüfung überspringen
+        ledger.replay_mode = true;
 
         // Genesis-Allokation anwenden (Mint-TXs sind nicht im Genesis-Block
         // gespeichert, sondern werden beim ersten Start separat erstellt)
@@ -984,7 +1023,10 @@ impl TokenLedger {
             if !block.transactions.is_empty() {
                 ledger.apply_block_txs(&block.transactions, block.index);
             }
+            ledger.last_synced_block = Some(block.index);
         }
+
+        ledger.replay_mode = false;
         if ledger.total_supply > Decimal::ZERO || ledger.registered_account_count() > 0 {
             println!(
                 "[token] 🔄 Ledger aus Chain rekonstruiert: {} Accounts, {} Registrierte, Supply: {}",
@@ -1017,6 +1059,133 @@ impl TokenLedger {
                 self.processed_txs.len()
             );
         }
+    }
+
+    /// Synchronisiert den Ledger mit der tatsächlichen Chain.
+    ///
+    /// Erkennt vier Fälle:
+    /// 0. **Kein Sync-Marker** (alte DB ohne last_synced_block) → Integritätsprüfung
+    /// 1. **Chain hat mehr Blöcke** als `last_synced_block` → fehlende Blöcke nachspielen
+    /// 2. **Chain hat weniger Blöcke** (Reset/Prune) → kompletter Rebuild
+    /// 3. **Chain und Ledger konsistent** → nur processed_txs laden
+    ///
+    /// Gibt `true` zurück wenn ein Rebuild/Replay stattgefunden hat.
+    pub fn sync_with_chain(&mut self, blocks: &[crate::blockchain::Block]) -> bool {
+        let chain_height = if blocks.is_empty() { 0 } else { blocks.last().unwrap().index + 1 };
+
+        // Fall 0: Kein Sync-Marker vorhanden (alte DB) → immer Integritätsprüfung
+        if self.last_synced_block.is_none() && chain_height > 0 {
+            println!(
+                "[token] ℹ️  Kein Sync-Marker in DB — Integritätsprüfung gegen Chain ({} Blöcke)",
+                blocks.len()
+            );
+            return self.verify_and_repair(blocks);
+        }
+
+        let synced_to = self.last_synced_block.unwrap_or(0);
+
+        // Fall 2: Chain wurde zurückgesetzt oder hat weniger Blöcke → kompletter Rebuild
+        if chain_height > 0 && synced_to > 0 && chain_height <= synced_to {
+            println!(
+                "[token] ⚠️  Chain-Höhe ({}) < Ledger-Stand ({}) – Chain wurde zurückgesetzt, Rebuild nötig",
+                chain_height, synced_to + 1
+            );
+            let rebuilt = Self::rebuild_from_chain(blocks);
+            *self = rebuilt;
+            return true;
+        }
+
+        // Fall 1: Fehlende Blöcke nachspielen (nur wenn Sync-Marker bekannt!)
+        if chain_height > synced_to + 1 {
+            let start_block = synced_to + 1;
+            let mut replayed = 0u64;
+            self.replay_mode = true;
+            for block in blocks {
+                if block.index < start_block {
+                    // Nur processed_txs auffüllen für bereits verarbeitete Blöcke
+                    for tx in &block.transactions {
+                        self.processed_txs.insert(tx.tx_id.clone());
+                    }
+                    continue;
+                }
+                if !block.transactions.is_empty() {
+                    self.apply_block_txs(&block.transactions, block.index);
+                }
+                self.last_synced_block = Some(block.index);
+                replayed += 1;
+            }
+            self.replay_mode = false;
+            if replayed > 0 {
+                println!(
+                    "[token] 🔄 {} fehlende Blöcke nachgespielt (#{} → #{}), Supply: {}",
+                    replayed, start_block, chain_height - 1, self.total_supply
+                );
+                if let Err(e) = self.persist() {
+                    eprintln!("[token] Persistierung nach Replay fehlgeschlagen: {e}");
+                }
+            } else {
+                self.rebuild_processed_txs(blocks);
+            }
+            return replayed > 0;
+        }
+
+        // Fall 3: Konsistent — nur Replay-Schutz laden
+        self.rebuild_processed_txs(blocks);
+        false
+    }
+
+    /// Vergleicht den geladenen Ledger mit einem Chain-Rebuild und repariert bei Abweichung.
+    fn verify_and_repair(&mut self, blocks: &[crate::blockchain::Block]) -> bool {
+        let rebuilt = Self::rebuild_from_chain(blocks);
+        let mut mismatches = Vec::new();
+        for (addr, rebuilt_bal) in &rebuilt.balances {
+            let current_bal = self.balance(addr);
+            if current_bal != *rebuilt_bal {
+                mismatches.push((addr.clone(), current_bal, *rebuilt_bal));
+            }
+        }
+        // Auch Accounts prüfen die nur im geladenen Ledger existieren
+        for (addr, current_bal) in &self.balances {
+            if !rebuilt.balances.contains_key(addr) && *current_bal != Decimal::ZERO {
+                mismatches.push((addr.clone(), *current_bal, Decimal::ZERO));
+            }
+        }
+
+        if !mismatches.is_empty() {
+            eprintln!(
+                "[token] ⚠️  LEDGER-DESYNC ERKANNT: {} Accounts haben falsche Balancen!",
+                mismatches.len()
+            );
+            for (addr, current, expected) in &mismatches {
+                let label = if addr.len() > 20 { &addr[..16] } else { addr };
+                eprintln!(
+                    "[token]   {} — DB: {}, Chain: {} (Δ {})",
+                    label, current, expected, *current - *expected
+                );
+            }
+            eprintln!("[token] → Ledger wird aus Chain neu aufgebaut");
+            *self = rebuilt;
+            return true;
+        }
+
+        // Alles konsistent — Sync-Marker setzen und processed_txs laden
+        println!("[token] ✅ Ledger-Integritätscheck bestanden — Sync-Marker gesetzt");
+        self.last_synced_block = rebuilt.last_synced_block;
+        self.rebuild_processed_txs(blocks);
+        if let Err(e) = self.persist() {
+            eprintln!("[token] Persistierung des Sync-Markers fehlgeschlagen: {e}");
+        }
+        false
+    }
+
+    /// Getter für last_synced_block.
+    pub fn last_synced_block(&self) -> Option<u64> {
+        self.last_synced_block
+    }
+
+    /// Setter für last_synced_block (wird nach genesis-apply gebraucht).
+    pub fn set_last_synced_block(&mut self, block: u64) {
+        self.last_synced_block = Some(block);
     }
 }
 

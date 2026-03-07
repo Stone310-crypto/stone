@@ -26,6 +26,7 @@ use serde::Deserialize;
 
 use stone::token::{
     AccountInfo, SupplyInfo, TokenTx, TxType, compute_tx_id, default_chain_id,
+    TokenLedger,
 };
 
 use super::super::auth_middleware::{require_admin, require_user};
@@ -542,11 +543,13 @@ pub async fn handle_token_history(
     Path(address): Path<String>,
 ) -> impl IntoResponse {
     let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
+    let chain_height = chain.blocks.len() as u64;
 
     let mut txs: Vec<serde_json::Value> = Vec::new();
     for block in &chain.blocks {
         for tx in &block.transactions {
             if tx.from == address || tx.to == address {
+                let confirmations = chain_height.saturating_sub(block.index);
                 txs.push(serde_json::json!({
                     "tx_id": tx.tx_id,
                     "tx_type": tx.tx_type,
@@ -558,6 +561,8 @@ pub async fn handle_token_history(
                     "timestamp": tx.timestamp,
                     "memo": tx.memo,
                     "block_index": block.index,
+                    "confirmations": confirmations,
+                    "confirmed": confirmations >= 1,
                 }));
             }
         }
@@ -567,6 +572,7 @@ pub async fn handle_token_history(
         "ok": true,
         "address": address,
         "count": txs.len(),
+        "chain_height": chain_height,
         "transactions": txs,
     }))
 }
@@ -1143,4 +1149,38 @@ pub async fn handle_staker_info(
             })),
         ),
     }
+}
+
+/// POST /api/v1/admin/ledger/rebuild
+///
+/// Forciert einen kompletten Ledger-Rebuild aus der Chain.
+/// Behebt Desync-Probleme zwischen token_db und Chain-State.
+pub async fn handle_ledger_rebuild(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
+    let blocks = &chain.blocks;
+
+    let old_supply = {
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
+        ledger.total_supply()
+    };
+
+    let rebuilt = TokenLedger::rebuild_from_chain(blocks);
+    let new_supply = rebuilt.total_supply();
+    let account_count = rebuilt.account_count();
+
+    {
+        let mut ledger = state.node.token_ledger.write().unwrap_or_else(|e| e.into_inner());
+        *ledger = rebuilt;
+    }
+
+    Json(serde_json::json!({
+        "ok": true,
+        "message": "Ledger aus Chain neu aufgebaut",
+        "old_supply": old_supply.to_string(),
+        "new_supply": new_supply.to_string(),
+        "accounts": account_count,
+        "blocks_processed": blocks.len(),
+    }))
 }

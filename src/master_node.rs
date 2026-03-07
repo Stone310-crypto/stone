@@ -469,10 +469,9 @@ impl MasterNodeState {
         if ledger.total_supply() == rust_decimal::Decimal::ZERO && chain.blocks.len() > 0 {
             // Versuche Rebuild aus Chain (falls DB fehlt, aber Chain TXs hat)
             ledger = TokenLedger::rebuild_from_chain(&chain.blocks);
-        } else {
-            // Replay-Schutz: processed_txs aus Chain rekonstruieren
-            // (wird nicht in RocksDB persistiert, muss nach jedem Start geladen werden)
-            ledger.rebuild_processed_txs(&chain.blocks);
+        } else if !chain.blocks.is_empty() {
+            // Sync-Check: vergleiche DB-Stand mit Chain und repariere bei Desync
+            ledger.sync_with_chain(&chain.blocks);
         }
         if ledger.total_supply() == rust_decimal::Decimal::ZERO {
             // Erster Start: Genesis-Allokation anwenden
@@ -1375,6 +1374,8 @@ impl MasterNodeState {
                     eprintln!("[mining] Ledger-Persistierung nach Block #{} fehlgeschlagen: {e}", block.index);
                 }
             }
+            // Sync-Marker aktualisieren (auch wenn keine Receipts — Block ist in der Chain)
+            ledger.set_last_synced_block(block.index);
         }
 
         // Block wurde bereits durch commit_block() → persist_last_block() persistiert.

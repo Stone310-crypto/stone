@@ -63,6 +63,7 @@ use super::handlers::{
         handle_wallet_info, handle_wallet_rotations,
         handle_token_stake, handle_token_unstake,
         handle_staking_info, handle_staking_pool, handle_staker_info,
+        handle_ledger_rebuild,
     },
     trust::{
         handle_trust_approve, handle_trust_check, handle_trust_history,
@@ -233,6 +234,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/staking/info", get(handle_staking_info))
         .route("/api/v1/staking/pool", get(handle_staking_pool))
         .route("/api/v1/staking/staker/:address", get(handle_staker_info))
+        // ─── Admin: Ledger ───────────────────────────────────────────────────
+        .route("/api/v1/admin/ledger/rebuild", post(handle_ledger_rebuild))
         // ─── OTA Updates ─────────────────────────────────────────────────────
         .route("/api/v1/updates/status", get(handle_update_status))
         .route("/api/v1/updates/chunk/:index", get(handle_update_chunk))

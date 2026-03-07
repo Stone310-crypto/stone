@@ -365,9 +365,13 @@ pub async fn pull_from_peer(node: &Arc<MasterNodeState>, peer_url: &str, api_key
             match chain.accept_peer_block(block, None) {
                 Ok(_) => {
                     // Token-TXs im Ledger verarbeiten
+                    // HTTP-Sync-Blöcke sind bereits vom Netzwerk validiert →
+                    // replay_mode aktivieren um Nonce/Balance-Checks zu überspringen
                     if !block_txs.is_empty() {
                         let mut ledger = node.token_ledger.write().unwrap_or_else(|e| e.into_inner());
+                        ledger.replay_mode = true;
                         let receipts = ledger.apply_block_txs(&block_txs, idx);
+                        ledger.replay_mode = false;
                         if !receipts.is_empty() {
                             if let Err(e) = ledger.persist() {
                                 eprintln!("[token] Ledger-Persist nach Sync-Block #{idx}: {e}");

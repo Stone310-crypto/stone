@@ -290,12 +290,24 @@ async fn main() {
                                                     );
                                                     if !block_txs.is_empty() {
                                                         let mut ledger = node_bg.token_ledger.write().unwrap();
+                                                        // Während Initial-Sync: replay_mode aktivieren
+                                                        // (Nonce/Balance-Checks überspringen, Blöcke sind netzwerk-validiert)
+                                                        let is_syncing = !node_bg.metrics.initial_sync_done.load(
+                                                            std::sync::atomic::Ordering::Relaxed
+                                                        );
+                                                        if is_syncing {
+                                                            ledger.replay_mode = true;
+                                                        }
                                                         let receipts = ledger.apply_block_txs(&block_txs, idx);
+                                                        if is_syncing {
+                                                            ledger.replay_mode = false;
+                                                        }
                                                         if !receipts.is_empty() {
                                                             if let Err(e) = ledger.persist() {
                                                                 eprintln!("[token] Ledger-Persist nach Peer-Block #{idx}: {e}");
                                                             }
                                                         }
+                                                        ledger.set_last_synced_block(idx);
                                                         for tx in &block_txs {
                                                             node_bg.mempool.mark_known(&tx.tx_id);
                                                             node_bg.mempool.remove_tx(&tx.tx_id);
