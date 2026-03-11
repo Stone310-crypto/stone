@@ -36,6 +36,10 @@ fn empty_block() -> Block {
         storage_proof: StorageProof::empty(),
         storage_challenges: Vec::new(),
         challenge_responses: Vec::new(),
+        chat_batches: Vec::new(),
+        pow_nonce: 0,
+        pow_hash: String::new(),
+        pow_difficulty: 0,
     }
 }
 

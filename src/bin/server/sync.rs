@@ -7,6 +7,7 @@ use std::{
 };
 use stone::{
     auth::{save_users, User},
+    consensus::verify_block_signature_standalone,
     master_node::{MasterNodeState, NodeEvent, PeerStatus},
     storage::ChunkStore,
 };
@@ -359,6 +360,40 @@ pub async fn pull_from_peer(node: &Arc<MasterNodeState>, peer_url: &str, api_key
         for block in pending_blocks {
             let idx = block.index;
             let block_txs = block.transactions.clone();
+            let chat_batches = block.chat_batches.clone();
+
+            // Equivocation-Check
+            {
+                let mut tracker = node.equivocation_tracker.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(evidence) = tracker.check_and_record(
+                    block.index,
+                    &block.validator_pub_key,
+                    &block.hash,
+                ) {
+                    eprintln!(
+                        "[sync] ⚠️  EQUIVOCATION: Validator {} hat Block #{} doppelt signiert!",
+                        &evidence.validator_pub_key[..16.min(evidence.validator_pub_key.len())],
+                        evidence.block_index,
+                    );
+                }
+            }
+
+            // Ed25519-Signatur prüfen (auch ohne PoA-Rotation-Check)
+            if block.index > 0
+                && (!block.validator_pub_key.is_empty() || !block.validator_signature.is_empty())
+            {
+                if !verify_block_signature_standalone(
+                    &block.hash,
+                    &block.validator_pub_key,
+                    &block.validator_signature,
+                ) {
+                    eprintln!(
+                        "[sync] ⚠ Block #{} von {peer_url} hat ungültige Validator-Signatur – übersprungen",
+                        block.index
+                    );
+                    continue;
+                }
+            }
 
             // accept_peer_block: Hash, Merkle, Memorial, Storage-Proof, Timestamp etc.
             // poa_ok = None → kein PoA-Check (HTTP-Sync hat keinen Validator-Set-Kontext)
@@ -381,6 +416,14 @@ pub async fn pull_from_peer(node: &Arc<MasterNodeState>, peer_url: &str, api_key
                         for tx in &block_txs {
                             node.mempool.mark_known(&tx.tx_id);
                             node.mempool.remove_tx(&tx.tx_id);
+                        }
+                    }
+                    // Chat-Batch-Records speichern (für Chat-Index)
+                    for batch in &chat_batches {
+                        if !batch.messages.is_empty() {
+                            node.message_pool.store_batch_record(
+                                &batch.merkle_root, &batch.messages, idx,
+                            );
                         }
                     }
 
@@ -431,18 +474,21 @@ pub async fn pull_from_peer(node: &Arc<MasterNodeState>, peer_url: &str, api_key
         }
     }
 
-    // ── Auto-Snapshot nach Sync ─────────────────────────────────────
-    // Snapshot auch nach Sync erstellen (nicht nur nach eigenem Mining).
-    // Damit haben Nodes die per Sync zur richtigen Höhe kommen auch Snapshots.
-    if added > 0 {
+    // ── Auto-Snapshot nach Sync (NUR Bootstrap-Nodes) ─────────────────
+    // Snapshots werden nur von Bootstrap-Nodes erstellt (immer online, zuverlässig).
+    // Erkennt auch übersprungene 200er-Grenzen beim Batch-Sync.
+    if added > 0 && stone::network::is_bootstrap_node() {
         let chain = node.chain.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(last) = chain.blocks.last() {
-            let height = last.index;
-            if stone::snapshot::should_create_snapshot(height) {
+            let post_height = last.index;
+            let pre_height = post_height.saturating_sub(added);
+            // Prüfe ob eine Snapshot-Grenze übersprungen wurde
+            if let Some(_boundary) = stone::snapshot::crossed_snapshot_boundary(pre_height, post_height) {
                 let genesis_hash = chain.blocks.first()
                     .map(|b| b.hash.clone())
                     .unwrap_or_default();
                 let latest_hash = last.hash.clone();
+                let height = post_height;
                 drop(chain);
                 std::thread::spawn(move || {
                     match stone::snapshot::create_snapshot(height, &genesis_hash, &latest_hash) {

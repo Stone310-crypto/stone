@@ -50,7 +50,7 @@ chrono  = { version = "0.4", features = ["serde"] }
 hmac    = "0.12"
 hex     = "0.4"
 rand    = "0.8"
-base64  = "0.21"
+base64  = "0.22"
 
 # Async-Runtime
 tokio   = { version = "1", features = ["full"] }
@@ -58,13 +58,13 @@ tokio-util = { version = "0.7", features = ["io"] }
 bytes   = "1.0"
 
 # HTTP-Server (axum – Master Node API + Auth Server)
-axum        = { version = "0.7", features = ["macros", "json", "multipart", "ws"] }
-axum-server = { version = "0.7", features = ["tls-rustls"] }
-tower       = { version = "0.4", features = ["util"] }
-tower-http  = { version = "0.5", features = ["cors"] }
+axum        = { version = "0.8", features = ["macros", "json", "multipart", "ws"] }
+axum-server = { version = "0.8", features = ["tls-rustls"] }
+tower       = { version = "0.5", features = ["util"] }
+tower-http  = { version = "0.6", features = ["cors"] }
 
 # HTTP-Client (Peer-Sync)
-reqwest = { version = "0.11", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Auth / Krypto
 bip39           = { version = "1.2", default-features = false, features = ["std", "rand"] }
@@ -79,7 +79,7 @@ aes-gcm         = "0.10"
 argon2          = "0.5"
 
 # ─── P2P-Netzwerk (libp2p) ───────────────────────────────────────────────────
-libp2p = { version = "0.54", features = [
+libp2p = { version = "0.55", features = [
     "tcp",
     "quic",
     "noise",
@@ -129,5 +129,8 @@ console     = "0.15"
 ratatui     = "0.29"
 crossterm   = "0.28"
 
+# ─── WebSocket (axum 0.8 braucht eigene ws-dependency) ────────────────────────
+tokio-tungstenite = "0.26"
+
 # ─── System-Metriken (Miner Dashboard) ───────────────────────────────────────
-sysinfo     = "0.31"
+sysinfo     = "0.33"

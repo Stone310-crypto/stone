@@ -84,10 +84,11 @@ pub fn require_user(headers: &HeaderMap, state: &AppState) -> Result<User, Respo
         }
     }
 
+    
+
     // 2. Versuche Authorization: Bearer <session_token> (Challenge-Response)
     if let Some(token) = extract_bearer_token(headers) {
-        if let Some(user) = resolve_user_by_session_token(&token, &state.users, &state.api_key) {
-            return Ok(user);
+        if let Some(user) = resolve_user_by_session_token(&token, &state.users, &state.api_key) {            return Ok(user);
         }
         return Err((
             StatusCode::UNAUTHORIZED,

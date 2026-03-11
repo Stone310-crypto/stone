@@ -50,8 +50,17 @@ pub struct TrustVoteBody {
 /// validators.
 pub async fn handle_trust_request(
     State(state): State<AppState>,
+    headers: HeaderMap,
     axum::Json(body): axum::Json<TrustRequestBody>,
 ) -> impl IntoResponse {
+    // Rate Limiting: per IP
+    let ip = super::super::rate_limiter::extract_client_ip(&headers);
+    if let Some(resp) = super::super::rate_limiter::check_rate_limit_tuple(
+        &state.rate_limits.trust_request, &ip, "Trust-Request",
+    ) {
+        return resp;
+    }
+
     if body.peer_id.trim().is_empty() || body.public_key_hex.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,

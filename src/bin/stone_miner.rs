@@ -453,13 +453,18 @@ fn try_daily_payout(
     if now.hour() as u8 != config.payout_hour { return None; }
     if validator_wallet == config.payout_wallet { return None; }
 
-    let balance = node.token_ledger.read().unwrap().balance(validator_wallet);
+    // Balance und Nonce atomar lesen (inkl. Pending-TXs im Mempool)
+    let (balance, nonce) = {
+        let ledger = node.token_ledger.read().unwrap();
+        let base_nonce = ledger.nonce(validator_wallet);
+        let pending = node.mempool.sender_pending_count(validator_wallet);
+        (ledger.balance(validator_wallet), base_nonce + pending)
+    };
     if balance <= Decimal::ZERO {
         return Some("Kein Guthaben zum Auszahlen".into());
     }
 
     let signing_key = load_or_create_validator_key();
-    let nonce = node.token_ledger.read().unwrap().nonce(validator_wallet);
     let fee = Decimal::new(1, 4);
     let payout_amount = balance - fee;
     if payout_amount <= Decimal::ZERO {
@@ -499,13 +504,18 @@ fn force_payout(
         return "Mining-Wallet = Payout-Wallet → kein Transfer nötig".into();
     }
 
-    let balance = node.token_ledger.read().unwrap().balance(validator_wallet);
+    // Balance und Nonce atomar lesen (inkl. Pending-TXs im Mempool)
+    let (balance, nonce) = {
+        let ledger = node.token_ledger.read().unwrap();
+        let base_nonce = ledger.nonce(validator_wallet);
+        let pending = node.mempool.sender_pending_count(validator_wallet);
+        (ledger.balance(validator_wallet), base_nonce + pending)
+    };
     if balance <= Decimal::ZERO {
         return "Kein Guthaben zum Auszahlen".into();
     }
 
     let signing_key = load_or_create_validator_key();
-    let nonce = node.token_ledger.read().unwrap().nonce(validator_wallet);
     let fee = Decimal::new(1, 4);
     let payout_amount = balance - fee;
     if payout_amount <= Decimal::ZERO {
@@ -544,7 +554,7 @@ async fn handle_p2p_event(
     api_key: &Arc<String>,
 ) {
     match event {
-        NetworkEvent::BlockReceived { block, from_peer: _ } => {
+        NetworkEvent::BlockReceived { block, from_peer } => {
             let peer_urls: Vec<String> = node.get_peers()
                 .into_iter()
                 .filter(|p| p.is_healthy())
@@ -561,29 +571,57 @@ async fn handle_p2p_event(
                     let vs = node.validator_set.read().unwrap();
                     if vs.validators.is_empty() || vs.active_count() <= 1 { None }
                     else {
-                        let prev_hash = {
+                        let (prev_hash, last_block_ts) = {
                             let chain = node.chain.lock().unwrap();
-                            chain.blocks.last().map(|b| b.hash.clone()).unwrap_or("genesis".into())
+                            let ph = chain.blocks.last().map(|b| b.hash.clone()).unwrap_or("genesis".into());
+                            let ts = chain.blocks.last().map(|b| b.timestamp);
+                            (ph, ts)
                         };
-                        Some(vs.verify_block_with_selection(
+                        let sync_done = node.metrics.initial_sync_done.load(std::sync::atomic::Ordering::Relaxed);
+                        let (sel_stakes, sel_jailed, sel_wallets) = node.build_selection_context();
+                        Some(vs.verify_block_with_context(
                             &block.hash, &block.signer, &block.validator_signature,
-                            &prev_hash, block.index,
+                            &prev_hash, block.index, block.pow_nonce,
+                            &sel_jailed, &sel_stakes, &sel_wallets,
+                            last_block_ts, sync_done,
                         ).is_acceptable())
                     }
                 }
             };
 
-            enum BlockResult { Accepted(u64), NeedsResync, Other }
+            enum BlockResult { Accepted(u64), NeedsResync, Rejected, AlreadyKnown, Stale }
 
             let result = {
                 let mut chain = node.chain.lock().unwrap();
                 if chain.blocks.iter().any(|b| b.hash == block.hash) {
-                    BlockResult::Other
+                    BlockResult::AlreadyKnown
                 } else {
                     let txs = block.transactions.clone();
+                    let chat_batches = block.chat_batches.clone();
                     let idx = block.index;
                     let block_signer = block.signer.clone();
                     let block_validator_pk = block.validator_pub_key.clone();
+
+                    // Equivocation-Check vor Block-Akzeptanz
+                    {
+                        let mut tracker = node.equivocation_tracker.lock().unwrap();
+                        if let Some(evidence) = tracker.check_and_record(
+                            block.index,
+                            &block.validator_pub_key,
+                            &block.hash,
+                        ) {
+                            eprintln!(
+                                "[p2p] ⚠️  EQUIVOCATION: Validator {} hat Block #{} doppelt signiert! \
+                                 hash_a={}… hash_b={}…",
+                                &evidence.validator_pub_key[..16.min(evidence.validator_pub_key.len())],
+                                evidence.block_index,
+                                &evidence.hash_a[..12.min(evidence.hash_a.len())],
+                                &evidence.hash_b[..12.min(evidence.hash_b.len())],
+                            );
+                            MasterNodeState::slash_equivocation(node, &evidence);
+                        }
+                    }
+
                     match chain.accept_peer_block(*block, poa_ok) {
                         Ok(_) => {
                             if !txs.is_empty() {
@@ -593,6 +631,14 @@ async fn handle_p2p_event(
                                 for tx in &txs {
                                     node.mempool.mark_known(&tx.tx_id);
                                     node.mempool.remove_tx(&tx.tx_id);
+                                }
+                            }
+                            // Chat-Batch-Records speichern (für Chat-Index)
+                            for batch in &chat_batches {
+                                if !batch.messages.is_empty() {
+                                    node.message_pool.store_batch_record(
+                                        &batch.merkle_root, &batch.messages, idx,
+                                    );
                                 }
                             }
                             // Validator Auto-Discovery: Nur nach Initial-Sync
@@ -606,23 +652,27 @@ async fn handle_p2p_event(
                             {
                                 let mut vs = node.validator_set.write().unwrap();
                                 if vs.get(&block_signer).is_none() {
-                                    let info = stone::consensus::ValidatorInfo::new(
+                                    let info = stone::consensus::ValidatorInfo::new_pending(
                                         block_signer.clone(),
                                         block_validator_pk.clone(),
                                     );
                                     vs.add(info);
                                     println!(
-                                        "[consensus] 🔗 Validator '{}' auto-discovered via Block #{}",
+                                        "[consensus] 🔗 Validator '{}' auto-discovered (pending) via Block #{}",
                                         &block_signer, idx,
                                     );
                                 }
                             }
                             BlockResult::Accepted(chain.blocks.len() as u64)
                         }
+                        Err(ref e) if e.starts_with("Stale:") => BlockResult::Stale,
                         Err(ref e) if e.starts_with("Gap:") || e.contains("previous_hash") => {
                             BlockResult::NeedsResync
                         }
-                        _ => BlockResult::Other,
+                        Err(e) => {
+                            eprintln!("[p2p] Block #{idx} abgelehnt: {e}");
+                            BlockResult::Rejected
+                        }
                     }
                 }
             };
@@ -638,12 +688,15 @@ async fn handle_p2p_event(
                         }
                     });
                 }
-                _ => {}
+                BlockResult::Rejected => {
+                    handle.report_penalty(&from_peer, 50, "rejected block").await;
+                }
+                _ => {} // AlreadyKnown, Stale — kein Penalty
             }
         }
 
         // ── Range-Sync Batch (Fork-Reorg) ─────────────────────────────────
-        NetworkEvent::RangeSyncReceived { blocks, from_peer } => {
+        NetworkEvent::RangeSyncReceived { blocks, from_peer: _from_peer } => {
             let mut sorted = blocks;
             sorted.sort_by_key(|b| b.index);
 
@@ -682,8 +735,36 @@ async fn handle_p2p_event(
                     for block in peer_new {
                         let idx = block.index;
                         let txs = block.transactions.clone();
-                        let block_signer = block.signer.clone();
-                        let block_validator_pk = block.validator_pub_key.clone();
+                        let _block_signer = block.signer.clone();
+                        let _block_validator_pk = block.validator_pub_key.clone();
+
+                        // Equivocation-Check
+                        {
+                            let mut tracker = node.equivocation_tracker.lock().unwrap();
+                            let _ = tracker.check_and_record(
+                                block.index,
+                                &block.validator_pub_key,
+                                &block.hash,
+                            );
+                        }
+
+                        // Ed25519-Signatur prüfen (auch ohne PoA-Rotation)
+                        if block.index > 0
+                            && (!block.validator_pub_key.is_empty() || !block.validator_signature.is_empty())
+                        {
+                            if !stone::consensus::verify_block_signature_standalone(
+                                &block.hash,
+                                &block.validator_pub_key,
+                                &block.validator_signature,
+                            ) {
+                                eprintln!(
+                                    "[sync] ⚠ Block #{} hat ungültige Validator-Signatur – übersprungen",
+                                    block.index
+                                );
+                                continue;
+                            }
+                        }
+
                         match chain.accept_peer_block(block, None) {
                             Ok(_) => {
                                 applied += 1;
@@ -752,6 +833,17 @@ async fn handle_p2p_event(
         NetworkEvent::PeerConnected { peer_id, .. } => {
             eprintln!("[p2p] Peer verbunden: {}", &peer_id[..12.min(peer_id.len())]);
         }
+
+        NetworkEvent::ChatMessageReceived { message, from_peer } => {
+            match node.message_pool.add_message(message) {
+                Ok(seq) => eprintln!(
+                    "[p2p] 💬 Chat von {} (seq: {})",
+                    &from_peer[..12.min(from_peer.len())], seq,
+                ),
+                Err(_) => {}
+            }
+        }
+
         _ => {}
     }
 }
@@ -1607,12 +1699,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let new_blocks: Vec<_> = chain.blocks.iter()
                     .skip(idx.last_indexed_block as usize)
                     .collect();
-                idx.index_new_blocks(&new_blocks);
+                idx.index_new_blocks(&new_blocks, Some(&node.message_pool));
                 let _ = stone::chat::save_chat_index(&idx);
             }
             Arc::new(std::sync::Mutex::new(idx))
         },
         contacts: Arc::new(std::sync::Mutex::new(stone::chat::load_contacts())),
+        contact_requests: Arc::new(std::sync::Mutex::new(stone::chat::load_contact_requests())),
         challenge_store: stone::auth::ChallengeStore::new(),
         qr_login_store: stone::auth::QrLoginStore::new(),
     };
@@ -1620,10 +1713,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Main node API
     let main_router = build_router(node_app_state);
 
-    // Miner Dashboard routes (separate port)
-    let miner_router = Router::new()
+    // Miner-spezifische Routes (Dashboard + API)
+    let miner_routes = Router::new()
         .route("/ui", get(handle_dashboard))
-        .route("/", get(handle_dashboard))
         .route("/api/miner/stats", get(handle_miner_stats))
         .route("/api/miner/mining/toggle", post(handle_toggle_mining))
         .route("/api/miner/mining/throttle", post(handle_set_throttle))
@@ -1632,8 +1724,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/miner/config", post(handle_save_config))
         .with_state(miner_state.clone());
 
-    // Main node API (no miner UI routes)
-    let node_router = main_router;
+    // Dashboard-only Router (separate port: dashboard + miner API)
+    let miner_router = Router::new()
+        .route("/", get(handle_dashboard))
+        .with_state(miner_state.clone())
+        .merge(miner_routes.clone());
+
+    // Node-Router: Standard-API + Miner-Endpoints auf einem Port
+    let node_router = main_router.merge(miner_routes);
 
     // Miner verwendet eigene Port-ENV-Variablen, damit kein Konflikt mit stone-setup:
     //   STONE_MINER_PORT (default 8081) statt STONE_PORT (default 8080)

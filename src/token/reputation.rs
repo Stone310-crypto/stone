@@ -344,9 +344,8 @@ impl ReputationRegistry {
     // ── Persistierung ─────────────────────────────────────────────────────
 
     pub fn persist(&self) -> Result<(), String> {
-        let db_path = format!("{}/token_db", crate::blockchain::data_dir());
-        let db = rocksdb::DB::open_default(&db_path)
-            .map_err(|e| format!("Reputation DB open: {e}"))?;
+        let db = super::open_token_db()
+            .map_err(|e| format!("Reputation DB: {e}"))?;
 
         let json = serde_json::to_string(self)
             .map_err(|e| format!("Reputation serialize: {e}"))?;
@@ -358,8 +357,7 @@ impl ReputationRegistry {
     }
 
     pub fn load() -> Self {
-        let db_path = format!("{}/token_db", crate::blockchain::data_dir());
-        let db = match rocksdb::DB::open_default(&db_path) {
+        let db = match super::open_token_db() {
             Ok(db) => db,
             Err(_) => return ReputationRegistry::new(),
         };

@@ -404,6 +404,17 @@ impl ChunkStore {
         Ok(Self { base_dir })
     }
 
+    /// Validiert dass ein Chunk-Hash gültiges Hex-Format hat (64 Hex-Zeichen).
+    /// Verhindert Path-Traversal-Angriffe über manipulierte Hashes.
+    fn validate_chunk_hash(hash: &str) -> Result<(), StorageError> {
+        if hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(StorageError::NotFound(format!(
+                "Ungültiges Chunk-Hash-Format: '{}'", &hash[..hash.len().min(20)]
+            )));
+        }
+        Ok(())
+    }
+
     /// Pfad zu einem Chunk anhand seines Hashes.
     fn chunk_path(&self, hash: &str) -> PathBuf {
         self.base_dir.join(hash)
@@ -443,6 +454,7 @@ impl ChunkStore {
 
     /// Liest einen einzelnen Chunk anhand seines Hashes.
     pub fn read_chunk(&self, hash: &str) -> Result<Vec<u8>, StorageError> {
+        Self::validate_chunk_hash(hash)?;
         let path = self.chunk_path(hash);
         std::fs::read(&path).map_err(|_| {
             StorageError::NotFound(format!("Chunk {hash} nicht gefunden"))
@@ -473,11 +485,12 @@ impl ChunkStore {
 
     /// Gibt true zurück wenn ein Chunk mit diesem Hash vorhanden ist.
     pub fn has_chunk(&self, hash: &str) -> bool {
-        self.chunk_path(hash).exists()
+        Self::validate_chunk_hash(hash).is_ok() && self.chunk_path(hash).exists()
     }
 
     /// Gibt die Größe eines Chunks zurück (None falls nicht vorhanden).
     pub fn chunk_size(&self, hash: &str) -> Option<u64> {
+        Self::validate_chunk_hash(hash).ok()?;
         std::fs::metadata(self.chunk_path(hash)).ok().map(|m| m.len())
     }
 
@@ -1279,6 +1292,10 @@ mod tests {
             storage_proof: Default::default(),
             storage_challenges: Vec::new(),
             challenge_responses: Vec::new(),
+            chat_batches: Vec::new(),
+            pow_nonce: 0,
+            pow_hash: String::new(),
+            pow_difficulty: 0,
         }
     }
 

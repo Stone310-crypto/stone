@@ -362,11 +362,8 @@ pub fn verify_tx_signature(tx: &TokenTx) -> Result<(), TxError> {
         return Ok(());
     }
 
-    // Stake/Unstake: vom Node nach User-Authentifizierung erstellt, Signatur
-    // stammt vom Validator-Key, nicht vom User-Wallet → Prüfung überspringen.
-    if tx.tx_type == TxType::Stake || tx.tx_type == TxType::Unstake {
-        return Ok(());
-    }
+    // Stake/Unstake: Signatur wird gegen den `from`-Key geprüft.
+    // Die TX muss vom User-Wallet signiert sein (nicht mehr vom Validator-Key).
 
     // Public-Key aus Hex dekodieren
     let pub_bytes = hex::decode(&tx.from)

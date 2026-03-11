@@ -5,6 +5,8 @@ pub mod chat_policy;
 pub mod consensus;
 pub mod crypto;
 pub mod master_node;
+pub mod merkle_batch;
+pub mod message_pool;
 pub mod network;
 pub mod organization;
 pub mod shard;

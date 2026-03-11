@@ -1,6 +1,5 @@
 //! Shared application state, constants, chunk helpers, and peer persistence.
 
-use sha2::{Digest, Sha256};
 use std::{
     sync::{Arc, Mutex, RwLock},
     time::Duration,
@@ -8,7 +7,7 @@ use std::{
 use stone::{
     auth::{User, ChallengeStore, QrLoginStore},
     blockchain::{ChunkRef, data_dir, CHUNK_SIZE, Document},
-    chat::{ChatIndex, ContactList},
+    chat::{ChatIndex, ContactList, ContactRequestStore},
     master_node::{MasterNodeState, PeerInfo, TrustEntry, TrustVote},
     network::NetworkHandle,
     organization::Organization,
@@ -48,6 +47,8 @@ pub struct AppState {
     pub chat_index: Arc<Mutex<ChatIndex>>,
     /// Kontaktliste (Adding-Funktion)
     pub contacts: Arc<Mutex<ContactList>>,
+    /// Kontaktanfragen (Friend Request System)
+    pub contact_requests: Arc<Mutex<ContactRequestStore>>,
     /// Challenge-Store für Wallet-basierte Authentifizierung (Cross-Platform Login)
     pub challenge_store: ChallengeStore,
     /// QR-Login-Store für Cross-Device Authentifizierung (iOS App → Website)
@@ -84,10 +85,10 @@ pub fn load_api_key() -> String {
         eprintln!("[auth] WARNUNG: API-Key konnte nicht gespeichert werden: {e}");
     } else {
         println!("[auth] Neuer Admin-API-Key generiert und gespeichert: {token_path}");
-        println!("[auth] ╔══════════════════════════════════════════════════╗");
-        println!("[auth] ║  Admin API-Key: {key}  ║");
-        println!("[auth] ╚══════════════════════════════════════════════════╝");
-        println!("[auth] Setze x-api-key: {key} in deinen Web-UI Anfragen.");
+        println!("[auth] ╔══════════════════════════════════════════════════════╗");
+        println!("[auth] ║  Admin API-Key: {}…{}  ║", &key[..10], &key[key.len()-4..]);
+        println!("[auth] ║  Vollständig in: {token_path:<36}  ║");
+        println!("[auth] ╚══════════════════════════════════════════════════════╝");
     }
     key
 }
@@ -107,19 +108,10 @@ pub fn load_admin_key(fallback_api_key: &str) -> String {
 }
 
 pub fn generate_api_key() -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let ts = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos();
-    let mut h = Sha256::new();
-    h.update(b"stone-master-key-v1-");
-    h.update(ts.to_le_bytes());
-    h.update(std::process::id().to_le_bytes());
-    if let Ok(hn) = hostname::get() {
-        h.update(hn.to_string_lossy().as_bytes());
-    }
-    format!("sk_{}", hex::encode(h.finalize()))
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    format!("sk_{}", hex::encode(bytes))
 }
 
 // ─── Chunk-Verwaltung ─────────────────────────────────────────────────────────

@@ -477,6 +477,27 @@ pub fn should_create_snapshot(block_height: u64) -> bool {
     block_height % SNAPSHOT_INTERVAL == 0
 }
 
+/// Prüft ob ein Snapshot nach einem Sync erstellt werden soll.
+///
+/// Während eines Batch-Syncs kann die exakte 200er-Grenze übersprungen werden
+/// (z.B. Sync von Block 100 → 350). Diese Funktion prüft ob IRGENDEINE
+/// Snapshot-Grenze zwischen `pre_sync_height` und `post_sync_height` liegt.
+///
+/// Gibt die höchste übersprungene Snapshot-Grenze zurück (oder None).
+pub fn crossed_snapshot_boundary(pre_sync_height: u64, post_sync_height: u64) -> Option<u64> {
+    if post_sync_height < MIN_SNAPSHOT_HEIGHT {
+        return None;
+    }
+    // Höchste 200er-Grenze die <= post_sync_height ist
+    let latest_boundary = (post_sync_height / SNAPSHOT_INTERVAL) * SNAPSHOT_INTERVAL;
+    // Wurde diese Grenze während des Syncs übersprungen?
+    if latest_boundary > pre_sync_height && latest_boundary >= MIN_SNAPSHOT_HEIGHT {
+        Some(latest_boundary)
+    } else {
+        None
+    }
+}
+
 /// Lädt die Metadaten des neuesten lokalen Snapshots.
 pub fn latest_snapshot() -> Option<SnapshotMeta> {
     let path = latest_snapshot_meta_path();
@@ -606,6 +627,24 @@ mod tests {
         assert!(should_create_snapshot(200));
         assert!(should_create_snapshot(400));
         assert!(!should_create_snapshot(201));
+    }
+
+    #[test]
+    fn test_crossed_snapshot_boundary() {
+        // Kein Crossing: beide unter MIN_SNAPSHOT_HEIGHT
+        assert_eq!(crossed_snapshot_boundary(0, 49), None);
+        // Kein Crossing: gleiche Seite der Grenze
+        assert_eq!(crossed_snapshot_boundary(201, 350), None);
+        // Crossing: 100 → 350 überspringt die 200er-Grenze
+        assert_eq!(crossed_snapshot_boundary(100, 350), Some(200));
+        // Crossing: 100 → 500 überspringt 200 und 400 → gibt die höchste (400) zurück
+        assert_eq!(crossed_snapshot_boundary(100, 500), Some(400));
+        // Exakter Treffer: 100 → 200
+        assert_eq!(crossed_snapshot_boundary(100, 200), Some(200));
+        // Kein Crossing: Start und Ende in gleicher Intervall-Periode
+        assert_eq!(crossed_snapshot_boundary(200, 250), None);
+        // Crossing: 199 → 200
+        assert_eq!(crossed_snapshot_boundary(199, 200), Some(200));
     }
 
     #[test]

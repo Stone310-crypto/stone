@@ -8,6 +8,8 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::json;
+
+use super::super::rate_limiter::{check_rate_limit, extract_client_ip};
 use sha2::{Digest, Sha256};
 use std::sync::atomic::Ordering;
 use stone::{
@@ -513,6 +515,16 @@ pub async fn handle_upload_document(
     mut multipart: Multipart,
 ) -> Result<impl IntoResponse, Response> {
     let user = require_user(&headers, &state)?;
+
+    // Rate Limiting: per User-Wallet
+    let rl_key = if user.wallet_address.is_empty() {
+        extract_client_ip(&headers)
+    } else {
+        user.wallet_address.clone()
+    };
+    if let Some(resp) = check_rate_limit(&state.rate_limits.document_upload, &rl_key, "Upload") {
+        return Err(resp);
+    }
 
     let mut file_data: Option<Vec<u8>> = None;
     let mut title: Option<String> = None;

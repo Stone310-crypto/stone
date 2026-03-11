@@ -172,8 +172,9 @@ async fn main() {
     }
 
     // Hintergrund-Tasks starten
+    // HINWEIS: Mining wurde entfernt — nur stone-miner erzeugt neue Blöcke.
+    // master_server ist ein reiner Full-Node (Sync, API, Validierung, Storage).
     MasterNodeState::start_heartbeat(node.clone(), HEARTBEAT_INTERVAL);
-    MasterNodeState::start_mining_loop(node.clone());
     spawn_auto_sync_task(node.clone(), api_key.clone(), users.clone());
 
     // Mempool-Eviction: abgelaufene TXs und known_ids periodisch bereinigen
@@ -249,16 +250,26 @@ async fn main() {
                                             if vs.validators.is_empty() {
                                                 None
                                             } else {
-                                                let prev_hash = {
+                                                let (prev_hash, last_block_ts) = {
                                                     let chain = node_bg.chain.lock().unwrap();
-                                                    chain.blocks.last().map(|b| b.hash.clone()).unwrap_or_else(|| "genesis".into())
+                                                    let ph = chain.blocks.last().map(|b| b.hash.clone()).unwrap_or_else(|| "genesis".into());
+                                                    let ts = chain.blocks.last().map(|b| b.timestamp);
+                                                    (ph, ts)
                                                 };
-                                                let result = vs.verify_block_with_selection(
+                                                let sync_done = node_bg.metrics.initial_sync_done.load(std::sync::atomic::Ordering::Relaxed);
+                                                let (sel_stakes, sel_jailed, sel_wallets) = node_bg.build_selection_context();
+                                                let result = vs.verify_block_with_context(
                                                     &block.hash,
                                                     &block.signer,
                                                     &block.validator_signature,
                                                     &prev_hash,
                                                     block.index,
+                                                    block.pow_nonce,
+                                                    &sel_jailed,
+                                                    &sel_stakes,
+                                                    &sel_wallets,
+                                                    last_block_ts,
+                                                    sync_done,
                                                 );
                                                 Some(result.is_acceptable())
                                             }
@@ -283,6 +294,29 @@ async fn main() {
                                         } else {
                                             let idx = block.index;
                                             let block_txs = block.transactions.clone();
+                                            let chat_batches = block.chat_batches.clone();
+
+                                            // Equivocation-Check vor Block-Akzeptanz
+                                            {
+                                                let mut tracker = node_bg.equivocation_tracker.lock().unwrap();
+                                                if let Some(evidence) = tracker.check_and_record(
+                                                    block.index,
+                                                    &block.validator_pub_key,
+                                                    &block.hash,
+                                                ) {
+                                                    eprintln!(
+                                                        "[p2p] ⚠️  EQUIVOCATION: Validator {} hat Block #{} doppelt signiert! \
+                                                         hash_a={}… hash_b={}…",
+                                                        &evidence.validator_pub_key[..16.min(evidence.validator_pub_key.len())],
+                                                        evidence.block_index,
+                                                        &evidence.hash_a[..12.min(evidence.hash_a.len())],
+                                                        &evidence.hash_b[..12.min(evidence.hash_b.len())],
+                                                    );
+                                                    // Auto-Slashing: Double-Sign → Stake-Penalty + Jail
+                                                    MasterNodeState::slash_equivocation(&node_bg, &evidence);
+                                                }
+                                            }
+
                                             match chain.accept_peer_block(*block, poa_ok) {
                                                 Ok(_) => {
                                                     println!(
@@ -304,6 +338,14 @@ async fn main() {
                                                         for tx in &block_txs {
                                                             node_bg.mempool.mark_known(&tx.tx_id);
                                                             node_bg.mempool.remove_tx(&tx.tx_id);
+                                                        }
+                                                    }
+                                                    // Chat-Batch-Records speichern (für Chat-Index)
+                                                    for batch in &chat_batches {
+                                                        if !batch.messages.is_empty() {
+                                                            node_bg.message_pool.store_batch_record(
+                                                                &batch.merkle_root, &batch.messages, idx,
+                                                            );
                                                         }
                                                     }
                                                     BlockResult::Accepted(chain.blocks.len() as u64)
@@ -422,7 +464,11 @@ async fn main() {
                                                 });
                                             }
                                         }
-                                        _ => {}
+                                        BlockResult::Rejected => {
+                                            // Peer hat ungültigen Block geliefert → Penalty
+                                            handle_bg.report_penalty(&from_peer, 50, "rejected block").await;
+                                        }
+                                        _ => {} // Stale, AlreadyKnown
                                     }
                                 }
 
@@ -589,6 +635,17 @@ async fn main() {
                                     });
                                 }
 
+                                // ── Chat per Gossip empfangen ──────────
+                                NetworkEvent::ChatMessageReceived { message, from_peer } => {
+                                    match node_bg.message_pool.add_message(message) {
+                                        Ok(seq) => println!(
+                                            "[p2p] 💬 Chat von {} (seq: {})",
+                                            &from_peer[..12.min(from_peer.len())], seq,
+                                        ),
+                                        Err(_) => {}
+                                    }
+                                }
+
                                 _ => {} // Listening etc.
                                 }
                             }
@@ -703,16 +760,24 @@ async fn main() {
             let mut idx = stone::chat::load_chat_index();
             // Chat-Index aus der Chain aufbauen/aktualisieren
             let chain = node.chain.lock().unwrap();
-            if chain.blocks.len() as u64 > idx.last_indexed_block {
+            let chain_len = chain.blocks.len() as u64;
+            if idx.last_indexed_block > 0 && chain_len > 0 && idx.last_indexed_block >= chain_len {
+                println!("[chat-index] ⚠️ Chain-Reset erkannt beim Start! last_indexed_block={} aber chain hat nur {} Blöcke. Rebuild...", idx.last_indexed_block, chain_len);
+                let all_blocks: Vec<_> = chain.blocks.iter().collect();
+                idx = stone::chat::ChatIndex::rebuild_from_chain(&all_blocks, Some(&node.message_pool));
+                let _ = stone::chat::save_chat_index(&idx);
+                println!("[chat-index] ✅ Rebuild fertig: {} Konversationen, last_indexed_block={}", idx.conversations.len(), idx.last_indexed_block);
+            } else if chain_len > 0 && (chain_len - 1) > idx.last_indexed_block {
                 let new_blocks: Vec<_> = chain.blocks.iter()
-                    .skip(idx.last_indexed_block as usize)
+                    .skip((idx.last_indexed_block + 1) as usize)
                     .collect();
-                idx.index_new_blocks(&new_blocks);
+                idx.index_new_blocks(&new_blocks, Some(&node.message_pool));
                 let _ = stone::chat::save_chat_index(&idx);
             }
             Arc::new(std::sync::Mutex::new(idx))
         },
         contacts: Arc::new(std::sync::Mutex::new(stone::chat::load_contacts())),
+        contact_requests: Arc::new(std::sync::Mutex::new(stone::chat::load_contact_requests())),
         challenge_store: stone::auth::ChallengeStore::new(),
         qr_login_store: stone::auth::QrLoginStore::new(),
     };

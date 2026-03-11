@@ -584,13 +584,13 @@ impl TokenLedger {
             )));
         }
 
-        // 3. Nonce-Prüfung (nur für echte Nutzer-Transaktionen)
+        // 3. Nonce-Prüfung (für alle Nutzer-Transaktionen inkl. Stake/Unstake)
         //    Im Replay-Modus überspringen: Blöcke wurden bereits vom Netzwerk validiert.
-        //    Stake/Unstake werden vom Node erstellt (nicht vom User signiert) → Nonce überspringen.
         if !self.replay_mode
             && (tx.tx_type == TxType::Transfer || tx.tx_type == TxType::Burn || tx.tx_type == TxType::RotateKey
             || tx.tx_type == TxType::AccountRegister || tx.tx_type == TxType::AccountUpdate
-            || tx.tx_type == TxType::ChatMessage)
+            || tx.tx_type == TxType::ChatMessage
+            || tx.tx_type == TxType::Stake || tx.tx_type == TxType::Unstake)
         {
             // Prüfen ob der Key durch Rotation invalidiert wurde
             if let Some(active) = self.resolve_active_key(&tx.from) {
@@ -790,9 +790,8 @@ impl TokenLedger {
 
     /// Speichert den kompletten Ledger-Zustand in RocksDB.
     pub fn persist(&self) -> Result<(), LedgerError> {
-        let db_path = format!("{}/token_db", crate::blockchain::data_dir());
-        let db = rocksdb::DB::open_default(&db_path)
-            .map_err(|e| LedgerError::Persistence(format!("DB open: {e}")))?;
+        let db = super::open_token_db()
+            .map_err(|e| LedgerError::Persistence(format!("Persistierungsfehler: {e}")))?;
 
         // Balancen
         for (addr, bal) in &self.balances {
@@ -861,8 +860,7 @@ impl TokenLedger {
     ///
     /// Gibt einen leeren Ledger zurück wenn die DB nicht existiert.
     pub fn load() -> Self {
-        let db_path = format!("{}/token_db", crate::blockchain::data_dir());
-        let db = match rocksdb::DB::open_default(&db_path) {
+        let db = match super::open_token_db() {
             Ok(db) => db,
             Err(_) => return TokenLedger::new(),
         };

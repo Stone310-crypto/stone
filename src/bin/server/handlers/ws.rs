@@ -1,8 +1,8 @@
 //! WebSocket event-stream handler.
 
 use axum::{
-    extract::{State, WebSocketUpgrade},
-    extract::ws::{Message, WebSocket},
+    extract::State,
+    extract::ws::{Message, WebSocket, WebSocketUpgrade},
     response::IntoResponse,
 };
 use std::{sync::Arc, sync::atomic::Ordering};

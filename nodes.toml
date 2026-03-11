@@ -15,16 +15,6 @@ service = "stone-node"
 bins    = "stone-setup stone-master"
 
 [[node]]
-name    = "server2"
-host    = "100.95.171.71"
-user    = "root"
-port    = "22"
-root    = "/opt/stone-node"
-path    = "/opt/stone-node/target/release"
-service = "stone-node"
-bins    = "stone-setup stone-master"
-
-[[node]]
 name    = "VPSServer"
 host    = "212.227.54.241"
 user    = "root"
@@ -40,6 +30,15 @@ host    = "69.48.200.255"
 user    = "root"
 port    = "22"
 root    = "/home"
+path    = "/home"
+service = "stone-node"
+bins    = "stone-setup stone-master"
+
+[[node]]
+name    = "server2"
+host    = "10.1.128.189"
+user    = "root"
+port    = "22"
 path    = "/home"
 service = "stone-node"
 bins    = "stone-setup stone-master"

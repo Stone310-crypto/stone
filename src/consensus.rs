@@ -72,6 +72,20 @@ impl ValidatorInfo {
         }
     }
 
+    /// Erstellt einen neuen Validator als `active: false` (Pending).
+    /// Wird bei Auto-Discovery verwendet – erst nach Mindest-Stake-Prüfung aktivieren.
+    pub fn new_pending(node_id: impl Into<String>, public_key_hex: impl Into<String>) -> Self {
+        Self {
+            node_id: node_id.into(),
+            public_key_hex: public_key_hex.into(),
+            name: String::new(),
+            endpoint: String::new(),
+            added_at: Utc::now().timestamp(),
+            active: false,
+            blocks_signed: 0,
+        }
+    }
+
     /// Ed25519-Public-Key aus Hex dekodieren
     pub fn verifying_key(&self) -> Result<VerifyingKey, String> {
         let bytes = hex::decode(&self.public_key_hex)
@@ -93,6 +107,25 @@ impl ValidatorInfo {
     }
 }
 
+/// Standalone Ed25519-Signaturprüfung – braucht kein ValidatorSet.
+/// Wird im P2P-Gossip-Layer aufgerufen, bevor ein Block in die Pipeline geht.
+pub fn verify_block_signature_standalone(
+    block_hash: &str,
+    pub_key_hex: &str,
+    signature_hex: &str,
+) -> bool {
+    if pub_key_hex.is_empty() || signature_hex.is_empty() {
+        return false;
+    }
+    let Ok(pk_bytes) = hex::decode(pub_key_hex) else { return false };
+    let Ok(arr32): Result<[u8; 32], _> = pk_bytes.try_into() else { return false };
+    let Ok(vk) = VerifyingKey::from_bytes(&arr32) else { return false };
+    let Ok(sig_bytes) = hex::decode(signature_hex) else { return false };
+    let Ok(arr64): Result<[u8; 64], _> = sig_bytes.try_into() else { return false };
+    let sig = Signature::from_bytes(&arr64);
+    vk.verify(block_hash.as_bytes(), &sig).is_ok()
+}
+
 // ─── Validator-Set ───────────────────────────────────────────────────────────
 
 /// Persistente Whitelist aller bekannten Validatoren.
@@ -107,10 +140,13 @@ impl ValidatorSet {
     }
 
     pub fn load() -> Self {
-        match std::fs::read_to_string(Self::path()) {
+        let mut vs = match std::fs::read_to_string(Self::path()) {
             Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
             Err(_) => ValidatorSet::default(),
-        }
+        };
+        // Beim Laden automatisch Duplikate (gleicher PubKey) bereinigen
+        vs.dedup_by_pubkey();
+        vs
     }
 
     pub fn save(&self) {
@@ -120,14 +156,53 @@ impl ValidatorSet {
         }
     }
 
-    /// Validator aufnehmen (oder aktualisieren falls node_id bereits vorhanden)
+    /// Validator aufnehmen (oder aktualisieren falls node_id bereits vorhanden).
+    /// Falls ein anderer Validator denselben PubKey hat, wird der alte entfernt
+    /// (Rename-Szenario: gleicher Server, neuer node_id).
     pub fn add(&mut self, info: ValidatorInfo) {
         if let Some(existing) = self.validators.iter_mut().find(|v| v.node_id == info.node_id) {
             *existing = info;
         } else {
+            // PubKey-Konflikt prüfen: gibt es schon einen Validator mit demselben Key?
+            if let Some(pos) = self.validators.iter().position(|v| v.public_key_hex == info.public_key_hex) {
+                let old_id = self.validators[pos].node_id.clone();
+                println!(
+                    "[consensus] 🔄 Validator '{}' ersetzt '{}' (gleicher PubKey)",
+                    info.node_id, old_id,
+                );
+                self.validators.remove(pos);
+            }
             self.validators.push(info);
         }
         self.save();
+    }
+
+    /// Duplikat-Validatoren entfernen: wenn mehrere Validator-Einträge denselben
+    /// public_key_hex haben, behalte nur den mit den meisten blocks_signed.
+    /// Gibt Anzahl entfernter Einträge zurück.
+    pub fn dedup_by_pubkey(&mut self) -> usize {
+        use std::collections::HashMap;
+        let mut best: HashMap<String, usize> = HashMap::new(); // pubkey → index of best
+        for (i, v) in self.validators.iter().enumerate() {
+            let entry = best.entry(v.public_key_hex.clone()).or_insert(i);
+            if self.validators[*entry].blocks_signed < v.blocks_signed {
+                *entry = i;
+            }
+        }
+        let keep_indices: std::collections::HashSet<usize> = best.values().copied().collect();
+        let before = self.validators.len();
+        let mut idx = 0;
+        self.validators.retain(|_| {
+            let keep = keep_indices.contains(&idx);
+            idx += 1;
+            keep
+        });
+        let removed = before - self.validators.len();
+        if removed > 0 {
+            println!("[consensus] 🧹 {} Duplikat-Validator(en) entfernt (gleicher PubKey)", removed);
+            self.save();
+        }
+        removed
     }
 
     /// Validator entfernen
@@ -433,9 +508,8 @@ impl ValidatorSet {
 
     /// Block-Signatur + randomisierte Validator-Auswahl verifizieren.
     ///
-    /// Erweiterte Version von `verify_block` die zusätzlich prüft ob der Signer
-    /// für diesen Block-Slot der ausgewählte Validator war (SHA256-basiert).
-    /// `prev_hash` ist der Hash des vorherigen Blocks (oder "genesis" für Block #0).
+    /// Legacy-Wrapper — nutzt leere Jail/Stake-Daten.
+    /// **Bevorzuge `verify_block_with_context()`** wenn `build_selection_context()` verfügbar ist.
     pub fn verify_block_with_selection(
         &self,
         block_hash: &str,
@@ -443,38 +517,474 @@ impl ValidatorSet {
         signature_hex: &str,
         prev_hash: &str,
         block_index: u64,
+        pow_nonce: u64,
+    ) -> BlockVerifyResult {
+        let empty_jailed = std::collections::HashSet::new();
+        let empty_stakes = HashMap::new();
+        let wallet_map: HashMap<String, String> = self.validators.iter()
+            .filter(|v| v.active && !v.public_key_hex.is_empty())
+            .map(|v| (v.node_id.clone(), v.public_key_hex.clone()))
+            .collect();
+        self.verify_block_with_context(
+            block_hash, signer_node_id, signature_hex,
+            prev_hash, block_index, pow_nonce,
+            &empty_jailed, &empty_stakes, &wallet_map,
+            None, false,
+        )
+    }
+
+    /// Block-Signatur + Validator-Auswahl verifizieren **mit echtem Kontext**.
+    ///
+    /// Nutzt das Jailed-Set und Stakes für korrekte Round-Robin- und
+    /// Backup-Proposer-Prüfung. Sollte immer bevorzugt werden wenn
+    /// `MasterNodeState::build_selection_context()` verfügbar ist.
+    /// `last_block_ts` — Timestamp des letzten Blocks (Unix-Sekunden). Wenn gesetzt,
+    /// wird der Backup-Proposer nur akzeptiert wenn der letzte Block älter als
+    /// 2× MINING_INTERVAL ist (= Primär-Validator hat seinen Slot verpasst).
+    ///
+    /// `initial_sync_done` — Wenn `true` und das ValidatorSet leer ist, wird der Block
+    /// als `Rejected` behandelt (nach dem Sync sollte ein ValidatorSet existieren).
+    pub fn verify_block_with_context(
+        &self,
+        block_hash: &str,
+        signer_node_id: &str,
+        signature_hex: &str,
+        prev_hash: &str,
+        block_index: u64,
+        pow_nonce: u64,
+        jailed: &std::collections::HashSet<String>,
+        stakes: &HashMap<String, rust_decimal::Decimal>,
+        wallet_map: &HashMap<String, String>,
+        last_block_ts: Option<i64>,
+        initial_sync_done: bool,
     ) -> BlockVerifyResult {
         // Basis-Prüfung (Signatur + Validator-Status)
         let basic = self.verify_block(block_hash, signer_node_id, signature_hex);
         if !basic.is_acceptable() {
             return basic;
         }
-        // Bei NoValidatorsConfigured → keine weitere Prüfung
+        // Bei NoValidatorsConfigured:
+        // Vor initial_sync → akzeptieren (kein ValidatorSet vorhanden).
+        // Nach initial_sync → restriktiver: Block ablehnen, da jetzt ein
+        // ValidatorSet existieren sollte.
         if basic == BlockVerifyResult::NoValidatorsConfigured {
+            if initial_sync_done {
+                return BlockVerifyResult::Rejected;
+            }
             return basic;
         }
-        // Prüfe ob der Signer der ausgewählte Validator für diesen Slot war.
-        // Auch Backup-Proposer (rank 1-3) sind erlaubt — sie springen ein
-        // wenn der primäre Validator seinen Slot verpasst hat.
+
+        // Gejailter Validator darf keine Blöcke produzieren
+        if jailed.contains(signer_node_id) {
+            return BlockVerifyResult::NotSelectedValidator;
+        }
+
+        // 1. Round-Robin mit echtem Jailed-Set
+        if self.is_round_robin_turn(signer_node_id, block_index, jailed) {
+            return BlockVerifyResult::Valid;
+        }
+
+        // 2. Legacy Stake-gewichtete Auswahl (Rückwärtskompatibilität für alte Blöcke)
         if self.is_selected_validator(signer_node_id, prev_hash, block_index) {
             return BlockVerifyResult::Valid;
         }
-        // Prüfe ob der Signer ein Backup-Proposer ist (rank 1..3)
-        let empty_stakes = HashMap::new();
-        let empty_jailed = std::collections::HashSet::new();
-        let wallet_map: HashMap<String, String> = self.validators.iter()
-            .filter(|v| v.active && !v.public_key_hex.is_empty())
-            .map(|v| (v.node_id.clone(), v.public_key_hex.clone()))
-            .collect();
-        if let Some(rank) = self.backup_proposer_rank(
-            signer_node_id, prev_hash, block_index,
-            &empty_stakes, &empty_jailed, &wallet_map,
-        ) {
-            if rank <= 3 {
-                return BlockVerifyResult::Valid;
+
+        // 3. Lite-PoW Fallback: Wenn der Signer nicht der Round-Robin-Validator ist,
+        //    muss er ein gültiges PoW vorweisen (Fallback bei Validator-Ausfall).
+        if pow_nonce > 0 && verify_lite_pow(prev_hash, block_index, signer_node_id, pow_nonce, BLOCK_POW_DIFFICULTY) {
+            return BlockVerifyResult::Valid;
+        }
+
+        // 4. Backup-Proposer mit echten Stakes/Jailed — NUR nach Timeout.
+        //    Verhindert dass Backup-Proposer sofort konkurrierend produzieren.
+        let backup_allowed = match last_block_ts {
+            Some(ts) => {
+                let age = chrono::Utc::now().timestamp() - ts;
+                age >= (BACKUP_PROPOSER_TIMEOUT_SECS as i64)
+            }
+            None => true, // Kein Timestamp verfügbar → Legacy-Verhalten
+        };
+        if backup_allowed {
+            if let Some(rank) = self.backup_proposer_rank(
+                signer_node_id, prev_hash, block_index,
+                stakes, jailed, wallet_map,
+            ) {
+                if rank <= 3 {
+                    return BlockVerifyResult::Valid;
+                }
             }
         }
         BlockVerifyResult::NotSelectedValidator
+    }
+
+    // ─── Round-Robin Validator-Auswahl ──────────────────────────────────────
+    //
+    // Deterministische, faire Rotation: Jeder aktive Validator kommt der Reihe
+    // nach dran. Die Sortierung nach node_id garantiert, dass alle Nodes die
+    // gleiche Reihenfolge sehen.
+    //
+    // Fallback: Wenn der Round-Robin-Validator seinen Slot verpasst, darf jeder
+    // aktive Validator mit einem Lite-PoW-Beweis einspringen.
+
+    /// Wählt den Validator für `block_index` per Round-Robin (sortiert nach node_id).
+    ///
+    /// ```text
+    /// 3 Nodes (A, B, C sortiert):
+    ///   Block 1 → A
+    ///   Block 2 → B
+    ///   Block 3 → C
+    ///   Block 4 → A  (wrap-around)
+    /// ```
+    pub fn select_validator_round_robin(
+        &self,
+        block_index: u64,
+        jailed: &std::collections::HashSet<String>,
+    ) -> Option<&ValidatorInfo> {
+        let mut active: Vec<&ValidatorInfo> = self.validators.iter()
+            .filter(|v| v.active)
+            .filter(|v| !jailed.contains(&v.node_id))
+            .collect();
+        if active.is_empty() {
+            return None;
+        }
+        // Stabile Sortierung nach node_id (deterministisch auf allen Nodes gleich)
+        active.sort_by(|a, b| a.node_id.cmp(&b.node_id));
+
+        let idx = (block_index as usize) % active.len();
+        Some(active[idx])
+    }
+
+    /// Prüft ob `node_id` per Round-Robin für `block_index` ausgewählt ist.
+    pub fn is_round_robin_turn(
+        &self,
+        node_id: &str,
+        block_index: u64,
+        jailed: &std::collections::HashSet<String>,
+    ) -> bool {
+        if self.validators.is_empty() {
+            return true; // PoA deaktiviert → jeder darf
+        }
+        match self.select_validator_round_robin(block_index, jailed) {
+            Some(v) => v.node_id == node_id,
+            None => true,
+        }
+    }
+}
+
+// ─── Lite-PoW (Spam-Filter + Fallback-Mining) ────────────────────────────────
+//
+// Leichtes Proof-of-Work: nicht für Sicherheit, sondern als:
+// 1. Fallback wenn der Round-Robin-Validator ausfällt
+// 2. Spam-Filter für den MessagePool (Chat-Nachrichten)
+//
+// Difficulty 20 → ~1.048.576 SHA256-Hashes → ~50-100ms auf moderner Hardware
+// Erhöht die Kosten für PoW-Spam deutlich gegenüber dem alten Wert (16).
+
+/// Block-PoW Difficulty (Anzahl führender Null-Bits).
+/// 20 Bits → ~1M Versuche → ~50ms auf M1/M2, ~100ms auf einem VPS.
+pub const BLOCK_POW_DIFFICULTY: u32 = 20;
+
+/// Timeout bevor Backup-Proposer akzeptiert werden (Sekunden).
+/// 2× MINING_INTERVAL: Gibt dem Primär-Validator genug Zeit.
+pub const BACKUP_PROPOSER_TIMEOUT_SECS: u64 = 240;
+
+/// Chat-Nachrichten PoW Difficulty (Anzahl führender Null-Bits).
+/// 14 Bits → ~16k Versuche → ~2-5ms auf iPhone, ~1-2ms auf Desktop.
+pub const MESSAGE_POW_DIFFICULTY: u32 = 14;
+
+/// Löst ein Lite-PoW Puzzle.
+///
+/// Findet `nonce` sodass `SHA256(prev_hash | block_index | node_id | nonce)`
+/// die ersten `difficulty` Bits = 0 hat.
+///
+/// Typische Laufzeit bei difficulty=16: ~2-10ms.
+pub fn solve_lite_pow(prev_hash: &str, block_index: u64, node_id: &str, difficulty: u32) -> u64 {
+    let mut nonce: u64 = 0;
+    loop {
+        if verify_lite_pow(prev_hash, block_index, node_id, nonce, difficulty) {
+            return nonce;
+        }
+        nonce += 1;
+    }
+}
+
+/// Verifiziert ein Lite-PoW.
+///
+/// Prüft ob `SHA256(prev_hash | block_index | node_id | nonce)` die
+/// geforderten führenden Null-Bits hat.
+pub fn verify_lite_pow(prev_hash: &str, block_index: u64, node_id: &str, nonce: u64, difficulty: u32) -> bool {
+    let mut h = Sha256::new();
+    h.update(prev_hash.as_bytes());
+    h.update(block_index.to_le_bytes());
+    h.update(node_id.as_bytes());
+    h.update(nonce.to_le_bytes());
+    let hash: [u8; 32] = h.finalize().into();
+    leading_zero_bits(&hash) >= difficulty
+}
+
+/// Verifiziert ein Lite-PoW für Chat-Nachrichten (Spam-Filter).
+///
+/// Prüft ob `SHA256(msg_id | pow_nonce)` die geforderten führenden Null-Bits hat.
+pub fn verify_message_pow(msg_id: &str, pow_nonce: u64, difficulty: u32) -> bool {
+    let mut h = Sha256::new();
+    h.update(msg_id.as_bytes());
+    h.update(pow_nonce.to_le_bytes());
+    let hash: [u8; 32] = h.finalize().into();
+    leading_zero_bits(&hash) >= difficulty
+}
+
+/// Löst ein Lite-PoW für Chat-Nachrichten.
+///
+/// Typische Laufzeit bei difficulty=14: ~1-5ms.
+pub fn solve_message_pow(msg_id: &str, difficulty: u32) -> u64 {
+    let mut nonce: u64 = 0;
+    loop {
+        if verify_message_pow(msg_id, nonce, difficulty) {
+            return nonce;
+        }
+        nonce += 1;
+    }
+}
+
+/// Zählt die führenden Null-Bits in einem Byte-Array.
+fn leading_zero_bits(bytes: &[u8]) -> u32 {
+    let mut count = 0u32;
+    for &b in bytes {
+        if b == 0 {
+            count += 8;
+        } else {
+            count += b.leading_zeros();
+            break;
+        }
+    }
+    count
+}
+
+// ─── Argon2id CPU-PoW ─────────────────────────────────────────────────────────
+//
+// Memory-hard Proof-of-Work mit Argon2id. Jeder Block muss ein Puzzle lösen:
+//
+//   Input:  prev_hash || block_index || validator_pubkey || nonce
+//   Params: memory = 64 MiB, iterations = 4, parallelism = 1
+//   Target: leading_zero_bits(argon2id_hash) >= difficulty
+//
+// Warum Argon2id:
+// - Memory-hard → GPUs/ASICs haben keinen Vorteil (64 MB pro Hash)
+// - CPU-optimiert → fairer Zugang für jeden Miner
+// - Kryptographisch bewiesen (Password Hashing Competition Gewinner)
+// - Difficulty über führende Null-Bits steuerbar
+//
+// Difficulty-Adjustment: Alle DIFFICULTY_ADJUSTMENT_INTERVAL Blöcke wird die
+// Difficulty so angepasst, dass die durchschnittliche Block-Time dem Target
+// entspricht (~15 Sekunden Mining-Zeit bei 120s Block-Intervall).
+
+/// Standard-Difficulty für Argon2id-PoW (Anzahl führender Null-Bits).
+/// 8 Bits → ~256 Argon2id-Hashes → bei ~100ms/Hash ≈ 25s auf Desktop-CPU.
+/// Wird dynamisch über `calculate_next_difficulty()` angepasst.
+pub const ARGON2_POW_INITIAL_DIFFICULTY: u32 = 8;
+
+/// Argon2id Memory-Parameter in KiB (64 MiB).
+/// Genug um GPU/ASIC-Vorteil zu eliminieren, wenig genug für jeden Laptop.
+pub const ARGON2_MEMORY_KIB: u32 = 65_536;
+
+/// Argon2id Iterations (time cost).
+/// 4 Iterationen → ~100ms pro Hash auf moderner CPU.
+pub const ARGON2_ITERATIONS: u32 = 4;
+
+/// Argon2id Parallelism (Threads pro Hash-Berechnung).
+/// 1 = single-threaded → maximale Fairness (kein Vorteil durch mehr Cores).
+pub const ARGON2_PARALLELISM: u32 = 1;
+
+/// Difficulty-Adjustment alle N Blöcke.
+pub const DIFFICULTY_ADJUSTMENT_INTERVAL: u64 = 100;
+
+/// Ziel-Mining-Zeit in Sekunden (wie lange das PoW-Puzzle dauern soll).
+pub const TARGET_MINING_TIME_SECS: u64 = 15;
+
+/// Minimale Difficulty (nie unter diesem Wert).
+pub const MIN_POW_DIFFICULTY: u32 = 4;
+
+/// Maximale Difficulty (nie über diesem Wert).
+pub const MAX_POW_DIFFICULTY: u32 = 24;
+
+/// Ab welchem Block-Index Argon2id-PoW aktiviert ist.
+/// Alle Blöcke vor diesem Index sind Legacy-Blöcke ohne Argon2id.
+pub const ARGON2_POW_ACTIVATION_BLOCK: u64 = 600;
+
+/// Löst ein Argon2id Proof-of-Work Puzzle.
+///
+/// Findet `nonce` sodass `Argon2id(prev_hash || block_index || validator_pk || nonce)`
+/// die geforderte Anzahl führender Null-Bits hat.
+///
+/// Gibt `(nonce, pow_hash_hex)` zurück.
+pub fn solve_argon2_pow(
+    prev_hash: &str,
+    block_index: u64,
+    validator_pubkey: &str,
+    difficulty: u32,
+) -> (u64, String) {
+    let start = std::time::Instant::now();
+    let mut nonce: u64 = 0;
+    loop {
+        let hash = compute_argon2_pow_hash(prev_hash, block_index, validator_pubkey, nonce);
+        if leading_zero_bits(&hash) >= difficulty {
+            let elapsed = start.elapsed();
+            let hash_hex = hex::encode(&hash);
+            println!(
+                "[pow] ⛏️  Argon2id-PoW gelöst: nonce={}, difficulty={}, {:.1}s ({} Versuche)",
+                nonce, difficulty, elapsed.as_secs_f64(), nonce + 1,
+            );
+            return (nonce, hash_hex);
+        }
+        nonce += 1;
+        // Fortschritt alle 50 Versuche loggen
+        if nonce % 50 == 0 {
+            let elapsed = start.elapsed();
+            println!(
+                "[pow] ⛏️  Mining... {} Versuche in {:.1}s ({:.1} H/s)",
+                nonce, elapsed.as_secs_f64(),
+                nonce as f64 / elapsed.as_secs_f64().max(0.001),
+            );
+        }
+    }
+}
+
+/// Berechnet einen einzelnen Argon2id-Hash für das PoW-Puzzle.
+///
+/// Input (salt): `prev_hash || block_index (LE) || validator_pubkey || nonce (LE)`
+/// Password: Kombination der Input-Felder (deterministisch).
+fn compute_argon2_pow_hash(
+    prev_hash: &str,
+    block_index: u64,
+    validator_pubkey: &str,
+    nonce: u64,
+) -> [u8; 32] {
+    use argon2::Argon2;
+    use argon2::Algorithm;
+    use argon2::Version;
+    use argon2::Params;
+
+    // Password = SHA256(prev_hash || block_index || validator_pubkey || nonce)
+    // (Argon2 braucht password + salt, wir leiten beides deterministisch ab)
+    let mut pw_hasher = Sha256::new();
+    pw_hasher.update(prev_hash.as_bytes());
+    pw_hasher.update(block_index.to_le_bytes());
+    pw_hasher.update(validator_pubkey.as_bytes());
+    pw_hasher.update(nonce.to_le_bytes());
+    let password: [u8; 32] = pw_hasher.finalize().into();
+
+    // Salt = SHA256("stone-pow" || block_index || prev_hash)
+    // (Mindestens 8 Bytes, deterministisch)
+    let mut salt_hasher = Sha256::new();
+    salt_hasher.update(b"stone-pow");
+    salt_hasher.update(block_index.to_le_bytes());
+    salt_hasher.update(prev_hash.as_bytes());
+    let salt: [u8; 32] = salt_hasher.finalize().into();
+
+    let params = Params::new(
+        ARGON2_MEMORY_KIB,
+        ARGON2_ITERATIONS,
+        ARGON2_PARALLELISM,
+        Some(32), // output length
+    ).expect("Argon2 params");
+
+    let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
+
+    let mut output = [0u8; 32];
+    argon2.hash_password_into(&password, &salt, &mut output)
+        .expect("Argon2 hash");
+    output
+}
+
+/// Verifiziert ein Argon2id Proof-of-Work.
+///
+/// Prüft ob der gegebene nonce den Difficulty-Target erfüllt.
+/// Gibt `true` zurück wenn der PoW gültig ist.
+pub fn verify_argon2_pow(
+    prev_hash: &str,
+    block_index: u64,
+    validator_pubkey: &str,
+    nonce: u64,
+    pow_hash_hex: &str,
+    difficulty: u32,
+) -> bool {
+    // Zuerst: Hash neu berechnen und mit dem angegebenen vergleichen
+    let computed = compute_argon2_pow_hash(prev_hash, block_index, validator_pubkey, nonce);
+    let computed_hex = hex::encode(&computed);
+    if computed_hex != pow_hash_hex {
+        return false;
+    }
+    // Dann: Difficulty prüfen
+    leading_zero_bits(&computed) >= difficulty
+}
+
+/// Berechnet die nächste Difficulty basierend auf den letzten N Blöcken.
+///
+/// Algorithmus:
+/// 1. Messe die durchschnittliche Block-Time der letzten DIFFICULTY_ADJUSTMENT_INTERVAL Blöcke
+/// 2. Vergleiche mit TARGET_MINING_TIME_SECS + MINING_INTERVAL
+/// 3. Passe Difficulty um ±1 an (smooth adjustment, kein Springen)
+///
+/// Wird nur aufgerufen wenn `block_index % DIFFICULTY_ADJUSTMENT_INTERVAL == 0`.
+pub fn calculate_next_difficulty(
+    blocks: &[Block],
+    current_difficulty: u32,
+) -> u32 {
+    if blocks.len() < 2 {
+        return current_difficulty;
+    }
+
+    // Letzte N Blöcke betrachten (oder alle wenn weniger verfügbar)
+    let window = (DIFFICULTY_ADJUSTMENT_INTERVAL as usize).min(blocks.len());
+    let recent = &blocks[blocks.len() - window..];
+
+    if recent.len() < 2 {
+        return current_difficulty;
+    }
+
+    // Durchschnittliche Block-Time berechnen
+    let time_span = (recent.last().unwrap().timestamp - recent.first().unwrap().timestamp).max(1);
+    let avg_block_time = time_span as u64 / (recent.len() as u64 - 1);
+
+    // Ziel: MINING_INTERVAL (120s) Gesamtzeit pro Block.
+    // Davon soll TARGET_MINING_TIME_SECS (15s) auf PoW entfallen.
+    let target_total = crate::master_node::MINING_INTERVAL_SECS;
+
+    let new_difficulty = if avg_block_time > target_total + 30 {
+        // Blöcke zu langsam → Difficulty runter
+        current_difficulty.saturating_sub(1)
+    } else if avg_block_time < target_total.saturating_sub(30) {
+        // Blöcke zu schnell → Difficulty hoch
+        current_difficulty + 1
+    } else {
+        // Im Zielbereich → Difficulty beibehalten
+        current_difficulty
+    };
+
+    new_difficulty.clamp(MIN_POW_DIFFICULTY, MAX_POW_DIFFICULTY)
+}
+
+/// Bestimmt die aktuelle Argon2id-PoW-Difficulty für einen Block.
+///
+/// Vor dem Activation-Block: 0 (kein Argon2id-PoW).
+/// Am Activation-Block: ARGON2_POW_INITIAL_DIFFICULTY.
+/// Danach: Aus der Chain berechnet (letzter Block mit pow_difficulty > 0).
+pub fn get_current_pow_difficulty(blocks: &[Block], next_block_index: u64) -> u32 {
+    if next_block_index < ARGON2_POW_ACTIVATION_BLOCK {
+        return 0; // Legacy-Block, kein Argon2id-PoW
+    }
+
+    // Difficulty vom letzten Block übernehmen (falls vorhanden)
+    let last_difficulty = blocks.iter().rev()
+        .find(|b| b.pow_difficulty > 0)
+        .map(|b| b.pow_difficulty)
+        .unwrap_or(ARGON2_POW_INITIAL_DIFFICULTY);
+
+    // Adjustment-Check: Nur alle DIFFICULTY_ADJUSTMENT_INTERVAL Blöcke anpassen
+    if next_block_index % DIFFICULTY_ADJUSTMENT_INTERVAL == 0 && !blocks.is_empty() {
+        calculate_next_difficulty(blocks, last_difficulty)
+    } else {
+        last_difficulty
     }
 }
 
@@ -492,6 +1002,8 @@ pub enum BlockVerifyResult {
     InvalidSignature,
     /// Signatur gültig, aber dieser Validator war nicht der ausgewählte für diesen Slot
     NotSelectedValidator,
+    /// Block wurde abgelehnt (z.B. leeres ValidatorSet nach initial_sync)
+    Rejected,
 }
 
 impl BlockVerifyResult {
@@ -632,6 +1144,19 @@ impl VoteMessage {
     pub fn verify(&self, validator_set: &ValidatorSet) -> bool {
         let Some(v) = validator_set.get(&self.voter_id) else { return false; };
         let Ok(vk) = v.verifying_key() else { return false; };
+        self.verify_with_verifying_key(&vk)
+    }
+
+    /// Signatur direkt gegen einen Public Key (hex) verifizieren.
+    /// Für Auto-Discovery: Voter ist noch nicht im ValidatorSet registriert.
+    pub fn verify_with_pubkey_hex(&self, pubkey_hex: &str) -> bool {
+        let Ok(pk_bytes) = hex::decode(pubkey_hex) else { return false; };
+        let Ok(arr): Result<[u8; 32], _> = pk_bytes.try_into() else { return false; };
+        let Ok(vk) = VerifyingKey::from_bytes(&arr) else { return false; };
+        self.verify_with_verifying_key(&vk)
+    }
+
+    fn verify_with_verifying_key(&self, vk: &VerifyingKey) -> bool {
         let Ok(sig_bytes) = hex::decode(&self.signature) else { return false; };
         let Ok(arr): Result<[u8; 64], _> = sig_bytes.try_into() else { return false; };
         let sig = Signature::from_bytes(&arr);
@@ -658,6 +1183,10 @@ pub struct PreCommitRequest {
     pub proposer_id: String,
     /// Gesammelte Pre-Vote-Nachrichten als Beweis
     pub pre_votes: Vec<VoteMessage>,
+    /// Public Keys der Voter (voter_id → public_key_hex)
+    /// Erlaubt dem Empfänger, Votes von unbekannten Validatoren zu verifizieren.
+    #[serde(default)]
+    pub voter_keys: std::collections::HashMap<String, String>,
 }
 
 // ─── Voting-Tally ─────────────────────────────────────────────────────────────
@@ -773,6 +1302,25 @@ impl VotingRound {
         }
     }
 
+    /// Responsive Tally: Quorum basiert nur auf Validators die tatsächlich
+    /// geantwortet haben (accept oder reject), nicht auf allen aktiven.
+    /// Wird verwendet wenn Peers voting nicht unterstützen (alter Code).
+    pub fn tally_pre_votes_responsive(&self) -> VoteTally {
+        let accepts = self.pre_votes.values().filter(|v| v.accept).count();
+        let rejects = self.pre_votes.values().filter(|v| !v.accept).count();
+        let responded = accepts + rejects;
+        // Mindestens 1 Stimme nötig, Supermajority der Antwortenden
+        let threshold = if responded == 0 { 1 } else { (responded * 2 / 3) + 1 };
+        VoteTally {
+            accepts,
+            rejects,
+            abstentions: 0,
+            total_validators: responded,
+            threshold,
+            quorum_reached: accepts >= threshold,
+        }
+    }
+
     /// Pre-Commit Auswertung: Supermajorität bei Pre-Commits erreicht?
     pub fn tally_pre_commits(&self, validator_set: &ValidatorSet) -> VoteTally {
         let accepts = self.pre_commits.values().filter(|v| v.accept).count();
@@ -784,6 +1332,22 @@ impl VotingRound {
             rejects,
             abstentions: total_active.saturating_sub(self.pre_commits.len()),
             total_validators: total_active,
+            threshold,
+            quorum_reached: accepts >= threshold,
+        }
+    }
+
+    /// Responsive Pre-Commit Tally: nur antwortende Validators zählen.
+    pub fn tally_pre_commits_responsive(&self) -> VoteTally {
+        let accepts = self.pre_commits.values().filter(|v| v.accept).count();
+        let rejects = self.pre_commits.values().filter(|v| !v.accept).count();
+        let responded = accepts + rejects;
+        let threshold = if responded == 0 { 1 } else { (responded * 2 / 3) + 1 };
+        VoteTally {
+            accepts,
+            rejects,
+            abstentions: 0,
+            total_validators: responded,
             threshold,
             quorum_reached: accepts >= threshold,
         }
@@ -813,6 +1377,26 @@ impl VotingRound {
         self.finalized = true;
         self.accepted = tally.quorum_reached;
         tally
+    }
+
+    /// Finalisiert mit Responsive-Fallback.
+    pub fn finalize_responsive(&mut self, validator_set: &ValidatorSet) -> (VoteTally, bool) {
+        let tally = self.tally_pre_commits(validator_set);
+        if tally.quorum_reached {
+            self.finalized = true;
+            self.accepted = true;
+            return (tally, false);
+        }
+        let responsive = self.tally_pre_commits_responsive();
+        let responded = responsive.accepts + responsive.rejects;
+        if responded < tally.total_validators && responsive.quorum_reached {
+            self.finalized = true;
+            self.accepted = true;
+            return (responsive, true);
+        }
+        self.finalized = true;
+        self.accepted = false;
+        (tally, false)
     }
 }
 
@@ -1251,6 +1835,89 @@ impl SlashingStore {
     }
 }
 
+// ─── Equivocation-Tracker ────────────────────────────────────────────────────
+
+/// Erkennt Double-Signing: Ein Validator signiert zwei verschiedene Blöcke
+/// für denselben Block-Index.
+///
+/// Wird bei jedem neuen Block gefüttert und meldet Equivocation-Events
+/// die dann via `SlashingStore` bestraft werden können.
+///
+/// Nur die letzten `WINDOW` Blöcke werden getracked um Speicher zu begrenzen.
+#[derive(Debug, Clone, Default)]
+pub struct EquivocationTracker {
+    /// (block_index, validator_pub_key) → block_hash
+    seen: HashMap<(u64, String), String>,
+    /// Niedrigster getrackter Block-Index (für Garbage-Collection)
+    min_index: u64,
+}
+
+/// Equivocation-Evidence: Beweis dass ein Validator doppelt signiert hat.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EquivocationEvidence {
+    pub validator_pub_key: String,
+    pub block_index: u64,
+    pub hash_a: String,
+    pub hash_b: String,
+    pub detected_at: i64,
+}
+
+impl EquivocationTracker {
+    /// Wie viele Block-Indizes im Tracker gehalten werden.
+    const WINDOW: u64 = 100;
+
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registriert einen Block und prüft auf Equivocation.
+    ///
+    /// Gibt `Some(EquivocationEvidence)` zurück wenn der Validator
+    /// bereits einen anderen Block für denselben Index signiert hat.
+    pub fn check_and_record(
+        &mut self,
+        block_index: u64,
+        validator_pub_key: &str,
+        block_hash: &str,
+    ) -> Option<EquivocationEvidence> {
+        if validator_pub_key.is_empty() {
+            return None;
+        }
+
+        // Garbage-Collection: Alte Einträge entfernen
+        if block_index > Self::WINDOW {
+            let new_min = block_index - Self::WINDOW;
+            if new_min > self.min_index {
+                self.seen.retain(|(idx, _), _| *idx >= new_min);
+                self.min_index = new_min;
+            }
+        }
+
+        let key = (block_index, validator_pub_key.to_string());
+        if let Some(existing_hash) = self.seen.get(&key) {
+            if existing_hash != block_hash {
+                return Some(EquivocationEvidence {
+                    validator_pub_key: validator_pub_key.to_string(),
+                    block_index,
+                    hash_a: existing_hash.clone(),
+                    hash_b: block_hash.to_string(),
+                    detected_at: chrono::Utc::now().timestamp(),
+                });
+            }
+            // Gleicher Hash → kein Problem (Duplikat)
+            return None;
+        }
+
+        self.seen.insert(key, block_hash.to_string());
+        None
+    }
+
+    /// Anzahl der getrackten Einträge.
+    pub fn tracked_count(&self) -> usize {
+        self.seen.len()
+    }
+}
+
 // ─── Fork-Erkennung & Auflösung ──────────────────────────────────────────────
 
 /// Ein Fork-Kandidat: ein Block auf einem bestimmten Index der eine Alternative darstellt.
@@ -1557,33 +2224,40 @@ fn is_encrypted_key_file(data: &[u8]) -> bool {
 ///
 /// ## Verschlüsselung
 ///
-/// Wenn die Umgebungsvariable `STONE_VALIDATOR_PASSPHRASE` gesetzt ist,
-/// wird der Key mit Argon2id + AES-256-GCM verschlüsselt auf Disk gespeichert.
+/// Der Key wird **immer** verschlüsselt auf Disk gespeichert (AES-256-GCM + Argon2id).
 ///
-/// - **Neue Datei:** Key wird verschlüsselt gespeichert als `validator_key.enc`
-/// - **Bestehende Klartext-Datei:** Wird automatisch migriert (verschlüsselt, Klartext gelöscht)
-/// - **Ohne Passphrase:** Fallback auf Klartext `validator_key.bin` (mit Warnung)
+/// Passphrase-Auflösung (Priorität):
+/// 1. `STONE_VALIDATOR_PASSPHRASE` Umgebungsvariable (manuell)
+/// 2. `{data_dir}/validator_passphrase.key` (automatisch generiert)
+/// 3. Neue Auto-Passphrase generieren + speichern (chmod 600)
+///
+/// ## Migration
+///
+/// Bestehende Klartext-Dateien (`validator_key.bin`) werden automatisch
+/// verschlüsselt und die Klartext-Datei sicher gelöscht.
 ///
 /// ## Dateien
 ///
 /// - `{data_dir}/validator_key.enc` — verschlüsselter Key (88 Bytes)
-/// - `{data_dir}/validator_key.bin` — Klartext-Key (32 Bytes, Legacy)
+/// - `{data_dir}/validator_passphrase.key` — Auto-Passphrase (64 Hex, chmod 600)
 pub fn load_or_create_validator_key() -> SigningKey {
     let dir = data_dir();
     let enc_path = format!("{}/validator_key.enc", dir);
     let plain_path = format!("{}/validator_key.bin", dir);
-    let passphrase = std::env::var("STONE_VALIDATOR_PASSPHRASE").ok()
-        .filter(|s| !s.trim().is_empty());
+    let auto_pass_path = format!("{}/validator_passphrase.key", dir);
+
+    // ── Passphrase-Auflösung: ENV > Auto-Datei > Neu generieren ─────────
+    let passphrase = resolve_passphrase(&dir, &auto_pass_path);
 
     // ── Fall 1: Verschlüsselte Datei existiert ───────────────────────────
     if let Ok(data) = std::fs::read(&enc_path) {
         if is_encrypted_key_file(&data) {
             let Some(ref pass) = passphrase else {
                 eprintln!(
-                    "[consensus] ❌ Verschlüsselter Key gefunden aber STONE_VALIDATOR_PASSPHRASE nicht gesetzt!"
+                    "[consensus] ❌ Verschlüsselter Key gefunden aber keine Passphrase verfügbar!"
                 );
                 eprintln!(
-                    "[consensus]    Setze die Umgebungsvariable oder lösche {} für einen neuen Key.",
+                    "[consensus]    Setze STONE_VALIDATOR_PASSPHRASE oder lösche {} für einen neuen Key.",
                     enc_path
                 );
                 std::process::exit(1);
@@ -1595,14 +2269,14 @@ pub fn load_or_create_validator_key() -> SigningKey {
                 }
                 Err(e) => {
                     eprintln!("[consensus] ❌ Validator-Key Entschlüsselung fehlgeschlagen: {e}");
-                    eprintln!("[consensus]    Prüfe STONE_VALIDATOR_PASSPHRASE.");
+                    eprintln!("[consensus]    Prüfe STONE_VALIDATOR_PASSPHRASE oder lösche {auto_pass_path}");
                     std::process::exit(1);
                 }
             }
         }
     }
 
-    // ── Fall 2: Klartext-Datei existiert ─────────────────────────────────
+    // ── Fall 2: Klartext-Datei existiert → automatisch migrieren ─────────
     if let Ok(bytes) = std::fs::read(&plain_path) {
         if bytes.len() == 32 {
             let arr: [u8; 32] = bytes.try_into().unwrap();
@@ -1632,7 +2306,7 @@ pub fn load_or_create_validator_key() -> SigningKey {
                     plain_path
                 );
                 eprintln!(
-                    "[consensus]    Setze STONE_VALIDATOR_PASSPHRASE für automatische Verschlüsselung."
+                    "[consensus]    Auto-Passphrase konnte nicht erstellt werden."
                 );
             }
             return key;
@@ -1659,10 +2333,54 @@ pub fn load_or_create_validator_key() -> SigningKey {
             plain_path
         );
         eprintln!(
-            "[consensus]    Empfehlung: Setze STONE_VALIDATOR_PASSPHRASE für verschlüsselte Speicherung."
+            "[consensus]    Auto-Passphrase konnte nicht erstellt werden."
         );
     }
     key
+}
+
+/// Löst die Passphrase auf: ENV → Auto-Datei → Neu generieren.
+fn resolve_passphrase(dir: &str, auto_pass_path: &str) -> Option<String> {
+    // Priorität 1: Umgebungsvariable
+    if let Some(pass) = std::env::var("STONE_VALIDATOR_PASSPHRASE").ok()
+        .filter(|s| !s.trim().is_empty())
+    {
+        return Some(pass);
+    }
+
+    // Priorität 2: Auto-Passphrase aus Datei laden
+    if let Ok(content) = std::fs::read_to_string(auto_pass_path) {
+        let pass = content.trim().to_string();
+        if !pass.is_empty() {
+            println!("[consensus] 🔑 Auto-Passphrase geladen: {auto_pass_path}");
+            return Some(pass);
+        }
+    }
+
+    // Priorität 3: Neue Auto-Passphrase generieren und speichern
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let pass = hex::encode(bytes);
+
+    let _ = std::fs::create_dir_all(dir);
+    if let Err(e) = std::fs::write(auto_pass_path, &pass) {
+        eprintln!("[consensus] ⚠️  Auto-Passphrase konnte nicht gespeichert werden: {e}");
+        return None;
+    }
+
+    // Restriktive Dateiberechtigungen (nur Owner lesen/schreiben)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(
+            auto_pass_path,
+            std::fs::Permissions::from_mode(0o600),
+        );
+    }
+
+    println!("[consensus] 🔑 Auto-Passphrase generiert: {auto_pass_path} (chmod 600)");
+    Some(pass)
 }
 
 /// Public Key dieser Node als Hex

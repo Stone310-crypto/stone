@@ -17,6 +17,7 @@ use stone::{
 };
 
 use super::super::auth_middleware::{require_admin, require_user};
+use super::super::rate_limiter::{check_rate_limit_tuple, extract_client_ip};
 use super::super::state::AppState;
 
 #[derive(Deserialize)]
@@ -32,8 +33,15 @@ pub struct LoginPhraseRequest {
 /// POST /api/v1/auth/signup
 pub async fn handle_signup(
     State(state): State<AppState>,
+    headers: HeaderMap,
     axum::Json(req): axum::Json<SignupRequest>,
 ) -> impl IntoResponse {
+    // Rate Limiting: per IP
+    let ip = extract_client_ip(&headers);
+    if let Some(resp) = check_rate_limit_tuple(&state.rate_limits.auth_signup, &ip, "Signup") {
+        return resp;
+    }
+
     if req.name.trim().is_empty() {
         return (
             StatusCode::BAD_REQUEST,
@@ -201,8 +209,15 @@ pub async fn push_user_to_peers(user: &User, peers: &[PeerInfo], _api_key: &str)
 /// POST /api/v1/auth/login
 pub async fn handle_login(
     State(state): State<AppState>,
+    headers: HeaderMap,
     axum::Json(req): axum::Json<LoginPhraseRequest>,
 ) -> impl IntoResponse {
+    // Rate Limiting: per IP
+    let ip = extract_client_ip(&headers);
+    if let Some(resp) = check_rate_limit_tuple(&state.rate_limits.auth_login, &ip, "Login") {
+        return resp;
+    }
+
     let Some(hash) = resolve_phrase(&req.phrase) else {
         return (
             StatusCode::BAD_REQUEST,

@@ -233,6 +233,10 @@ fn load_or_create_genesis() -> Block {
         storage_proof: Default::default(),
         storage_challenges: Vec::new(),
         challenge_responses: Vec::new(),
+        chat_batches: Vec::new(),
+        pow_nonce: 0,
+        pow_hash: String::new(),
+        pow_difficulty: 0,
     };
     let h = calculate_hash(&genesis);
     genesis.hash = h;
@@ -783,11 +787,11 @@ async fn main() {
 
     let app = Router::new()
         .route("/nodes", get(list_nodes).post(register_node))
-        .route("/nodes/allow/:url", post(allow_node))
-        .route("/nodes/deny/:url", post(deny_node))
-        .route("/nodes/quarantine/:url", post(quarantine_node))
-        .route("/nodes/unquarantine/:url", post(unquarantine_node))
-        .route("/nodes/status/:url", get(allow_status))
+        .route("/nodes/allow/{url}", post(allow_node))
+        .route("/nodes/deny/{url}", post(deny_node))
+        .route("/nodes/quarantine/{url}", post(quarantine_node))
+        .route("/nodes/unquarantine/{url}", post(unquarantine_node))
+        .route("/nodes/status/{url}", get(allow_status))
         .route("/token", post(issue_token))
         .route("/ca/root", get(get_root_ca))
         .route("/cert/request", post(request_cert))

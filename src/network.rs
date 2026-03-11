@@ -55,6 +55,7 @@
 //! | `stone/mempool/v1` | Token-TXs (Mempool-Broadcast)        |
 
 use crate::blockchain::Block;
+use crate::consensus::verify_block_signature_standalone;
 use futures_util::StreamExt;
 use libp2p::{
     Multiaddr, PeerId, Swarm, SwarmBuilder,
@@ -94,6 +95,7 @@ pub const TOPIC_BLOCKS: &str = "stone/blocks/v1";
 pub const TOPIC_PEERS: &str = "stone/peers/v1";
 pub const TOPIC_MEMPOOL: &str = "stone/mempool/v1";
 pub const TOPIC_STORAGE: &str = "stone/storage/v1";
+pub const TOPIC_CHAT: &str = "stone/chat/v1";
 
 /// Protokoll-Version für den Sync-Handshake.
 /// Peers mit einer anderen Major-Version werden abgelehnt.
@@ -129,8 +131,8 @@ const SEED_NODES: &[&str] = &[
     "/ip4/212.227.54.241/tcp/4001/p2p/12D3KooWNz9GTNsFks567mHaQLKR4Ai6MCiw5WUDWAgvny1ow4tJ",
     "/ip4/212.227.54.241/udp/4001/quic-v1/p2p/12D3KooWNz9GTNsFks567mHaQLKR4Ai6MCiw5WUDWAgvny1ow4tJ",
     // ── VPS2 (69.48.200.255) – sekundärer Bootstrap + Relay ───
-    "/ip4/69.48.200.255/tcp/7654/p2p/12D3KooWQ4yo42uYwihPAJx1qXm85rTVVXEbH5oWu4GHrrNMs564",
-    "/ip4/69.48.200.255/udp/7654/quic-v1/p2p/12D3KooWQ4yo42uYwihPAJx1qXm85rTVVXEbH5oWu4GHrrNMs564",
+    "/ip4/69.48.200.255/tcp/4001/p2p/12D3KooWQ4yo42uYwihPAJx1qXm85rTVVXEbH5oWu4GHrrNMs564",
+    "/ip4/69.48.200.255/udp/4001/quic-v1/p2p/12D3KooWQ4yo42uYwihPAJx1qXm85rTVVXEbH5oWu4GHrrNMs564",
 ];
 
 /// Gibt das aktive Daten-Verzeichnis zurück.
@@ -372,6 +374,13 @@ pub enum NetworkEvent {
         from_peer: String,
     },
 
+    // ── Chat-Pool-Events ──────────────────────────────────────────────────
+    /// Eine Chat-Nachricht wurde per Gossipsub von einem Peer empfangen
+    ChatMessageReceived {
+        message: crate::message_pool::PooledMessage,
+        from_peer: String,
+    },
+
     // ── Update-Events ─────────────────────────────────────────────────────
     /// Ein Update-Manifest wurde per Gossipsub empfangen
     UpdateManifestReceived {
@@ -450,6 +459,13 @@ pub enum NetworkCommand {
     /// Chain-Referenz injizieren (nach Node-Start, damit der SwarmTask
     /// Block-Requests direkt aus der lokalen Chain beantworten kann).
     SetChainRef(std::sync::Arc<std::sync::Mutex<crate::blockchain::StoneChain>>),
+
+    /// Penalty für einen Peer melden (aus den Binaries/Handlern heraus)
+    ReportPenalty {
+        peer_id_str: String,
+        points: u32,
+        reason: String,
+    },
 }
 
 impl std::fmt::Debug for NetworkCommand {
@@ -469,6 +485,7 @@ impl std::fmt::Debug for NetworkCommand {
             Self::ListPeerShards { peer_id, chunk_hash, .. } => write!(f, "ListPeerShards({peer_id}, {chunk_hash})"),
             Self::PublishGossip { topic, .. } => write!(f, "PublishGossip({topic})"),
             Self::SetChainRef(_) => write!(f, "SetChainRef(..)"),
+            Self::ReportPenalty { peer_id_str, points, .. } => write!(f, "ReportPenalty({peer_id_str}, {points})"),
         }
     }
 }
@@ -765,6 +782,29 @@ pub fn read_peer_id() -> Option<String> {
     Some(libp2p::PeerId::from_public_key(&kp.public()).to_string())
 }
 
+/// PeerIds der eingebauten Seed/Bootstrap-Nodes (aus SEED_NODES extrahiert).
+const BOOTSTRAP_PEER_IDS: &[&str] = &[
+    "12D3KooWNz9GTNsFks567mHaQLKR4Ai6MCiw5WUDWAgvny1ow4tJ", // VPS1
+    "12D3KooWQ4yo42uYwihPAJx1qXm85rTVVXEbH5oWu4GHrrNMs564", // VPS2
+];
+
+/// Prüft ob dieser Node ein Bootstrap-/Seed-Node ist.
+///
+/// Erkennung:
+/// 1. `STONE_IS_BOOTSTRAP=1` Env-Variable (explizit gesetzt)
+/// 2. Lokale PeerId stimmt mit einem der eingebauten SEED_NODES überein
+pub fn is_bootstrap_node() -> bool {
+    // Env-Override (für Tests oder manuelle Zuweisung)
+    if std::env::var("STONE_IS_BOOTSTRAP").as_deref() == Ok("1") {
+        return true;
+    }
+    // PeerId-basierte Erkennung
+    if let Some(local_id) = read_peer_id() {
+        return BOOTSTRAP_PEER_IDS.iter().any(|&id| id == local_id);
+    }
+    false
+}
+
 // ─── Swarm Behaviour ──────────────────────────────────────────────────────────
 
 #[derive(libp2p::swarm::NetworkBehaviour)]
@@ -820,11 +860,10 @@ pub fn build_swarm(
     let kad = kad::Behaviour::with_config(peer_id, MemoryStore::new(peer_id), kad_config);
 
     // ── Identify ──────────────────────────────────────────────────────────────
-    let mut identify_config = identify::Config::new(
+    let identify_config = identify::Config::new(
         "/stone/id/1.0.0".to_string(),
         keypair.public(),
-    );
-    identify_config.agent_version = format!("stone/{}", env!("CARGO_PKG_VERSION"));
+    ).with_agent_version(format!("stone/{}", env!("CARGO_PKG_VERSION")));
     let identify = identify::Behaviour::new(identify_config);
 
     // ── mDNS ──────────────────────────────────────────────────────────────────
@@ -1033,6 +1072,8 @@ struct PeerPenalty {
     score: u32,
     last_offense: Instant,
     reasons: Vec<String>,
+    /// Wie oft dieser Peer bereits gebannt wurde (für eskalierende Ban-Dauer)
+    ban_count: u32,
 }
 
 /// Ab diesem Score wird ein Peer gebannt (Verbindung getrennt, kein Re-Dial)
@@ -1052,6 +1093,18 @@ struct BannedPeerEntry {
     banned_at: i64,
     /// Unix-Timestamp wann der Ban abläuft (0 = nach Decay)
     expires_at: i64,
+    /// Wie oft dieser Peer bereits gebannt wurde
+    #[serde(default)]
+    ban_count: u32,
+    /// Letzte bekannte Adressen (IP/Multiaddr) zum Ban-Zeitpunkt
+    #[serde(default)]
+    last_known_addresses: Vec<String>,
+    /// Agent-Version des Peers (z.B. "stone/0.4.1")
+    #[serde(default)]
+    agent_version: String,
+    /// Menschenlesbare Ban-Dauer (z.B. "2h", "24h")
+    #[serde(default)]
+    ban_duration: String,
 }
 
 /// Lädt die Ban-Liste aus `stone_data/banned_peers.json`
@@ -1076,6 +1129,7 @@ fn load_banned_peers() -> HashMap<PeerId, PeerPenalty> {
                 score: entry.score,
                 last_offense: Instant::now(), // konservativ: als "gerade passiert" behandeln
                 reasons: entry.reasons,
+                ban_count: entry.ban_count,
             });
         }
     }
@@ -1085,19 +1139,49 @@ fn load_banned_peers() -> HashMap<PeerId, PeerPenalty> {
     map
 }
 
+/// Formatiert Sekunden als menschenlesbare Dauer (z.B. "2h 30m", "24h")
+fn format_ban_duration(secs: i64) -> String {
+    if secs <= 0 { return "0m".into(); }
+    let h = secs / 3600;
+    let m = (secs % 3600) / 60;
+    if h > 0 && m > 0 { format!("{h}h {m:02}m") }
+    else if h > 0 { format!("{h}h") }
+    else { format!("{m}m") }
+}
+
 /// Speichert die aktuelle Ban-Liste nach `stone_data/banned_peers.json`
-fn save_banned_peers(penalties: &HashMap<PeerId, PeerPenalty>) {
+fn save_banned_peers_with_context(
+    penalties: &HashMap<PeerId, PeerPenalty>,
+    peers: &HashMap<PeerId, PeerInfo>,
+) {
     let now = chrono::Utc::now().timestamp();
-    let ban_duration_secs = (PENALTY_DECAY_MINS * 60 * 2) as i64;
+    let base_ban_secs = (PENALTY_DECAY_MINS * 60 * 2) as i64; // 1 Stunde Basis
     let entries: Vec<BannedPeerEntry> = penalties
         .iter()
         .filter(|(_, p)| p.score >= BAN_THRESHOLD)
-        .map(|(peer_id, p)| BannedPeerEntry {
-            peer_id: peer_id.to_string(),
-            score: p.score,
-            reasons: p.reasons.clone(),
-            banned_at: now,
-            expires_at: now + ban_duration_secs,
+        .map(|(peer_id, p)| {
+            // Eskalierende Ban-Dauer: base × 2^ban_count (max 24h)
+            let escalated = base_ban_secs * (1i64 << p.ban_count.min(5));
+            let max_ban = 24 * 60 * 60; // 24 Stunden Maximum
+            let ban_secs = escalated.min(max_ban);
+            // Peer-Metadaten vom Zeitpunkt des Bans
+            let (addrs, agent) = peers.get(peer_id)
+                .map(|info| (
+                    info.addresses.clone(),
+                    info.agent_version.clone(),
+                ))
+                .unwrap_or_default();
+            BannedPeerEntry {
+                peer_id: peer_id.to_string(),
+                score: p.score,
+                reasons: p.reasons.clone(),
+                banned_at: now,
+                expires_at: now + ban_secs,
+                ban_count: p.ban_count,
+                last_known_addresses: addrs,
+                agent_version: agent,
+                ban_duration: format_ban_duration(ban_secs),
+            }
         })
         .collect();
     let path = format!("{}/{}", data_dir(), BANNED_PEERS_FILENAME);
@@ -1754,6 +1838,13 @@ impl SwarmTask {
                             from_peer: propagation_source.to_string(),
                         });
                     }
+                } else if topic == TOPIC_CHAT {
+                    if let Ok(msg) = serde_json::from_slice::<crate::message_pool::PooledMessage>(&message.data) {
+                        let _ = self.event_tx.send(NetworkEvent::ChatMessageReceived {
+                            message: msg,
+                            from_peer: propagation_source.to_string(),
+                        });
+                    }
                 } else {
                     let _ = message_id; // acknowledged
                 }
@@ -1782,7 +1873,7 @@ impl SwarmTask {
 
             // ── Request/Response (Block-Sync + Ping) ──────────────────────
             StoneBehaviourEvent::BlockExchange(
-                request_response::Event::Message { peer, message }
+                request_response::Event::Message { peer, message, .. }
             ) => match message {
                 request_response::Message::Request { request, channel, .. } => {
                     // ── Rate-Limit prüfen ──────────────────────────────────
@@ -2179,7 +2270,7 @@ impl SwarmTask {
 
             // ── Shard-Exchange (Request/Response) ────────────────────────────
             StoneBehaviourEvent::ShardExchange(
-                request_response::Event::Message { peer, message }
+                request_response::Event::Message { peer, message, .. }
             ) => match message {
                 request_response::Message::Request { request, channel, .. } => {
                     match request {
@@ -2518,6 +2609,7 @@ impl SwarmTask {
             score: 0,
             last_offense: Instant::now(),
             reasons: Vec::new(),
+            ban_count: 0,
         });
 
         // Penalty-Verfall: wenn letzte Offense > PENALTY_DECAY_MINS her → Score halbieren
@@ -2536,9 +2628,11 @@ impl SwarmTask {
         );
 
         if entry.score >= BAN_THRESHOLD {
+            entry.ban_count += 1;
             eprintln!(
-                "[p2p] 🔨 BANNED: {peer} (Score: {}, Gründe: {:?})",
+                "[p2p] 🔨 BANNED: {peer} (Score: {}, Ban #{}, Gründe: {:?})",
                 entry.score,
+                entry.ban_count,
                 entry.reasons,
             );
             // Verbindung trennen
@@ -2547,8 +2641,8 @@ impl SwarmTask {
             if let Some(info) = self.peers.get_mut(peer) {
                 info.connected = false;
             }
-            // Ban-Liste persistieren
-            save_banned_peers(&self.peer_penalties);
+            // Ban-Liste persistieren (mit Peer-Metadaten)
+            save_banned_peers_with_context(&self.peer_penalties, &self.peers);
         }
     }
 
@@ -2666,6 +2760,30 @@ impl SwarmTask {
                     return;
                 }
 
+                // ── Ed25519-Validator-Signatur prüfen ─────────────────────────
+                if block.index > 0 {
+                    if block.validator_pub_key.is_empty() || block.validator_signature.is_empty() {
+                        eprintln!(
+                            "[p2p] ⚠ Block #{} von {source} hat keine Validator-Signatur – ignoriert",
+                            block.index
+                        );
+                        self.add_peer_penalty(&source, 100, "missing validator signature");
+                        return;
+                    }
+                    if !verify_block_signature_standalone(
+                        &block.hash,
+                        &block.validator_pub_key,
+                        &block.validator_signature,
+                    ) {
+                        eprintln!(
+                            "[p2p] ⚠ Block #{} von {source} hat ungültige Validator-Signatur – ignoriert",
+                            block.index
+                        );
+                        self.add_peer_penalty(&source, 200, "invalid validator signature");
+                        return;
+                    }
+                }
+
                 // ── Block-Größe vs. data_size Plausibilität ───────────────────
                 let actual_data_size: u64 = block.documents.iter().map(|d| d.size).sum();
                 if block.data_size > 0 && actual_data_size == 0 && !block.documents.is_empty() {
@@ -2747,6 +2865,19 @@ impl SwarmTask {
 
         match serde_json::from_slice::<crate::token::TokenTx>(&data) {
             Ok(tx) => {
+                // Stake/Unstake-TXs dürfen nur lokal über authentifizierte
+                // API-Handler erstellt werden – via P2P ablehnen.
+                if tx.tx_type == crate::token::TxType::Stake
+                    || tx.tx_type == crate::token::TxType::Unstake
+                {
+                    eprintln!(
+                        "[p2p] ⚠ {:?}-TX {} von {source} via Gossip abgelehnt (nur lokal erlaubt)",
+                        tx.tx_type, &tx.tx_id[..12.min(tx.tx_id.len())]
+                    );
+                    self.add_peer_penalty(&source, 50, "unauthorized stake/unstake via gossip");
+                    return;
+                }
+
                 // Duplikat-Filter (tx_id basiert)
                 let key = format!("tx:{}", tx.tx_id);
                 if self.is_duplicate(&key) {
@@ -3257,6 +3388,15 @@ impl SwarmTask {
                 }
                 false
             }
+
+            NetworkCommand::ReportPenalty { peer_id_str, points, reason } => {
+                if let Ok(peer_id) = peer_id_str.parse::<PeerId>() {
+                    self.add_peer_penalty(&peer_id, points, &reason);
+                } else {
+                    eprintln!("[p2p] ReportPenalty: ungültige PeerId '{peer_id_str}'");
+                }
+                false
+            }
         }
     }
 }
@@ -3282,7 +3422,7 @@ struct SyncHandshake {
 // ─── Gossipsub: Topics abonnieren ─────────────────────────────────────────────
 
 fn subscribe_all_topics(gossipsub: &mut gossipsub::Behaviour) -> Result<(), String> {
-    for topic in [TOPIC_BLOCKS, TOPIC_PEERS, TOPIC_SYNC_HANDSHAKE, TOPIC_MEMPOOL, crate::updater::TOPIC_UPDATES, TOPIC_STORAGE] {
+    for topic in [TOPIC_BLOCKS, TOPIC_PEERS, TOPIC_SYNC_HANDSHAKE, TOPIC_MEMPOOL, TOPIC_CHAT, crate::updater::TOPIC_UPDATES, TOPIC_STORAGE] {
         gossipsub.subscribe(&IdentTopic::new(topic))
             .map_err(|e| format!("Subscribe '{topic}': {e}"))?;
     }
@@ -3449,6 +3589,15 @@ impl NetworkHandle {
             Ok(Ok(indices)) => indices,
             _ => vec![],
         }
+    }
+
+    /// Meldet Fehlverhalten eines Peers (aus Handlern/Binaries heraus).
+    pub async fn report_penalty(&self, peer_id_str: &str, points: u32, reason: &str) {
+        let _ = self.cmd_tx.send(NetworkCommand::ReportPenalty {
+            peer_id_str: peer_id_str.to_string(),
+            points,
+            reason: reason.to_string(),
+        }).await;
     }
 }
 

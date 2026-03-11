@@ -67,6 +67,10 @@ pub struct ConversationSummary {
     pub last_message_preview: String,
     /// Timestamp der letzten Nachricht
     pub last_timestamp: i64,
+    /// msg_id der letzten Nachricht
+    pub last_msg_id: String,
+    /// Wallet des Absenders der letzten Nachricht
+    pub last_from_wallet: String,
     /// Anzahl ungelesener Nachrichten
     pub unread_count: u32,
     /// Gesamtzahl der Nachrichten
@@ -131,7 +135,13 @@ impl ChatIndex {
                     .map(|m| m.encrypted_content.clone())
                     .unwrap_or_default(),
                 last_timestamp: last.map(|m| m.timestamp).unwrap_or(0),
-                unread_count: 0, // Client verwaltet "gelesen" Status lokal
+                last_msg_id: last
+                    .map(|m| m.msg_id.clone())
+                    .unwrap_or_default(),
+                last_from_wallet: last
+                    .map(|m| m.from_wallet.clone())
+                    .unwrap_or_default(),
+                unread_count: 0,
                 total_messages: messages.len() as u32,
             });
         }
@@ -158,16 +168,23 @@ impl ChatIndex {
     }
 
     /// Index aus der Blockchain rekonstruieren.
-    pub fn rebuild_from_chain(blocks: &[&crate::blockchain::Block]) -> Self {
+    ///
+    /// Verarbeitet sowohl klassische ChatMessage-TXs als auch Chat-Batch-Nachrichten.
+    /// Für Batches wird zuerst der Pool (RAM) geprüft, dann persistierte Batch-Records.
+    pub fn rebuild_from_chain(
+        blocks: &[&crate::blockchain::Block],
+        pool: Option<&crate::message_pool::MessagePool>,
+    ) -> Self {
         let mut index = ChatIndex::default();
+        let mut batch_count = 0u32;
 
         for block in blocks {
+            // ── Klassische ChatMessage TXs ───────────────────────────────
             for tx in &block.transactions {
                 if tx.tx_type != crate::token::TxType::ChatMessage {
                     continue;
                 }
 
-                // Memo enthält JSON: {"msg_id":"…","encrypted":"…","nonce":"…","from_user_id":"…","from_name":"…"}
                 if let Ok(data) = serde_json::from_str::<serde_json::Value>(&tx.memo) {
                     let entry = ChatEntry {
                         msg_id: data["msg_id"].as_str().unwrap_or("").to_string(),
@@ -184,14 +201,75 @@ impl ChatIndex {
                     index.add_message(entry);
                 }
             }
+
+            // ── Chat-Batch-Nachrichten: Anchor → Pool → BatchRecord ────
+            for batch in &block.chat_batches {
+                let owned_msgs: Vec<crate::message_pool::PooledMessage>;
+                let msgs: &[crate::message_pool::PooledMessage] = if !batch.messages.is_empty() {
+                    &batch.messages
+                } else if let Some(pool) = pool {
+                    let mut v = pool.messages_in_seq_range(batch.seq_start, batch.seq_end);
+                    if v.is_empty() {
+                        v = pool.load_batch_messages(&batch.merkle_root);
+                    }
+                    owned_msgs = v;
+                    &owned_msgs
+                } else {
+                    owned_msgs = Vec::new();
+                    &owned_msgs
+                };
+
+                if !msgs.is_empty() {
+                    println!(
+                        "[chat-index] Rebuild: Block #{}: {} Batch-Nachrichten (seq {}-{}, root: {}…)",
+                        block.index, msgs.len(),
+                        batch.seq_start, batch.seq_end,
+                        &batch.merkle_root[..12.min(batch.merkle_root.len())],
+                    );
+                }
+                for m in msgs {
+                    let key = Self::conv_key(&m.from_wallet, &m.to_wallet);
+                    let already = index.conversations.get(&key)
+                        .map(|entries| entries.iter().any(|e| e.msg_id == m.msg_id))
+                        .unwrap_or(false);
+                    if already { continue; }
+
+                    let entry = ChatEntry {
+                        msg_id: m.msg_id.clone(),
+                        from_wallet: m.from_wallet.clone(),
+                        to_wallet: m.to_wallet.clone(),
+                        from_user_id: m.from_user_id.clone(),
+                        from_name: m.from_name.clone(),
+                        encrypted_content: m.encrypted_content.clone(),
+                        nonce: m.nonce.clone(),
+                        timestamp: m.timestamp,
+                        block_index: block.index,
+                        tx_id: String::new(),
+                    };
+                    index.add_message(entry);
+                    batch_count += 1;
+                }
+            }
+
             index.last_indexed_block = block.index;
+        }
+
+        if batch_count > 0 {
+            println!("[chat-index] Rebuild: {} Batch-Nachrichten indexiert", batch_count);
         }
 
         index
     }
 
     /// Nur neue Blöcke in den Index aufnehmen (inkrementell).
-    pub fn index_new_blocks(&mut self, blocks: &[&crate::blockchain::Block]) {
+    ///
+    /// Verarbeitet sowohl klassische ChatMessage-TXs (backward compat)
+    /// als auch Chat-Batch-Nachrichten aus dem MessagePool.
+    pub fn index_new_blocks(
+        &mut self,
+        blocks: &[&crate::blockchain::Block],
+        pool: Option<&crate::message_pool::MessagePool>,
+    ) {
         let mut chat_count = 0u32;
         for block in blocks {
             if block.index <= self.last_indexed_block {
@@ -242,6 +320,58 @@ impl ChatIndex {
                     }
                 }
             }
+
+            // ── Chat-Batch-Nachrichten aus dem MessagePool indexieren ──────
+            // ── Chat-Batch-Nachrichten: Anchor → Pool → BatchRecord ──────
+            for batch in &block.chat_batches {
+                let owned_msgs: Vec<crate::message_pool::PooledMessage>;
+                let msgs: &[crate::message_pool::PooledMessage] = if !batch.messages.is_empty() {
+                    &batch.messages
+                } else if let Some(pool) = pool {
+                    let mut v = pool.messages_in_seq_range(batch.seq_start, batch.seq_end);
+                    if v.is_empty() {
+                        v = pool.load_batch_messages(&batch.merkle_root);
+                    }
+                    owned_msgs = v;
+                    &owned_msgs
+                } else {
+                    owned_msgs = Vec::new();
+                    &owned_msgs
+                };
+
+                if !msgs.is_empty() {
+                    println!(
+                        "[chat-index] Block #{}: {} Batch-Nachrichten (seq {}-{}, root: {}…)",
+                        block.index, msgs.len(),
+                        batch.seq_start, batch.seq_end,
+                        &batch.merkle_root[..12.min(batch.merkle_root.len())],
+                    );
+                }
+                for m in msgs {
+                    // Duplikat-Check: msg_id bereits im Index?
+                    let key = Self::conv_key(&m.from_wallet, &m.to_wallet);
+                    let already = self.conversations.get(&key)
+                        .map(|entries| entries.iter().any(|e| e.msg_id == m.msg_id))
+                        .unwrap_or(false);
+                    if already { continue; }
+
+                    let entry = ChatEntry {
+                        msg_id: m.msg_id.clone(),
+                        from_wallet: m.from_wallet.clone(),
+                        to_wallet: m.to_wallet.clone(),
+                        from_user_id: m.from_user_id.clone(),
+                        from_name: m.from_name.clone(),
+                        encrypted_content: m.encrypted_content.clone(),
+                        nonce: m.nonce.clone(),
+                        timestamp: m.timestamp,
+                        block_index: block.index,
+                        tx_id: String::new(),
+                    };
+                    self.add_message(entry);
+                    chat_count += 1;
+                }
+            }
+
             self.last_indexed_block = block.index;
         }
         if chat_count > 0 {
@@ -354,5 +484,146 @@ pub fn save_contacts(contacts: &ContactList) {
     if let Ok(json) = serde_json::to_string_pretty(contacts) {
         let _ = fs::create_dir_all(data_dir());
         let _ = fs::write(contacts_file(), json);
+    }
+}
+
+// ─── Kontaktanfragen (Friend Request System) ────────────────────────────────
+
+fn contact_requests_file() -> String {
+    format!("{}/contact_requests.json", data_dir())
+}
+
+/// Status einer Kontaktanfrage.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum ContactRequestStatus {
+    Pending,
+    Accepted,
+    Declined,
+}
+
+/// Eine Kontaktanfrage zwischen zwei Usern.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ContactRequest {
+    /// Eindeutige ID (UUID)
+    pub id: String,
+    /// Wallet des Absenders
+    pub from_wallet: String,
+    /// Name des Absenders
+    pub from_name: String,
+    /// User-ID des Absenders
+    pub from_user_id: String,
+    /// Wallet des Empfängers
+    pub to_wallet: String,
+    /// Name des Empfängers
+    pub to_name: String,
+    /// User-ID des Empfängers
+    pub to_user_id: String,
+    /// Status
+    pub status: ContactRequestStatus,
+    /// Erstellt (Unix-Timestamp)
+    pub created_at: i64,
+    /// Zuletzt aktualisiert (Unix-Timestamp)
+    pub updated_at: i64,
+}
+
+/// Speicher für alle Kontaktanfragen.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct ContactRequestStore {
+    pub requests: Vec<ContactRequest>,
+}
+
+impl ContactRequestStore {
+    /// Neue Anfrage erstellen. Gibt `Err` zurück wenn bereits eine offene existiert.
+    pub fn add_request(
+        &mut self,
+        from_wallet: &str,
+        from_name: &str,
+        from_user_id: &str,
+        to_wallet: &str,
+        to_name: &str,
+        to_user_id: &str,
+    ) -> Result<&ContactRequest, &'static str> {
+        // Prüfe ob bereits eine offene Anfrage existiert (in beide Richtungen)
+        let exists = self.requests.iter().any(|r| {
+            r.status == ContactRequestStatus::Pending
+                && ((r.from_wallet == from_wallet && r.to_wallet == to_wallet)
+                    || (r.from_wallet == to_wallet && r.to_wallet == from_wallet))
+        });
+        if exists {
+            return Err("Eine offene Anfrage existiert bereits");
+        }
+
+        let now = chrono::Utc::now().timestamp();
+        let req = ContactRequest {
+            id: uuid::Uuid::new_v4().to_string(),
+            from_wallet: from_wallet.to_string(),
+            from_name: from_name.to_string(),
+            from_user_id: from_user_id.to_string(),
+            to_wallet: to_wallet.to_string(),
+            to_name: to_name.to_string(),
+            to_user_id: to_user_id.to_string(),
+            status: ContactRequestStatus::Pending,
+            created_at: now,
+            updated_at: now,
+        };
+        self.requests.push(req);
+        Ok(self.requests.last().unwrap())
+    }
+
+    /// Eingehende Anfragen für eine Wallet (status=pending).
+    pub fn incoming_for(&self, wallet: &str) -> Vec<&ContactRequest> {
+        self.requests
+            .iter()
+            .filter(|r| r.to_wallet == wallet && r.status == ContactRequestStatus::Pending)
+            .collect()
+    }
+
+    /// Ausgehende Anfragen einer Wallet (status=pending).
+    pub fn outgoing_for(&self, wallet: &str) -> Vec<&ContactRequest> {
+        self.requests
+            .iter()
+            .filter(|r| r.from_wallet == wallet && r.status == ContactRequestStatus::Pending)
+            .collect()
+    }
+
+    /// Anfrage akzeptieren. Gibt from_wallet und to_wallet zurück (für Auto-Add).
+    pub fn accept(&mut self, request_id: &str, wallet: &str) -> Result<(String, String), &'static str> {
+        let req = self.requests.iter_mut()
+            .find(|r| r.id == request_id && r.to_wallet == wallet && r.status == ContactRequestStatus::Pending)
+            .ok_or("Anfrage nicht gefunden oder nicht berechtigt")?;
+        req.status = ContactRequestStatus::Accepted;
+        req.updated_at = chrono::Utc::now().timestamp();
+        Ok((req.from_wallet.clone(), req.to_wallet.clone()))
+    }
+
+    /// Anfrage ablehnen.
+    pub fn decline(&mut self, request_id: &str, wallet: &str) -> Result<(), &'static str> {
+        let req = self.requests.iter_mut()
+            .find(|r| r.id == request_id && r.to_wallet == wallet && r.status == ContactRequestStatus::Pending)
+            .ok_or("Anfrage nicht gefunden oder nicht berechtigt")?;
+        req.status = ContactRequestStatus::Declined;
+        req.updated_at = chrono::Utc::now().timestamp();
+        Ok(())
+    }
+
+    /// Anfrage nach ID finden.
+    pub fn find(&self, request_id: &str) -> Option<&ContactRequest> {
+        self.requests.iter().find(|r| r.id == request_id)
+    }
+}
+
+pub fn load_contact_requests() -> ContactRequestStore {
+    if let Ok(data) = fs::read_to_string(contact_requests_file()) {
+        serde_json::from_str(&data).unwrap_or_default()
+    } else {
+        ContactRequestStore::default()
+    }
+}
+
+pub fn save_contact_requests(store: &ContactRequestStore) {
+    if let Ok(json) = serde_json::to_string_pretty(store) {
+        let _ = fs::create_dir_all(data_dir());
+        let _ = fs::write(contact_requests_file(), json);
     }
 }

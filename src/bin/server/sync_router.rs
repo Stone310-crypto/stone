@@ -4,13 +4,13 @@
 //!   GET  /health            – Node-Status
 //!   GET  /info              – Node-ID, Version, Peers
 //!   GET  /users             – Öffentliche User-Liste (Name, ID, Wallet)
-//!   GET  /resolve/:id       – User-Suche
+//!   GET  /resolve/{id}       – User-Suche
 //!   GET  /peers             – Peer-Liste
 //!   GET  /chain-info        – Block-Height + Hash für Sync
 //!   GET  /blocks            – Blöcke (paginiert, für Resync)
-//!   GET  /blocks/:index     – Einzelner Block
+//!   GET  /blocks/{index}     – Einzelner Block
 //!   POST /sync-users        – User-Push empfangen
-//!   GET  /chunk/:hash       – Chunk-Daten für Peer-Sync
+//!   GET  /chunk/{hash}       – Chunk-Daten für Peer-Sync
 
 use axum::{
     Router,
@@ -96,7 +96,7 @@ async fn sync_users_list(State(state): State<AppState>) -> impl IntoResponse {
     )
 }
 
-/// GET /resolve/:identifier – User-Suche (lokal + Chain)
+/// GET /resolve/{identifier} – User-Suche (lokal + Chain)
 async fn sync_resolve(
     Path(identifier): Path<String>,
     State(state): State<AppState>,
@@ -247,7 +247,7 @@ async fn sync_blocks(
     )
 }
 
-/// GET /blocks/:index
+/// GET /blocks/{index}
 async fn sync_block(
     Path(index): Path<u64>,
     State(state): State<AppState>,
@@ -342,7 +342,7 @@ struct SyncUser {
     wallet_address: String,
 }
 
-/// GET /chunk/:hash – Chunk-Daten für Peer-Sync
+/// GET /chunk/{hash} – Chunk-Daten für Peer-Sync
 async fn sync_chunk(
     Path(hash): Path<String>,
     State(_state): State<AppState>,
@@ -388,13 +388,13 @@ pub fn build_sync_router(state: AppState) -> Router {
         .route("/health", get(sync_health))
         .route("/info", get(sync_info))
         .route("/users", get(sync_users_list))
-        .route("/resolve/:identifier", get(sync_resolve))
+        .route("/resolve/{identifier}", get(sync_resolve))
         .route("/peers", get(sync_peers))
         .route("/chain-info", get(sync_chain_info))
         .route("/blocks", get(sync_blocks))
-        .route("/blocks/:index", get(sync_block))
+        .route("/blocks/{index}", get(sync_block))
         .route("/sync-users", post(sync_receive_users))
-        .route("/chunk/:hash", get(sync_chunk))
+        .route("/chunk/{hash}", get(sync_chunk))
         .layer(cors)
         .with_state(state)
 }

@@ -7,6 +7,13 @@ use crate::token::transaction::{TokenTx, TxType, FeeTier, compute_tx_id};
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// Maximale Reorg-Tiefe in Blöcken.
+///
+/// Begrenzt wie viele Blöcke bei einem Fork zurückgerollt werden dürfen.
+/// Verhindert Deep-Reorg-Angriffe, bei denen ein Angreifer eine lange
+/// alternative Chain anbietet um bestätigte Transaktionen rückgängig zu machen.
+pub const MAX_REORG_DEPTH: u64 = 10;
+
 // ─── bincode-kompatibles serde_json::Value Wrapper ───────────────────────────
 //
 // bincode v2 unterstützt kein serde_json::Value direkt (AnyNotSupported-Fehler).
@@ -247,6 +254,33 @@ pub struct Block {
     /// Antworten auf frühere Challenges (durch herausgeforderte Nodes eingereicht)
     #[serde(default)]
     pub challenge_responses: Vec<crate::storage_proof::ChallengeResponse>,
+
+    // ─── Chat Batch Anchors ─────────────────────────────────────────────
+    /// Merkle-Batch-Anker für Chat-Nachrichten.
+    /// Nur der Merkle-Root-Hash geht in den Block-Hash ein;
+    /// die einzelnen Nachrichten bleiben off-chain im MessagePool.
+    #[serde(default)]
+    pub chat_batches: Vec<crate::merkle_batch::ChatBatchAnchor>,
+
+    // ─── Lite-PoW (Spam-Filter / Fallback-Mining) ───────────────────────
+    /// Lite-PoW Nonce für Fallback-Mining (wenn Round-Robin-Validator ausfällt).
+    /// 0 = normaler Round-Robin-Block (kein PoW nötig).
+    /// >0 = Fallback-Block, gelöst mit `solve_lite_pow()`.
+    #[serde(default)]
+    pub pow_nonce: u64,
+
+    // ─── Argon2id CPU-PoW ─────────────────────────────────────────────────
+    /// Argon2id Proof-of-Work Hash.
+    /// Jeder Block muss ein Argon2id-Puzzle lösen (memory-hard, CPU-fair).
+    /// Leer = Block vor Argon2id-PoW-Aktivierung (rückwärtskompatibel).
+    #[serde(default)]
+    pub pow_hash: String,
+
+    /// Argon2id PoW Difficulty-Target (Anzahl führender Null-Bits im Hash).
+    /// Wird dynamisch angepasst (Ziel: ~15 Sekunden Mining-Zeit).
+    /// 0 = Legacy-Block ohne Argon2id-PoW.
+    #[serde(default)]
+    pub pow_difficulty: u32,
 }
 
 // ─── Chain ───────────────────────────────────────────────────────────────────
@@ -325,6 +359,22 @@ impl StoneChain {
                     _ => {}
                 }
             }
+            Err(e) => {
+                let err_msg = format!("{e}");
+                if err_msg.contains("Corruption") || err_msg.contains("No such file or directory") {
+                    eprintln!(
+                        "[chain] ⚠️  RocksDB korrupt: {}",
+                        &err_msg[..120.min(err_msg.len())]
+                    );
+                    eprintln!("[chain] 🗑️  Lösche beschädigte DB und starte mit frischer Chain...");
+                    let db_path = format!("{}/chain_db", data_dir());
+                    if let Err(e2) = std::fs::remove_dir_all(&db_path) {
+                        eprintln!("[chain] DB-Löschung fehlgeschlagen: {e2}");
+                    }
+                } else {
+                    eprintln!("[chain] RocksDB konnte nicht geöffnet werden: {e}");
+                }
+            }
             _ => {}
         }
 
@@ -345,13 +395,25 @@ impl StoneChain {
     pub fn persist_last_block(&self) {
         use crate::storage::ChainStore;
         if let Some(block) = self.blocks.last() {
-            match ChainStore::open() {
-                Ok(store) => {
-                    if let Err(e) = store.write_block_sync(block) {
-                        eprintln!("[chain] RocksDB-Schreibfehler: {e}");
+            // Retry-Logik: RocksDB kann bei konkurrierendem Zugriff LOCK-Fehler werfen
+            for attempt in 0..3 {
+                match ChainStore::open() {
+                    Ok(store) => {
+                        if let Err(e) = store.write_block_sync(block) {
+                            eprintln!("[chain] RocksDB-Schreibfehler: {e}");
+                        }
+                        return;
+                    }
+                    Err(e) => {
+                        let msg = format!("{e}");
+                        if (msg.contains("lock") || msg.contains("LOCK") || msg.contains("temporarily unavailable")) && attempt < 2 {
+                            std::thread::sleep(std::time::Duration::from_millis(100 * (attempt as u64 + 1)));
+                            continue;
+                        }
+                        eprintln!("[chain] RocksDB konnte nicht geöffnet werden: {e}");
+                        return;
                     }
                 }
-                Err(e) => eprintln!("[chain] RocksDB konnte nicht geöffnet werden: {e}"),
             }
         }
     }
@@ -410,7 +472,7 @@ impl StoneChain {
         cluster_key: &str,
         node_role: NodeRole,
     ) -> Block {
-        let block = self.prepare_block(documents, tombstones, transactions, owner, signer, cluster_key, node_role);
+        let block = self.prepare_block(documents, tombstones, transactions, owner, signer, cluster_key, node_role, Vec::new());
         self.commit_block(block.clone());
         block
     }
@@ -428,6 +490,7 @@ impl StoneChain {
         signer: String,
         cluster_key: &str,
         node_role: NodeRole,
+        chat_batches: Vec<crate::merkle_batch::ChatBatchAnchor>,
     ) -> Block {
         // Memorial TX wird nur im Genesis-Block gespeichert – nicht in
         // jedem Block wiederholt (spart Platz, vermeidet doppelte TX-IDs).
@@ -470,6 +533,10 @@ impl StoneChain {
             storage_proof,
             storage_challenges: Vec::new(),
             challenge_responses: Vec::new(),
+            chat_batches,
+            pow_nonce: 0,
+            pow_hash: String::new(),
+            pow_difficulty: 0,
         };
 
         let hash = calculate_hash(&new_block);
@@ -524,8 +591,6 @@ impl StoneChain {
         let local_len = self.blocks.len() as u64;
 
         // ── Fork-Reorg: Block liegt hinter unserer Chain ──────────────────
-        // Bei kurzen Chains (< 50 Blöcke) Reorg erlauben, falls der Block
-        // von einer längeren Peer-Chain stammt.
         if block.index < local_len {
             // Prüfe ob der Block identisch mit unserem ist → Stale (ignorieren)
             if let Some(existing) = self.blocks.get(block.index as usize) {
@@ -535,34 +600,58 @@ impl StoneChain {
                         block.index
                     ));
                 }
+
+                // ── Equivocation-Erkennung: gleicher Validator, gleicher Index, anderer Hash ──
+                if !existing.validator_pub_key.is_empty()
+                    && !block.validator_pub_key.is_empty()
+                    && existing.validator_pub_key == block.validator_pub_key
+                    && existing.hash != block.hash
+                {
+                    eprintln!(
+                        "[chain] ⚠️  EQUIVOCATION erkannt! Validator {} hat Block #{} doppelt signiert: \
+                         lokal={}… peer={}…",
+                        &existing.validator_pub_key[..16.min(existing.validator_pub_key.len())],
+                        block.index,
+                        &existing.hash[..12.min(existing.hash.len())],
+                        &block.hash[..12.min(block.hash.len())],
+                    );
+                    return Err(format!(
+                        "Equivocation: Validator {} hat zwei verschiedene Blöcke für Index #{} signiert",
+                        &block.validator_pub_key[..16.min(block.validator_pub_key.len())],
+                        block.index
+                    ));
+                }
+
                 // Block hat gleichen Index aber anderen Hash → Fork!
-                if local_len <= 50 {
-                    // Prüfe ob der block.previous_hash zu unserem Vorgänger passt
-                    let prev_ok = if block.index == 0 {
-                        true // Genesis
-                    } else {
-                        self.blocks.get((block.index - 1) as usize)
-                            .map(|b| b.hash == block.previous_hash)
-                            .unwrap_or(false)
-                    };
-                    if prev_ok {
-                        println!(
-                            "[chain] 🔄 Fork-Reorg bei Block #{}: lokal={}… peer={}… – ersetze lokale Blöcke",
-                            block.index,
-                            &existing.hash[..8.min(existing.hash.len())],
-                            &block.hash[..8.min(block.hash.len())],
-                        );
-                        self.truncate_to(block.index);
-                        // Weiter mit normaler Block-Akzeptanz
-                    } else {
-                        return Err(format!(
-                            "Stale: Block #{} bereits bekannt (Fork, previous_hash passt nicht)",
-                            block.index
-                        ));
-                    }
+                let reorg_depth = local_len - block.index;
+                if reorg_depth > MAX_REORG_DEPTH {
+                    return Err(format!(
+                        "Reorg abgelehnt: Tiefe {} überschreitet MAX_REORG_DEPTH ({}) bei Block #{} (lokale Höhe: {local_len})",
+                        reorg_depth, MAX_REORG_DEPTH, block.index
+                    ));
+                }
+
+                // Prüfe ob der block.previous_hash zu unserem Vorgänger passt
+                let prev_ok = if block.index == 0 {
+                    true // Genesis
+                } else {
+                    self.blocks.get((block.index - 1) as usize)
+                        .map(|b| b.hash == block.previous_hash)
+                        .unwrap_or(false)
+                };
+                if prev_ok {
+                    println!(
+                        "[chain] 🔄 Fork-Reorg bei Block #{}: lokal={}… peer={}… (Tiefe: {}) – ersetze lokale Blöcke",
+                        block.index,
+                        &existing.hash[..8.min(existing.hash.len())],
+                        &block.hash[..8.min(block.hash.len())],
+                        reorg_depth,
+                    );
+                    self.truncate_to(block.index);
+                    // Weiter mit normaler Block-Akzeptanz
                 } else {
                     return Err(format!(
-                        "Stale: Block #{} bereits bekannt (lokale Höhe: {local_len})",
+                        "Stale: Block #{} bereits bekannt (Fork, previous_hash passt nicht)",
                         block.index
                     ));
                 }
@@ -587,18 +676,24 @@ impl StoneChain {
         }
 
         if block.previous_hash != self.latest_hash {
-            // ── Fork-Erkennung bei kurzer Chain ───────────────────────────
-            // Wenn unsere Chain sehr kurz ist (< 50 Blöcke), ist es wahrscheinlich
-            // ein lokaler Fork durch Mining vor Peer-Sync. In diesem Fall: Reorg
-            // durchführen, also unsere divergierenden Blöcke entfernen und den
-            // Peer-Block akzeptieren.
-            if local_len <= 50 && block.index > 0 {
+            // ── Fork-Erkennung: Suche gemeinsamen Vorgänger ──────────────
+            if block.index > 0 {
                 // Suche den gemeinsamen Vorgänger (Fork-Punkt)
                 if let Some(prev_block) = self.blocks.iter().find(|b| b.hash == block.previous_hash) {
                     let fork_point = prev_block.index + 1;
+                    let reorg_depth = local_len - fork_point;
+
+                    // Reorg-Tiefe prüfen
+                    if reorg_depth > MAX_REORG_DEPTH {
+                        return Err(format!(
+                            "Reorg abgelehnt: Tiefe {} überschreitet MAX_REORG_DEPTH ({}) – Fork bei #{}",
+                            reorg_depth, MAX_REORG_DEPTH, fork_point
+                        ));
+                    }
+
                     println!(
                         "[chain] 🔄 Fork-Reorg: Lokale Chain hat {} Blöcke, Fork bei #{} – entferne {} lokale Blöcke",
-                        local_len, fork_point, local_len - fork_point
+                        local_len, fork_point, reorg_depth
                     );
                     self.truncate_to(fork_point);
                     // Jetzt sollte latest_hash == block.previous_hash sein
@@ -740,6 +835,41 @@ impl StoneChain {
         // ── Signer darf nicht leer sein (außer Genesis) ───────────────────
         if block.signer.is_empty() && block.index > 0 {
             return Err("Block hat keinen Signer".to_string());
+        }
+
+        // ── Argon2id CPU-PoW Verifikation (ab Activation-Block) ──────────
+        {
+            use crate::consensus::{
+                get_current_pow_difficulty, verify_argon2_pow,
+                ARGON2_POW_ACTIVATION_BLOCK,
+            };
+            if block.index >= ARGON2_POW_ACTIVATION_BLOCK {
+                let difficulty = get_current_pow_difficulty(&self.blocks, block.index);
+                if difficulty > 0 {
+                    if block.pow_hash.is_empty() || block.pow_difficulty == 0 {
+                        return Err(format!(
+                            "Argon2id-PoW fehlt (ab Block #{} erforderlich)",
+                            ARGON2_POW_ACTIVATION_BLOCK,
+                        ));
+                    }
+                    if block.pow_difficulty < difficulty {
+                        return Err(format!(
+                            "Argon2id-Difficulty zu niedrig: {} < {}",
+                            block.pow_difficulty, difficulty,
+                        ));
+                    }
+                    if !verify_argon2_pow(
+                        &block.previous_hash,
+                        block.index,
+                        &block.validator_pub_key,
+                        block.pow_nonce,
+                        &block.pow_hash,
+                        block.pow_difficulty,
+                    ) {
+                        return Err("Ungültiger Argon2id-PoW (Hash-Verifikation fehlgeschlagen)".into());
+                    }
+                }
+            }
         }
 
         // PoA: externer Signatur-Check
@@ -957,6 +1087,13 @@ pub fn calculate_hash(block: &Block) -> String {
     h.update(crate::storage_proof::network_challenges_hash(&block.storage_challenges).as_bytes());
     // Challenge-Responses sind ebenfalls Teil des Block-Hashes → manipulationssicher
     h.update(crate::storage_proof::challenge_responses_hash(&block.challenge_responses).as_bytes());
+    // Chat-Batch-Anchors: Merkle-Roots der Off-Chain-Nachrichten-Batches
+    h.update(crate::merkle_batch::chat_batches_hash(&block.chat_batches).as_bytes());
+    // Lite-PoW Nonce (nur relevant bei Fallback-Blöcken)
+    h.update(block.pow_nonce.to_le_bytes());
+    // Argon2id PoW: Hash + Difficulty in Block-Hash einbeziehen
+    h.update(block.pow_hash.as_bytes());
+    h.update(block.pow_difficulty.to_le_bytes());
     format!("{:x}", h.finalize())
 }
 
@@ -1085,6 +1222,10 @@ Because Dennis died of cancer and nobody could do anything.
         validator_pub_key: String::new(),
         validator_signature: String::new(),
         storage_proof: Default::default(),
+        chat_batches: Vec::new(),
+        pow_nonce: 0,
+        pow_hash: String::new(),
+        pow_difficulty: 0,
     };
     let hash = calculate_hash(&genesis);
     genesis.hash = hash.clone();

@@ -20,7 +20,7 @@ cd "$SCRIPT_DIR/.."
 
 SIGNING_KEY="${STONE_SIGNING_KEY:-keys/update_signing.key}"
 TARGET="${STONE_UPDATE_TARGET:-x86_64-unknown-linux-gnu}"
-SEED_NODE="${STONE_SEED_NODE:-http://100.90.28.68:8080}"
+SEED_NODE="${STONE_SEED_NODE:-http://212.227.54.241:8080}"
 API_KEY="${STONE_PUBLISH_API_KEY:-${STONE_API_KEY:-}}"
 BINARY_NAME="stone-setup"
 CHANGELOG="${1:-}"  # Erstes Argument = Changelog

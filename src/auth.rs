@@ -125,7 +125,10 @@ pub fn wallet_address_from_phrase(phrase: &str) -> String {
 
     // Gleiche Key-Derivation wie token::wallet::Wallet
     let key_bytes: [u8; 32] = if entropy.len() == 32 {
-        entropy.try_into().unwrap()
+        match entropy.try_into() {
+            Ok(b) => b,
+            Err(_) => return String::new(),
+        }
     } else {
         // SHA-256 expandiert kürzere Entropy auf 32 Byte
         let mut hasher = Sha256::new();
@@ -365,7 +368,7 @@ impl ChallengeStore {
             expires_at: now + CHALLENGE_TTL_SECS,
         };
 
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         // Aufräumen: abgelaufene Challenges entfernen
         map.retain(|_, c| !c.is_expired());
         map.insert(wallet_address.to_string(), challenge.clone());
@@ -376,7 +379,7 @@ impl ChallengeStore {
     /// Gibt `Some(challenge)` zurück wenn gültig, `None` wenn abgelaufen oder unbekannt.
     /// Der Challenge wird nach einmaliger Nutzung gelöscht (Replay-Schutz).
     pub fn consume_challenge(&self, wallet_address: &str) -> Option<AuthChallenge> {
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let challenge = map.remove(wallet_address)?;
         if challenge.is_expired() {
             return None;
@@ -623,7 +626,7 @@ impl QrLoginStore {
             approved_phrase: None,
         };
 
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         // Aufräumen: abgelaufene Sessions entfernen
         map.retain(|_, s| !s.is_expired());
         map.insert(session.login_token.clone(), session.clone());
@@ -633,7 +636,7 @@ impl QrLoginStore {
     /// Fragt den Status einer QR-Login-Session ab.
     /// Gibt `None` zurück wenn unbekannt oder abgelaufen.
     pub fn get_status(&self, login_token: &str) -> Option<QrLoginSession> {
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         // Aufräumen
         map.retain(|_, s| !s.is_expired());
         map.get(login_token).cloned()
@@ -648,7 +651,7 @@ impl QrLoginStore {
         user: &User,
         phrase: Option<String>,
     ) -> bool {
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(session) = map.get_mut(login_token) {
             if session.is_expired() || session.status != QrLoginStatus::Pending {
                 return false;
@@ -669,7 +672,7 @@ impl QrLoginStore {
     /// Konsumiert eine genehmigte Session (Website holt das Token ab).
     /// Nach dem Abruf wird die Session gelöscht (einmalig verwendbar).
     pub fn consume_approved(&self, login_token: &str) -> Option<QrLoginSession> {
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let session = map.get(login_token)?;
         if session.status != QrLoginStatus::Approved {
             return None;

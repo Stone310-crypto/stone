@@ -18,8 +18,8 @@
 use crate::blockchain::{Block, Document, DocumentTombstone, NodeRole, StoneChain};
 use crate::consensus::{
     load_or_create_validator_key, local_validator_pubkey_hex, sign_block,
-    BlockProposal, CheckpointStore, PreCommitRequest, SlashingStore, ValidatorSet,
-    VoteMessage, VotePhase, VotingRound,
+    BlockProposal, CheckpointStore, EquivocationTracker, PreCommitRequest, SlashingStore,
+    ValidatorSet, VoteMessage, VotePhase, VotingRound,
 };
 use crate::shard::ShardHolderRegistry;
 use crate::chat_policy::ChatPolicyStore;
@@ -413,6 +413,8 @@ pub struct MasterNodeState {
     pub token_ledger: RwLock<TokenLedger>,
     /// StoneCoin Mempool (pending Transaktionen)
     pub mempool: Mempool,
+    /// Off-Chain Message Pool für Chat-Nachrichten (Batch-Commits statt Einzel-TXs)
+    pub message_pool: crate::message_pool::MessagePool,
     /// StoneCoin Staking-Pool
     pub staking_pool: RwLock<crate::token::StakingPool>,
     /// Shard-Holder-Registry: Wer hält welchen Shard?
@@ -438,6 +440,8 @@ pub struct MasterNodeState {
     /// Kanal um geminete Blöcke an das P2P-Netzwerk zu broadcasten.
     /// Wird von setup.rs gesetzt nachdem das Netzwerk gestartet ist.
     pub block_broadcast_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<Block>>>,
+    /// Equivocation-Tracker: Erkennt Double-Signing durch Validatoren
+    pub equivocation_tracker: Mutex<EquivocationTracker>,
 }
 
 #[derive(Default)]
@@ -524,6 +528,7 @@ impl MasterNodeState {
             trust_history: Mutex::new(Vec::new()),
             token_ledger: RwLock::new(ledger),
             mempool: Mempool::new(),
+            message_pool: crate::message_pool::MessagePool::load(),
             staking_pool: RwLock::new(staking_pool),
             shard_registry: ShardHolderRegistry::new(),
             checkpoint_store: RwLock::new(CheckpointStore::load()),
@@ -534,6 +539,7 @@ impl MasterNodeState {
             pending_challenge_responses: Mutex::new(Vec::new()),
             pending_repair_rewards: Mutex::new(Vec::new()),
             block_broadcast_tx: Mutex::new(None),
+            equivocation_tracker: Mutex::new(EquivocationTracker::new()),
         });
 
         // Nach Restart: Prüfen ob die lokale Chain aktuell genug ist.
@@ -586,18 +592,50 @@ impl MasterNodeState {
             let mut vs = state.validator_set.write().unwrap();
             if vs.get(&node_id).is_none() {
                 use crate::consensus::ValidatorInfo;
-                let info = ValidatorInfo::new(node_id.clone(), pub_key_hex.clone());
-                vs.add(info);
-                println!(
-                    "[consensus] ✅ Node '{}' als Validator registriert (Wallet: {}…)",
-                    &node_id,
-                    &pub_key_hex[..16.min(pub_key_hex.len())]
-                );
+                // Erster Node im Netzwerk → sofort aktiv (Bootstrap).
+                // Weitere Nodes → pending (müssen erst aktiviert werden).
+                if vs.validators.is_empty() {
+                    let info = ValidatorInfo::new(node_id.clone(), pub_key_hex.clone());
+                    vs.add(info);
+                    println!(
+                        "[consensus] ✅ Bootstrap-Node '{}' als aktiver Validator registriert (Wallet: {}…)",
+                        &node_id,
+                        &pub_key_hex[..16.min(pub_key_hex.len())]
+                    );
+                } else {
+                    let info = ValidatorInfo::new_pending(node_id.clone(), pub_key_hex.clone());
+                    vs.add(info);
+                    println!(
+                        "[consensus] ⏳ Node '{}' als PENDING Validator registriert – Aktivierung durch Admin oder Stake erforderlich (Wallet: {}…)",
+                        &node_id,
+                        &pub_key_hex[..16.min(pub_key_hex.len())]
+                    );
+                }
             } else {
-                println!(
-                    "[consensus] Validator '{}' bereits registriert",
-                    &node_id
-                );
+                // Key-Rotation erkennen: Wenn sich der lokale Validator-Key geändert hat,
+                // muss der Public Key im ValidatorSet aktualisiert werden.
+                let existing_pk = vs.get(&node_id).map(|v| v.public_key_hex.clone()).unwrap_or_default();
+                if existing_pk != pub_key_hex {
+                    eprintln!(
+                        "[consensus] ⚠️  Validator-Key hat sich geändert! Alter Key: {}…, Neuer Key: {}…",
+                        &existing_pk[..16.min(existing_pk.len())],
+                        &pub_key_hex[..16.min(pub_key_hex.len())],
+                    );
+                    if let Some(v) = vs.validators.iter_mut().find(|v| v.node_id == node_id) {
+                        v.public_key_hex = pub_key_hex.clone();
+                    }
+                    vs.save();
+                    println!(
+                        "[consensus] 🔄 Public Key für '{}' aktualisiert → {}…",
+                        &node_id,
+                        &pub_key_hex[..16.min(pub_key_hex.len())],
+                    );
+                } else {
+                    println!(
+                        "[consensus] Validator '{}' bereits registriert",
+                        &node_id
+                    );
+                }
             }
         }
 
@@ -617,7 +655,9 @@ impl MasterNodeState {
                     && vs.get(&block.signer).is_none()
                 {
                     use crate::consensus::ValidatorInfo;
-                    let info = ValidatorInfo::new(
+                    // Auto-discovered Nodes starten als pending –
+                    // sie müssen ihre Aktivität erst beweisen.
+                    let info = ValidatorInfo::new_pending(
                         block.signer.clone(),
                         block.validator_pub_key.clone(),
                     );
@@ -1121,6 +1161,10 @@ impl MasterNodeState {
                         restored
                     );
                 }
+                // Chat-Batches zurückrollen (Nachrichten wieder auf Pending setzen)
+                for batch in &block.chat_batches {
+                    self.message_pool.unbatch(&batch.merkle_root);
+                }
                 Err(e)
             }
         }
@@ -1183,9 +1227,9 @@ impl MasterNodeState {
             mw.clone().unwrap_or_else(|| validator_wallet.clone())
         };
 
-        // ── PoA-Check: Ist diese Node der ausgewählte Validator? ──────────
+        // ── PoA-Check: Round-Robin Validator-Rotation + Lite-PoW Fallback ──
         // Lock-Ordnung: chain zuerst (Daten cachen) → drop → dann validator_set
-        let (chain_next_index, chain_prev_hash) = {
+        let (chain_next_index, _chain_prev_hash) = {
             let chain = self.chain.lock().unwrap();
             let idx = chain.blocks.len() as u64;
             let hash = chain.blocks.last()
@@ -1193,6 +1237,10 @@ impl MasterNodeState {
                 .unwrap_or_else(|| "genesis".into());
             (idx, hash)
         };
+        // Phase 1: Round-Robin — Jeder aktive Validator kommt der Reihe nach dran.
+        // Phase 2: Lite-PoW Fallback — wenn der Primäre ausfällt, darf jeder
+        //          aktive Validator mit einem gelösten PoW-Puzzle einspringen.
+        let mut is_pow_fallback = false;
         {
             let vs = self.validator_set.read().unwrap();
             if !vs.validators.is_empty() {
@@ -1200,12 +1248,27 @@ impl MasterNodeState {
                     return Err("Mining: Node ist kein aktiver Validator".into());
                 }
 
-                let (stakes, jailed, wallet_map) = self.build_selection_context();
+                // Mindest-Validator-Anzahl prüfen
+                let active = vs.active_count();
+                if active < 2 {
+                    // Einzelner Validator: Round-Robin/PoA deaktiviert, direkt minen
+                    println!(
+                        "[mining] ⚠️ Nur {} aktiver Validator — PoA-Rotation deaktiviert",
+                        active
+                    );
+                } else {
+                    if active < 3 {
+                        println!(
+                            "[mining] ⚠️ Nur {} aktive Validatoren — BFT-Sicherheit eingeschränkt (min. 3 empfohlen)",
+                            active
+                        );
+                    }
 
-                if !vs.is_selected_validator_weighted(&self.node_id, &chain_prev_hash, chain_next_index, &stakes, &jailed, &wallet_map) {
-                    // ── Backup-Proposer: Wenn der primäre Validator keinen Block
-                    // produziert hat, darf der nächste Validator einspringen.
-                    // Grace-Period: MINING_INTERVAL_SECS pro Backup-Rang.
+                let (_stakes, jailed, _wallet_map) = self.build_selection_context();
+
+                if !vs.is_round_robin_turn(&self.node_id, chain_next_index, &jailed) {
+                    // Nicht unser Round-Robin-Slot.
+                    // Prüfe ob der primäre Validator seinen Slot verpasst hat.
                     let last_block_age = {
                         let chain = self.chain.lock().unwrap();
                         chain.blocks.last()
@@ -1213,47 +1276,10 @@ impl MasterNodeState {
                             .unwrap_or(u64::MAX)
                     };
 
-                    let backup_rank = vs.backup_proposer_rank(
-                        &self.node_id, &chain_prev_hash, chain_next_index,
-                        &stakes, &jailed, &wallet_map,
-                    );
-
-                    // Backup-Proposer darf erst nach (rank * MINING_INTERVAL_SECS) Sekunden
-                    // Beispiel: Backup #1 nach 120s, Backup #2 nach 240s, usw.
-                    let grace_secs = match backup_rank {
-                        Some(rank) => (rank as u64) * MINING_INTERVAL_SECS,
-                        None => {
-                            // ── Stall-Recovery Fallback ──────────────────────
-                            // Kein Backup-Rang vorhanden (z.B. einziger Validator
-                            // oder wallet_map-Fehler). Nach 5× MINING_INTERVAL
-                            // trotzdem Mining erlauben mit deterministischem Delay.
-                            let stall_threshold = MINING_INTERVAL_SECS * 5;
-                            if last_block_age >= stall_threshold {
-                                use sha2::{Sha256 as S256, Digest as D256};
-                                let mut h = S256::new();
-                                h.update(chain_prev_hash.as_bytes());
-                                h.update(chain_next_index.to_le_bytes());
-                                h.update(self.node_id.as_bytes());
-                                let hash = h.finalize();
-                                let slot = (hash[0] as u64) % 5; // 0-4
-                                let delay = slot * 30; // 0, 30, 60, 90, 120s
-                                if last_block_age >= stall_threshold + delay {
-                                    println!(
-                                        "[mining] 🚨 Stall-Recovery für Block #{}: Chain seit {}s stalled, slot={slot}",
-                                        chain_next_index, last_block_age
-                                    );
-                                    0 // grace_secs = 0 → sofort erlaubt (stall_threshold check hat bestanden)
-                                } else {
-                                    u64::MAX // noch warten
-                                }
-                            } else {
-                                u64::MAX // Kein Backup → noch nicht stalled genug
-                            }
-                        }
-                    };
-
-                    if last_block_age < MINING_INTERVAL_SECS + grace_secs {
-                        let selected = vs.select_validator_weighted(&chain_prev_hash, chain_next_index, &stakes, &jailed, &wallet_map)
+                    // Fallback erst nach 2× MINING_INTERVAL (gibt dem Primären genug Zeit)
+                    let fallback_threshold = MINING_INTERVAL_SECS * 2;
+                    if last_block_age < fallback_threshold {
+                        let selected = vs.select_validator_round_robin(chain_next_index, &jailed)
                             .map(|v| v.node_id.clone())
                             .unwrap_or_else(|| "?".into());
                         return Err(format!(
@@ -1262,12 +1288,14 @@ impl MasterNodeState {
                         ));
                     }
 
-                    // Backup-Proposer springt ein!
+                    // Primärer Validator hat seinen Slot verpasst → Lite-PoW Fallback
                     println!(
-                        "[mining] ⚡ Backup-Proposer #{} für Block #{}: Primärer Validator hat {}s nicht produziert",
-                        backup_rank.unwrap_or(0), chain_next_index, last_block_age
+                        "[mining] ⚡ Round-Robin Fallback für Block #{}: Primärer Validator hat {}s nicht produziert – löse Lite-PoW",
+                        chain_next_index, last_block_age
                     );
+                    is_pow_fallback = true;
                 }
+                } // end active >= 2
             }
         }
 
@@ -1314,6 +1342,33 @@ impl MasterNodeState {
             );
         }
 
+        // ── Chat-Nachrichten aus dem MessagePool batchen ──────────────────
+        let chat_batches = if self.message_pool.batch_ready() {
+            let drained = self.message_pool.drain_for_batch();
+            if !drained.is_empty() {
+                let msg_ids: Vec<String> = drained.iter().map(|m| m.msg_id.clone()).collect();
+                match crate::merkle_batch::build_batch(&drained) {
+                    Some((anchor, _tree)) => {
+                        println!(
+                            "[mining] 📦 Chat-Batch: {} Nachrichten, seq {}-{}, root: {}…",
+                            anchor.batch_size,
+                            anchor.seq_start,
+                            anchor.seq_end,
+                            &anchor.merkle_root[..12],
+                        );
+                        // Nachrichten als "batched" markieren
+                        self.message_pool.mark_batched(&msg_ids, &anchor.merkle_root);
+                        vec![anchor]
+                    }
+                    None => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
         // ── Block vorbereiten (ohne Commit in die Chain) ──────────────────
         let signer = self.node_id.clone();
         let chain = self.chain.lock().unwrap();
@@ -1325,6 +1380,7 @@ impl MasterNodeState {
             signer,
             &self.cluster_key,
             self.role.clone(),
+            chat_batches,
         );
 
         // ── PoA: Block-Signierung ────────────────────────────────────────
@@ -1501,12 +1557,66 @@ impl MasterNodeState {
             }
         }
 
+        // ── Lite-PoW lösen (nur bei Fallback-Mining) ─────────────────────
+        if is_pow_fallback {
+            use crate::consensus::{solve_lite_pow, BLOCK_POW_DIFFICULTY};
+            let pow_nonce = solve_lite_pow(
+                &block.previous_hash,
+                block.index,
+                &self.node_id,
+                BLOCK_POW_DIFFICULTY,
+            );
+            block.pow_nonce = pow_nonce;
+            // Hash neu berechnen (pow_nonce fließt in den Hash ein)
+            block.hash = crate::blockchain::calculate_hash(&block);
+            block.signature = crate::blockchain::sign_hash(&self.cluster_key, &block.hash);
+            block.validator_signature = sign_block(&signing_key, &block.hash);
+            println!(
+                "[mining] 🔨 Lite-PoW gelöst für Block #{}: nonce={pow_nonce} (difficulty={})",
+                block.index, BLOCK_POW_DIFFICULTY
+            );
+        }
+
+        // ── Argon2id CPU-PoW lösen (ab Activation-Block) ────────────────
+        {
+            use crate::consensus::{
+                get_current_pow_difficulty, solve_argon2_pow,
+                ARGON2_POW_ACTIVATION_BLOCK,
+            };
+            let chain_ref = self.chain.lock().unwrap();
+            let difficulty = get_current_pow_difficulty(&chain_ref.blocks, block.index);
+            drop(chain_ref);
+
+            if block.index >= ARGON2_POW_ACTIVATION_BLOCK && difficulty > 0 {
+                println!(
+                    "[mining] ⛏️  Starte Argon2id-PoW für Block #{} (Difficulty: {} Bits, Memory: 64 MiB)…",
+                    block.index, difficulty,
+                );
+                let (nonce, pow_hash) = solve_argon2_pow(
+                    &block.previous_hash,
+                    block.index,
+                    &validator_wallet,
+                    difficulty,
+                );
+                block.pow_nonce = nonce;
+                block.pow_hash = pow_hash;
+                block.pow_difficulty = difficulty;
+
+                // Hash + Signaturen neu berechnen (pow_hash + pow_difficulty fließen in Block-Hash ein)
+                block.hash = crate::blockchain::calculate_hash(&block);
+                block.signature = crate::blockchain::sign_hash(&self.cluster_key, &block.hash);
+                block.validator_signature = sign_block(&signing_key, &block.hash);
+            }
+        }
+
         println!(
-            "[mining] ⛏️  Block #{} vorbereitet – {} TXs, Reward: {} STONE → {}",
+            "[mining] ⛏️  Block #{} vorbereitet – {} TXs, Reward: {} STONE → {}{}{}",
             block.index,
             block.transactions.len(),
             reward_amount,
             &reward_wallet[..16.min(reward_wallet.len())],
+            if is_pow_fallback { " [PoW-Fallback]" } else { "" },
+            if !block.pow_hash.is_empty() { format!(" [Argon2id: d={}]", block.pow_difficulty) } else { String::new() },
         );
 
         Ok(block)
@@ -1574,6 +1684,22 @@ impl MasterNodeState {
 
         // Block wurde bereits durch commit_block() → persist_last_block() persistiert.
 
+        // ── Chat-Batch-Messages als confirmed markieren ───────────────────
+        for batch in &block.chat_batches {
+            let msg_ids = self.message_pool.msg_ids_for_batch(&batch.merkle_root);
+            if !msg_ids.is_empty() {
+                // Batch-Record für Proof-Generierung speichern
+                let msgs = self.message_pool.messages_in_seq_range(batch.seq_start, batch.seq_end);
+                self.message_pool.store_batch_record(&batch.merkle_root, &msgs, block.index);
+
+                self.message_pool.mark_confirmed(&msg_ids, block.index);
+                println!(
+                    "[mining] ✅ Chat-Batch bestätigt: {} Nachrichten in Block #{}",
+                    msg_ids.len(), block.index,
+                );
+            }
+        }
+
         // ── Validator-Statistik aktualisieren ─────────────────────────────
         {
             let mut vs_w = self.validator_set.write().unwrap();
@@ -1632,8 +1758,10 @@ impl MasterNodeState {
             &validator_wallet[..16.min(validator_wallet.len())],
         );
 
-        // ── Auto-Snapshot (alle SNAPSHOT_INTERVAL Blöcke) ─────────────────
-        if crate::snapshot::should_create_snapshot(block.index) {
+        // ── Auto-Snapshot (alle SNAPSHOT_INTERVAL Blöcke, NUR Bootstrap-Nodes) ──
+        if crate::snapshot::should_create_snapshot(block.index)
+            && crate::network::is_bootstrap_node()
+        {
             let genesis_hash = {
                 let chain = self.chain.lock().unwrap();
                 chain.blocks.first().map(|b| b.hash.clone()).unwrap_or_default()
@@ -1781,6 +1909,26 @@ impl MasterNodeState {
                     vs.active_count()
                 };
 
+                // Nicht minen wenn Peers weiter sind (verhindert Reject wegen Block-Index-Mismatch)
+                if active_validators > 1 {
+                    let our_height = state.chain.lock().unwrap().blocks.len() as u64;
+                    let max_peer_height = {
+                        let peers = state.peers.read().unwrap();
+                        peers.iter()
+                            .filter(|p| p.is_healthy())
+                            .map(|p| p.block_height)
+                            .max()
+                            .unwrap_or(0)
+                    };
+                    if max_peer_height > our_height {
+                        eprintln!(
+                            "[mining] ⏳ Skip: Peers bei Höhe {}, wir bei {} – warte auf Sync",
+                            max_peer_height, our_height,
+                        );
+                        continue;
+                    }
+                }
+
                 if active_validators <= 1 {
                     // ═══ SINGLE-NODE MODUS: Sofort committen (wie bisher) ═══
                     match state.mint_block() {
@@ -1825,10 +1973,28 @@ impl MasterNodeState {
                                 round,
                             );
 
-                            println!(
-                                "[consensus] 📤 Proposal für Block #{} gesendet (Runde {}, {} aktive Validators)",
-                                block.index, round, active_validators,
-                            );
+                            // Debug: Round-Robin-Auswahl loggen
+                            {
+                                let vs = state.validator_set.read().unwrap();
+                                let (_dbg_stakes, dbg_jailed, _dbg_wallets) = state.build_selection_context();
+                                let selected = vs.select_validator_round_robin(block.index, &dbg_jailed)
+                                    .map(|v| v.node_id.clone())
+                                    .unwrap_or_else(|| "?".into());
+                                let active_ids: Vec<String> = vs.validators.iter()
+                                    .filter(|v| v.active)
+                                    .filter(|v| !dbg_jailed.contains(&v.node_id))
+                                    .map(|v| v.node_id.clone())
+                                    .collect();
+                                println!(
+                                    "[consensus] 📤 Proposal für Block #{} gesendet (Runde {}, {} aktive Validators)",
+                                    block.index, round, active_validators,
+                                );
+                                println!(
+                                    "[consensus] 🔄 Round-Robin: Block #{} % {} = {} → Gewählt: '{}' (Aktive: {:?})",
+                                    block.index, active_ids.len(), block.index as usize % active_ids.len().max(1),
+                                    selected, active_ids,
+                                );
+                            }
 
                             // ── Phase 1: Pre-Vote ──────────────────────────────
                             // Eigene Pre-Vote: Auto-Accept
@@ -1876,24 +2042,85 @@ impl MasterNodeState {
                                     .await
                                 {
                                     Ok(resp) => {
-                                        if let Ok(val) = resp.json::<serde_json::Value>().await {
+                                        let status = resp.status();
+                                        match resp.json::<serde_json::Value>().await {
+                                        Ok(val) => {
                                             if let Ok(vote) = serde_json::from_value::<VoteMessage>(
                                                 val.get("vote").cloned().unwrap_or_default()
                                             ) {
+                                                // Auto-Discovery: Voter registrieren falls unbekannt
+                                                let needs_register = {
+                                                    let vs = state.validator_set.read().unwrap();
+                                                    vs.get(&vote.voter_id).is_none()
+                                                };
+                                                if needs_register {
+                                                    // Quelle 1: voter_pub_key im Response (neue Server)
+                                                    let mut pk_opt = val.get("voter_pub_key")
+                                                        .and_then(|v| v.as_str())
+                                                        .map(|s| s.to_string());
+                                                    // Quelle 2: Fallback — Public Key vom Peer abrufen (alte Server)
+                                                    if pk_opt.is_none() {
+                                                        let info_url = format!("{}/api/v1/validators/self", peer_url.trim_end_matches('/'));
+                                                        if let Ok(info_resp) = client.get(&info_url).send().await {
+                                                            if let Ok(info_val) = info_resp.json::<serde_json::Value>().await {
+                                                                pk_opt = info_val.get("public_key_hex")
+                                                                    .and_then(|v| v.as_str())
+                                                                    .map(|s| s.to_string());
+                                                            }
+                                                        }
+                                                    }
+                                                    if let Some(pk) = pk_opt {
+                                                        if vote.verify_with_pubkey_hex(&pk) {
+                                                            let mut vs_w = state.validator_set.write().unwrap();
+                                                            if vs_w.get(&vote.voter_id).is_none() {
+                                                                let mut vi = crate::consensus::ValidatorInfo::new_pending(
+                                                                    vote.voter_id.clone(), pk,
+                                                                );
+                                                                vi.name = format!("Auto-discovered (PreVote)");
+                                                                vs_w.add(vi);
+                                                                println!(
+                                                                    "[consensus] 🔗 Voter '{}' automatisch als Validator registriert (PreVote)",
+                                                                    vote.voter_id,
+                                                                );
+                                                            }
+                                                        }
+                                                    }
+                                                }
                                                 let vs = state.validator_set.read().unwrap();
                                                 let mut voting = state.active_voting.lock().unwrap();
                                                 if let Some(ref mut vr) = *voting {
                                                     if let Err(e) = vr.add_pre_vote(vote.clone(), &vs) {
                                                         eprintln!("[consensus] PreVote von {} ungültig: {e}", peer_url);
                                                     } else {
-                                                        println!(
-                                                            "[consensus] 🗳️  PreVote von '{}': {}",
-                                                            vote.voter_id,
-                                                            if vote.accept { "✅ Accept" } else { "❌ Reject" }
-                                                        );
+                                                        if vote.accept {
+                                                            println!(
+                                                                "[consensus] 🗳️  PreVote von '{}': ✅ Accept",
+                                                                vote.voter_id,
+                                                            );
+                                                        } else {
+                                                            println!(
+                                                                "[consensus] 🗳️  PreVote von '{}': ❌ Reject – Grund: {}",
+                                                                vote.voter_id,
+                                                                if vote.reason.is_empty() { "(kein Grund angegeben)".to_string() } else { vote.reason.clone() },
+                                                            );
+                                                        }
                                                     }
                                                 }
+                                            } else {
+                                                // Response hat kein gültiges "vote"-Feld → alter Server oder Fehler
+                                                let error = val.get("error").and_then(|v| v.as_str()).unwrap_or("kein vote-Feld");
+                                                eprintln!(
+                                                    "[consensus] ⚠️  Peer {} hat kein gültiges Vote zurückgegeben (HTTP {}): {}",
+                                                    peer_url, status, error,
+                                                );
                                             }
+                                        }
+                                        Err(_) => {
+                                            eprintln!(
+                                                "[consensus] ⚠️  Peer {} hat keine JSON-Antwort gesendet (HTTP {})",
+                                                peer_url, status,
+                                            );
+                                        }
                                         }
                                     }
                                     Err(e) => {
@@ -1902,18 +2129,47 @@ impl MasterNodeState {
                                 }
                             }
 
-                            // Phase 1 auswerten: ⅔+1 Pre-Votes?
+                            // Phase 1 auswerten: Responsive-Quorum
+                            // Zuerst reguläres Quorum prüfen. Wenn das scheitert UND
+                            // weniger als die Hälfte der Validators geantwortet hat,
+                            // Responsive-Quorum verwenden (nur Antwortende zählen).
                             let (prevote_quorum, prevote_info) = {
                                 let vs = state.validator_set.read().unwrap();
                                 let voting = state.active_voting.lock().unwrap();
                                 if let Some(ref vr) = *voting {
                                     let tally = vr.tally_pre_votes(&vs);
-                                    let info = format!(
-                                        "{}/{} PreVote-Accept, {}/{} nötig",
-                                        tally.accepts, tally.total_validators,
-                                        tally.threshold, tally.total_validators,
-                                    );
-                                    (tally.quorum_reached, info)
+                                    if tally.quorum_reached {
+                                        let info = format!(
+                                            "{}/{} PreVote-Accept, {}/{} nötig",
+                                            tally.accepts, tally.total_validators,
+                                            tally.threshold, tally.total_validators,
+                                        );
+                                        (true, info)
+                                    } else {
+                                        // Nicht genug Antworten? Responsive-Quorum versuchen:
+                                        // Nur tatsächlich antwortende Validators zählen
+                                        let responsive = vr.tally_pre_votes_responsive();
+                                        let responded = responsive.accepts + responsive.rejects;
+                                        if responded < tally.total_validators && responsive.quorum_reached {
+                                            let info = format!(
+                                                "{}/{} PreVote-Accept (responsive: {}/{} antworteten)",
+                                                responsive.accepts, responsive.total_validators,
+                                                responded, tally.total_validators,
+                                            );
+                                            println!(
+                                                "[consensus] ⚠️  Nur {}/{} Validators haben geantwortet – verwende Responsive-Quorum",
+                                                responded, tally.total_validators,
+                                            );
+                                            (true, info)
+                                        } else {
+                                            let info = format!(
+                                                "{}/{} PreVote-Accept, {}/{} nötig",
+                                                tally.accepts, tally.total_validators,
+                                                tally.threshold, tally.total_validators,
+                                            );
+                                            (false, info)
+                                        }
+                                    }
                                 } else {
                                     (false, "Keine Voting-Runde".into())
                                 }
@@ -1929,6 +2185,10 @@ impl MasterNodeState {
                                         let _ = state.mempool.add_tx(tx.clone(), None);
                                     }
                                 }
+                                // Chat-Batches zurückrollen (Nachrichten wieder auf Pending setzen)
+                                for batch in &block.chat_batches {
+                                    state.message_pool.unbatch(&batch.merkle_root);
+                                }
                                 *state.active_voting.lock().unwrap() = None;
                                 continue;
                             }
@@ -1943,11 +2203,22 @@ impl MasterNodeState {
                             let pre_commit_request = {
                                 let mut voting = state.active_voting.lock().unwrap();
                                 if let Some(ref mut vr) = *voting {
+                                    // Voter-Keys für Auto-Discovery beim Empfänger zusammenstellen
+                                    let voter_keys = {
+                                        let vs = state.validator_set.read().unwrap();
+                                        vr.collected_pre_votes().iter()
+                                            .filter_map(|pv| {
+                                                vs.get(&pv.voter_id)
+                                                    .map(|v| (pv.voter_id.clone(), v.public_key_hex.clone()))
+                                            })
+                                            .collect::<std::collections::HashMap<_, _>>()
+                                    };
                                     let req = PreCommitRequest {
                                         round: vr.round,
                                         block_hash: vr.block_hash.clone(),
                                         proposer_id: vr.proposer_id.clone(),
                                         pre_votes: vr.collected_pre_votes(),
+                                        voter_keys,
                                     };
                                     vr.advance_to_precommit();
                                     // Eigene Pre-Commit: Auto-Accept
@@ -1980,10 +2251,48 @@ impl MasterNodeState {
                                         .await
                                     {
                                         Ok(resp) => {
-                                            if let Ok(val) = resp.json::<serde_json::Value>().await {
+                                            let status = resp.status();
+                                            match resp.json::<serde_json::Value>().await {
+                                            Ok(val) => {
                                                 if let Ok(vote) = serde_json::from_value::<VoteMessage>(
                                                     val.get("vote").cloned().unwrap_or_default()
                                                 ) {
+                                                    // Auto-Discovery: Voter registrieren falls unbekannt
+                                                    let needs_register = {
+                                                        let vs = state.validator_set.read().unwrap();
+                                                        vs.get(&vote.voter_id).is_none()
+                                                    };
+                                                    if needs_register {
+                                                        let mut pk_opt = val.get("voter_pub_key")
+                                                            .and_then(|v| v.as_str())
+                                                            .map(|s| s.to_string());
+                                                        if pk_opt.is_none() {
+                                                            let info_url = format!("{}/api/v1/validators/self", peer_url.trim_end_matches('/'));
+                                                            if let Ok(info_resp) = client.get(&info_url).send().await {
+                                                                if let Ok(info_val) = info_resp.json::<serde_json::Value>().await {
+                                                                    pk_opt = info_val.get("public_key_hex")
+                                                                        .and_then(|v| v.as_str())
+                                                                        .map(|s| s.to_string());
+                                                                }
+                                                            }
+                                                        }
+                                                        if let Some(pk) = pk_opt {
+                                                            if vote.verify_with_pubkey_hex(&pk) {
+                                                                let mut vs_w = state.validator_set.write().unwrap();
+                                                                if vs_w.get(&vote.voter_id).is_none() {
+                                                                    let mut vi = crate::consensus::ValidatorInfo::new_pending(
+                                                                        vote.voter_id.clone(), pk,
+                                                                    );
+                                                                    vi.name = format!("Auto-discovered (PreCommit)");
+                                                                    vs_w.add(vi);
+                                                                    println!(
+                                                                        "[consensus] 🔗 Voter '{}' automatisch als Validator registriert (PreCommit)",
+                                                                        vote.voter_id,
+                                                                    );
+                                                                }
+                                                            }
+                                                        }
+                                                    }
                                                     let vs = state.validator_set.read().unwrap();
                                                     let mut voting = state.active_voting.lock().unwrap();
                                                     if let Some(ref mut vr) = *voting {
@@ -1997,7 +2306,20 @@ impl MasterNodeState {
                                                             );
                                                         }
                                                     }
+                                                } else {
+                                                    let error = val.get("error").and_then(|v| v.as_str()).unwrap_or("kein vote-Feld");
+                                                    eprintln!(
+                                                        "[consensus] ⚠️  Peer {} hat kein gültiges PreCommit-Vote (HTTP {}): {}",
+                                                        peer_url, status, error,
+                                                    );
                                                 }
+                                            }
+                                            Err(_) => {
+                                                eprintln!(
+                                                    "[consensus] ⚠️  Peer {} hat keine JSON-Antwort (PreCommit, HTTP {})",
+                                                    peer_url, status,
+                                                );
+                                            }
                                             }
                                         }
                                         Err(e) => {
@@ -2012,12 +2334,24 @@ impl MasterNodeState {
                                 let vs = state.validator_set.read().unwrap();
                                 let mut voting = state.active_voting.lock().unwrap();
                                 if let Some(ref mut vr) = *voting {
-                                    let tally = vr.finalize(&vs);
-                                    let info = format!(
-                                        "{}/{} PreCommit-Accept, {}/{} nötig",
-                                        tally.accepts, tally.total_validators,
-                                        tally.threshold, tally.total_validators,
-                                    );
+                                    let (tally, was_responsive) = vr.finalize_responsive(&vs);
+                                    let info = if was_responsive {
+                                        println!(
+                                            "[consensus] ⚠️  Nur {}/{} Validators haben geantwortet (PreCommit) – verwende Responsive-Quorum",
+                                            tally.total_validators, vs.active_count(),
+                                        );
+                                        format!(
+                                            "{}/{} PreCommit-Accept (responsive: {}/{} antworteten)",
+                                            tally.accepts, tally.total_validators,
+                                            tally.total_validators, vs.active_count(),
+                                        )
+                                    } else {
+                                        format!(
+                                            "{}/{} PreCommit-Accept, {}/{} nötig",
+                                            tally.accepts, tally.total_validators,
+                                            tally.threshold, tally.total_validators,
+                                        )
+                                    };
                                     (tally.quorum_reached, info)
                                 } else {
                                     (false, "Keine Voting-Runde".into())
@@ -2062,6 +2396,10 @@ impl MasterNodeState {
                                     if tx.tx_type != TxType::Reward && tx.tx_type != TxType::Memorial {
                                         let _ = state.mempool.add_tx(tx.clone(), None);
                                     }
+                                }
+                                // Chat-Batches zurückrollen (Nachrichten wieder auf Pending setzen)
+                                for batch in &block.chat_batches {
+                                    state.message_pool.unbatch(&batch.merkle_root);
                                 }
                             }
 
@@ -2142,13 +2480,12 @@ impl MasterNodeState {
             slash_store.mark_active(&block.signer, block.index);
         }
 
-        // 2. Abgelaufene Jails aufheben → Validator re-aktivieren
+        // 2. Abgelaufene Jails aufheben → Validator bleibt inaktiv (Cooldown)
+        //    Muss sich durch einen PoW-Block beweisen um wieder aktiv zu werden.
         let released = slash_store.release_expired_jails();
         if !released.is_empty() {
-            let mut vs = state.validator_set.write().unwrap();
             for vid in &released {
-                vs.set_active(vid, true);
-                println!("[slashing] 🔓 Validator '{}' aus Jail entlassen, re-aktiviert", vid);
+                println!("[slashing] 🔓 Validator '{}' aus Jail entlassen — bleibt inaktiv (Cooldown, muss durch Admin oder Stake re-aktiviert werden)", vid);
             }
         }
 
@@ -2213,6 +2550,74 @@ impl MasterNodeState {
                 });
             }
         }
+    }
+
+    /// Equivocation-Evidence → Slashing + Jail + Deaktivierung.
+    ///
+    /// Wird aus den P2P-Event-Handlern (master_server, stone_miner, setup)
+    /// aufgerufen, wenn der `EquivocationTracker` einen Double-Sign erkennt.
+    pub fn slash_equivocation(state: &Arc<Self>, evidence: &crate::consensus::EquivocationEvidence) {
+        use crate::consensus::SlashingOffense;
+
+        // Validator-NodeId via pub_key auflösen
+        let (validator_id, wallet_addr) = {
+            let vs = state.validator_set.read().unwrap();
+            let found = vs.validators.iter().find(|v| v.public_key_hex == evidence.validator_pub_key);
+            match found {
+                Some(v) => (v.node_id.clone(), Self::resolve_validator_wallet(state, &v.node_id)),
+                None => (evidence.validator_pub_key.clone(), None),
+            }
+        };
+
+        let offense = SlashingOffense::DoubleSigning {
+            block_index: evidence.block_index,
+            hash_a: evidence.hash_a.clone(),
+            hash_b: evidence.hash_b.clone(),
+        };
+
+        let slashed_amount = if let Some(ref wallet) = wallet_addr {
+            let mut pool = state.staking_pool.write().unwrap();
+            let stake = pool.stakers.get(wallet)
+                .map(|s| s.staked_amount)
+                .unwrap_or(rust_decimal::Decimal::ZERO);
+            let penalty = stake * rust_decimal::Decimal::from(offense.penalty_percent())
+                / rust_decimal::Decimal::from(100u64);
+            pool.slash(wallet, penalty)
+        } else {
+            rust_decimal::Decimal::ZERO
+        };
+
+        let mut slash_store = state.slashing_store.write().unwrap();
+        let record = slash_store.record_slash(
+            &validator_id,
+            wallet_addr.as_deref(),
+            offense,
+            slashed_amount,
+            evidence.block_index,
+        );
+        drop(slash_store);
+
+        // Validator deaktivieren
+        {
+            let mut vs = state.validator_set.write().unwrap();
+            vs.set_active(&validator_id, false);
+        }
+
+        eprintln!(
+            "[slashing] ⚠️  EQUIVOCATION SLASH: {} – {} STONE geslasht (Block #{}, hashes: {}…/{}…)",
+            validator_id,
+            record.slashed_amount,
+            evidence.block_index,
+            &evidence.hash_a[..12.min(evidence.hash_a.len())],
+            &evidence.hash_b[..12.min(evidence.hash_b.len())],
+        );
+
+        state.events.publish(NodeEvent::ValidatorSlashed {
+            validator_id,
+            offense: record.offense.description(),
+            slashed_amount: record.slashed_amount,
+            timestamp: record.timestamp,
+        });
     }
 
     /// Reputation-System nach einem committed Block aktualisieren.
