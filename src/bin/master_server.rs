@@ -270,6 +270,10 @@ async fn main() {
                                                     &sel_wallets,
                                                     last_block_ts,
                                                     sync_done,
+                                                    &block.pow_hash,
+                                                    block.pow_difficulty,
+                                                    &block.validator_pub_key,
+                                                    block.effective_difficulty,
                                                 );
                                                 Some(result.is_acceptable())
                                             }
@@ -780,6 +784,7 @@ async fn main() {
         contact_requests: Arc::new(std::sync::Mutex::new(stone::chat::load_contact_requests())),
         challenge_store: stone::auth::ChallengeStore::new(),
         qr_login_store: stone::auth::QrLoginStore::new(),
+        miner_status_store: server::state::MinerStatusStore::new(),
     };
 
     let router = build_router(state.clone());

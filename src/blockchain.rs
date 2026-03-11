@@ -281,6 +281,39 @@ pub struct Block {
     /// 0 = Legacy-Block ohne Argon2id-PoW.
     #[serde(default)]
     pub pow_difficulty: u32,
+
+    // ─── PoS/PoW Hybrid ─────────────────────────────────────────────────
+    /// Effektive PoW-Difficulty nach Abzug des Stake-Bonus.
+    /// Staker erhalten eine reduzierte Difficulty → finden Blöcke schneller.
+    /// 0 = Legacy-Block oder kein Stake-Bonus (effektive == pow_difficulty).
+    #[serde(default)]
+    pub effective_difficulty: u32,
+
+    // ─── Kumulative Difficulty (Fork-Choice) ────────────────────────────
+    /// Kumulative Schwierigkeit der Chain bis einschließlich dieses Blocks.
+    /// Summe von block_work(effective_difficulty) für alle Blöcke von Genesis bis hier.
+    /// Dient der "Heaviest Chain"-Regel: bei Forks gewinnt die Chain mit der
+    /// höchsten kumulativen Difficulty (meiste Gesamtarbeit).
+    /// 0 = Legacy-Block (vor Einführung des Feldes).
+    #[serde(default)]
+    pub cumulative_difficulty: u64,
+}
+
+/// Berechnet die "Arbeit" eines einzelnen Blocks basierend auf seiner Difficulty.
+/// Verwendet effective_difficulty wenn gesetzt (PoS/PoW Hybrid: tatsächlich geleistete Arbeit),
+/// fällt zurück auf pow_difficulty für Legacy-Blöcke.
+/// Blöcke mit höherer Difficulty repräsentieren exponentiell mehr Rechenarbeit.
+pub fn block_work_effective(effective_difficulty: u32, pow_difficulty: u32) -> u64 {
+    let d = if effective_difficulty > 0 { effective_difficulty } else { pow_difficulty };
+    if d == 0 { return 1; }
+    1u64.checked_shl(d).unwrap_or(u64::MAX)
+}
+
+/// Berechnet die "Arbeit" eines einzelnen Blocks basierend auf seiner PoW-Difficulty.
+/// Legacy-Kompatibilität: Verwende `block_work_effective()` für PoS/PoW Hybrid.
+pub fn block_work(pow_difficulty: u32) -> u64 {
+    if pow_difficulty == 0 { return 1; }
+    1u64.checked_shl(pow_difficulty).unwrap_or(u64::MAX)
 }
 
 // ─── Chain ───────────────────────────────────────────────────────────────────
@@ -289,6 +322,10 @@ pub struct Block {
 pub struct StoneChain {
     pub blocks: Vec<Block>,
     pub latest_hash: String,
+    /// Fork-Block-Cache: Blöcke die zu einer alternativen Chain gehören.
+    /// Gespeichert nach Block-Hash, max. 50 Einträge.
+    /// Wird genutzt um Forks aufzulösen wenn nachfolgende Blöcke eintreffen.
+    pub fork_blocks: std::collections::HashMap<String, Block>,
 }
 
 impl StoneChain {
@@ -353,7 +390,7 @@ impl StoneChain {
                                 blocks.len(),
                                 &latest_hash[..8]
                             );
-                            return StoneChain { blocks, latest_hash };
+                            return StoneChain { blocks, latest_hash, fork_blocks: std::collections::HashMap::new() };
                         }
                     }
                     _ => {}
@@ -383,6 +420,7 @@ impl StoneChain {
         let chain = StoneChain {
             blocks: vec![genesis.clone()],
             latest_hash: genesis.hash.clone(),
+            fork_blocks: std::collections::HashMap::new(),
         };
         chain.persist_last_block();
         println!("[chain] Neue Stone-Chain erstellt – Genesis Block: {}...", &genesis.hash[..8]);
@@ -537,6 +575,8 @@ impl StoneChain {
             pow_nonce: 0,
             pow_hash: String::new(),
             pow_difficulty: 0,
+            effective_difficulty: 0,
+            cumulative_difficulty: 0,
         };
 
         let hash = calculate_hash(&new_block);
@@ -559,20 +599,33 @@ impl StoneChain {
     /// Fügt einen bereits vorbereiteten Block in die lokale Chain ein und persistiert ihn.
     ///
     /// Wird nach erfolgreicher Voting-Phase (oder im Single-Node-Modus) aufgerufen.
-    pub fn commit_block(&mut self, block: Block) {
+    /// Setzt `cumulative_difficulty` automatisch falls nicht gesetzt.
+    pub fn commit_block(&mut self, mut block: Block) {
         let hash = block.hash.clone();
         let idx = block.index;
         let docs = block.documents.len();
         let txs = block.transactions.len();
         let bytes = block.data_size;
 
+        // Kumulative Difficulty berechnen falls nicht gesetzt
+        if block.cumulative_difficulty == 0 {
+            let parent_cd = self.blocks.last()
+                .map(|b| b.cumulative_difficulty)
+                .unwrap_or(0);
+            block.cumulative_difficulty = parent_cd
+                + block_work_effective(block.effective_difficulty, block.pow_difficulty);
+        }
+
         self.blocks.push(block);
         self.latest_hash = hash;
         self.persist_last_block();
 
         println!(
-            "[chain] Block #{} committed – {} Dok., {} TXs, {} Bytes",
+            "[chain] Block #{} committed – {} Dok., {} TXs, {} Bytes, d={}/{}, cd={}",
             idx, docs, txs, bytes,
+            self.blocks.last().map(|b| b.effective_difficulty).unwrap_or(0),
+            self.blocks.last().map(|b| b.pow_difficulty).unwrap_or(0),
+            self.blocks.last().map(|b| b.cumulative_difficulty).unwrap_or(0),
         );
     }
 
@@ -585,7 +638,7 @@ impl StoneChain {
     ///   - `Some(false)` → Prüfung fehlgeschlagen → Block wird abgelehnt
     pub fn accept_peer_block(
         &mut self,
-        block: Block,
+        mut block: Block,
         poa_ok: Option<bool>,
     ) -> Result<(), String> {
         let local_len = self.blocks.len() as u64;
@@ -640,15 +693,53 @@ impl StoneChain {
                         .unwrap_or(false)
                 };
                 if prev_ok {
-                    println!(
-                        "[chain] 🔄 Fork-Reorg bei Block #{}: lokal={}… peer={}… (Tiefe: {}) – ersetze lokale Blöcke",
-                        block.index,
-                        &existing.hash[..8.min(existing.hash.len())],
-                        &block.hash[..8.min(block.hash.len())],
-                        reorg_depth,
-                    );
-                    self.truncate_to(block.index);
-                    // Weiter mit normaler Block-Akzeptanz
+                    // ── Heaviest-Chain-Regel: Nur reorgen wenn der Fork schwerer ist ──
+                    let our_tip_cd = self.blocks.last()
+                        .map(|b| b.cumulative_difficulty)
+                        .unwrap_or(0);
+                    let incoming_cd = if block.cumulative_difficulty > 0 {
+                        block.cumulative_difficulty
+                    } else {
+                        // Legacy-Block: berechne CD manuell
+                        let parent_cd = self.blocks.get((block.index - 1) as usize)
+                            .map(|b| b.cumulative_difficulty)
+                            .unwrap_or(0);
+                        parent_cd + block_work_effective(block.effective_difficulty, block.pow_difficulty)
+                    };
+
+                    // Nur reorgen wenn der Fork-Block mehr kumulative Arbeit hat als
+                    // unser Tip. Bei gleicher Tiefe (1 Block): direkter Vergleich.
+                    // Bei tieferem Reorg: einzelner Block kann unseren Tip nicht schlagen
+                    // → im Fork-Cache speichern für spätere Auflösung.
+                    if incoming_cd > our_tip_cd {
+                        println!(
+                            "[chain] 🔄 Fork-Reorg bei Block #{}: lokal={}… peer={}… (Tiefe: {}, cd: {} > {}) – ersetze lokale Blöcke",
+                            block.index,
+                            &existing.hash[..8.min(existing.hash.len())],
+                            &block.hash[..8.min(block.hash.len())],
+                            reorg_depth, incoming_cd, our_tip_cd,
+                        );
+                        self.truncate_to(block.index);
+                        // Weiter mit normaler Block-Akzeptanz
+                    } else if incoming_cd == our_tip_cd && reorg_depth == 1 && block.hash < existing.hash {
+                        // Tiebreaker bei gleicher CD und Tiefe 1: niedrigerer Hash gewinnt
+                        // (deterministische Fork-Auflösung)
+                        println!(
+                            "[chain] 🔄 Fork-Tiebreak bei Block #{}: lokal={}… peer={}… (niedrigerer Hash gewinnt)",
+                            block.index,
+                            &existing.hash[..8.min(existing.hash.len())],
+                            &block.hash[..8.min(block.hash.len())],
+                        );
+                        self.truncate_to(block.index);
+                    } else {
+                        // Fork ist nicht schwerer → im Cache speichern
+                        let bi = block.index;
+                        self.store_fork_block(block);
+                        return Err(format!(
+                            "Fork bei Block #{}: nicht schwerer als aktuelle Chain (cd: {} ≤ {}) – gespeichert",
+                            bi, incoming_cd, our_tip_cd,
+                        ));
+                    }
                 } else {
                     return Err(format!(
                         "Stale: Block #{} bereits bekannt (Fork, previous_hash passt nicht)",
@@ -691,9 +782,29 @@ impl StoneChain {
                         ));
                     }
 
+                    // ── Heaviest-Chain-Regel ──────────────────────────────────
+                    let our_tip_cd = self.blocks.last()
+                        .map(|b| b.cumulative_difficulty)
+                        .unwrap_or(0);
+                    let incoming_cd = if block.cumulative_difficulty > 0 {
+                        block.cumulative_difficulty
+                    } else {
+                        let parent_cd = prev_block.cumulative_difficulty;
+                        parent_cd + block_work_effective(block.effective_difficulty, block.pow_difficulty)
+                    };
+
+                    if incoming_cd <= our_tip_cd {
+                        // Fork ist nicht schwerer → speichern, nicht reorgen
+                        self.store_fork_block(block);
+                        return Err(format!(
+                            "Fork bei #{}: nicht schwerer (cd: {} ≤ {}) – gespeichert für spätere Auflösung",
+                            fork_point, incoming_cd, our_tip_cd,
+                        ));
+                    }
+
                     println!(
-                        "[chain] 🔄 Fork-Reorg: Lokale Chain hat {} Blöcke, Fork bei #{} – entferne {} lokale Blöcke",
-                        local_len, fork_point, reorg_depth
+                        "[chain] 🔄 Fork-Reorg: Lokale Chain hat {} Blöcke, Fork bei #{} – ersetze {} Blöcke (cd: {} > {})",
+                        local_len, fork_point, reorg_depth, incoming_cd, our_tip_cd,
                     );
                     self.truncate_to(fork_point);
                     // Jetzt sollte latest_hash == block.previous_hash sein
@@ -713,11 +824,33 @@ impl StoneChain {
                         ));
                     }
                 } else {
-                    return Err(format!(
-                        "previous_hash passt nicht: erwartet {}, empfangen {} – möglicher Fork (kein gemeinsamer Vorgänger)",
-                        &self.latest_hash[..12.min(self.latest_hash.len())],
-                        &block.previous_hash[..12.min(block.previous_hash.len())],
-                    ));
+                    // Kein gemeinsamer Vorgänger in der Hauptchain → Fork-Cache prüfen
+                    // Speichere den Block im Cache und versuche den Fork aufzulösen
+                    self.store_fork_block(block.clone());
+                    match self.try_resolve_fork(&block) {
+                        Ok(true) => {
+                            // Fork wurde aufgelöst, neuer Block kann normal angefügt werden
+                            // (latest_hash sollte jetzt block.previous_hash sein)
+                            if block.previous_hash != self.latest_hash {
+                                return Err(format!(
+                                    "Fork aufgelöst aber previous_hash passt nicht: {} ≠ {}",
+                                    &block.previous_hash[..12.min(block.previous_hash.len())],
+                                    &self.latest_hash[..12.min(self.latest_hash.len())],
+                                ));
+                            }
+                            // Entferne den neuen Block aus dem Fork-Cache
+                            self.fork_blocks.remove(&block.hash);
+                        }
+                        Ok(false) => {
+                            return Err(format!(
+                                "Fork-Block #{} gespeichert (cd nicht ausreichend für Reorg)",
+                                block.index,
+                            ));
+                        }
+                        Err(e) => {
+                            return Err(format!("Fork-Auflösung fehlgeschlagen: {e}"));
+                        }
+                    }
                 }
             } else {
                 return Err(format!(
@@ -841,30 +974,50 @@ impl StoneChain {
         {
             use crate::consensus::{
                 get_current_pow_difficulty, verify_argon2_pow,
-                ARGON2_POW_ACTIVATION_BLOCK,
+                ARGON2_POW_ACTIVATION_BLOCK, MIN_EFFECTIVE_POW_DIFFICULTY,
             };
             if block.index >= ARGON2_POW_ACTIVATION_BLOCK {
-                let difficulty = get_current_pow_difficulty(&self.blocks, block.index);
-                if difficulty > 0 {
+                let base_difficulty = get_current_pow_difficulty(&self.blocks, block.index);
+                if base_difficulty > 0 {
                     if block.pow_hash.is_empty() || block.pow_difficulty == 0 {
                         return Err(format!(
                             "Argon2id-PoW fehlt (ab Block #{} erforderlich)",
                             ARGON2_POW_ACTIVATION_BLOCK,
                         ));
                     }
-                    if block.pow_difficulty < difficulty {
+                    if block.pow_difficulty < base_difficulty {
                         return Err(format!(
                             "Argon2id-Difficulty zu niedrig: {} < {}",
-                            block.pow_difficulty, difficulty,
+                            block.pow_difficulty, base_difficulty,
                         ));
                     }
+                    // PoS/PoW Hybrid: effektive Difficulty bestimmen
+                    // effective_difficulty muss zwischen MIN_EFFECTIVE_POW_DIFFICULTY
+                    // und pow_difficulty liegen (Stake-Bonus darf maximal MAX_STAKE_DIFFICULTY_BONUS reduzieren)
+                    let verify_difficulty = if block.effective_difficulty > 0 {
+                        if block.effective_difficulty > block.pow_difficulty {
+                            return Err(format!(
+                                "effective_difficulty ({}) > pow_difficulty ({}) – ungültig",
+                                block.effective_difficulty, block.pow_difficulty,
+                            ));
+                        }
+                        if block.effective_difficulty < MIN_EFFECTIVE_POW_DIFFICULTY {
+                            return Err(format!(
+                                "effective_difficulty ({}) < MIN ({}) – ungültig",
+                                block.effective_difficulty, MIN_EFFECTIVE_POW_DIFFICULTY,
+                            ));
+                        }
+                        block.effective_difficulty
+                    } else {
+                        block.pow_difficulty
+                    };
                     if !verify_argon2_pow(
                         &block.previous_hash,
                         block.index,
                         &block.validator_pub_key,
                         block.pow_nonce,
                         &block.pow_hash,
-                        block.pow_difficulty,
+                        verify_difficulty,
                     ) {
                         return Err("Ungültiger Argon2id-PoW (Hash-Verifikation fehlgeschlagen)".into());
                     }
@@ -880,10 +1033,162 @@ impl StoneChain {
             ));
         }
 
+        // ── Kumulative Difficulty berechnen ───────────────────────────────
+        if block.cumulative_difficulty == 0 {
+            let parent_cd = self.blocks.last()
+                .map(|b| b.cumulative_difficulty)
+                .unwrap_or(0);
+            block.cumulative_difficulty = parent_cd
+                + block_work_effective(block.effective_difficulty, block.pow_difficulty);
+        }
+
         self.latest_hash = block.hash.clone();
         self.blocks.push(block);
         self.persist_last_block();
+
+        // Fork-Cache aufräumen: Blöcke die jetzt hinter der Chain liegen entfernen
+        self.prune_fork_blocks();
+
         Ok(())
+    }
+
+    // ── Fork-Block-Cache ──────────────────────────────────────────────────────
+
+    /// Speichert einen Fork-Block im Cache für spätere Auflösung.
+    /// Begrenzt auf 50 Einträge (älteste werden entfernt).
+    pub fn store_fork_block(&mut self, block: Block) {
+        const MAX_FORK_BLOCKS: usize = 50;
+        println!(
+            "[fork] 📦 Fork-Block #{} gespeichert (hash={}…, cd={})",
+            block.index,
+            &block.hash[..8.min(block.hash.len())],
+            block.cumulative_difficulty,
+        );
+        self.fork_blocks.insert(block.hash.clone(), block);
+        // Eviction: älteste (niedrigster Index) entfernen
+        while self.fork_blocks.len() > MAX_FORK_BLOCKS {
+            if let Some(oldest_hash) = self.fork_blocks.values()
+                .min_by_key(|b| b.index)
+                .map(|b| b.hash.clone())
+            {
+                self.fork_blocks.remove(&oldest_hash);
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Entfernt Fork-Blöcke die weit hinter der Chain liegen.
+    fn prune_fork_blocks(&mut self) {
+        let chain_height = self.blocks.len() as u64;
+        self.fork_blocks.retain(|_, b| {
+            b.index + MAX_REORG_DEPTH >= chain_height
+        });
+    }
+
+    /// Versucht eine Fork-Chain aufzubauen die bei `tip_hash` endet.
+    /// Sucht rückwärts durch den Fork-Cache bis ein Vorgänger in der
+    /// Hauptchain gefunden wird.
+    /// Gibt die Fork-Blöcke in aufsteigender Reihenfolge zurück (ohne den Hauptchain-Block).
+    pub fn build_fork_chain(&self, tip_hash: &str) -> Option<(u64, Vec<Block>)> {
+        let mut chain = Vec::new();
+        let mut current_hash = tip_hash.to_string();
+
+        // Rückwärts durch Fork-Blöcke suchen
+        for _ in 0..MAX_REORG_DEPTH {
+            if let Some(block) = self.fork_blocks.get(&current_hash) {
+                current_hash = block.previous_hash.clone();
+                chain.push(block.clone());
+            } else {
+                break;
+            }
+        }
+
+        if chain.is_empty() {
+            return None;
+        }
+
+        chain.reverse(); // Aufsteigend sortieren
+
+        // Prüfen ob der erste Fork-Block an die Hauptchain anknüpft
+        let fork_start = &chain[0];
+        let connects = self.blocks.iter().any(|b| b.hash == fork_start.previous_hash);
+        if connects {
+            let fork_point = fork_start.index;
+            Some((fork_point, chain))
+        } else {
+            None
+        }
+    }
+
+    /// Prüft ob ein Fork im Cache zusammen mit einem neuen Block schwerer ist
+    /// als unsere aktuelle Chain. Wenn ja, führt die Reorg durch.
+    /// Gibt Ok(true) zurück wenn reorgt wurde, Ok(false) wenn nicht.
+    pub fn try_resolve_fork(&mut self, new_block: &Block) -> Result<bool, String> {
+        // Suche ob new_block.previous_hash auf einen Fork-Block zeigt
+        if let Some((fork_point, fork_chain)) = self.build_fork_chain(&new_block.previous_hash) {
+            // Kumulative Difficulty des Forks berechnen
+            let fork_tip_cd = if new_block.cumulative_difficulty > 0 {
+                new_block.cumulative_difficulty
+            } else {
+                // Berechne aus Fork-Chain
+                let last_fork = fork_chain.last().unwrap();
+                let last_cd = if last_fork.cumulative_difficulty > 0 {
+                    last_fork.cumulative_difficulty
+                } else {
+                    // Berechne manuell entlang der Fork-Chain
+                    let anchor_cd = self.blocks.get((fork_point - 1) as usize)
+                        .map(|b| b.cumulative_difficulty)
+                        .unwrap_or(0);
+                    let mut cd = anchor_cd;
+                    for fb in &fork_chain {
+                        cd += block_work(fb.pow_difficulty);
+                    }
+                    cd
+                };
+                last_cd + block_work(new_block.pow_difficulty)
+            };
+
+            let our_tip_cd = self.blocks.last()
+                .map(|b| b.cumulative_difficulty)
+                .unwrap_or(0);
+
+            if fork_tip_cd > our_tip_cd {
+                let reorg_depth = self.blocks.len() as u64 - fork_point;
+                if reorg_depth > MAX_REORG_DEPTH {
+                    return Err(format!(
+                        "Fork-Reorg abgelehnt: Tiefe {} > MAX_REORG_DEPTH",
+                        reorg_depth
+                    ));
+                }
+
+                println!(
+                    "[fork] 🔄 Fork-Reorg via Cache: {} Fork-Blöcke + neuer Block, cd: {} > {} (Tiefe: {})",
+                    fork_chain.len(), fork_tip_cd, our_tip_cd, reorg_depth,
+                );
+
+                // Hauptchain kürzen
+                self.truncate_to(fork_point);
+
+                // Fork-Blöcke einfügen
+                for mut fb in fork_chain {
+                    if fb.cumulative_difficulty == 0 {
+                        let parent_cd = self.blocks.last()
+                            .map(|b| b.cumulative_difficulty)
+                            .unwrap_or(0);
+                        fb.cumulative_difficulty = parent_cd + block_work(fb.pow_difficulty);
+                    }
+                    // Entferne aus Fork-Cache
+                    self.fork_blocks.remove(&fb.hash);
+                    self.latest_hash = fb.hash.clone();
+                    self.blocks.push(fb);
+                    self.persist_last_block();
+                }
+
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Aktives Dokument per doc_id finden
@@ -1094,6 +1399,8 @@ pub fn calculate_hash(block: &Block) -> String {
     // Argon2id PoW: Hash + Difficulty in Block-Hash einbeziehen
     h.update(block.pow_hash.as_bytes());
     h.update(block.pow_difficulty.to_le_bytes());
+    // PoS/PoW Hybrid: effective_difficulty in Block-Hash einbeziehen
+    h.update(block.effective_difficulty.to_le_bytes());
     format!("{:x}", h.finalize())
 }
 
@@ -1226,6 +1533,8 @@ Because Dennis died of cancer and nobody could do anything.
         pow_nonce: 0,
         pow_hash: String::new(),
         pow_difficulty: 0,
+        effective_difficulty: 0,
+        cumulative_difficulty: 1, // Genesis = 1
     };
     let hash = calculate_hash(&genesis);
     genesis.hash = hash.clone();

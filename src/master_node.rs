@@ -18,8 +18,8 @@
 use crate::blockchain::{Block, Document, DocumentTombstone, NodeRole, StoneChain};
 use crate::consensus::{
     load_or_create_validator_key, local_validator_pubkey_hex, sign_block,
-    BlockProposal, CheckpointStore, EquivocationTracker, PreCommitRequest, SlashingStore,
-    ValidatorSet, VoteMessage, VotePhase, VotingRound,
+    CheckpointStore, EquivocationTracker, SlashingStore,
+    ValidatorSet, VotingRound,
 };
 use crate::shard::ShardHolderRegistry;
 use crate::chat_policy::ChatPolicyStore;
@@ -35,17 +35,20 @@ use std::time::Duration;
 
 // ─── Mining-Konstanten ───────────────────────────────────────────────────────
 
-/// Block-Intervall in Sekunden (wie oft ein neuer Block erzeugt wird)
-/// 120s = 2 Minuten — genug Zeit für Shard-Repairs und Challenge-Responses,
-/// ohne die Chain mit leeren Blöcken zu fluten.
-pub const MINING_INTERVAL_SECS: u64 = 120;
+/// Ziel-Block-Zeit in Sekunden (Competitive PoW).
+/// 30s = schnelle Blöcke, Difficulty wird dynamisch angepasst.
+pub const TARGET_BLOCK_TIME_SECS: u64 = crate::consensus::TARGET_BLOCK_TIME_SECS;
+
+/// Legacy: Block-Intervall in Sekunden (für Kompatibilität mit altem Code).
+/// Wird durch TARGET_BLOCK_TIME_SECS ersetzt.
+pub const MINING_INTERVAL_SECS: u64 = TARGET_BLOCK_TIME_SECS;
 
 /// Initialer Block-Reward in STONE (vor erstem Halving)
 pub const INITIAL_BLOCK_REWARD: &str = "10.0";
 
 /// Alle N Blöcke halbiert sich der Reward
-/// 52.500 Blöcke × 120s = ~73 Tage pro Halving-Epoche (selber Rhythmus wie vorher)
-pub const HALVING_INTERVAL: u64 = 52_500;
+/// 210.000 Blöcke × 30s = ~73 Tage pro Halving-Epoche
+pub const HALVING_INTERVAL: u64 = 210_000;
 
 /// Maximale Supply (aus Genesis-Config, hier als Fallback)
 pub const MAX_SUPPLY: &str = "50000000";
@@ -55,6 +58,52 @@ pub const MIN_BLOCK_REWARD: &str = "0.00000001";
 
 /// Timeout für Peer-Voting in Sekunden (Multi-Node-Konsensus)
 pub const VOTE_TIMEOUT_SECS: u64 = 10;
+
+/// Wie oft (Sekunden) ein neues Mining-Template generiert wird.
+/// Externe Miner können das Template per API abrufen.
+pub const TEMPLATE_REFRESH_SECS: u64 = 5;
+
+// ─── Mining Template ─────────────────────────────────────────────────────────
+
+/// Block-Template für externe Miner.
+/// Enthält alle Daten die ein Miner braucht um einen Block zu lösen.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MiningTemplate {
+    /// Block-Index (Höhe)
+    pub block_index: u64,
+    /// Hash des Vorgänger-Blocks
+    pub previous_hash: String,
+    /// Aktuelle Argon2id-PoW-Difficulty (Netzwerk-Basis, Anzahl führender Null-Bits)
+    pub difficulty: u32,
+    /// Effektive Difficulty nach Stake-Bonus (PoS/PoW Hybrid).
+    /// <= difficulty. Miner löst gegen diesen (leichteren) Target.
+    #[serde(default)]
+    pub effective_difficulty: u32,
+    /// Unix-Timestamp wann das Template erstellt wurde
+    pub timestamp: i64,
+    /// Validator-Public-Key (wird für PoW-Input benötigt)
+    pub validator_pubkey: String,
+    /// SHA-256 Hash des vorbereiteten Blocks (ohne PoW-Felder)
+    /// Der Miner muss den PoW über prev_hash, block_index, validator_pubkey lösen.
+    pub block_hash_pre_pow: String,
+    /// Anzahl Transaktionen im Block
+    pub tx_count: usize,
+    /// Block-Reward in STONE
+    pub reward: String,
+    /// Template-ID (für Submit-Zuordnung)
+    pub template_id: String,
+}
+
+/// Einreichung eines gelösten Blocks durch einen externen Miner.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MiningSubmission {
+    /// Template-ID (muss mit dem aktuellen Template übereinstimmen)
+    pub template_id: String,
+    /// Gelöster PoW-Nonce
+    pub nonce: u64,
+    /// Argon2id-Hash (hex-encoded)
+    pub pow_hash: String,
+}
 
 // ─── Peer-Status ─────────────────────────────────────────────────────────────
 
@@ -442,6 +491,9 @@ pub struct MasterNodeState {
     pub block_broadcast_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<Block>>>,
     /// Equivocation-Tracker: Erkennt Double-Signing durch Validatoren
     pub equivocation_tracker: Mutex<EquivocationTracker>,
+    /// Aktuelles Mining-Template (für externe Miner).
+    /// Enthält einen vorbereiteten Block ohne PoW-Lösung.
+    pub current_mining_template: RwLock<Option<(MiningTemplate, Block)>>,
 }
 
 #[derive(Default)]
@@ -540,6 +592,7 @@ impl MasterNodeState {
             pending_repair_rewards: Mutex::new(Vec::new()),
             block_broadcast_tx: Mutex::new(None),
             equivocation_tracker: Mutex::new(EquivocationTracker::new()),
+            current_mining_template: RwLock::new(None),
         });
 
         // Nach Restart: Prüfen ob die lokale Chain aktuell genug ist.
@@ -803,10 +856,7 @@ impl MasterNodeState {
             // Token-TXs im Ledger verarbeiten (chain → ledger: korrekte Reihenfolge)
             if !block.transactions.is_empty() {
                 let mut ledger = self.token_ledger.write().unwrap();
-                // Block ist soeben gemined → replay_mode (Chain ist Wahrheit)
-                ledger.replay_mode = true;
                 let receipts = ledger.apply_block_txs(&block.transactions, block.index);
-                ledger.replay_mode = false;
                 if !receipts.is_empty() {
                     if let Err(e) = ledger.persist() {
                         eprintln!("[token] Ledger-Persistierung nach Block #{} fehlgeschlagen: {e}", block.index);
@@ -1170,6 +1220,325 @@ impl MasterNodeState {
         }
     }
 
+    // ─── Competitive PoW: Block-Template für externe Miner ─────────────────
+
+    /// Erstellt ein Block-Template für externe Miner (ohne PoW).
+    ///
+    /// Der Block wird vollständig vorbereitet (TXs, Reward, Signatur) aber
+    /// das Argon2id-PoW-Puzzle wird NICHT gelöst. Das Template enthält alle
+    /// Daten die ein externer Miner braucht um den PoW zu lösen.
+    ///
+    /// Das Template wird in `current_mining_template` gespeichert und kann
+    /// per `GET /api/v1/mining/template` abgerufen werden.
+    pub fn prepare_block_template(&self) -> Result<MiningTemplate, String> {
+        // Validator-Schlüssel laden
+        let signing_key = load_or_create_validator_key();
+        let validator_wallet = local_validator_pubkey_hex(&signing_key);
+
+        // Reward-Wallet bestimmen
+        let reward_wallet = {
+            let mw = self.mining_wallet.read().unwrap();
+            mw.clone().unwrap_or_else(|| validator_wallet.clone())
+        };
+
+        // ── Block-Reward berechnen ──────────────────────────────────────
+        let (reward_amount, next_index, _prev_hash) = {
+            let chain = self.chain.lock().unwrap();
+            let next_idx = chain.blocks.len() as u64;
+            let prev = chain.blocks.last()
+                .map(|b| b.hash.clone())
+                .unwrap_or_else(|| "genesis".into());
+            let ledger = self.token_ledger.read().unwrap();
+            let pool_balance = ledger.balance("pool:storage_rewards");
+            (Self::calculate_block_reward(next_idx, pool_balance), next_idx, prev)
+        };
+
+        // ── Mempool-TXs + Reward-TX sammeln ────────────────────────────
+        let mut pending_txs = self.mempool.drain_all_for_block();
+
+        if reward_amount > Decimal::ZERO {
+            let reward_tx = Self::create_reward_tx(&reward_wallet, reward_amount, next_index);
+            pending_txs.push(reward_tx);
+        }
+
+        // ── Pre-Block-Validierung: Ungültige TXs herausfiltern ──────────
+        // Verhindert dass TXs mit unzureichender Balance oder falscher Nonce
+        // in den Block aufgenommen werden (Double-Spend-Schutz).
+        let pending_txs = {
+            let ledger = self.token_ledger.read().unwrap();
+            ledger.filter_valid_txs(&pending_txs)
+        };
+
+        // ── Chat-Nachrichten batchen ────────────────────────────────────
+        let chat_batches = if self.message_pool.batch_ready() {
+            let drained = self.message_pool.drain_for_batch();
+            if !drained.is_empty() {
+                let msg_ids: Vec<String> = drained.iter().map(|m| m.msg_id.clone()).collect();
+                match crate::merkle_batch::build_batch(&drained) {
+                    Some((anchor, _tree)) => {
+                        self.message_pool.mark_batched(&msg_ids, &anchor.merkle_root);
+                        vec![anchor]
+                    }
+                    None => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        // ── Block vorbereiten (ohne PoW) ────────────────────────────────
+        let signer = self.node_id.clone();
+        let chain = self.chain.lock().unwrap();
+        let mut block = chain.prepare_block(
+            Vec::new(),
+            Vec::new(),
+            pending_txs,
+            "system".to_string(),
+            signer,
+            &self.cluster_key,
+            self.role.clone(),
+            chat_batches,
+        );
+        drop(chain);
+
+        // ── Block-Signierung ────────────────────────────────────────────
+        let sig = sign_block(&signing_key, &block.hash);
+        block.validator_pub_key = validator_wallet.clone();
+        block.validator_signature = sig;
+
+        // ── Storage Challenges ──────────────────────────────────────────
+        {
+            let chain = self.chain.lock().unwrap();
+            let chunk_refs = crate::storage_proof::collect_chunk_refs(&chain);
+            if !chunk_refs.is_empty() {
+                let vs = self.validator_set.read().unwrap();
+                let mut known_wallets: Vec<String> = vs.validators.iter()
+                    .filter(|v| v.active)
+                    .filter_map(|v| if v.public_key_hex.is_empty() { None } else { Some(v.public_key_hex.clone()) })
+                    .collect();
+                {
+                    let trust = self.trust_registry.read().unwrap();
+                    for entry in trust.iter() {
+                        if !entry.public_key_hex.is_empty() && !known_wallets.contains(&entry.public_key_hex) {
+                            known_wallets.push(entry.public_key_hex.clone());
+                        }
+                    }
+                }
+                let challenges = crate::storage_proof::generate_network_challenges(
+                    &block.previous_hash, block.index, &chunk_refs, &known_wallets, &validator_wallet,
+                );
+                block.storage_challenges = challenges;
+
+                // Challenge-Responses aufnehmen
+                let responses = self.collect_pending_challenge_responses(&chain);
+                if !responses.is_empty() {
+                    let challenge_reward: Decimal = crate::storage_proof::CHALLENGE_REWARD
+                        .parse().unwrap_or(Decimal::new(5, 1));
+                    let pool_balance = {
+                        let ledger = self.token_ledger.read().unwrap();
+                        ledger.balance("pool:storage_rewards")
+                    };
+                    let mut total = Decimal::ZERO;
+                    for resp in &responses {
+                        if total + challenge_reward > pool_balance { break; }
+                        let chain_id = std::env::var("STONE_NETWORK")
+                            .map(|n| if n == "mainnet" || n == "main" { "stone-mainnet".to_string() } else { "stone-testnet".to_string() })
+                            .unwrap_or_else(|_| "stone-testnet".to_string());
+                        let mut reward_tx = TokenTx {
+                            tx_id: String::new(), tx_type: TxType::Reward,
+                            from: "pool:storage_rewards".to_string(), to: resp.responder_wallet.clone(),
+                            amount: challenge_reward, fee: Decimal::ZERO, nonce: 0,
+                            timestamp: Utc::now().timestamp(), signature: String::new(),
+                            memo: format!("Storage Challenge Reward ({})", &resp.challenge_id[..12.min(resp.challenge_id.len())]),
+                            chain_id, fee_tier: crate::token::FeeTier::Express,
+                        };
+                        reward_tx.tx_id = compute_tx_id(&reward_tx);
+                        block.transactions.push(reward_tx);
+                        total += challenge_reward;
+                    }
+                    if total > Decimal::ZERO {
+                        block.merkle_root = crate::blockchain::compute_merkle_root(
+                            &block.documents, &block.tombstones, &block.transactions,
+                        );
+                    }
+                    block.challenge_responses = responses;
+                }
+
+                // Block-Hash neu berechnen
+                block.hash = crate::blockchain::calculate_hash(&block);
+                block.signature = crate::blockchain::sign_hash(&self.cluster_key, &block.hash);
+                block.validator_signature = sign_block(&signing_key, &block.hash);
+            }
+        }
+
+        // ── PoW-Difficulty bestimmen ────────────────────────────────────
+        let difficulty = {
+            let chain = self.chain.lock().unwrap();
+            crate::consensus::get_current_pow_difficulty(&chain.blocks, block.index)
+        };
+        block.pow_difficulty = difficulty;
+
+        // ── PoS/PoW Hybrid: Effektive Difficulty berechnen ───────────────
+        let eff_difficulty = {
+            let pool = self.staking_pool.read().unwrap();
+            let miner_stake = pool.stakers.get(&validator_wallet)
+                .map(|e| e.staked_amount)
+                .unwrap_or(rust_decimal::Decimal::ZERO);
+            let total_staked = pool.total_staked;
+            crate::consensus::effective_pow_difficulty(difficulty, miner_stake, total_staked)
+        };
+        block.effective_difficulty = eff_difficulty;
+
+        // ── Kumulative Difficulty setzen ─────────────────────────────────
+        {
+            let chain = self.chain.lock().unwrap();
+            let parent_cd = chain.blocks.last()
+                .map(|b| b.cumulative_difficulty)
+                .unwrap_or(0);
+            block.cumulative_difficulty = parent_cd
+                + crate::blockchain::block_work_effective(eff_difficulty, difficulty);
+        }
+
+        // Template-ID: Hash aus Block-Index + Timestamp + prev_hash
+        let template_id = {
+            use sha2::{Sha256, Digest};
+            let mut h = Sha256::new();
+            h.update(block.index.to_le_bytes());
+            h.update(block.timestamp.to_le_bytes());
+            h.update(block.previous_hash.as_bytes());
+            hex::encode(h.finalize())[..16].to_string()
+        };
+
+        let template = MiningTemplate {
+            block_index: block.index,
+            previous_hash: block.previous_hash.clone(),
+            difficulty,
+            effective_difficulty: eff_difficulty,
+            timestamp: block.timestamp,
+            validator_pubkey: validator_wallet.clone(),
+            block_hash_pre_pow: block.hash.clone(),
+            tx_count: block.transactions.len(),
+            reward: reward_amount.to_string(),
+            template_id: template_id.clone(),
+        };
+
+        println!(
+            "[mining] 📋 Template #{} erstellt: Block #{}, {} TXs, d={}/{}, Reward: {} STONE",
+            &template_id[..8], block.index, block.transactions.len(),
+            eff_difficulty, difficulty, reward_amount,
+        );
+
+        // Template + Block speichern
+        {
+            let mut tmpl = self.current_mining_template.write().unwrap();
+            *tmpl = Some((template.clone(), block));
+        }
+
+        Ok(template)
+    }
+
+    /// Nimmt eine PoW-Lösung eines externen Miners entgegen und committed den Block.
+    ///
+    /// 1. Prüft ob das Template noch aktuell ist
+    /// 2. Verifiziert den Argon2id-PoW
+    /// 3. Setzt PoW-Felder im Block
+    /// 4. Committed den Block + Broadcast
+    pub fn submit_mining_solution(
+        &self,
+        submission: &MiningSubmission,
+    ) -> Result<Block, String> {
+        // Template laden und prüfen
+        let (template, mut block) = {
+            let tmpl = self.current_mining_template.read().unwrap();
+            match tmpl.as_ref() {
+                Some((t, b)) => {
+                    if t.template_id != submission.template_id {
+                        return Err("Template-ID stimmt nicht überein (veraltet?)".into());
+                    }
+                    (t.clone(), b.clone())
+                }
+                None => return Err("Kein aktives Mining-Template vorhanden".into()),
+            }
+        };
+
+        // Chain-Konsistenz: Ist der Block noch der nächste?
+        {
+            let chain = self.chain.lock().unwrap();
+            let expected = chain.blocks.len() as u64;
+            if block.index != expected {
+                // Template ist veraltet (zwischenzeitlich neuer Block empfangen)
+                // TXs zurück in Mempool
+                self.restore_block_txs(&block);
+                // Template invalidieren
+                *self.current_mining_template.write().unwrap() = None;
+                return Err(format!(
+                    "Block #{} veraltet (Chain ist bei #{})", block.index, expected
+                ));
+            }
+        }
+
+        // PoW verifizieren (gegen effective_difficulty = Stake-reduziertes Target)
+        let verify_difficulty = if template.effective_difficulty > 0 {
+            template.effective_difficulty
+        } else {
+            template.difficulty
+        };
+        if verify_difficulty > 0 {
+            let valid = crate::consensus::verify_argon2_pow(
+                &block.previous_hash,
+                block.index,
+                &template.validator_pubkey,
+                submission.nonce,
+                &submission.pow_hash,
+                verify_difficulty,
+            );
+            if !valid {
+                return Err("Ungültiger Argon2id-PoW (Hash oder Difficulty falsch)".into());
+            }
+        }
+
+        // PoW-Felder setzen
+        block.pow_nonce = submission.nonce;
+        block.pow_hash = submission.pow_hash.clone();
+        block.pow_difficulty = template.difficulty;
+        block.effective_difficulty = template.effective_difficulty;
+
+        // Hash + Signaturen neu berechnen (PoW-Felder fließen in Block-Hash ein)
+        block.hash = crate::blockchain::calculate_hash(&block);
+        block.signature = crate::blockchain::sign_hash(&self.cluster_key, &block.hash);
+        let signing_key = load_or_create_validator_key();
+        block.validator_signature = sign_block(&signing_key, &block.hash);
+
+        // Template invalidieren (wurde gelöst)
+        *self.current_mining_template.write().unwrap() = None;
+
+        // Block committen
+        self.commit_mining_block(block.clone())?;
+
+        println!(
+            "[mining] ✅ Externer PoW akzeptiert: Block #{}, nonce={}, d={}/{}",
+            block.index, submission.nonce, template.effective_difficulty, template.difficulty,
+        );
+
+        Ok(block)
+    }
+
+    /// Stellt TXs eines gescheiterten Blocks zurück in den Mempool.
+    fn restore_block_txs(&self, block: &Block) {
+        for tx in &block.transactions {
+            if tx.tx_type != TxType::Reward && tx.tx_type != TxType::Mint
+                && tx.tx_type != crate::token::transaction::TxType::Memorial
+            {
+                let _ = self.mempool.add_tx(tx.clone(), None);
+            }
+        }
+        for batch in &block.chat_batches {
+            self.message_pool.unbatch(&batch.merkle_root);
+        }
+    }
+
     // ─── Mining-Wallet Persistierung ───────────────────────────────────────
 
     fn mining_config_path() -> String {
@@ -1264,10 +1633,19 @@ impl MasterNodeState {
                         );
                     }
 
-                let (_stakes, jailed, _wallet_map) = self.build_selection_context();
+                let (stakes, jailed, wallet_map) = self.build_selection_context();
 
-                if !vs.is_round_robin_turn(&self.node_id, chain_next_index, &jailed) {
-                    // Nicht unser Round-Robin-Slot.
+                // Beide Algorithmen prüfen: gewichtete Auswahl (= Peer-Validierung)
+                // UND Round-Robin (= lokale Rotation). Primary wenn einer zutrifft.
+                let is_weighted_turn = vs.is_selected_validator_weighted(
+                    &self.node_id, &_chain_prev_hash, chain_next_index,
+                    &stakes, &jailed, &wallet_map,
+                );
+                let is_rr_turn = vs.is_round_robin_turn(&self.node_id, chain_next_index, &jailed);
+                let is_primary = is_weighted_turn || is_rr_turn;
+
+                if !is_primary {
+                    // Nicht unser Slot.
                     // Prüfe ob der primäre Validator seinen Slot verpasst hat.
                     let last_block_age = {
                         let chain = self.chain.lock().unwrap();
@@ -1328,6 +1706,12 @@ impl MasterNodeState {
             let reward_tx = Self::create_reward_tx(&reward_wallet, reward_amount, next_index);
             pending_txs.push(reward_tx);
         }
+
+        // ── Pre-Block-Validierung: Ungültige TXs herausfiltern ──────────
+        let pending_txs = {
+            let ledger = self.token_ledger.read().unwrap();
+            ledger.filter_valid_txs(&pending_txs)
+        };
 
         // Blöcke werden IMMER erzeugt — auch ohne User-TXs.
         // Der Block-Reward, Network-Challenges und Shard-Repair-Rewards
@@ -1647,10 +2031,10 @@ impl MasterNodeState {
             let mut ledger = self.token_ledger.write().unwrap();
             // Fee-Split: Validator-Wallet setzen BEVOR TXs verarbeitet werden
             ledger.set_current_validator(Some(validator_wallet.clone()));
-            // Block ist committed → replay_mode (Chain ist Wahrheit)
-            ledger.replay_mode = true;
+            // TXs wurden bereits durch filter_valid_txs() validiert →
+            // Trotzdem Balance/Nonce prüfen (kein replay_mode), damit
+            // auch per Gossip empfangene Blöcke korrekt geprüft werden.
             let receipts = ledger.apply_block_txs(&block.transactions, block.index);
-            ledger.replay_mode = false;
             ledger.set_current_validator(None);
 
             // ── Staking-TXs im StakingPool verarbeiten ────────────────────
@@ -1785,51 +2169,41 @@ impl MasterNodeState {
         Ok(())
     }
 
-    /// Hintergrund-Task: Block-Mining alle `MINING_INTERVAL_SECS` Sekunden.
+    /// Hintergrund-Task: Continuous Mining-Loop (Competitive PoW).
     ///
-    /// Der Mining-Loop:
-    /// 1. Prüft ob seit dem letzten Block genug Zeit vergangen ist
-    /// 2. Prüft PoA-Berechtigung
-    /// 3. Erstellt einen neuen Block mit Reward-TX + Mempool-TXs
-    /// 4. Schläft bis zum nächsten Intervall
+    /// Statt timer-basiertem Intervall-Mining (PoA) wird jetzt:
+    /// 1. Kontinuierlich ein Block-Template bereitgehalten
+    /// 2. Externe Miner lösen das Argon2id-PoW per API (`/mining/template` + `/mining/submit`)
+    /// 3. Gossip-Blöcke von anderen Nodes invalidieren das lokale Template
+    /// 4. Template wird alle TEMPLATE_REFRESH_SECS Sekunden aktualisiert
     pub fn start_mining_loop(state: Arc<Self>) {
-        let interval = Duration::from_secs(MINING_INTERVAL_SECS);
         println!(
-            "[mining] ⛏️  Mining-Loop gestartet (Intervall: {}s, Reward: {} STONE, Halving: alle {} Blöcke)",
-            MINING_INTERVAL_SECS, INITIAL_BLOCK_REWARD, HALVING_INTERVAL
+            "[mining] ⛏️  Competitive-PoW Mining-Loop gestartet (Target: {}s, Reward: {} STONE, Halving: alle {} Blöcke)",
+            TARGET_BLOCK_TIME_SECS, INITIAL_BLOCK_REWARD, HALVING_INTERVAL
         );
 
         tokio::spawn(async move {
-            // Erste Wartezeit: halbes Intervall (damit nicht sofort nach Start)
-            tokio::time::sleep(Duration::from_secs(MINING_INTERVAL_SECS / 2)).await;
+            // Erste Wartezeit: 15s (P2P-Netzwerk aufbauen lassen)
+            tokio::time::sleep(Duration::from_secs(15)).await;
 
-            let mut ticker = tokio::time::interval(interval);
+            let template_interval = Duration::from_secs(TEMPLATE_REFRESH_SECS);
+            let mut ticker = tokio::time::interval(template_interval);
+            let mut last_template_height: u64 = 0;
+
             loop {
                 ticker.tick().await;
 
                 // ── Initial-Sync abwarten ─────────────────────────────────
-                // Erst nach abgeschlossenem Peer-Sync starten, damit keine
-                // Fork-Blöcke erzeugt werden.
-                //
-                // Timeout: 2× MINING_INTERVAL_SECS (240s) nach Node-Start.
-                // Das gibt dem P2P-Netzwerk genug Zeit für:
-                //   - NAT-Traversal / Relay-Aufbau (~30-60s)
-                //   - Kademlia-Bootstrap + Peer-Discovery (~30s)
-                //   - Block-Range-Sync (~30-60s)
-                // Erst danach fängt Mining an.
                 if !state.metrics.initial_sync_done.load(Ordering::Relaxed) {
                     let uptime = Utc::now().timestamp() - state.started_at;
-                    let sync_timeout = (MINING_INTERVAL_SECS * 2) as i64; // 240s
+                    let sync_timeout = 60_i64; // 60s Sync-Timeout für schnellere Block-Time
                     if uptime < sync_timeout {
-                        continue; // Warte auf Sync
+                        continue;
                     }
-                    // Timeout: kein Peer hat mehr Blöcke oder kein Peer verbunden
                     println!("[mining] ⏰ Initial-Sync Timeout ({}s) – starte Mining", sync_timeout);
                     state.metrics.initial_sync_done.store(true, Ordering::Relaxed);
 
-                    // Token-Ledger vollständig aus der (jetzt synced) Chain neu aufbauen.
-                    // Während des P2P-Sync konnten TXs wegen falscher Nonce-Reihenfolge
-                    // übersprungen worden sein – der Rebuild korrigiert das.
+                    // Token-Ledger aus synced Chain rebuilden
                     {
                         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
                         if chain.blocks.len() > 1 {
@@ -1845,72 +2219,16 @@ impl MasterNodeState {
                     }
                 }
 
-                // Mining-Throttle: Leistungsbegrenzung prüfen
+                // Mining-Throttle prüfen
                 {
                     let throttle = state.metrics.mining_throttle_pct.load(Ordering::Relaxed);
                     if throttle == 0 {
                         continue; // Mining komplett deaktiviert
                     }
-                    if throttle < 100 {
-                        // Probabilistisches Throttling: Block mit (100-throttle)% überspringen
-                        use std::collections::hash_map::DefaultHasher;
-                        use std::hash::{Hash, Hasher};
-                        let now = Utc::now().timestamp_millis() as u64;
-                        let mut hasher = DefaultHasher::new();
-                        now.hash(&mut hasher);
-                        let roll = hasher.finish() % 100;
-                        if roll >= throttle {
-                            continue; // Throttled – diesen Block überspringen
-                        }
-                    }
                 }
 
-                // Prüfen ob der letzte Block alt genug ist (verhindert Doppel-Blocks
-                // wenn commit_documents oder ein Peer-Block kurz vorher einen Block
-                // zur Chain hinzugefügt hat). Der nächste Block darf frühestens nach
-                // MINING_INTERVAL_SECS gemint werden — nicht nach der Hälfte.
-                // Sonst erzeugen mehrere Nodes parallel Blöcke für denselben Slot.
+                // Nicht minen wenn Peers weiter sind
                 {
-                    let chain = state.chain.lock().unwrap();
-                    if let Some(last) = chain.blocks.last() {
-                        let age = Utc::now().timestamp() - last.timestamp;
-                        if age < (MINING_INTERVAL_SECS as i64 - 5) {
-                            continue; // Zu früh – nächster Block-Slot noch nicht erreicht
-                        }
-                    }
-                }
-
-                // Mempool: abgelaufene TXs bereinigen
-                let evicted = state.mempool.evict_expired();
-                if evicted > 0 {
-                    println!("[mining] 🧹 {} abgelaufene TXs aus Mempool entfernt", evicted);
-                }
-
-                // ── Stall-Warnung: pending TXs + alte Chain ──────────────
-                {
-                    let pending = state.mempool.pending_count();
-                    if pending > 0 {
-                        let chain = state.chain.lock().unwrap();
-                        if let Some(last) = chain.blocks.last() {
-                            let age = Utc::now().timestamp() - last.timestamp;
-                            if age > (MINING_INTERVAL_SECS as i64 * 3) {
-                                println!(
-                                    "[mining] ⚠ Stall: {} pending TXs, letzter Block vor {}s ({}x Intervall)",
-                                    pending, age, age / MINING_INTERVAL_SECS as i64
-                                );
-                            }
-                        }
-                    }
-                }
-
-                // ── Hybrid Consensus: Single-Node vs. Multi-Node ──────────
-                let active_validators = {
-                    let vs = state.validator_set.read().unwrap();
-                    vs.active_count()
-                };
-
-                // Nicht minen wenn Peers weiter sind (verhindert Reject wegen Block-Index-Mismatch)
-                if active_validators > 1 {
                     let our_height = state.chain.lock().unwrap().blocks.len() as u64;
                     let max_peer_height = {
                         let peers = state.peers.read().unwrap();
@@ -1920,501 +2238,86 @@ impl MasterNodeState {
                             .max()
                             .unwrap_or(0)
                     };
-                    if max_peer_height > our_height {
-                        eprintln!(
-                            "[mining] ⏳ Skip: Peers bei Höhe {}, wir bei {} – warte auf Sync",
-                            max_peer_height, our_height,
-                        );
+                    if max_peer_height > our_height + 1 {
+                        // Template invalidieren wenn wir hinterher sind
+                        *state.current_mining_template.write().unwrap() = None;
                         continue;
                     }
                 }
 
-                if active_validators <= 1 {
-                    // ═══ SINGLE-NODE MODUS: Sofort committen (wie bisher) ═══
-                    match state.mint_block() {
-                        Ok(block) => {
-                            // Committete Challenge-Responses aus Pending-Buffer entfernen
-                            let committed_ids: Vec<String> = block.challenge_responses
-                                .iter().map(|r| r.challenge_id.clone()).collect();
-                            state.clear_committed_responses(&committed_ids);
-
-                            Self::post_block_staking(&state, &block);
-                            Self::post_block_slashing(&state, &block);
-                            Self::post_block_reputation(&state, &block);
-                            Self::post_block_chat_policy(&state, &block, None);
-                            Self::post_block_checkpoint(&state, &block).await;
-
-                            // ── Block via P2P-Gossipsub an alle Peers senden ──
-                            {
-                                let tx = state.block_broadcast_tx.lock().unwrap();
-                                if let Some(ref sender) = *tx {
-                                    let _ = sender.send(block.clone());
-                                }
-                            }
-
-                            let _ = block;
-                        }
-                        Err(e) => {
-                            if !e.contains("nicht ausgewählt") && !e.contains("kein aktiver") {
-                                eprintln!("[mining] {e}");
-                            }
-                        }
+                // Mempool: abgelaufene TXs bereinigen (alle 30s)
+                let current_height = state.chain.lock().unwrap().blocks.len() as u64;
+                if current_height != last_template_height {
+                    let evicted = state.mempool.evict_expired();
+                    if evicted > 0 {
+                        println!("[mining] 🧹 {} abgelaufene TXs aus Mempool entfernt", evicted);
                     }
-                } else {
-                    // ═══ MULTI-NODE MODUS: Proposal → Voting → Commit ═══
-                    match state.prepare_mining_block() {
-                        Ok(block) => {
-                            let round = state.round_counter.fetch_add(1, Ordering::Relaxed);
-                            let signing_key = load_or_create_validator_key();
-                            let proposal = BlockProposal::new(
-                                block.clone(),
-                                state.node_id.clone(),
-                                &signing_key,
-                                round,
-                            );
+                }
 
-                            // Debug: Round-Robin-Auswahl loggen
-                            {
-                                let vs = state.validator_set.read().unwrap();
-                                let (_dbg_stakes, dbg_jailed, _dbg_wallets) = state.build_selection_context();
-                                let selected = vs.select_validator_round_robin(block.index, &dbg_jailed)
-                                    .map(|v| v.node_id.clone())
-                                    .unwrap_or_else(|| "?".into());
-                                let active_ids: Vec<String> = vs.validators.iter()
-                                    .filter(|v| v.active)
-                                    .filter(|v| !dbg_jailed.contains(&v.node_id))
-                                    .map(|v| v.node_id.clone())
-                                    .collect();
+                // ── Stall-Warnung ────────────────────────────────────────
+                {
+                    let pending = state.mempool.pending_count();
+                    if pending > 0 {
+                        let chain = state.chain.lock().unwrap();
+                        if let Some(last) = chain.blocks.last() {
+                            let age = Utc::now().timestamp() - last.timestamp;
+                            if age > (TARGET_BLOCK_TIME_SECS as i64 * 5) {
                                 println!(
-                                    "[consensus] 📤 Proposal für Block #{} gesendet (Runde {}, {} aktive Validators)",
-                                    block.index, round, active_validators,
+                                    "[mining] ⚠ Stall: {} pending TXs, letzter Block vor {}s (kein Miner aktiv?)",
+                                    pending, age,
                                 );
-                                println!(
-                                    "[consensus] 🔄 Round-Robin: Block #{} % {} = {} → Gewählt: '{}' (Aktive: {:?})",
-                                    block.index, active_ids.len(), block.index as usize % active_ids.len().max(1),
-                                    selected, active_ids,
-                                );
-                            }
-
-                            // ── Phase 1: Pre-Vote ──────────────────────────────
-                            // Eigene Pre-Vote: Auto-Accept
-                            let own_vote = VoteMessage::new_with_phase(
-                                round,
-                                block.hash.clone(),
-                                state.node_id.clone(),
-                                true,
-                                &signing_key,
-                                String::new(),
-                                VotePhase::PreVote,
-                            );
-
-                            // VotingRound starten (Phase 1: PreVote)
-                            {
-                                let vs = state.validator_set.read().unwrap();
-                                let mut voting = state.active_voting.lock().unwrap();
-                                let mut vr = VotingRound::new(round, block.hash.clone(), state.node_id.clone());
-                                let _ = vr.add_pre_vote(own_vote, &vs);
-                                *voting = Some(vr);
-                            }
-
-                            // Proposal an alle Healthy Peers senden → Pre-Votes sammeln
-                            let peer_urls: Vec<String> = {
-                                let peers = state.peers.read().unwrap();
-                                peers.iter()
-                                    .filter(|p| p.is_healthy())
-                                    .map(|p| p.url.clone())
-                                    .collect()
-                            };
-
-                            let proposal_json = serde_json::to_vec(&proposal).unwrap_or_default();
-                            let client = reqwest::Client::builder()
-                                .timeout(Duration::from_secs(VOTE_TIMEOUT_SECS))
-                                .danger_accept_invalid_certs(true)
-                                .build()
-                                .unwrap_or_default();
-
-                            for peer_url in &peer_urls {
-                                let url = format!("{}/api/v1/p2p/proposal", peer_url.trim_end_matches('/'));
-                                match client.post(&url)
-                                    .header("Content-Type", "application/json")
-                                    .body(proposal_json.clone())
-                                    .send()
-                                    .await
-                                {
-                                    Ok(resp) => {
-                                        let status = resp.status();
-                                        match resp.json::<serde_json::Value>().await {
-                                        Ok(val) => {
-                                            if let Ok(vote) = serde_json::from_value::<VoteMessage>(
-                                                val.get("vote").cloned().unwrap_or_default()
-                                            ) {
-                                                // Auto-Discovery: Voter registrieren falls unbekannt
-                                                let needs_register = {
-                                                    let vs = state.validator_set.read().unwrap();
-                                                    vs.get(&vote.voter_id).is_none()
-                                                };
-                                                if needs_register {
-                                                    // Quelle 1: voter_pub_key im Response (neue Server)
-                                                    let mut pk_opt = val.get("voter_pub_key")
-                                                        .and_then(|v| v.as_str())
-                                                        .map(|s| s.to_string());
-                                                    // Quelle 2: Fallback — Public Key vom Peer abrufen (alte Server)
-                                                    if pk_opt.is_none() {
-                                                        let info_url = format!("{}/api/v1/validators/self", peer_url.trim_end_matches('/'));
-                                                        if let Ok(info_resp) = client.get(&info_url).send().await {
-                                                            if let Ok(info_val) = info_resp.json::<serde_json::Value>().await {
-                                                                pk_opt = info_val.get("public_key_hex")
-                                                                    .and_then(|v| v.as_str())
-                                                                    .map(|s| s.to_string());
-                                                            }
-                                                        }
-                                                    }
-                                                    if let Some(pk) = pk_opt {
-                                                        if vote.verify_with_pubkey_hex(&pk) {
-                                                            let mut vs_w = state.validator_set.write().unwrap();
-                                                            if vs_w.get(&vote.voter_id).is_none() {
-                                                                let mut vi = crate::consensus::ValidatorInfo::new_pending(
-                                                                    vote.voter_id.clone(), pk,
-                                                                );
-                                                                vi.name = format!("Auto-discovered (PreVote)");
-                                                                vs_w.add(vi);
-                                                                println!(
-                                                                    "[consensus] 🔗 Voter '{}' automatisch als Validator registriert (PreVote)",
-                                                                    vote.voter_id,
-                                                                );
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                                let vs = state.validator_set.read().unwrap();
-                                                let mut voting = state.active_voting.lock().unwrap();
-                                                if let Some(ref mut vr) = *voting {
-                                                    if let Err(e) = vr.add_pre_vote(vote.clone(), &vs) {
-                                                        eprintln!("[consensus] PreVote von {} ungültig: {e}", peer_url);
-                                                    } else {
-                                                        if vote.accept {
-                                                            println!(
-                                                                "[consensus] 🗳️  PreVote von '{}': ✅ Accept",
-                                                                vote.voter_id,
-                                                            );
-                                                        } else {
-                                                            println!(
-                                                                "[consensus] 🗳️  PreVote von '{}': ❌ Reject – Grund: {}",
-                                                                vote.voter_id,
-                                                                if vote.reason.is_empty() { "(kein Grund angegeben)".to_string() } else { vote.reason.clone() },
-                                                            );
-                                                        }
-                                                    }
-                                                }
-                                            } else {
-                                                // Response hat kein gültiges "vote"-Feld → alter Server oder Fehler
-                                                let error = val.get("error").and_then(|v| v.as_str()).unwrap_or("kein vote-Feld");
-                                                eprintln!(
-                                                    "[consensus] ⚠️  Peer {} hat kein gültiges Vote zurückgegeben (HTTP {}): {}",
-                                                    peer_url, status, error,
-                                                );
-                                            }
-                                        }
-                                        Err(_) => {
-                                            eprintln!(
-                                                "[consensus] ⚠️  Peer {} hat keine JSON-Antwort gesendet (HTTP {})",
-                                                peer_url, status,
-                                            );
-                                        }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        eprintln!("[consensus] Proposal an {} fehlgeschlagen: {e}", peer_url);
-                                    }
-                                }
-                            }
-
-                            // Phase 1 auswerten: Responsive-Quorum
-                            // Zuerst reguläres Quorum prüfen. Wenn das scheitert UND
-                            // weniger als die Hälfte der Validators geantwortet hat,
-                            // Responsive-Quorum verwenden (nur Antwortende zählen).
-                            let (prevote_quorum, prevote_info) = {
-                                let vs = state.validator_set.read().unwrap();
-                                let voting = state.active_voting.lock().unwrap();
-                                if let Some(ref vr) = *voting {
-                                    let tally = vr.tally_pre_votes(&vs);
-                                    if tally.quorum_reached {
-                                        let info = format!(
-                                            "{}/{} PreVote-Accept, {}/{} nötig",
-                                            tally.accepts, tally.total_validators,
-                                            tally.threshold, tally.total_validators,
-                                        );
-                                        (true, info)
-                                    } else {
-                                        // Nicht genug Antworten? Responsive-Quorum versuchen:
-                                        // Nur tatsächlich antwortende Validators zählen
-                                        let responsive = vr.tally_pre_votes_responsive();
-                                        let responded = responsive.accepts + responsive.rejects;
-                                        if responded < tally.total_validators && responsive.quorum_reached {
-                                            let info = format!(
-                                                "{}/{} PreVote-Accept (responsive: {}/{} antworteten)",
-                                                responsive.accepts, responsive.total_validators,
-                                                responded, tally.total_validators,
-                                            );
-                                            println!(
-                                                "[consensus] ⚠️  Nur {}/{} Validators haben geantwortet – verwende Responsive-Quorum",
-                                                responded, tally.total_validators,
-                                            );
-                                            (true, info)
-                                        } else {
-                                            let info = format!(
-                                                "{}/{} PreVote-Accept, {}/{} nötig",
-                                                tally.accepts, tally.total_validators,
-                                                tally.threshold, tally.total_validators,
-                                            );
-                                            (false, info)
-                                        }
-                                    }
-                                } else {
-                                    (false, "Keine Voting-Runde".into())
-                                }
-                            };
-
-                            if !prevote_quorum {
-                                println!(
-                                    "[consensus] ❌ Kein PreVote-Quorum ({}) – Block #{} verworfen",
-                                    prevote_info, block.index,
-                                );
-                                for tx in &block.transactions {
-                                    if tx.tx_type != TxType::Reward && tx.tx_type != TxType::Memorial {
-                                        let _ = state.mempool.add_tx(tx.clone(), None);
-                                    }
-                                }
-                                // Chat-Batches zurückrollen (Nachrichten wieder auf Pending setzen)
-                                for batch in &block.chat_batches {
-                                    state.message_pool.unbatch(&batch.merkle_root);
-                                }
-                                *state.active_voting.lock().unwrap() = None;
-                                continue;
-                            }
-
-                            println!(
-                                "[consensus] ✅ PreVote-Quorum erreicht ({}) – starte PreCommit-Phase",
-                                prevote_info,
-                            );
-
-                            // ── Phase 2: Pre-Commit ────────────────────────────
-                            // Übergang zur PreCommit-Phase + PreCommitRequest bauen
-                            let pre_commit_request = {
-                                let mut voting = state.active_voting.lock().unwrap();
-                                if let Some(ref mut vr) = *voting {
-                                    // Voter-Keys für Auto-Discovery beim Empfänger zusammenstellen
-                                    let voter_keys = {
-                                        let vs = state.validator_set.read().unwrap();
-                                        vr.collected_pre_votes().iter()
-                                            .filter_map(|pv| {
-                                                vs.get(&pv.voter_id)
-                                                    .map(|v| (pv.voter_id.clone(), v.public_key_hex.clone()))
-                                            })
-                                            .collect::<std::collections::HashMap<_, _>>()
-                                    };
-                                    let req = PreCommitRequest {
-                                        round: vr.round,
-                                        block_hash: vr.block_hash.clone(),
-                                        proposer_id: vr.proposer_id.clone(),
-                                        pre_votes: vr.collected_pre_votes(),
-                                        voter_keys,
-                                    };
-                                    vr.advance_to_precommit();
-                                    // Eigene Pre-Commit: Auto-Accept
-                                    let own_pc = VoteMessage::new_with_phase(
-                                        round,
-                                        block.hash.clone(),
-                                        state.node_id.clone(),
-                                        true,
-                                        &signing_key,
-                                        String::new(),
-                                        VotePhase::PreCommit,
-                                    );
-                                    let vs = state.validator_set.read().unwrap();
-                                    let _ = vr.add_pre_commit(own_pc, &vs);
-                                    Some(req)
-                                } else {
-                                    None
-                                }
-                            };
-
-                            if let Some(pcr) = pre_commit_request {
-                                let pcr_json = serde_json::to_vec(&pcr).unwrap_or_default();
-
-                                for peer_url in &peer_urls {
-                                    let url = format!("{}/api/v1/p2p/precommit", peer_url.trim_end_matches('/'));
-                                    match client.post(&url)
-                                        .header("Content-Type", "application/json")
-                                        .body(pcr_json.clone())
-                                        .send()
-                                        .await
-                                    {
-                                        Ok(resp) => {
-                                            let status = resp.status();
-                                            match resp.json::<serde_json::Value>().await {
-                                            Ok(val) => {
-                                                if let Ok(vote) = serde_json::from_value::<VoteMessage>(
-                                                    val.get("vote").cloned().unwrap_or_default()
-                                                ) {
-                                                    // Auto-Discovery: Voter registrieren falls unbekannt
-                                                    let needs_register = {
-                                                        let vs = state.validator_set.read().unwrap();
-                                                        vs.get(&vote.voter_id).is_none()
-                                                    };
-                                                    if needs_register {
-                                                        let mut pk_opt = val.get("voter_pub_key")
-                                                            .and_then(|v| v.as_str())
-                                                            .map(|s| s.to_string());
-                                                        if pk_opt.is_none() {
-                                                            let info_url = format!("{}/api/v1/validators/self", peer_url.trim_end_matches('/'));
-                                                            if let Ok(info_resp) = client.get(&info_url).send().await {
-                                                                if let Ok(info_val) = info_resp.json::<serde_json::Value>().await {
-                                                                    pk_opt = info_val.get("public_key_hex")
-                                                                        .and_then(|v| v.as_str())
-                                                                        .map(|s| s.to_string());
-                                                                }
-                                                            }
-                                                        }
-                                                        if let Some(pk) = pk_opt {
-                                                            if vote.verify_with_pubkey_hex(&pk) {
-                                                                let mut vs_w = state.validator_set.write().unwrap();
-                                                                if vs_w.get(&vote.voter_id).is_none() {
-                                                                    let mut vi = crate::consensus::ValidatorInfo::new_pending(
-                                                                        vote.voter_id.clone(), pk,
-                                                                    );
-                                                                    vi.name = format!("Auto-discovered (PreCommit)");
-                                                                    vs_w.add(vi);
-                                                                    println!(
-                                                                        "[consensus] 🔗 Voter '{}' automatisch als Validator registriert (PreCommit)",
-                                                                        vote.voter_id,
-                                                                    );
-                                                                }
-                                                            }
-                                                        }
-                                                    }
-                                                    let vs = state.validator_set.read().unwrap();
-                                                    let mut voting = state.active_voting.lock().unwrap();
-                                                    if let Some(ref mut vr) = *voting {
-                                                        if let Err(e) = vr.add_pre_commit(vote.clone(), &vs) {
-                                                            eprintln!("[consensus] PreCommit von {} ungültig: {e}", peer_url);
-                                                        } else {
-                                                            println!(
-                                                                "[consensus] 🔒 PreCommit von '{}': {}",
-                                                                vote.voter_id,
-                                                                if vote.accept { "✅ Commit" } else { "❌ Reject" }
-                                                            );
-                                                        }
-                                                    }
-                                                } else {
-                                                    let error = val.get("error").and_then(|v| v.as_str()).unwrap_or("kein vote-Feld");
-                                                    eprintln!(
-                                                        "[consensus] ⚠️  Peer {} hat kein gültiges PreCommit-Vote (HTTP {}): {}",
-                                                        peer_url, status, error,
-                                                    );
-                                                }
-                                            }
-                                            Err(_) => {
-                                                eprintln!(
-                                                    "[consensus] ⚠️  Peer {} hat keine JSON-Antwort (PreCommit, HTTP {})",
-                                                    peer_url, status,
-                                                );
-                                            }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            eprintln!("[consensus] PreCommit-Anfrage an {} fehlgeschlagen: {e}", peer_url);
-                                        }
-                                    }
-                                }
-                            }
-
-                            // Phase 2 finalisieren: ⅔+1 Pre-Commits?
-                            let (quorum_reached, tally_info) = {
-                                let vs = state.validator_set.read().unwrap();
-                                let mut voting = state.active_voting.lock().unwrap();
-                                if let Some(ref mut vr) = *voting {
-                                    let (tally, was_responsive) = vr.finalize_responsive(&vs);
-                                    let info = if was_responsive {
-                                        println!(
-                                            "[consensus] ⚠️  Nur {}/{} Validators haben geantwortet (PreCommit) – verwende Responsive-Quorum",
-                                            tally.total_validators, vs.active_count(),
-                                        );
-                                        format!(
-                                            "{}/{} PreCommit-Accept (responsive: {}/{} antworteten)",
-                                            tally.accepts, tally.total_validators,
-                                            tally.total_validators, vs.active_count(),
-                                        )
-                                    } else {
-                                        format!(
-                                            "{}/{} PreCommit-Accept, {}/{} nötig",
-                                            tally.accepts, tally.total_validators,
-                                            tally.threshold, tally.total_validators,
-                                        )
-                                    };
-                                    (tally.quorum_reached, info)
-                                } else {
-                                    (false, "Keine Voting-Runde".into())
-                                }
-                            };
-
-                            if quorum_reached {
-                                println!(
-                                    "[consensus] ✅ 2-Phase BFT Quorum erreicht ({}) – Block #{} wird committed",
-                                    tally_info, block.index,
-                                );
-                                match state.commit_mining_block(block.clone()) {
-                                    Ok(()) => {
-                                        // Committete Challenge-Responses aus Pending-Buffer entfernen
-                                        let committed_ids: Vec<String> = block.challenge_responses
-                                            .iter().map(|r| r.challenge_id.clone()).collect();
-                                        state.clear_committed_responses(&committed_ids);
-
-                                        Self::post_block_staking(&state, &block);
-                                        Self::post_block_slashing(&state, &block);
-                                        Self::post_block_reputation(&state, &block);
-                                        Self::post_block_chat_policy(&state, &block, None);
-                                        Self::post_block_checkpoint(&state, &block).await;
-
-                                        // ── Block via P2P-Gossipsub broadcasten ──
-                                        {
-                                            let tx = state.block_broadcast_tx.lock().unwrap();
-                                            if let Some(ref sender) = *tx {
-                                                let _ = sender.send(block.clone());
-                                            }
-                                        }
-                                    }
-                                    Err(e) => eprintln!("[consensus] Commit fehlgeschlagen: {e}"),
-                                }
-                            } else {
-                                println!(
-                                    "[consensus] ❌ Kein PreCommit-Quorum ({}) – Block #{} verworfen",
-                                    tally_info, block.index,
-                                );
-                                // TXs zurück in den Mempool (außer Reward + Memorial)
-                                for tx in &block.transactions {
-                                    if tx.tx_type != TxType::Reward && tx.tx_type != TxType::Memorial {
-                                        let _ = state.mempool.add_tx(tx.clone(), None);
-                                    }
-                                }
-                                // Chat-Batches zurückrollen (Nachrichten wieder auf Pending setzen)
-                                for batch in &block.chat_batches {
-                                    state.message_pool.unbatch(&batch.merkle_root);
-                                }
-                            }
-
-                            // Voting-Runde aufräumen
-                            *state.active_voting.lock().unwrap() = None;
-                        }
-                        Err(e) => {
-                            if !e.contains("nicht ausgewählt") && !e.contains("kein aktiver") {
-                                eprintln!("[mining] {e}");
                             }
                         }
                     }
                 }
+
+                // ── Template aktualisieren ────────────────────────────────
+                // Nur neues Template erstellen wenn:
+                // 1. Noch kein Template vorhanden, oder
+                // 2. Neuer Block seit letztem Template (Height hat sich geändert)
+                let needs_new_template = {
+                    let tmpl = state.current_mining_template.read().unwrap();
+                    match tmpl.as_ref() {
+                        Some((t, _)) => t.block_index != current_height,
+                        None => true,
+                    }
+                };
+
+                if needs_new_template {
+                    match state.prepare_block_template() {
+                        Ok(template) => {
+                            last_template_height = template.block_index;
+                        }
+                        Err(e) => {
+                            if !e.contains("kein aktiver") {
+                                eprintln!("[mining] Template-Fehler: {e}");
+                            }
+                        }
+                    }
+                }
+
+                // ── Post-Block-Hooks für Gossip-Blöcke ───────────────────
+                // Checkpoint-Prüfung
+                if current_height > 0 && current_height % 100 == 0 {
+                    let block = {
+                        let chain = state.chain.lock().unwrap();
+                        chain.blocks.last().cloned()
+                    };
+                    if let Some(block) = block {
+                        Self::post_block_checkpoint(&state, &block).await;
+                    }
+                }
             }
         });
+    }
+
+    /// Öffentlicher Wrapper für alle Post-Block-Hooks.
+    /// Wird vom Mining-Submit-Handler aufgerufen.
+    pub fn run_post_block_hooks(state: &Arc<Self>, block: &Block) {
+        Self::post_block_staking(state, block);
+        Self::post_block_slashing(state, block);
+        Self::post_block_reputation(state, block);
+        Self::post_block_chat_policy(state, block, None);
     }
 
     /// Staking Epoch-Verarbeitung nach einem committed Block.

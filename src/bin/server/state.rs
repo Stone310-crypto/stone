@@ -1,9 +1,11 @@
 //! Shared application state, constants, chunk helpers, and peer persistence.
 
 use std::{
+    collections::HashMap,
     sync::{Arc, Mutex, RwLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
+use serde::{Deserialize, Serialize};
 use stone::{
     auth::{User, ChallengeStore, QrLoginStore},
     blockchain::{ChunkRef, data_dir, CHUNK_SIZE, Document},
@@ -53,6 +55,65 @@ pub struct AppState {
     pub challenge_store: ChallengeStore,
     /// QR-Login-Store für Cross-Device Authentifizierung (iOS App → Website)
     pub qr_login_store: QrLoginStore,
+    /// Miner-Status-Relay: Miner pushen ihren Status, Apps pollen ihn
+    pub miner_status_store: MinerStatusStore,
+}
+
+// ─── Miner Status Relay Store ────────────────────────────────────────────────
+
+/// TTL für Miner-Status-Reports (60 Sekunden)
+const MINER_STATUS_TTL_SECS: u64 = 60;
+
+/// Einzelner Miner-Status-Report (vom Miner signiert)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MinerStatusReport {
+    pub wallet: String,
+    pub timestamp: u64,
+    pub hashrate: f64,
+    pub block_height: u64,
+    pub blocks_mined: u64,
+    pub difficulty: u32,
+    pub active: bool,
+    pub throttle_pct: u64,
+    pub total_rewards: String,
+    pub peers_connected: u64,
+    pub uptime_secs: u64,
+    pub version: String,
+    pub node_name: String,
+    pub signature: String,
+}
+
+#[derive(Clone)]
+pub struct MinerStatusStore {
+    inner: Arc<Mutex<HashMap<String, (MinerStatusReport, Instant)>>>,
+}
+
+impl MinerStatusStore {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Speichert einen Status-Report für eine Wallet
+    pub fn insert(&self, report: MinerStatusReport) {
+        let wallet = report.wallet.clone();
+        let mut map = self.inner.lock().unwrap();
+        map.insert(wallet, (report, Instant::now()));
+        // Cleanup: Alte Einträge entfernen
+        map.retain(|_, (_, ts)| ts.elapsed().as_secs() < MINER_STATUS_TTL_SECS * 5);
+    }
+
+    /// Holt den letzten Status für eine Wallet (falls noch nicht abgelaufen)
+    pub fn get(&self, wallet: &str) -> Option<MinerStatusReport> {
+        let map = self.inner.lock().unwrap();
+        if let Some((report, ts)) = map.get(wallet) {
+            if ts.elapsed().as_secs() < MINER_STATUS_TTL_SECS {
+                return Some(report.clone());
+            }
+        }
+        None
+    }
 }
 
 // ─── API-Key laden ────────────────────────────────────────────────────────────

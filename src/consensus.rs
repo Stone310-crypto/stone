@@ -530,6 +530,8 @@ impl ValidatorSet {
             prev_hash, block_index, pow_nonce,
             &empty_jailed, &empty_stakes, &wallet_map,
             None, false,
+            "", 0, "",
+            0,
         )
     }
 
@@ -557,6 +559,12 @@ impl ValidatorSet {
         wallet_map: &HashMap<String, String>,
         last_block_ts: Option<i64>,
         initial_sync_done: bool,
+        // Competitive PoW Felder
+        pow_hash: &str,
+        pow_difficulty: u32,
+        validator_pubkey: &str,
+        // PoS/PoW Hybrid
+        effective_difficulty: u32,
     ) -> BlockVerifyResult {
         // Basis-Prüfung (Signatur + Validator-Status)
         let basic = self.verify_block(block_hash, signer_node_id, signature_hex);
@@ -579,6 +587,21 @@ impl ValidatorSet {
             return BlockVerifyResult::NotSelectedValidator;
         }
 
+        // ── Competitive PoW: Argon2id als primärer Konsensus ──────────────
+        // Jeder Validator mit gültigem PoW darf einen Block produzieren.
+        // Kein Round-Robin nötig — der schnellste Miner gewinnt.
+        if pow_difficulty > 0 && !pow_hash.is_empty() {
+            // PoS/PoW Hybrid: verwende effective_difficulty (Stake-reduziert) falls gesetzt
+            let verify_d = if effective_difficulty > 0 { effective_difficulty } else { pow_difficulty };
+            if verify_argon2_pow(prev_hash, block_index, validator_pubkey, pow_nonce, pow_hash, verify_d) {
+                return BlockVerifyResult::Valid;
+            }
+            // PoW-Felder gesetzt aber ungültig → ablehnen
+            return BlockVerifyResult::NotSelectedValidator;
+        }
+
+        // ── Legacy-Validierung (für Blöcke vor Competitive-PoW) ───────────
+
         // 1. Round-Robin mit echtem Jailed-Set
         if self.is_round_robin_turn(signer_node_id, block_index, jailed) {
             return BlockVerifyResult::Valid;
@@ -596,13 +619,12 @@ impl ValidatorSet {
         }
 
         // 4. Backup-Proposer mit echten Stakes/Jailed — NUR nach Timeout.
-        //    Verhindert dass Backup-Proposer sofort konkurrierend produzieren.
         let backup_allowed = match last_block_ts {
             Some(ts) => {
                 let age = chrono::Utc::now().timestamp() - ts;
                 age >= (BACKUP_PROPOSER_TIMEOUT_SECS as i64)
             }
-            None => true, // Kein Timestamp verfügbar → Legacy-Verhalten
+            None => true,
         };
         if backup_allowed {
             if let Some(rank) = self.backup_proposer_rank(
@@ -747,7 +769,7 @@ pub fn solve_message_pow(msg_id: &str, difficulty: u32) -> u64 {
 }
 
 /// Zählt die führenden Null-Bits in einem Byte-Array.
-fn leading_zero_bits(bytes: &[u8]) -> u32 {
+pub fn leading_zero_bits(bytes: &[u8]) -> u32 {
     let mut count = 0u32;
     for &b in bytes {
         if b == 0 {
@@ -779,9 +801,9 @@ fn leading_zero_bits(bytes: &[u8]) -> u32 {
 // entspricht (~15 Sekunden Mining-Zeit bei 120s Block-Intervall).
 
 /// Standard-Difficulty für Argon2id-PoW (Anzahl führender Null-Bits).
-/// 8 Bits → ~256 Argon2id-Hashes → bei ~100ms/Hash ≈ 25s auf Desktop-CPU.
+/// 12 Bits → ~4096 Argon2id-Hashes → bei ~100ms/Hash ≈ 7 Min auf Desktop-CPU.
 /// Wird dynamisch über `calculate_next_difficulty()` angepasst.
-pub const ARGON2_POW_INITIAL_DIFFICULTY: u32 = 8;
+pub const ARGON2_POW_INITIAL_DIFFICULTY: u32 = 12;
 
 /// Argon2id Memory-Parameter in KiB (64 MiB).
 /// Genug um GPU/ASIC-Vorteil zu eliminieren, wenig genug für jeden Laptop.
@@ -796,20 +818,73 @@ pub const ARGON2_ITERATIONS: u32 = 4;
 pub const ARGON2_PARALLELISM: u32 = 1;
 
 /// Difficulty-Adjustment alle N Blöcke.
-pub const DIFFICULTY_ADJUSTMENT_INTERVAL: u64 = 100;
+pub const DIFFICULTY_ADJUSTMENT_INTERVAL: u64 = 50;
 
-/// Ziel-Mining-Zeit in Sekunden (wie lange das PoW-Puzzle dauern soll).
-pub const TARGET_MINING_TIME_SECS: u64 = 15;
+/// Ziel-Block-Zeit in Sekunden (Gesamtzeit pro Block).
+/// 30s = schnelle Blöcke, Difficulty wird dynamisch angepasst.
+pub const TARGET_BLOCK_TIME_SECS: u64 = 30;
 
 /// Minimale Difficulty (nie unter diesem Wert).
 pub const MIN_POW_DIFFICULTY: u32 = 4;
 
 /// Maximale Difficulty (nie über diesem Wert).
-pub const MAX_POW_DIFFICULTY: u32 = 24;
+pub const MAX_POW_DIFFICULTY: u32 = 32;
 
 /// Ab welchem Block-Index Argon2id-PoW aktiviert ist.
-/// Alle Blöcke vor diesem Index sind Legacy-Blöcke ohne Argon2id.
-pub const ARGON2_POW_ACTIVATION_BLOCK: u64 = 600;
+/// 0 = PoW von Genesis an (Competitive Mining ab Start).
+pub const ARGON2_POW_ACTIVATION_BLOCK: u64 = 0;
+
+// ─── PoS/PoW Hybrid Konstanten ──────────────────────────────────────────────
+
+/// Maximaler Difficulty-Bonus durch Staking (Anzahl Bits).
+/// 3 Bits = bis zu 8× leichteres Mining für den größten Staker.
+pub const MAX_STAKE_DIFFICULTY_BONUS: u32 = 3;
+
+/// Minimale effektive Difficulty (auch mit maximalem Stake-Bonus nie darunter).
+pub const MIN_EFFECTIVE_POW_DIFFICULTY: u32 = 4;
+
+/// Berechnet den Difficulty-Bonus basierend auf dem Stake des Miners.
+///
+/// Formel: `floor(sqrt(miner_stake / total_staked) × MAX_STAKE_DIFFICULTY_BONUS)`
+/// Sqrt bewirkt abnehmende Rendite: hoher Stake-Anteil nötig für maximalen Bonus.
+///
+/// Beispiele (bei MAX_STAKE_DIFFICULTY_BONUS=3):
+///   1% Stake → sqrt(0.01)=0.1  →  0 Bits
+///  11% Stake → sqrt(0.11)=0.33 →  1 Bit  (2× leichter)
+///  45% Stake → sqrt(0.45)=0.67 →  2 Bits (4× leichter)
+/// 100% Stake → sqrt(1.0)=1.0   →  3 Bits (8× leichter)
+pub fn calculate_stake_difficulty_bonus(
+    miner_stake: rust_decimal::Decimal,
+    total_staked: rust_decimal::Decimal,
+) -> u32 {
+    if total_staked <= rust_decimal::Decimal::ZERO
+        || miner_stake <= rust_decimal::Decimal::ZERO
+    {
+        return 0;
+    }
+    use rust_decimal::prelude::ToPrimitive;
+    let ratio = (miner_stake / total_staked)
+        .min(rust_decimal::Decimal::ONE)
+        .to_f64()
+        .unwrap_or(0.0);
+    let bonus = (ratio.sqrt() * MAX_STAKE_DIFFICULTY_BONUS as f64).floor() as u32;
+    bonus.min(MAX_STAKE_DIFFICULTY_BONUS)
+}
+
+/// Berechnet die effektive PoW-Difficulty nach Abzug des Stake-Bonus.
+///
+/// `base_difficulty` kommt von `get_current_pow_difficulty()` (Netzwerk-Difficulty).
+/// Staker bekommen eine reduzierte Difficulty → finden Blöcke schneller.
+pub fn effective_pow_difficulty(
+    base_difficulty: u32,
+    miner_stake: rust_decimal::Decimal,
+    total_staked: rust_decimal::Decimal,
+) -> u32 {
+    let bonus = calculate_stake_difficulty_bonus(miner_stake, total_staked);
+    base_difficulty
+        .saturating_sub(bonus)
+        .max(MIN_EFFECTIVE_POW_DIFFICULTY)
+}
 
 /// Löst ein Argon2id Proof-of-Work Puzzle.
 ///
@@ -853,7 +928,7 @@ pub fn solve_argon2_pow(
 ///
 /// Input (salt): `prev_hash || block_index (LE) || validator_pubkey || nonce (LE)`
 /// Password: Kombination der Input-Felder (deterministisch).
-fn compute_argon2_pow_hash(
+pub fn compute_argon2_pow_hash(
     prev_hash: &str,
     block_index: u64,
     validator_pubkey: &str,
@@ -922,7 +997,7 @@ pub fn verify_argon2_pow(
 ///
 /// Algorithmus:
 /// 1. Messe die durchschnittliche Block-Time der letzten DIFFICULTY_ADJUSTMENT_INTERVAL Blöcke
-/// 2. Vergleiche mit TARGET_MINING_TIME_SECS + MINING_INTERVAL
+/// 2. Vergleiche mit TARGET_BLOCK_TIME_SECS
 /// 3. Passe Difficulty um ±1 an (smooth adjustment, kein Springen)
 ///
 /// Wird nur aufgerufen wenn `block_index % DIFFICULTY_ADJUSTMENT_INTERVAL == 0`.
@@ -946,14 +1021,16 @@ pub fn calculate_next_difficulty(
     let time_span = (recent.last().unwrap().timestamp - recent.first().unwrap().timestamp).max(1);
     let avg_block_time = time_span as u64 / (recent.len() as u64 - 1);
 
-    // Ziel: MINING_INTERVAL (120s) Gesamtzeit pro Block.
-    // Davon soll TARGET_MINING_TIME_SECS (15s) auf PoW entfallen.
-    let target_total = crate::master_node::MINING_INTERVAL_SECS;
+    // Ziel: TARGET_BLOCK_TIME_SECS (30s) Gesamtzeit pro Block.
+    let target = TARGET_BLOCK_TIME_SECS;
+    // Toleranzband: ±30% vom Target
+    let upper = target + target / 3; // ~40s
+    let lower = target.saturating_sub(target / 3); // ~20s
 
-    let new_difficulty = if avg_block_time > target_total + 30 {
+    let new_difficulty = if avg_block_time > upper {
         // Blöcke zu langsam → Difficulty runter
         current_difficulty.saturating_sub(1)
-    } else if avg_block_time < target_total.saturating_sub(30) {
+    } else if avg_block_time < lower {
         // Blöcke zu schnell → Difficulty hoch
         current_difficulty + 1
     } else {

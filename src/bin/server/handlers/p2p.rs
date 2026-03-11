@@ -264,23 +264,53 @@ pub async fn handle_p2p_proposal(
         })));
     }
 
-    // Validator-Auswahl prüfen (Stake-gewichtete Rotation)
+    // Validator-Auswahl prüfen: Primärer Validator ODER PoW-Fallback
     let (stakes, jailed, wallet_map) = state.node.build_selection_context();
-    if !vs.is_selected_validator_weighted(&proposal.proposer_id, &prev_hash, proposal.block.index, &stakes, &jailed, &wallet_map) {
-        let signing_key = load_or_create_validator_key();
-        let vote = VoteMessage::new(
-            proposal.round,
-            proposal.block.hash.clone(),
-            state.node.node_id.clone(),
-            false,
-            &signing_key,
-            format!("Validator '{}' ist nicht der ausgewählte für Block #{}", proposal.proposer_id, proposal.block.index),
+    let is_primary = vs.is_selected_validator_weighted(
+        &proposal.proposer_id, &prev_hash, proposal.block.index,
+        &stakes, &jailed, &wallet_map,
+    ) || vs.is_round_robin_turn(&proposal.proposer_id, proposal.block.index, &jailed);
+
+    if !is_primary {
+        // Nicht der primäre Validator → prüfe PoW-Fallback
+        let pow_valid = proposal.block.pow_nonce > 0
+            && stone::consensus::verify_lite_pow(
+                &prev_hash,
+                proposal.block.index,
+                &proposal.proposer_id,
+                proposal.block.pow_nonce,
+                stone::consensus::BLOCK_POW_DIFFICULTY,
+            );
+
+        let last_block_age = {
+            let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
+            chain.blocks.last()
+                .map(|b| (chrono::Utc::now().timestamp() - b.timestamp) as u64)
+                .unwrap_or(u64::MAX)
+        };
+        let fallback_threshold = stone::master_node::MINING_INTERVAL_SECS * 2;
+
+        if !pow_valid || last_block_age < fallback_threshold {
+            let signing_key = load_or_create_validator_key();
+            let vote = VoteMessage::new(
+                proposal.round,
+                proposal.block.hash.clone(),
+                state.node.node_id.clone(),
+                false,
+                &signing_key,
+                format!("Validator '{}' ist nicht der ausgewählte für Block #{}", proposal.proposer_id, proposal.block.index),
+            );
+            return (StatusCode::OK, axum::Json(json!({
+                "ok": false,
+                "error": "Nicht der ausgewählte Validator für diesen Slot",
+                "vote": vote,
+            })));
+        }
+        // PoW-Fallback akzeptiert: Primärer Validator hat Slot verpasst
+        println!(
+            "[consensus] ⚡ PoW-Fallback akzeptiert für Block #{} von '{}' (letzter Block vor {}s)",
+            proposal.block.index, proposal.proposer_id, last_block_age,
         );
-        return (StatusCode::OK, axum::Json(json!({
-            "ok": false,
-            "error": "Nicht der ausgewählte Validator für diesen Slot",
-            "vote": vote,
-        })));
     }
 
     // 4. Block-Hash verifizieren (Integrität)

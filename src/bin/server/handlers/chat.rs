@@ -257,7 +257,74 @@ pub async fn handle_chat_conversations(
 
     let users_map = state.users.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let idx = state.chat_index.lock().unwrap_or_else(|e| e.into_inner());
-    let convos = idx.conversations_for(&user.wallet_address, &users_map);
+    let mut convos = idx.conversations_for(&user.wallet_address, &users_map);
+    let existing_peers: std::collections::HashSet<String> = convos.iter()
+        .map(|c| c.peer_wallet.clone()).collect();
+    drop(idx);
+
+    // Pending ChatMessage TXs als Konversationen ergänzen (noch nicht gemined)
+    let pending_txs = state.node.mempool.pending_txs();
+    let mut pending_convos: std::collections::HashMap<String, (String, String, i64, String, String)> = std::collections::HashMap::new();
+    for tx in &pending_txs {
+        if tx.tx_type != TxType::ChatMessage {
+            continue;
+        }
+        let (is_mine, peer) = if tx.from == user.wallet_address {
+            (true, tx.to.clone())
+        } else if tx.to == user.wallet_address {
+            (false, tx.from.clone())
+        } else {
+            continue;
+        };
+        // Nur neue Konversationen (nicht bereits im Index) oder neuere Nachrichten
+        let entry = pending_convos.entry(peer.clone()).or_insert_with(|| {
+            let memo_data = serde_json::from_str::<serde_json::Value>(&tx.memo).unwrap_or_default();
+            let msg_id = memo_data["msg_id"].as_str().unwrap_or("").to_string();
+            let encrypted = memo_data["encrypted"].as_str().unwrap_or("").to_string();
+            (msg_id, encrypted, tx.timestamp, tx.from.clone(), peer.clone())
+        });
+        if tx.timestamp > entry.2 {
+            let memo_data = serde_json::from_str::<serde_json::Value>(&tx.memo).unwrap_or_default();
+            *entry = (
+                memo_data["msg_id"].as_str().unwrap_or("").to_string(),
+                memo_data["encrypted"].as_str().unwrap_or("").to_string(),
+                tx.timestamp,
+                tx.from.clone(),
+                if is_mine { tx.to.clone() } else { tx.from.clone() },
+            );
+        }
+    }
+    for (peer, (msg_id, encrypted, ts, from_wallet, _)) in pending_convos {
+        if existing_peers.contains(&peer) {
+            // Update existing conversation if pending message is newer
+            if let Some(c) = convos.iter_mut().find(|c| c.peer_wallet == peer) {
+                if ts > c.last_timestamp {
+                    c.last_timestamp = ts;
+                    c.last_msg_id = msg_id;
+                    c.last_message_preview = encrypted;
+                    c.last_from_wallet = from_wallet;
+                }
+            }
+        } else {
+            let (peer_user_id, peer_name) = users_map
+                .iter()
+                .find(|u| u.wallet_address == peer)
+                .map(|u| (u.id.clone(), u.name.clone()))
+                .unwrap_or_else(|| (String::new(), format!("{}…", &peer[..8.min(peer.len())])));
+            convos.push(stone::chat::ConversationSummary {
+                peer_wallet: peer.clone(),
+                peer_user_id,
+                peer_name,
+                last_message_preview: encrypted,
+                last_timestamp: ts,
+                last_msg_id: msg_id,
+                last_from_wallet: from_wallet,
+                unread_count: 1,
+                total_messages: 1,
+            });
+        }
+    }
+    convos.sort_by(|a, b| b.last_timestamp.cmp(&a.last_timestamp));
 
     (
         StatusCode::OK,
@@ -293,11 +360,49 @@ pub async fn handle_chat_messages(
     index_new_blocks_if_needed(&state);
 
     let idx = state.chat_index.lock().unwrap_or_else(|e| e.into_inner());
-    let messages = idx.messages_between(&user.wallet_address, &peer_wallet, query.limit, query.offset);
+    let confirmed: Vec<stone::chat::ChatEntry> = idx.messages_between(&user.wallet_address, &peer_wallet, query.limit, query.offset)
+        .into_iter().cloned().collect();
+    let confirmed_msg_ids: std::collections::HashSet<String> = confirmed.iter()
+        .map(|m| m.msg_id.clone()).collect();
+    drop(idx);
+
+    // Pending ChatMessage TXs aus dem Mempool als ChatEntry anhängen
+    let pending_entries: Vec<stone::chat::ChatEntry> = state.node.mempool.pending_txs()
+        .into_iter()
+        .filter(|tx| {
+            tx.tx_type == TxType::ChatMessage && (
+                (tx.from == user.wallet_address && tx.to == peer_wallet)
+                || (tx.from == peer_wallet && tx.to == user.wallet_address)
+            )
+        })
+        .filter_map(|tx| {
+            serde_json::from_str::<serde_json::Value>(&tx.memo).ok().map(|data| {
+                let msg_id = data["msg_id"].as_str().unwrap_or("").to_string();
+                (msg_id, tx, data)
+            })
+        })
+        .filter(|(msg_id, _, _)| !msg_id.is_empty() && !confirmed_msg_ids.contains(msg_id))
+        .map(|(msg_id, tx, data)| stone::chat::ChatEntry {
+            msg_id,
+            from_wallet: tx.from,
+            to_wallet: tx.to,
+            from_user_id: data["from_user_id"].as_str().unwrap_or("").to_string(),
+            from_name: data["from_name"].as_str().unwrap_or("").to_string(),
+            encrypted_content: data["encrypted"].as_str().unwrap_or("").to_string(),
+            nonce: data["nonce"].as_str().unwrap_or("").to_string(),
+            timestamp: tx.timestamp,
+            block_index: 0,
+            tx_id: tx.tx_id,
+        })
+        .collect();
+
+    let mut messages = confirmed;
+    messages.extend(pending_entries);
+    messages.sort_by_key(|m| m.timestamp);
 
     // Diagnostic info
     let block_height = state.node.chain.lock().unwrap_or_else(|e| e.into_inner()).blocks.len() as u64;
-    let last_indexed = idx.last_indexed_block;
+    let last_indexed = state.chat_index.lock().unwrap_or_else(|e| e.into_inner()).last_indexed_block;
     let mempool_count = state.node.mempool.pending_count();
     let mining_active = state.node.metrics.mining_throttle_pct.load(std::sync::atomic::Ordering::Relaxed) > 0;
 
@@ -1312,6 +1417,7 @@ pub async fn handle_chat_proof(
 #[derive(Deserialize)]
 pub struct SendContactRequestBody {
     /// Empfänger: Wallet-Adresse, User-ID oder Name
+    #[serde(alias = "identifier")]
     pub to: String,
 }
 

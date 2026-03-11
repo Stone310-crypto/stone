@@ -2795,7 +2795,83 @@ impl SwarmTask {
                     return;
                 }
 
-                println!("[p2p] 📦 Block #{} von {source} (hash={}...) ✓ validiert", block.index, &block.hash[..8]);
+                // ── Argon2id-PoW Schnellprüfung ──────────────────────────────
+                // Blöcke ab dem Activation-Block müssen einen gültigen Argon2id-PoW haben.
+                // Prüfung hier verhindert Weiterleitung ungültiger PoW-Blöcke im Gossip.
+                {
+                    use crate::consensus::{
+                        ARGON2_POW_ACTIVATION_BLOCK, MIN_EFFECTIVE_POW_DIFFICULTY,
+                        MAX_STAKE_DIFFICULTY_BONUS,
+                    };
+                    if block.index >= ARGON2_POW_ACTIVATION_BLOCK && block.index > 0 {
+                        if block.pow_hash.is_empty() || block.pow_difficulty == 0 {
+                            eprintln!(
+                                "[p2p] ⚠ Block #{} von {source}: Argon2id-PoW fehlt – ignoriert",
+                                block.index
+                            );
+                            self.add_peer_penalty(&source, 100, "missing pow");
+                            return;
+                        }
+                        // PoS/PoW Hybrid: effective_difficulty Plausibilität prüfen
+                        if block.effective_difficulty > 0 {
+                            if block.effective_difficulty > block.pow_difficulty {
+                                eprintln!(
+                                    "[p2p] ⚠ Block #{} von {source}: effective_difficulty ({}) > pow_difficulty ({}) – ignoriert",
+                                    block.index, block.effective_difficulty, block.pow_difficulty,
+                                );
+                                self.add_peer_penalty(&source, 100, "invalid effective_difficulty");
+                                return;
+                            }
+                            if block.effective_difficulty < MIN_EFFECTIVE_POW_DIFFICULTY {
+                                eprintln!(
+                                    "[p2p] ⚠ Block #{} von {source}: effective_difficulty ({}) < MIN ({}) – ignoriert",
+                                    block.index, block.effective_difficulty, MIN_EFFECTIVE_POW_DIFFICULTY,
+                                );
+                                self.add_peer_penalty(&source, 100, "effective_difficulty below min");
+                                return;
+                            }
+                            let bonus = block.pow_difficulty - block.effective_difficulty;
+                            if bonus > MAX_STAKE_DIFFICULTY_BONUS {
+                                eprintln!(
+                                    "[p2p] ⚠ Block #{} von {source}: Stake-Bonus ({}) > MAX ({}) – ignoriert",
+                                    block.index, bonus, MAX_STAKE_DIFFICULTY_BONUS,
+                                );
+                                self.add_peer_penalty(&source, 100, "stake bonus too high");
+                                return;
+                            }
+                        }
+                        // PoW gegen effektive Difficulty verifizieren
+                        let verify_difficulty = if block.effective_difficulty > 0 {
+                            block.effective_difficulty
+                        } else {
+                            block.pow_difficulty
+                        };
+                        if !crate::consensus::verify_argon2_pow(
+                            &block.previous_hash,
+                            block.index,
+                            &block.validator_pub_key,
+                            block.pow_nonce,
+                            &block.pow_hash,
+                            verify_difficulty,
+                        ) {
+                            eprintln!(
+                                "[p2p] ⚠ Block #{} von {source}: Ungültiger Argon2id-PoW (d={}) – ignoriert",
+                                block.index, verify_difficulty,
+                            );
+                            self.add_peer_penalty(&source, 200, "invalid argon2id pow");
+                            return;
+                        }
+                        // Stake-Verifizierung: effective_difficulty korrekt für den Miner?
+                        // Detaillierte Prüfung erfolgt in accept_peer_block; hier nur Bounds-Check.
+                    }
+                }
+
+                println!(
+                    "[p2p] 📦 Block #{} von {source} (hash={}…, d={}/{}, cd={}) ✓ validiert",
+                    block.index, &block.hash[..8],
+                    block.effective_difficulty, block.pow_difficulty,
+                    block.cumulative_difficulty,
+                );
 
                 if let Some(entry) = self.peers.get_mut(&source) {
                     entry.blocks_received += 1;
@@ -2809,7 +2885,20 @@ impl SwarmTask {
                     .unwrap_or(self.local_chain_count);
 
                 if block.index < actual_local {
-                    // Block liegt hinter unserer Chain → veraltet, ignorieren
+                    // ── Fork-Erkennung: Competing Block innerhalb Reorg-Tiefe ──
+                    // Statt veraltet wegwerfen → als potenziellen Fork weiterleiten.
+                    let depth = actual_local - block.index;
+                    if depth <= crate::blockchain::MAX_REORG_DEPTH {
+                        println!(
+                            "[p2p] 🔀 Competing Block #{} von {source} (Tiefe: {depth}) – weiterleiten",
+                            block.index,
+                        );
+                        let _ = self.event_tx.send(NetworkEvent::BlockReceived {
+                            block: Box::new(block),
+                            from_peer: source.to_string(),
+                        });
+                    }
+                    // Blöcke jenseits MAX_REORG_DEPTH → wirklich veraltet
                     return;
                 }
 

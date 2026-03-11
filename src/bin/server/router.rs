@@ -25,6 +25,8 @@ use super::handlers::{
         handle_mining_status, handle_mining_throttle, handle_mining_withdraw,
         handle_mining_stake, handle_mining_unstake,
         handle_bind_mining_wallet, handle_mining_wallet_info,
+        handle_mining_template, handle_mining_submit,
+        handle_mining_report, handle_mining_remote_status,
     },
     chat::{
         handle_chat_conversations, handle_chat_messages, handle_chat_pending,
@@ -296,6 +298,12 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/mining/unstake", post(handle_mining_unstake))
         .route("/api/v1/mining/bind-wallet", post(handle_bind_mining_wallet))
         .route("/api/v1/mining/wallet", get(handle_mining_wallet_info))
+        // ─── Competitive PoW: External Miner API ────────────────────────
+        .route("/api/v1/mining/template", get(handle_mining_template))
+        .route("/api/v1/mining/submit", post(handle_mining_submit))
+        // ─── Miner Status Relay (Bootstrap-Server als Relay) ────────────
+        .route("/api/v1/mining/report", post(handle_mining_report))
+        .route("/api/v1/mining/remote-status/{wallet}", get(handle_mining_remote_status))
         // ─── Reputation ──────────────────────────────────────────────────────
         .route("/api/v1/reputation/status", get(handle_reputation_status))
         .route("/api/v1/reputation/nodes", get(handle_reputation_nodes))

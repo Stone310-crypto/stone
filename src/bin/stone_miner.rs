@@ -182,6 +182,30 @@ struct SystemMetrics {
     stone_data_size_bytes: u64,
 }
 
+// ─── PoW Mining Metrics ─────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Default)]
+struct PowMetrics {
+    /// Aktiv am Mining?
+    solving: bool,
+    /// Aktuelle Hashrate (Hashes/Sekunde)
+    hashrate: f64,
+    /// Aktueller Nonce-Fortschritt
+    current_nonce: u64,
+    /// Aktuelle Difficulty
+    current_difficulty: u32,
+    /// Block-Index des aktuellen Templates
+    current_block_index: u64,
+    /// Template-ID
+    current_template_id: String,
+    /// Gelöste Blöcke insgesamt (lokal gezählt)
+    blocks_solved: u64,
+    /// Letzter gelöster Block
+    last_solved_block: u64,
+    /// Zeit seit letztem gelösten Block (Sekunden)
+    last_solve_elapsed_secs: f64,
+}
+
 // ─── Shared Miner State (für Web UI Zugriff) ────────────────────────────────
 
 #[derive(Clone)]
@@ -193,6 +217,7 @@ struct MinerWebState {
     started_at: Instant,
     storage_metrics: Arc<std::sync::RwLock<StorageMetrics>>,
     system_metrics: Arc<std::sync::RwLock<SystemMetrics>>,
+    pow_metrics: Arc<std::sync::RwLock<PowMetrics>>,
     network_active: bool,
 }
 
@@ -288,6 +313,7 @@ async fn handle_miner_stats(State(state): State<MinerWebState>) -> impl IntoResp
     let config = state.config.read().unwrap().clone();
     let storage = state.storage_metrics.read().unwrap().clone();
     let system = state.system_metrics.read().unwrap().clone();
+    let pow = state.pow_metrics.read().unwrap().clone();
     let logs = state.logs.read().unwrap().clone();
     let (peers_healthy, peers_total) = {
         let peers = state.node.get_peers();
@@ -334,6 +360,7 @@ async fn handle_miner_stats(State(state): State<MinerWebState>) -> impl IntoResp
             "chain_valid": chain_valid,
         },
         "system": system,
+        "pow": pow,
         "info": {
             "version": env!("CARGO_PKG_VERSION"),
             "node_name": config.node_name,
@@ -584,6 +611,8 @@ async fn handle_p2p_event(
                             &prev_hash, block.index, block.pow_nonce,
                             &sel_jailed, &sel_stakes, &sel_wallets,
                             last_block_ts, sync_done,
+                            &block.pow_hash, block.pow_difficulty, &block.validator_pub_key,
+                            block.effective_difficulty,
                         ).is_acceptable())
                     }
                 }
@@ -1268,6 +1297,303 @@ fn spawn_shard_repair_worker(
     });
 }
 
+// ─── PoW Solver Worker (Argon2id Mining) ────────────────────────────────────
+
+/// Background task: continuously solves Argon2id PoW puzzles using templates
+/// from the local node.
+///
+/// Workflow:
+/// 1. Warte auf Initial-Sync
+/// 2. Hole aktuelles Mining-Template vom lokalen Node
+/// 3. Iteriere Nonces, berechne Argon2id-Hash
+/// 4. Bei Treffer: submit_mining_solution() → Block committed + broadcastet
+/// 5. Wiederhole mit neuem Template
+///
+/// Multi-Thread: Spawnt N Worker-Threads (= CPU-Kerne), jeder sucht
+/// eigene Nonce-Range. Erster Fund stoppt alle via AtomicBool.
+fn spawn_pow_solver(
+    node: Arc<MasterNodeState>,
+    pow_metrics: Arc<std::sync::RwLock<PowMetrics>>,
+    log_tx: std::sync::mpsc::Sender<String>,
+) {
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+    let num_threads: usize = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+
+    // Coordinator-Thread: verwaltet Templates und startet Worker-Runden
+    std::thread::Builder::new()
+        .name("pow-coordinator".into())
+        .spawn(move || {
+            // Warte auf Initial-Sync (blockierend)
+            loop {
+                if node.metrics.initial_sync_done.load(Ordering::Relaxed) {
+                    break;
+                }
+                std::thread::sleep(Duration::from_secs(2));
+            }
+
+            let _ = log_tx.send(format!(
+                "⛏️  PoW-Solver gestartet (Argon2id, 64 MiB, {num_threads} Threads)"
+            ));
+
+            loop {
+                // Throttle-Check: Mining pausiert?
+                let throttle = node.metrics.mining_throttle_pct.load(Ordering::Relaxed);
+                if throttle == 0 {
+                    {
+                        let mut m = pow_metrics.write().unwrap();
+                        m.solving = false;
+                        m.hashrate = 0.0;
+                    }
+                    std::thread::sleep(Duration::from_secs(1));
+                    continue;
+                }
+
+                // Template holen (oder erstellen)
+                let template = {
+                    let tmpl = node.current_mining_template.read().unwrap();
+                    if let Some((t, _)) = tmpl.as_ref() {
+                        let chain = node.chain.lock().unwrap();
+                        let current_height = chain.blocks.len() as u64;
+                        if t.block_index == current_height {
+                            Some(t.clone())
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                };
+
+                let template = match template {
+                    Some(t) => t,
+                    None => {
+                        match node.prepare_block_template() {
+                            Ok(t) => t,
+                            Err(e) => {
+                                if !e.contains("Kein Reward") {
+                                    let _ = log_tx.send(format!("⚠ Template-Fehler: {e}"));
+                                }
+                                std::thread::sleep(Duration::from_secs(5));
+                                continue;
+                            }
+                        }
+                    }
+                };
+
+                // Mining-Parameter
+                let difficulty = template.difficulty;
+                let eff_difficulty = if template.effective_difficulty > 0 {
+                    template.effective_difficulty
+                } else {
+                    difficulty
+                };
+                let block_index = template.block_index;
+                let template_id = template.template_id.clone();
+
+                {
+                    let mut m = pow_metrics.write().unwrap();
+                    m.solving = true;
+                    m.current_difficulty = eff_difficulty;
+                    m.current_block_index = block_index;
+                    m.current_template_id = template_id.clone();
+                    m.current_nonce = 0;
+                }
+
+                let stake_info = if eff_difficulty < difficulty {
+                    format!(", stake-bonus={}bits", difficulty - eff_difficulty)
+                } else {
+                    String::new()
+                };
+                let _ = log_tx.send(format!(
+                    "⛏️  Mining Block #{block_index} (d={eff_difficulty}/{difficulty}{stake_info}, {num_threads} threads, template={})…",
+                    &template_id[..8.min(template_id.len())],
+                ));
+
+                // ── Multi-Thread Nonce-Suche ────────────────────────────
+                let found = Arc::new(AtomicBool::new(false));
+                let total_hashes = Arc::new(AtomicU64::new(0));
+                let start = Instant::now();
+
+                // Channel für Ergebnis: (nonce, pow_hash)
+                let (result_tx, result_rx) = std::sync::mpsc::channel::<(u64, String)>();
+
+                // Aktive Worker-Threads bestimmen (Throttle < 100 → weniger Threads)
+                let active_threads = if throttle < 100 {
+                    ((num_threads as u64 * throttle) / 100).max(1) as usize
+                } else {
+                    num_threads
+                };
+
+                let mut worker_handles = Vec::with_capacity(active_threads);
+
+                for thread_id in 0..active_threads {
+                    let found_c = found.clone();
+                    let total_hashes_c = total_hashes.clone();
+                    let result_tx_c = result_tx.clone();
+                    let prev_hash = template.previous_hash.clone();
+                    let validator_pub = template.validator_pubkey.clone();
+                    let tmpl_id = template_id.clone();
+                    let node_c = node.clone();
+
+                    let handle = std::thread::Builder::new()
+                        .name(format!("pow-worker-{thread_id}"))
+                        .spawn(move || {
+                            // Jeder Thread startet bei eigenem Offset, stride = active_threads
+                            let mut nonce = thread_id as u64;
+                            let stride = active_threads as u64;
+
+                            loop {
+                                if found_c.load(Ordering::Relaxed) {
+                                    break;
+                                }
+
+                                let hash_bytes = stone::consensus::compute_argon2_pow_hash(
+                                    &prev_hash,
+                                    block_index,
+                                    &validator_pub,
+                                    nonce,
+                                );
+
+                                total_hashes_c.fetch_add(1, Ordering::Relaxed);
+
+                                if stone::consensus::leading_zero_bits(&hash_bytes) >= eff_difficulty {
+                                    found_c.store(true, Ordering::Relaxed);
+                                    let _ = result_tx_c.send((nonce, hex::encode(&hash_bytes)));
+                                    break;
+                                }
+
+                                nonce += stride;
+
+                                // Alle 5 Hashes pro Thread: Staleness-Check
+                                if (nonce / stride) % 5 == 0 {
+                                    let stale = {
+                                        let tmpl = node_c.current_mining_template.read().unwrap();
+                                        match tmpl.as_ref() {
+                                            Some((t, _)) => t.template_id != tmpl_id,
+                                            None => true,
+                                        }
+                                    };
+                                    if stale {
+                                        found_c.store(true, Ordering::Relaxed);
+                                        break;
+                                    }
+                                    // Throttle-Stop Check
+                                    let thr = node_c.metrics.mining_throttle_pct.load(Ordering::Relaxed);
+                                    if thr == 0 {
+                                        found_c.store(true, Ordering::Relaxed);
+                                        break;
+                                    }
+                                }
+                            }
+                        })
+                        .expect("pow worker thread");
+
+                    worker_handles.push(handle);
+                }
+                // Drop the coordinator's copy so channel closes when all workers done
+                drop(result_tx);
+
+                // Metrics-Update in Hintergrund während Workers laufen
+                let pow_metrics_c = pow_metrics.clone();
+                let total_hashes_c = total_hashes.clone();
+                let found_c = found.clone();
+                let log_tx_c = log_tx.clone();
+                let metrics_handle = std::thread::Builder::new()
+                    .name("pow-metrics".into())
+                    .spawn(move || {
+                        loop {
+                            std::thread::sleep(Duration::from_secs(5));
+                            if found_c.load(Ordering::Relaxed) {
+                                break;
+                            }
+                            let hashes = total_hashes_c.load(Ordering::Relaxed);
+                            let elapsed = start.elapsed();
+                            let hashrate = hashes as f64 / elapsed.as_secs_f64().max(0.001);
+                            {
+                                let mut m = pow_metrics_c.write().unwrap();
+                                m.current_nonce = hashes;
+                                m.hashrate = hashrate;
+                            }
+                            let _ = log_tx_c.send(format!(
+                                "⛏️  Mining… {} Hashes in {:.1}s ({:.1} H/s, d={eff_difficulty}/{difficulty}, {active_threads}T)",
+                                hashes, elapsed.as_secs_f64(), hashrate,
+                            ));
+                        }
+                    })
+                    .ok();
+
+                // Auf Ergebnis warten
+                let solution = result_rx.recv().ok();
+
+                // Alle Workers joinen
+                for h in worker_handles {
+                    let _ = h.join();
+                }
+                if let Some(mh) = metrics_handle {
+                    let _ = mh.join();
+                }
+
+                let hashes_total = total_hashes.load(Ordering::Relaxed);
+                let elapsed = start.elapsed();
+
+                if let Some((nonce, pow_hash)) = solution {
+                    let hashrate = hashes_total as f64 / elapsed.as_secs_f64().max(0.001);
+
+                    let _ = log_tx.send(format!(
+                        "✅ Block #{block_index} gelöst! nonce={nonce}, d={eff_difficulty}/{difficulty}, {:.1}s ({:.1} H/s, {active_threads}T)",
+                        elapsed.as_secs_f64(), hashrate,
+                    ));
+
+                    let submission = stone::master_node::MiningSubmission {
+                        template_id: template_id.clone(),
+                        nonce,
+                        pow_hash,
+                    };
+
+                    match node.submit_mining_solution(&submission) {
+                        Ok(block) => {
+                            MasterNodeState::run_post_block_hooks(&node, &block);
+
+                            {
+                                let tx = node.block_broadcast_tx.lock().unwrap();
+                                if let Some(ref sender) = *tx {
+                                    let _ = sender.send(block.clone());
+                                }
+                            }
+
+                            {
+                                let mut m = pow_metrics.write().unwrap();
+                                m.blocks_solved += 1;
+                                m.last_solved_block = block.index;
+                                m.last_solve_elapsed_secs = elapsed.as_secs_f64();
+                                m.hashrate = hashrate;
+                            }
+
+                            let _ = log_tx.send(format!(
+                                "📦 Block #{} committed + broadcastet ({} TXs)",
+                                block.index, block.transactions.len(),
+                            ));
+                        }
+                        Err(e) => {
+                            let _ = log_tx.send(format!("⚠ Submit fehlgeschlagen: {e}"));
+                        }
+                    }
+                } else {
+                    // Kein Ergebnis → Template stale oder Mining gestoppt
+                    {
+                        let mut m = pow_metrics.write().unwrap();
+                        m.solving = false;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        })
+        .expect("PoW coordinator thread");
+}
+
 // ─── System Metrics Worker ──────────────────────────────────────────────────
 
 fn spawn_system_metrics_worker(
@@ -1374,6 +1700,83 @@ fn spawn_log_watcher(
                     let _ = log_tx.send(format!("⚠ {n} Events übersprungen"));
                 }
                 Err(_) => break,
+            }
+        }
+    });
+}
+
+// ─── Status Relay Push ──────────────────────────────────────────────────────
+
+/// Pusht alle 10 Sekunden den Miner-Status (signiert) an die Seed-Peers
+fn spawn_status_relay_push(
+    node: Arc<MasterNodeState>,
+    pow_metrics: Arc<std::sync::RwLock<PowMetrics>>,
+    validator_wallet: String,
+    seed_peers: Vec<String>,
+    miner_state: MinerWebState,
+) {
+    use ed25519_dalek::Signer;
+    use sha2::{Sha256, Digest};
+    use stone::consensus::load_or_create_validator_key;
+
+    tokio::spawn(async move {
+        let signing_key = load_or_create_validator_key();
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+
+        let mut interval = tokio::time::interval(Duration::from_secs(10));
+        loop {
+            interval.tick().await;
+
+            // Metriken sammeln
+            let pm = pow_metrics.read().unwrap().clone();
+            let block_height = miner_state.block_height();
+            let blocks_mined = miner_state.blocks_mined();
+            let total_rewards = miner_state.total_rewards().to_string();
+            let throttle = miner_state.throttle();
+            let active = miner_state.is_mining();
+            let uptime = miner_state.uptime_secs();
+            let peers_connected = {
+                let peers = node.get_peers();
+                peers.iter().filter(|p| p.is_healthy()).count() as u64
+            };
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+
+            // Signatur erstellen
+            let sig_data = format!(
+                "{}|{}|{}|{}|{}|{}|{}",
+                validator_wallet, timestamp, pm.hashrate as u64,
+                block_height, blocks_mined, pm.current_difficulty, active
+            );
+            let hash = Sha256::digest(sig_data.as_bytes());
+            let signature = signing_key.sign(&hash);
+
+            let report = serde_json::json!({
+                "wallet": validator_wallet,
+                "timestamp": timestamp,
+                "hashrate": pm.hashrate,
+                "block_height": block_height,
+                "blocks_mined": blocks_mined,
+                "difficulty": pm.current_difficulty,
+                "active": active,
+                "throttle_pct": throttle,
+                "total_rewards": total_rewards,
+                "peers_connected": peers_connected,
+                "uptime_secs": uptime,
+                "version": env!("CARGO_PKG_VERSION"),
+                "node_name": node.node_id.chars().take(12).collect::<String>(),
+                "signature": hex::encode(signature.to_bytes()),
+            });
+
+            // An alle Seed-Peers senden
+            for peer in &seed_peers {
+                let url = format!("{}/api/v1/mining/report", peer.trim_end_matches('/'));
+                let _ = client.post(&url).json(&report).send().await;
             }
         }
     });
@@ -1623,6 +2026,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Shared Miner State ──────────────────────────────────────────────
     let storage_metrics = Arc::new(std::sync::RwLock::new(StorageMetrics::default()));
     let system_metrics = Arc::new(std::sync::RwLock::new(SystemMetrics::default()));
+    let pow_metrics = Arc::new(std::sync::RwLock::new(PowMetrics::default()));
     let logs = Arc::new(std::sync::RwLock::new(Vec::<String>::new()));
 
     let miner_state = MinerWebState {
@@ -1633,6 +2037,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         started_at: Instant::now(),
         storage_metrics: storage_metrics.clone(),
         system_metrics: system_metrics.clone(),
+        pow_metrics: pow_metrics.clone(),
         network_active: network_handle.is_some(),
     };
 
@@ -1664,6 +2069,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── System Metrics Worker ───────────────────────────────────────────
     spawn_system_metrics_worker(system_metrics.clone());
+
+    // ── PoW Solver (Argon2id Mining) ────────────────────────────────────
+    spawn_pow_solver(node.clone(), pow_metrics.clone(), log_tx.clone());
+
+    // ── Status Relay Push (an Bootstrap-Server) ─────────────────────────
+    spawn_status_relay_push(
+        node.clone(),
+        pow_metrics.clone(),
+        validator_wallet.clone(),
+        config.seed_peers.clone(),
+        miner_state.clone(),
+    );
 
     // ── Log receiver → shared logs ──────────────────────────────────────
     {
@@ -1708,6 +2125,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         contact_requests: Arc::new(std::sync::Mutex::new(stone::chat::load_contact_requests())),
         challenge_store: stone::auth::ChallengeStore::new(),
         qr_login_store: stone::auth::QrLoginStore::new(),
+        miner_status_store: server::state::MinerStatusStore::new(),
     };
 
     // Main node API

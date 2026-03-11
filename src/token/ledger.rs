@@ -561,6 +561,102 @@ impl TokenLedger {
 
     // ── Transaktionsverarbeitung ──────────────────────────────────────────
 
+    /// Filtert eine Liste von TXs und gibt nur die zurück, die gegen den
+    /// aktuellen Ledger-Stand gültig sind. Ungültige TXs werden geloggt
+    /// und verworfen. Berücksichtigt kumulative Balance-Änderungen
+    /// (mehrere TXs desselben Senders in einem Block).
+    pub fn filter_valid_txs(&self, txs: &[TokenTx]) -> Vec<TokenTx> {
+        use std::collections::HashMap;
+        let mut valid = Vec::with_capacity(txs.len());
+        // Temporäre Balance-Tracker: Reale Balance minus bereits für diesen
+        // Block eingerechnete Abzüge.
+        let mut pending_debits: HashMap<String, Decimal> = HashMap::new();
+        // Temporäre Nonce-Tracker
+        let mut pending_nonces: HashMap<String, u64> = HashMap::new();
+
+        for tx in txs {
+            // System-TXs (Reward, Mint, Memorial) immer durchlassen
+            match tx.tx_type {
+                TxType::Reward | TxType::Mint | TxType::Memorial => {
+                    valid.push(tx.clone());
+                    continue;
+                }
+                _ => {}
+            }
+
+            // Duplikat-Check
+            if self.processed_txs.contains(&tx.tx_id) {
+                eprintln!(
+                    "[token] 🚫 TX {} verworfen: Duplikat",
+                    &tx.tx_id[..12.min(tx.tx_id.len())]
+                );
+                continue;
+            }
+
+            // Nonce-Check (kumulativ: berücksichtigt vorherige TXs im selben Block)
+            let needs_nonce = matches!(
+                tx.tx_type,
+                TxType::Transfer | TxType::Burn | TxType::RotateKey
+                | TxType::AccountRegister | TxType::AccountUpdate
+                | TxType::ChatMessage | TxType::Stake | TxType::Unstake
+            );
+            if needs_nonce {
+                let expected = pending_nonces
+                    .get(&tx.from)
+                    .copied()
+                    .unwrap_or_else(|| self.nonce(&tx.from));
+                if tx.nonce != expected {
+                    eprintln!(
+                        "[token] 🚫 TX {} verworfen: Nonce {} erwartet {expected}",
+                        &tx.tx_id[..12.min(tx.tx_id.len())], tx.nonce
+                    );
+                    continue;
+                }
+            }
+
+            // Balance-Check (kumulativ: berücksichtigt vorherige TXs im selben Block)
+            let needs_balance = matches!(
+                tx.tx_type,
+                TxType::Transfer | TxType::Burn | TxType::Stake
+            );
+            if needs_balance {
+                let total_debit = tx.amount + tx.fee;
+                let already_debited = pending_debits.get(&tx.from).copied().unwrap_or(Decimal::ZERO);
+                let available = self.balance(&tx.from) - already_debited;
+                if available < total_debit {
+                    eprintln!(
+                        "[token] 🚫 TX {} verworfen: {} hat {} verfügbar, benötigt {}",
+                        &tx.tx_id[..12.min(tx.tx_id.len())],
+                        &tx.from[..12.min(tx.from.len())],
+                        available, total_debit
+                    );
+                    continue;
+                }
+                *pending_debits.entry(tx.from.clone()).or_insert(Decimal::ZERO) += total_debit;
+            }
+
+            // Nonce-Fortschritt tracken
+            if needs_nonce {
+                let next = pending_nonces
+                    .get(&tx.from)
+                    .copied()
+                    .unwrap_or_else(|| self.nonce(&tx.from));
+                pending_nonces.insert(tx.from.clone(), next + 1);
+            }
+
+            valid.push(tx.clone());
+        }
+
+        let rejected = txs.len() - valid.len();
+        if rejected > 0 {
+            println!(
+                "[token] 🛡️  Pre-Block-Filter: {rejected} von {} TXs verworfen",
+                txs.len()
+            );
+        }
+        valid
+    }
+
     /// Verarbeitet eine vollständig validierte Transaktion.
     ///
     /// Prüft:
@@ -850,9 +946,37 @@ impl TokenLedger {
                 .map_err(|e| LedgerError::Persistence(format!("put last_synced_block: {e}")))?;
         }
 
-        println!("[token] 💾 Ledger persistiert: {} Accounts, {} Registrierte, {} Key-Rotations, {} Vesting, Supply: {}",
+        // Processed TX-IDs (Duplikat-Schutz über Restarts hinweg)
+        // Nur die neuesten TX-IDs persistieren (letzte 100k), ältere sind
+        // ohnehin durch die Chain abgedeckt.
+        {
+            // Alte ptx/ Einträge löschen
+            let mut to_delete = Vec::new();
+            let iter = db.prefix_iterator(b"ptx/");
+            for item in iter {
+                if let Ok((key, _)) = item {
+                    let key_str = String::from_utf8_lossy(&key);
+                    if !key_str.starts_with("ptx/") { break; }
+                    to_delete.push(key.to_vec());
+                }
+            }
+            for key in &to_delete {
+                let _ = db.delete(key);
+            }
+            // Nur die letzten MAX_PERSIST_TX_IDS speichern
+            const MAX_PERSIST_TX_IDS: usize = 100_000;
+            let tx_ids: Vec<&String> = self.processed_txs.iter().collect();
+            let start = tx_ids.len().saturating_sub(MAX_PERSIST_TX_IDS);
+            for tx_id in &tx_ids[start..] {
+                let key = format!("ptx/{}", tx_id);
+                db.put(key.as_bytes(), b"1")
+                    .map_err(|e| LedgerError::Persistence(format!("put ptx: {e}")))?;
+            }
+        }
+
+        println!("[token] 💾 Ledger persistiert: {} Accounts, {} Registrierte, {} Key-Rotations, {} Vesting, {} TX-IDs, Supply: {}",
             self.account_count(), self.registered_account_count(), self.key_rotations.len(),
-            self.vesting_schedules.len(), self.total_supply);
+            self.vesting_schedules.len(), self.processed_txs.len(), self.total_supply);
         Ok(())
     }
 
@@ -990,12 +1114,27 @@ impl TokenLedger {
             }
         }
 
+        // Processed TX-IDs laden (Duplikat-Schutz über Restarts hinweg)
+        {
+            let iter = db.prefix_iterator(b"ptx/");
+            for item in iter {
+                if let Ok((key, _)) = item {
+                    let key_str = String::from_utf8_lossy(&key);
+                    if !key_str.starts_with("ptx/") { break; }
+                    if let Some(tx_id) = key_str.strip_prefix("ptx/") {
+                        ledger.processed_txs.insert(tx_id.to_string());
+                    }
+                }
+            }
+        }
+
         println!(
-            "[token] 📂 Ledger geladen: {} Accounts, {} Registrierte, {} Key-Rotations, {} Vesting, Supply: {}",
+            "[token] 📂 Ledger geladen: {} Accounts, {} Registrierte, {} Key-Rotations, {} Vesting, {} TX-IDs, Supply: {}",
             ledger.account_count(),
             ledger.registered_account_count(),
             ledger.key_rotations.len(),
             ledger.vesting_schedules.len(),
+            ledger.processed_txs.len(),
             ledger.total_supply
         );
         ledger

@@ -1,7 +1,7 @@
 //! Mining-Dashboard handlers – Mining-Status, Metriken, Throttle und Reward-Withdrawal.
 
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
@@ -750,4 +750,249 @@ pub async fn handle_mining_wallet_info(
             "is_bound": mining_wallet.is_some(),
         })),
     ).into_response()
+}
+
+// ─── Competitive PoW: Mining Template + Submit ────────────────────────────────
+
+/// GET /api/v1/mining/template — Block-Template für externe Miner
+///
+/// Gibt ein Mining-Template zurück das alle Daten enthält die ein externer
+/// Miner braucht um den Argon2id-PoW zu lösen:
+/// - previous_hash, block_index, difficulty
+/// - validator_pubkey (wird für PoW-Input benötigt)
+/// - template_id (für Submit-Zuordnung)
+///
+/// Der Miner löst: Argon2id(prev_hash || block_index || validator_pubkey || nonce)
+/// bis leading_zero_bits(hash) >= difficulty
+pub async fn handle_mining_template(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    // Prüfe ob bereits ein aktuelles Template existiert
+    let existing = {
+        let tmpl = state.node.current_mining_template.read().unwrap();
+        tmpl.as_ref().map(|(t, _)| {
+            let chain = state.node.chain.lock().unwrap();
+            let current_height = chain.blocks.len() as u64;
+            (t.clone(), current_height)
+        })
+    };
+
+    // Template wiederverwenden wenn es noch aktuell ist (gleicher Block-Index)
+    if let Some((template, current_height)) = existing {
+        if template.block_index == current_height {
+            return (
+                StatusCode::OK,
+                axum::Json(json!({
+                    "ok": true,
+                    "template": template,
+                })),
+            ).into_response();
+        }
+    }
+
+    // Neues Template erstellen
+    match state.node.prepare_block_template() {
+        Ok(template) => {
+            (
+                StatusCode::OK,
+                axum::Json(json!({
+                    "ok": true,
+                    "template": template,
+                })),
+            ).into_response()
+        }
+        Err(e) => {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({
+                    "ok": false,
+                    "error": e,
+                })),
+            ).into_response()
+        }
+    }
+}
+
+/// POST /api/v1/mining/submit — PoW-Lösung eines externen Miners einreichen
+///
+/// Body: `{ "template_id": "...", "nonce": 12345, "pow_hash": "hex..." }`
+///
+/// Prüft den PoW, committed den Block und broadcastet ihn ans Netzwerk.
+pub async fn handle_mining_submit(
+    State(state): State<AppState>,
+    axum::Json(submission): axum::Json<stone::master_node::MiningSubmission>,
+) -> impl IntoResponse {
+    // Validierung: pow_hash muss gültiges Hex sein
+    if submission.pow_hash.len() != 64
+        || !submission.pow_hash.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({
+                "ok": false,
+                "error": "pow_hash muss 64 Hex-Zeichen (32 Bytes) sein",
+            })),
+        ).into_response();
+    }
+
+    match state.node.submit_mining_solution(&submission) {
+        Ok(block) => {
+            // Post-Block-Hooks ausführen (Staking, Slashing, Reputation, ChatPolicy)
+            stone::master_node::MasterNodeState::run_post_block_hooks(&state.node, &block);
+
+            // Block via P2P-Gossipsub broadcasten
+            {
+                let tx = state.node.block_broadcast_tx.lock().unwrap();
+                if let Some(ref sender) = *tx {
+                    let _ = sender.send(block.clone());
+                }
+            }
+
+            (
+                StatusCode::OK,
+                axum::Json(json!({
+                    "ok": true,
+                    "block_index": block.index,
+                    "block_hash": block.hash,
+                    "pow_nonce": block.pow_nonce,
+                    "pow_difficulty": block.pow_difficulty,
+                    "tx_count": block.transactions.len(),
+                    "message": "Block akzeptiert und broadcastet",
+                })),
+            ).into_response()
+        }
+        Err(e) => {
+            let status = if e.contains("veraltet") || e.contains("Template-ID") {
+                StatusCode::CONFLICT
+            } else if e.contains("Ungültiger") {
+                StatusCode::BAD_REQUEST
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            (
+                status,
+                axum::Json(json!({
+                    "ok": false,
+                    "error": e,
+                })),
+            ).into_response()
+        }
+    }
+}
+
+// ─── Miner Status Relay (Bootstrap-Server als Relay) ────────────────────────
+
+/// POST /api/v1/mining/report — Miner pusht seinen Status (signiert)
+///
+/// Kein Auth nötig — die Ed25519-Signatur beweist Wallet-Ownership.
+pub async fn handle_mining_report(
+    State(state): State<AppState>,
+    axum::Json(report): axum::Json<super::super::state::MinerStatusReport>,
+) -> impl IntoResponse {
+    // Wallet-Adresse validieren
+    if report.wallet.len() != 64 || !report.wallet.chars().all(|c| c.is_ascii_hexdigit()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({ "ok": false, "error": "Ungültige Wallet-Adresse" })),
+        ).into_response();
+    }
+
+    // Ed25519-Signatur verifizieren
+    let sig_data = format!(
+        "{}|{}|{}|{}|{}|{}|{}",
+        report.wallet, report.timestamp, report.hashrate as u64,
+        report.block_height, report.blocks_mined, report.difficulty, report.active
+    );
+
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    use sha2::{Sha256, Digest};
+
+    let pub_bytes = match hex::decode(&report.wallet) {
+        Ok(b) if b.len() == 32 => b,
+        _ => return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({ "ok": false, "error": "Wallet ist kein gültiger Ed25519-Key" })),
+        ).into_response(),
+    };
+
+    let verifying_key = match VerifyingKey::from_bytes(pub_bytes.as_slice().try_into().unwrap()) {
+        Ok(k) => k,
+        Err(_) => return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({ "ok": false, "error": "Ungültiger Public Key" })),
+        ).into_response(),
+    };
+
+    let sig_bytes = match hex::decode(&report.signature) {
+        Ok(b) if b.len() == 64 => b,
+        _ => return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({ "ok": false, "error": "Ungültige Signatur (muss 64 Byte Hex sein)" })),
+        ).into_response(),
+    };
+
+    let signature = Signature::from_bytes(sig_bytes.as_slice().try_into().unwrap());
+    let hash = Sha256::digest(sig_data.as_bytes());
+
+    if verifying_key.verify(&hash, &signature).is_err() {
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(json!({ "ok": false, "error": "Signatur-Verifikation fehlgeschlagen" })),
+        ).into_response();
+    }
+
+    // Report speichern
+    state.miner_status_store.insert(report);
+
+    (
+        StatusCode::OK,
+        axum::Json(json!({ "ok": true })),
+    ).into_response()
+}
+
+/// GET /api/v1/mining/remote-status/{wallet} — App pollt Miner-Status über Relay
+///
+/// Kein Auth nötig — die Wallet-Adresse ist öffentlich, der Status ist read-only.
+pub async fn handle_mining_remote_status(
+    State(state): State<AppState>,
+    Path(wallet): Path<String>,
+) -> impl IntoResponse {
+    if wallet.len() != 64 || !wallet.chars().all(|c| c.is_ascii_hexdigit()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({ "ok": false, "error": "Ungültige Wallet-Adresse" })),
+        ).into_response();
+    }
+
+    match state.miner_status_store.get(&wallet) {
+        Some(report) => (
+            StatusCode::OK,
+            axum::Json(json!({
+                "ok": true,
+                "online": true,
+                "wallet": report.wallet,
+                "timestamp": report.timestamp,
+                "hashrate": report.hashrate,
+                "block_height": report.block_height,
+                "blocks_mined": report.blocks_mined,
+                "difficulty": report.difficulty,
+                "active": report.active,
+                "throttle_pct": report.throttle_pct,
+                "total_rewards": report.total_rewards,
+                "peers_connected": report.peers_connected,
+                "uptime_secs": report.uptime_secs,
+                "version": report.version,
+                "node_name": report.node_name,
+            })),
+        ).into_response(),
+        None => (
+            StatusCode::OK,
+            axum::Json(json!({
+                "ok": true,
+                "online": false,
+                "wallet": wallet,
+                "message": "Kein aktueller Status vom Miner verfügbar",
+            })),
+        ).into_response(),
+    }
 }

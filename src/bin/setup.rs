@@ -34,10 +34,15 @@ use tower::ServiceExt;
 use stone::{
     auth::load_users,
     blockchain::{data_dir, NodeRole},
-    master_node::MasterNodeState,
+    consensus::{
+        ARGON2_POW_ACTIVATION_BLOCK, TARGET_BLOCK_TIME_SECS,
+        get_current_pow_difficulty, MIN_POW_DIFFICULTY, MAX_POW_DIFFICULTY,
+    },
+    master_node::{MasterNodeState, HALVING_INTERVAL, MINING_INTERVAL_SECS},
     network::{start_network, NetworkEvent, NetworkHandle, StorageAnnouncement, TOPIC_STORAGE},
     shard::ShardStore,
     storage::ChunkStore,
+    token::genesis::SupplyInfo,
 };
 
 use server::{
@@ -641,6 +646,7 @@ async fn start_full_node(state: SetupState) {
         contact_requests: Arc::new(std::sync::Mutex::new(stone::chat::load_contact_requests())),
         challenge_store: stone::auth::ChallengeStore::new(),
         qr_login_store: stone::auth::QrLoginStore::new(),
+        miner_status_store: server::state::MinerStatusStore::new(),
     };
 
     *state.node_state.write().await = Some(node_app_state.clone());
@@ -744,6 +750,8 @@ async fn handle_p2p_event(
                             &prev_hash, block.index, block.pow_nonce,
                             &sel_jailed, &sel_stakes, &sel_wallets,
                             last_block_ts, sync_done,
+                            &block.pow_hash, block.pow_difficulty, &block.validator_pub_key,
+                            block.effective_difficulty,
                         ).is_acceptable())
                     }
                 }
@@ -2032,23 +2040,60 @@ struct DashboardData {
     uptime_secs: u64,
     peers_connected: usize,
     seed_peers: Vec<String>,
-    storage: StorageInfo,
     http_port: u16,
     p2p_port: u16,
     public_ip: String,
-    reward_per_day: f64,
-    storage_offered_gb: u64,
-    // Neue Felder — Node-Status
     node_running: bool,
     block_count: u64,
     p2p_peer_id: String,
     mempool_size: usize,
+    // Mining & Blockchain
+    mining: MiningInfo,
+    // Token Economy
+    token_economy: TokenEconomyInfo,
     // Shard-Health
     shard_health: ShardHealthInfo,
     // Netzwerk-Metriken
     network_metrics: Option<NetworkMetricsData>,
-    // Netzwerk-Speicher
-    network_storage: Option<NetworkStorageSummary>,
+    // Connected Peers
+    connected_peers: Vec<PeerEntry>,
+}
+
+#[derive(Serialize)]
+struct MiningInfo {
+    pow_type: String,
+    difficulty: u32,
+    min_difficulty: u32,
+    max_difficulty: u32,
+    current_reward: f64,
+    halving_epoch: u64,
+    next_halving_block: u64,
+    blocks_until_halving: u64,
+    target_block_time: u64,
+    avg_block_time: f64,
+    mining_interval: u64,
+}
+
+#[derive(Serialize)]
+struct TokenEconomyInfo {
+    total_supply: f64,
+    max_supply: f64,
+    circulating: f64,
+    burned: f64,
+    fees_burned: f64,
+    accounts: usize,
+    total_staked: f64,
+    staker_count: usize,
+    estimated_apy: f64,
+    reward_pool_balance: f64,
+}
+
+#[derive(Serialize)]
+struct PeerEntry {
+    url: String,
+    name: String,
+    healthy: bool,
+    block_height: u64,
 }
 
 #[derive(Serialize)]
@@ -2071,21 +2116,6 @@ struct NetworkMetricsData {
     total_known_peers: usize,
 }
 
-#[derive(Serialize)]
-struct NetworkStorageSummary {
-    /// Netzwerk-Gesamt angebotener Speicher in GB
-    total_offered_gb: u64,
-    /// Netzwerk-Gesamt belegter Speicher in Bytes
-    total_used_bytes: u64,
-    /// Netzwerk-Gesamt freier Speicher in Bytes
-    total_free_bytes: u64,
-    /// Anzahl Nodes die Speicher melden
-    reporting_nodes: usize,
-    /// Menschenlesbare Darstellung
-    total_offered_human: String,
-    total_used_human: String,
-    total_free_human: String,
-}
 
 #[derive(Serialize)]
 struct ShardHealthInfo {
@@ -2116,23 +2146,10 @@ struct ShardDocInfo {
     size: u64,
 }
 
-#[derive(Serialize)]
-struct StorageInfo {
-    data_dir: String,
-    used_bytes: u64,
-    used_human: String,
-    total_gb: u64,
-    free_human: String,
-    usage_pct: f64,
-}
 
 async fn api_dashboard(State(state): State<SetupState>) -> Json<DashboardData> {
     let cfg = state.config.read().await;
     let uptime = state.start_time.elapsed().as_secs();
-    let used = dir_size(Path::new(&cfg.data_dir));
-    let total_bytes = cfg.storage_offered_gb * 1024 * 1024 * 1024;
-    let free = total_bytes.saturating_sub(used);
-    let pct = if total_bytes > 0 { (used as f64 / total_bytes as f64) * 100.0 } else { 0.0 };
 
     // Echte Node-Daten auslesen
     let ns = state.node_state.read().await;
@@ -2142,7 +2159,6 @@ async fn api_dashboard(State(state): State<SetupState>) -> Json<DashboardData> {
             let pc = ns.node.get_peers().into_iter().filter(|p| p.is_healthy()).count();
             let pid = ns.network.as_ref().map(|h| h.local_peer_id.to_string()).unwrap_or_default();
             let ms = ns.node.mempool.pending_count();
-            // Wallet-Balance aus Ledger
             let bal = {
                 let ledger = ns.node.token_ledger.read().unwrap();
                 let addr = cfg.wallet_address.clone();
@@ -2155,6 +2171,95 @@ async fn api_dashboard(State(state): State<SetupState>) -> Json<DashboardData> {
         } else {
             (false, 0, 0, String::new(), 0, cfg.wallet_balance)
         };
+
+    // ── Mining-Info ─────────────────────────────────────────────────────
+    let mining = if let Some(ref ns) = *ns {
+        let chain = ns.node.chain.lock().unwrap();
+        let bc = chain.blocks.len() as u64;
+        let difficulty = get_current_pow_difficulty(&chain.blocks, bc);
+        let pow_type = if bc >= ARGON2_POW_ACTIVATION_BLOCK { "Argon2id" } else { "SHA256 Lite" };
+        let halving_epoch = bc / HALVING_INTERVAL;
+        let next_halving_block = (halving_epoch + 1) * HALVING_INTERVAL;
+        let blocks_until_halving = next_halving_block.saturating_sub(bc);
+
+        // Current reward
+        let reward_pool = {
+            let ledger = ns.node.token_ledger.read().unwrap();
+            ledger.balance("pool:storage_rewards")
+        };
+        let current_reward = MasterNodeState::calculate_block_reward(bc, reward_pool);
+
+        // Avg block time (last 20 blocks)
+        let avg_block_time = if chain.blocks.len() >= 2 {
+            let window = chain.blocks.len().min(20);
+            let recent = &chain.blocks[chain.blocks.len() - window..];
+            if recent.len() >= 2 {
+                let time_span = (recent.last().unwrap().timestamp - recent.first().unwrap().timestamp).max(1);
+                time_span as f64 / (recent.len() - 1) as f64
+            } else { 0.0 }
+        } else { 0.0 };
+
+        MiningInfo {
+            pow_type: pow_type.to_string(),
+            difficulty,
+            min_difficulty: MIN_POW_DIFFICULTY,
+            max_difficulty: MAX_POW_DIFFICULTY,
+            current_reward: current_reward.to_string().parse().unwrap_or(0.0),
+            halving_epoch,
+            next_halving_block,
+            blocks_until_halving,
+            target_block_time: TARGET_BLOCK_TIME_SECS,
+            avg_block_time,
+            mining_interval: MINING_INTERVAL_SECS,
+        }
+    } else {
+        MiningInfo {
+            pow_type: "offline".to_string(),
+            difficulty: 0, min_difficulty: MIN_POW_DIFFICULTY, max_difficulty: MAX_POW_DIFFICULTY,
+            current_reward: 0.0, halving_epoch: 0, next_halving_block: HALVING_INTERVAL,
+            blocks_until_halving: HALVING_INTERVAL, target_block_time: TARGET_BLOCK_TIME_SECS,
+            avg_block_time: 0.0, mining_interval: MINING_INTERVAL_SECS,
+        }
+    };
+
+    // ── Token Economy ───────────────────────────────────────────────────
+    let token_economy = if let Some(ref ns) = *ns {
+        let ledger = ns.node.token_ledger.read().unwrap();
+        let supply = SupplyInfo::from_ledger(&ledger);
+        let reward_pool = ledger.balance("pool:storage_rewards");
+        let staking = ns.node.staking_pool.read().unwrap();
+        let pool_info = staking.pool_info(reward_pool);
+        TokenEconomyInfo {
+            total_supply: supply.total_supply.to_string().parse().unwrap_or(0.0),
+            max_supply: supply.max_supply.to_string().parse().unwrap_or(0.0),
+            circulating: supply.circulating.to_string().parse().unwrap_or(0.0),
+            burned: supply.burned.to_string().parse().unwrap_or(0.0),
+            fees_burned: supply.fees_burned.to_string().parse().unwrap_or(0.0),
+            accounts: supply.accounts,
+            total_staked: pool_info.total_staked.to_string().parse().unwrap_or(0.0),
+            staker_count: pool_info.staker_count,
+            estimated_apy: pool_info.estimated_apy.to_string().parse().unwrap_or(0.0),
+            reward_pool_balance: pool_info.reward_pool_balance.to_string().parse().unwrap_or(0.0),
+        }
+    } else {
+        TokenEconomyInfo {
+            total_supply: 0.0, max_supply: 50_000_000.0, circulating: 0.0, burned: 0.0,
+            fees_burned: 0.0, accounts: 0, total_staked: 0.0, staker_count: 0,
+            estimated_apy: 0.0, reward_pool_balance: 0.0,
+        }
+    };
+
+    // ── Connected Peers ─────────────────────────────────────────────────
+    let connected_peers = if let Some(ref ns) = *ns {
+        ns.node.get_peers().iter().map(|p| PeerEntry {
+            url: p.url.clone(),
+            name: p.name.clone().unwrap_or_default(),
+            healthy: p.is_healthy(),
+            block_height: p.block_height,
+        }).collect()
+    } else {
+        vec![]
+    };
 
     // ── Shard-Health berechnen (Registry-basiert) ─────────────────────
     let shard_health = if let Some(ref ns) = *ns {
@@ -2251,12 +2356,12 @@ async fn api_dashboard(State(state): State<SetupState>) -> Json<DashboardData> {
     };
 
     // ── Netzwerk-Metriken ──────────────────────────────────────────────
-    let (network_metrics, network_storage) = {
+    let network_metrics = {
         let net = state.network.read().await;
         if let Some(ref handle) = *net {
             if let Some(status) = handle.get_status().await {
                 let m = &status.metrics;
-                let nm = Some(NetworkMetricsData {
+                Some(NetworkMetricsData {
                     bytes_in: m.bytes_in,
                     bytes_out: m.bytes_out,
                     messages_in: m.messages_in,
@@ -2273,36 +2378,9 @@ async fn api_dashboard(State(state): State<SetupState>) -> Json<DashboardData> {
                     connected_peers: status.connected_peers,
                     gossipsub_mesh_size: status.gossipsub_mesh_size,
                     total_known_peers: status.total_known_peers,
-                });
-
-                // Netzwerk-Speicher aggregieren
-                let mut t_offered = cfg.storage_offered_gb;
-                let mut t_used = used;
-                let local_total_bytes = cfg.storage_offered_gb * 1024 * 1024 * 1024;
-                let mut t_free = local_total_bytes.saturating_sub(used);
-                let mut count = 1usize; // wir selbst
-
-                for ann in &status.peer_storage {
-                    if ann.peer_id == handle.local_peer_id { continue; }
-                    t_offered += ann.offered_gb;
-                    t_used += ann.used_bytes;
-                    t_free += ann.free_bytes;
-                    count += 1;
-                }
-
-                let ns = Some(NetworkStorageSummary {
-                    total_offered_gb: t_offered,
-                    total_used_bytes: t_used,
-                    total_free_bytes: t_free,
-                    reporting_nodes: count,
-                    total_offered_human: format!("{} GB", t_offered),
-                    total_used_human: human_bytes(t_used),
-                    total_free_human: human_bytes(t_free),
-                });
-
-                (nm, ns)
-            } else { (None, None) }
-        } else { (None, None) }
+                })
+            } else { None }
+        } else { None }
     };
 
     Json(DashboardData {
@@ -2313,26 +2391,18 @@ async fn api_dashboard(State(state): State<SetupState>) -> Json<DashboardData> {
         uptime_secs: uptime,
         peers_connected,
         seed_peers: cfg.seed_peers.clone(),
-        storage: StorageInfo {
-            data_dir: cfg.data_dir.clone(),
-            used_bytes: used,
-            used_human: human_bytes(used),
-            total_gb: cfg.storage_offered_gb,
-            free_human: human_bytes(free),
-            usage_pct: pct,
-        },
         http_port: cfg.http_port,
         p2p_port: cfg.p2p_port,
         public_ip: cfg.public_ip.clone(),
-        reward_per_day: cfg.reward_per_day,
-        storage_offered_gb: cfg.storage_offered_gb,
         node_running,
         block_count,
         p2p_peer_id,
         mempool_size,
+        mining,
+        token_economy,
         shard_health,
         network_metrics,
-        network_storage,
+        connected_peers,
     })
 }
 
