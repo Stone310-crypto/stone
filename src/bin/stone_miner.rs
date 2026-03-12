@@ -653,9 +653,29 @@ async fn handle_p2p_event(
 
                     match chain.accept_peer_block(*block, poa_ok) {
                         Ok(_) => {
-                            if !txs.is_empty() {
+                            // Orphan-TX-Recovery: User-TXs aus verwaisten Blöcken zurück in Mempool
+                            let orphaned = std::mem::take(&mut chain.orphaned_blocks);
+                            if !orphaned.is_empty() {
+                                node.mempool.requeue_orphaned_txs(&orphaned);
+                                // Ledger nach Single-Block-Reorg neu aufbauen (BUG-11 Fix)
+                                // accept_peer_block hat truncate_to intern gerufen,
+                                // danach den neuen Block angefügt → Ledger muss konsistent sein
+                                let rebuilt = stone::token::TokenLedger::rebuild_from_chain(&chain.blocks);
                                 let mut ledger = node.token_ledger.write().unwrap();
+                                *ledger = rebuilt;
+                                eprintln!(
+                                    "[sync] Token-Ledger nach Single-Block-Reorg neu aufgebaut: {} Accounts, Supply: {}",
+                                    ledger.account_count(),
+                                    ledger.total_supply()
+                                );
+                            } else if !txs.is_empty() {
+                                let mut ledger = node.token_ledger.write().unwrap();
+                                // Peer-Blöcke wurden bereits vom Netzwerk validiert →
+                                // replay_mode aktivieren um Nonce-Checks zu überspringen
+                                // (bei Initial-Sync hat der Ledger noch nicht alle Nonces)
+                                ledger.replay_mode = true;
                                 let _ = ledger.apply_block_txs(&txs, idx);
+                                ledger.replay_mode = false;
                                 let _ = ledger.persist();
                                 for tx in &txs {
                                     node.mempool.mark_known(&tx.tx_id);
@@ -718,7 +738,7 @@ async fn handle_p2p_event(
                     });
                 }
                 BlockResult::Rejected => {
-                    handle.report_penalty(&from_peer, 50, "rejected block").await;
+                    handle.report_penalty(&from_peer, 15, "rejected block").await;
                 }
                 _ => {} // AlreadyKnown, Stale — kein Penalty
             }
@@ -758,7 +778,24 @@ async fn handle_p2p_event(
                         "[sync] 🔄 Fork-Reorg: fork_at={fork_at}, lokal={local_len}, peer hat {} neue Blöcke",
                         peer_new.len()
                     );
-                    chain.truncate_to(fork_at as u64);
+                    let orphaned = chain.truncate_to(fork_at as u64);
+                    // Orphan-TX-Recovery: User-TXs aus verwaisten Blöcken zurück in Mempool
+                    if !orphaned.is_empty() {
+                        node.mempool.requeue_orphaned_txs(&orphaned);
+                    }
+
+                    // Ledger komplett aus der getrunkten Chain neu aufbauen,
+                    // damit Balancen/Nonces konsistent sind (BUG-11 Fix)
+                    {
+                        let rebuilt = stone::token::TokenLedger::rebuild_from_chain(&chain.blocks);
+                        let mut ledger = node.token_ledger.write().unwrap();
+                        *ledger = rebuilt;
+                        eprintln!(
+                            "[sync] Token-Ledger nach Reorg neu aufgebaut: {} Accounts, Supply: {}",
+                            ledger.account_count(),
+                            ledger.total_supply()
+                        );
+                    }
 
                     let mut applied = 0u64;
                     for block in peer_new {
@@ -799,7 +836,9 @@ async fn handle_p2p_event(
                                 applied += 1;
                                 if !txs.is_empty() {
                                     let mut ledger = node.token_ledger.write().unwrap();
+                                    ledger.replay_mode = true;
                                     let _ = ledger.apply_block_txs(&txs, idx);
+                                    ledger.replay_mode = false;
                                     let _ = ledger.persist();
                                     for tx in &txs {
                                         node.mempool.mark_known(&tx.tx_id);
@@ -825,9 +864,21 @@ async fn handle_p2p_event(
             }
         }
 
-        NetworkEvent::TxReceived { tx, .. } => {
+        NetworkEvent::TxReceived { tx, from_peer } => {
             let ledger = node.token_ledger.read().unwrap();
-            let _ = node.mempool.add_tx(*tx, Some(&ledger));
+            let tx_id_short = tx.tx_id[..12.min(tx.tx_id.len())].to_string();
+            let peer_short = from_peer[..8.min(from_peer.len())].to_string();
+            let tx_type = format!("{:?}", tx.tx_type);
+            match node.mempool.add_tx(*tx, Some(&ledger)) {
+                Ok(()) => {
+                    println!("[p2p] 💸 TX {} von Peer {} aufgenommen ({})",
+                        tx_id_short, peer_short, tx_type);
+                }
+                Err(e) => {
+                    println!("[p2p] ⚠️  TX {} von Peer {} abgelehnt: {}",
+                        tx_id_short, peer_short, e);
+                }
+            }
         }
 
         NetworkEvent::PeerIdentified { peer_id, addresses, .. } => {
@@ -1705,6 +1756,129 @@ fn spawn_log_watcher(
     });
 }
 
+// ─── Mempool Sync (Pending TXs von Peers holen) ────────────────────────────
+
+/// Alle 15 Sekunden: Pending TXs von bekannten Peers + Seed-Peers abrufen
+/// und in den lokalen Mempool aufnehmen. So werden TXs die auf entfernten
+/// Nodes eingereicht wurden zuverlässig zum Miner synchronisiert.
+fn spawn_mempool_sync(
+    node: Arc<MasterNodeState>,
+    seed_peers: Vec<String>,
+    _api_key: Arc<String>,
+) {
+    tokio::spawn(async move {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap_or_default();
+
+        loop {
+            tokio::time::sleep(Duration::from_secs(15)).await;
+
+            // Nur syncen wenn Initial-Sync fertig
+            if !node.metrics.initial_sync_done.load(std::sync::atomic::Ordering::Relaxed) {
+                continue;
+            }
+
+            // Peer-URLs sammeln (gesunde Peers + Seed-Peers)
+            let mut urls: Vec<String> = node.get_peers()
+                .into_iter()
+                .filter(|p| p.is_healthy())
+                .map(|p| p.url.clone())
+                .collect();
+            for sp in &seed_peers {
+                let normalized = sp.trim_end_matches('/').to_string();
+                if !urls.iter().any(|u| u.trim_end_matches('/') == normalized) {
+                    urls.push(normalized);
+                }
+            }
+
+            // Private/Docker-IPs filtern (nicht erreichbar vom Miner)
+            urls.retain(|url| {
+                let is_private = url.contains("://10.")
+                    || url.contains("://172.16.") || url.contains("://172.17.")
+                    || url.contains("://172.18.") || url.contains("://172.19.")
+                    || url.contains("://172.2") || url.contains("://172.3")
+                    || url.contains("://192.168.")
+                    || url.contains("://100.") // Tailscale
+                    || url.contains("://127.");
+                !is_private
+            });
+
+            if urls.is_empty() {
+                continue;
+            }
+
+            let mut total_added = 0usize;
+            let mut total_received = 0usize;
+            let mut total_known = 0usize;
+
+            for url in &urls {
+                let endpoint = format!("{}/api/v1/mempool/sync", url.trim_end_matches('/'));
+                match client.get(&endpoint).send().await {
+                    Ok(resp) if resp.status().is_success() => {
+                        match resp.json::<Vec<stone::token::TokenTx>>().await {
+                            Ok(mut txs) => {
+                                // Nach Nonce sortieren damit TXs vom selben Sender
+                                // in der richtigen Reihenfolge aufgenommen werden
+                                txs.sort_by_key(|tx| (tx.from.clone(), tx.nonce));
+                                let count = txs.len();
+                                total_received += count;
+                                let mut added = 0usize;
+                                let mut rejected = 0usize;
+                                for tx in txs {
+                                    if tx.tx_type == stone::token::TxType::Reward
+                                        || tx.tx_type == stone::token::TxType::Mint
+                                    {
+                                        continue;
+                                    }
+                                    if node.mempool.is_known(&tx.tx_id) {
+                                        total_known += 1;
+                                        continue;
+                                    }
+                                    // None = keine Nonce/Balance-Prüfung beim Sync.
+                                    // Nodes können unterschiedliche Ledger-Stände haben.
+                                    // Echte Validierung erfolgt beim Block-Bau via filter_valid_txs().
+                                    match node.mempool.add_tx(tx, None) {
+                                        Ok(_) => added += 1,
+                                        Err(e) => {
+                                            rejected += 1;
+                                            println!("[mempool-sync] ⚠️  TX abgelehnt von {}: {}", url, e);
+                                        }
+                                    }
+                                }
+                                if added > 0 {
+                                    total_added += added;
+                                    println!(
+                                        "[mempool-sync] ✅ {} TXs von {} aufgenommen ({} empfangen, {} abgelehnt)",
+                                        added, url, count, rejected,
+                                    );
+                                }
+                            }
+                            Err(e) => {
+                                println!("[mempool-sync] ⚠️  JSON-Parse-Fehler von {}: {}", url, e);
+                            }
+                        }
+                    }
+                    Ok(resp) => {
+                        println!("[mempool-sync] ⚠️  {} antwortete mit Status {}", url, resp.status());
+                    }
+                    Err(e) => {
+                        println!("[mempool-sync] ⚠️  {} nicht erreichbar: {}", url, e);
+                    }
+                }
+            }
+
+            if total_added > 0 || total_received > 0 {
+                println!(
+                    "[mempool-sync] 🔄 {} Peers, {} empfangen, {} neu, {} bekannt, Mempool: {}",
+                    urls.len(), total_received, total_added, total_known, node.mempool.pending_count(),
+                );
+            }
+        }
+    });
+}
+
 // ─── Status Relay Push ──────────────────────────────────────────────────────
 
 /// Pusht alle 10 Sekunden den Miner-Status (signiert) an die Seed-Peers
@@ -2072,6 +2246,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── PoW Solver (Argon2id Mining) ────────────────────────────────────
     spawn_pow_solver(node.clone(), pow_metrics.clone(), log_tx.clone());
+
+    // ── Mempool Sync (Pending TXs von Peers holen) ─────────────────────
+    spawn_mempool_sync(node.clone(), config.seed_peers.clone(), api_key.clone());
 
     // ── Status Relay Push (an Bootstrap-Server) ─────────────────────────
     spawn_status_relay_push(

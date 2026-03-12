@@ -266,18 +266,26 @@ impl ValidatorSet {
         signature_hex: &str,
     ) -> BlockVerifyResult {
         if self.validators.is_empty() {
-            // Kein Validator konfiguriert → PoA deaktiviert, alles erlaubt
             return BlockVerifyResult::NoValidatorsConfigured;
         }
         let Some(validator) = self.get(signer_node_id) else {
+            eprintln!("[poa-debug] UnknownValidator: '{}' nicht im Set ({}  Validators geladen)", signer_node_id, self.validators.len());
             return BlockVerifyResult::UnknownValidator;
         };
         if !validator.active {
+            eprintln!("[poa-debug] ValidatorInactive: '{}'", signer_node_id);
             return BlockVerifyResult::ValidatorInactive;
         }
         if validator.verify_block_signature(block_hash, signature_hex) {
             BlockVerifyResult::Valid
         } else {
+            eprintln!(
+                "[poa-debug] InvalidSignature: signer='{}', hash={}…, sig={}…, stored_pk={}…",
+                signer_node_id,
+                &block_hash[..16.min(block_hash.len())],
+                &signature_hex[..16.min(signature_hex.len())],
+                &validator.public_key_hex[..16.min(validator.public_key_hex.len())],
+            );
             BlockVerifyResult::InvalidSignature
         }
     }
@@ -569,6 +577,7 @@ impl ValidatorSet {
         // Basis-Prüfung (Signatur + Validator-Status)
         let basic = self.verify_block(block_hash, signer_node_id, signature_hex);
         if !basic.is_acceptable() {
+            eprintln!("[poa-debug] verify_block_with_context: basic check failed for '{}' → {:?}", signer_node_id, basic);
             return basic;
         }
         // Bei NoValidatorsConfigured:
@@ -597,6 +606,11 @@ impl ValidatorSet {
                 return BlockVerifyResult::Valid;
             }
             // PoW-Felder gesetzt aber ungültig → ablehnen
+            eprintln!(
+                "[poa-debug] Argon2 PoW failed: signer='{}', block={}, d={}, eff_d={}, pow_hash={}…",
+                signer_node_id, block_index, pow_difficulty, effective_difficulty,
+                &pow_hash[..16.min(pow_hash.len())],
+            );
             return BlockVerifyResult::NotSelectedValidator;
         }
 

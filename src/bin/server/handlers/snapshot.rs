@@ -6,7 +6,7 @@
 
 use axum::{
     body::Body,
-    extract::State,
+    extract::{State, Query},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
 };
@@ -33,6 +33,7 @@ pub async fn handle_snapshot_meta(
                 "created_at": meta.created_at,
                 "node_version": meta.node_version,
                 "filename": meta.filename,
+                "state_root": meta.state_root,
             })),
         ).into_response(),
         None => (
@@ -93,12 +94,15 @@ pub async fn handle_snapshot_create(
 ) -> Result<impl IntoResponse, Response> {
     require_admin(&headers, &state)?;
 
-    let (height, genesis, latest) = {
+    let (height, genesis, latest, sr) = {
         let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
         let h = chain.blocks.last().map(|b| b.index).unwrap_or(0);
         let g = chain.blocks.first().map(|b| b.hash.clone()).unwrap_or_default();
         let l = chain.latest_hash.clone();
-        (h, g, l)
+        drop(chain);
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
+        let s = ledger.state_root();
+        (h, g, l, s)
     };
 
     if height < stone::snapshot::MIN_SNAPSHOT_HEIGHT {
@@ -112,7 +116,7 @@ pub async fn handle_snapshot_create(
 
     // Snapshot im Blocking-Thread erstellen (IO-intensiv)
     let result = tokio::task::spawn_blocking(move || {
-        stone::snapshot::create_snapshot(height, &genesis, &latest)
+        stone::snapshot::create_snapshot(height, &genesis, &latest, &sr)
     }).await;
 
     match result {
@@ -134,4 +138,57 @@ pub async fn handle_snapshot_create(
             axum::Json(json!({"error": format!("Task-Fehler: {e}")})),
         ).into_response()),
     }
+}
+
+// ─── State-Root Abfrage ──────────────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+pub struct StateRootQuery {
+    /// Optionale Block-Höhe. Ohne → aktueller Ledger-State.
+    pub block_height: Option<u64>,
+}
+
+/// GET /api/v1/snapshot/state_root?block_height=600
+///
+/// Gibt den deterministischen state_root Hash des Token-Ledgers zurück.
+/// Wird für die Bootstrap-Konsensverifikation zwischen Nodes verwendet:
+/// Neue Nodes fragen alle Bootstrap-Nodes nach dem state_root bei einer bestimmten
+/// Block-Höhe und prüfen ob mindestens alle übereinstimmen.
+pub async fn handle_snapshot_state_root(
+    State(state): State<AppState>,
+    Query(q): Query<StateRootQuery>,
+) -> impl IntoResponse {
+    let chain_height = {
+        let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain.blocks.last().map(|b| b.index).unwrap_or(0)
+    };
+
+    // Wenn eine bestimmte Block-Höhe angefragt wird, prüfen ob wir so weit sind
+    if let Some(requested) = q.block_height {
+        if requested > chain_height {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(json!({
+                    "ok": false,
+                    "error": format!("Angefragte Höhe {} > lokale Chain-Höhe {}", requested, chain_height),
+                })),
+            ).into_response();
+        }
+    }
+
+    let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
+    let sr = ledger.state_root();
+    let accounts = ledger.account_count();
+    let supply = ledger.total_supply();
+
+    (
+        StatusCode::OK,
+        axum::Json(json!({
+            "ok": true,
+            "state_root": sr,
+            "block_height": chain_height,
+            "accounts": accounts,
+            "supply": supply.to_string(),
+        })),
+    ).into_response()
 }

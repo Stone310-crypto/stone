@@ -1986,42 +1986,19 @@ impl SwarmTask {
                             error: None,
                         });
                     } else if !response.blocks.is_empty() {
-                        // Range-Response
+                        // Range-Response → IMMER als Batch via RangeSyncReceived senden
+                        // (Einzelblock-Verarbeitung via sync_buffer führt zu PoA-Ablehnungen,
+                        //  weil Range-Sync Blöcke keiner erneuten PoA-Prüfung bedürfen)
                         let block_count = response.blocks.len();
                         println!("[p2p] ← {block_count} Blöcke via Range-Sync von {peer}");
 
-                        // Prüfe ob die Response Blöcke enthält die wir schon haben
-                        // UND Blöcke die wir noch nicht haben → Fork-Reorg nötig
-                        let actual_local = self.chain_ref.as_ref()
-                            .and_then(|arc| arc.lock().ok().map(|c| c.blocks.len() as u64))
-                            .unwrap_or(self.local_chain_count);
-                        let has_overlap = response.blocks.iter().any(|b| b.index < actual_local);
-                        let has_new = response.blocks.iter().any(|b| b.index >= actual_local);
-
-                        if has_overlap && has_new && actual_local <= 50 {
-                            // Fork-Resolution: als Batch senden (KEIN is_duplicate)
-                            println!("[p2p] 🔄 Fork-Sync: {block_count} Blöcke als Batch (lokal={actual_local})");
-                            if let Some(entry) = self.peers.get_mut(&peer) {
-                                entry.blocks_received += block_count as u64;
-                            }
-                            let _ = self.event_tx.send(NetworkEvent::RangeSyncReceived {
-                                blocks: response.blocks,
-                                from_peer: peer.to_string(),
-                            });
-                        } else {
-                            // Normaler Sync: is_duplicate + sync_buffer
-                            for block in response.blocks {
-                                let hash = block.hash.clone();
-                                if !self.is_duplicate(&hash) {
-                                    if let Some(entry) = self.peers.get_mut(&peer) {
-                                        entry.blocks_received += 1;
-                                    }
-                                    self.sync_buffer.insert(block.index, (block, peer.to_string()));
-                                }
-                            }
-                            self.sync_buffer_last_insert = Some(Instant::now());
-                            self.flush_sync_buffer();
+                        if let Some(entry) = self.peers.get_mut(&peer) {
+                            entry.blocks_received += block_count as u64;
                         }
+                        let _ = self.event_tx.send(NetworkEvent::RangeSyncReceived {
+                            blocks: response.blocks,
+                            from_peer: peer.to_string(),
+                        });
                     } else if let Some(block) = response.block {
                         // Einzelner Block-Sync
                         let hash = block.hash.clone();
@@ -3738,7 +3715,7 @@ pub async fn start_network(
     subscribe_all_topics(&mut swarm.behaviour_mut().gossipsub)
         .map_err(|e| format!("Gossipsub-Subscribe: {e}"))?;
 
-    let (event_tx, _) = broadcast::channel(512);
+    let (event_tx, _) = broadcast::channel(4096);
     let (cmd_tx, cmd_rx) = mpsc::channel(128);
 
     let bootstrap_addrs = config.bootstrap_nodes.clone();

@@ -22,6 +22,7 @@
 
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
 use super::transaction::{TokenTx, TxError, TxType, validate_tx};
@@ -289,6 +290,27 @@ impl TokenLedger {
         self.balances.values().filter(|b| **b > Decimal::ZERO).count()
     }
 
+    /// Deterministischer State-Root-Hash über den gesamten Ledger-Zustand.
+    ///
+    /// SHA-256 über sortierte (Adresse, Balance, Nonce)-Tripel + Supply + Fees.
+    /// Identischer Ledger-Zustand → identischer state_root auf allen Nodes.
+    pub fn state_root(&self) -> String {
+        let mut hasher = Sha256::new();
+        // Sortierte Adressen für Determinismus
+        let mut addrs: Vec<&String> = self.balances.keys().collect();
+        addrs.sort();
+        for addr in &addrs {
+            let bal = self.balances.get(*addr).copied().unwrap_or(Decimal::ZERO);
+            let nonce = self.nonces.get(*addr).copied().unwrap_or(0);
+            hasher.update(addr.as_bytes());
+            hasher.update(bal.to_string().as_bytes());
+            hasher.update(nonce.to_le_bytes());
+        }
+        hasher.update(self.total_supply.to_string().as_bytes());
+        hasher.update(self.total_fees_burned.to_string().as_bytes());
+        hex::encode(hasher.finalize())
+    }
+
     // ── On-Chain Account-Registry Abfragen ────────────────────────────────
 
     /// Gibt den registrierten Account-Namen für eine Wallet-Adresse zurück.
@@ -366,20 +388,20 @@ impl TokenLedger {
     ) -> Result<(), LedgerError> {
         let total_debit = amount + fee;
 
-        // Im Replay-Modus Balance-/Vesting-Checks überspringen:
-        // Die Chain war bereits validiert, und bei unvollständigen Chains
-        // fehlen möglicherweise frühere Gutschriften.
-        if !self.replay_mode {
-            let current_balance = self.balance(from);
-            if current_balance < total_debit {
-                return Err(LedgerError::InsufficientBalance {
-                    account: from.to_string(),
-                    available: current_balance,
-                    required: total_debit,
-                });
-            }
+        // Balance-Check immer durchführen — auch im Replay-Modus.
+        // Ungültige TXs in der Chain (z.B. Transfer ohne ausreichende Balance)
+        // werden so konsistent über alle Nodes hinweg übersprungen.
+        let current_balance = self.balance(from);
+        if current_balance < total_debit {
+            return Err(LedgerError::InsufficientBalance {
+                account: from.to_string(),
+                available: current_balance,
+                required: total_debit,
+            });
+        }
 
-            // Vesting-Check: bei Pool-Adressen prüfen ob der Betrag freigesetzt ist
+        // Vesting-Check: im Replay-Modus überspringen (Chain war validiert)
+        if !self.replay_mode {
             if let Some(schedule) = self.vesting_schedules.get_mut(from) {
                 let now = chrono::Utc::now().timestamp();
                 if let Err(e) = schedule.withdraw(total_debit, now) {
@@ -594,11 +616,14 @@ impl TokenLedger {
             }
 
             // Nonce-Check (kumulativ: berücksichtigt vorherige TXs im selben Block)
+            // ChatMessage TXs (amount=0, fee=0) überspringen den Nonce-Check —
+            // kein Double-Spend-Risiko, Replay-Schutz via tx_id Uniqueness.
+            // Das erlaubt Chat-TXs von Nodes mit veraltetem Ledger-Stand.
             let needs_nonce = matches!(
                 tx.tx_type,
                 TxType::Transfer | TxType::Burn | TxType::RotateKey
                 | TxType::AccountRegister | TxType::AccountUpdate
-                | TxType::ChatMessage | TxType::Stake | TxType::Unstake
+                | TxType::Stake | TxType::Unstake
             );
             if needs_nonce {
                 let expected = pending_nonces
@@ -685,7 +710,6 @@ impl TokenLedger {
         if !self.replay_mode
             && (tx.tx_type == TxType::Transfer || tx.tx_type == TxType::Burn || tx.tx_type == TxType::RotateKey
             || tx.tx_type == TxType::AccountRegister || tx.tx_type == TxType::AccountUpdate
-            || tx.tx_type == TxType::ChatMessage
             || tx.tx_type == TxType::Stake || tx.tx_type == TxType::Unstake)
         {
             // Prüfen ob der Key durch Rotation invalidiert wurde
@@ -830,8 +854,11 @@ impl TokenLedger {
             }
             TxType::ChatMessage => {
                 // Verschlüsselte Chat-Nachricht – keine Balance-Änderung.
-                // Die Nachricht wird durch die Aufnahme in den Block validiert.
-                self.advance_nonce(&tx.from, tx.nonce);
+                // ChatMessages nehmen NICHT am Nonce-Sequenzsystem teil:
+                // Sie überspringen die Nonce-Validierung (damit Nodes mit
+                // veraltetem Ledger-Stand chatten können), daher dürfen
+                // sie die Nonce auch nicht inkrementieren — sonst entstehen
+                // Lücken für Transfer-TXs die auf die gleiche Nonce angewiesen sind.
             }
         }
 
@@ -944,6 +971,8 @@ impl TokenLedger {
         if let Some(last_block) = self.last_synced_block {
             db.put(b"last_synced_block", last_block.to_le_bytes())
                 .map_err(|e| LedgerError::Persistence(format!("put last_synced_block: {e}")))?;
+        } else {
+            let _ = db.delete(b"last_synced_block");
         }
 
         // Processed TX-IDs (Duplikat-Schutz über Restarts hinweg)
@@ -1278,26 +1307,34 @@ impl TokenLedger {
         for (addr, rebuilt_bal) in &rebuilt.balances {
             let current_bal = self.balance(addr);
             if current_bal != *rebuilt_bal {
-                mismatches.push((addr.clone(), current_bal, *rebuilt_bal));
+                mismatches.push((addr.clone(), format!("Balance DB: {}, Chain: {}", current_bal, rebuilt_bal)));
             }
         }
         // Auch Accounts prüfen die nur im geladenen Ledger existieren
         for (addr, current_bal) in &self.balances {
             if !rebuilt.balances.contains_key(addr) && *current_bal != Decimal::ZERO {
-                mismatches.push((addr.clone(), *current_bal, Decimal::ZERO));
+                mismatches.push((addr.clone(), format!("Balance DB: {}, Chain: 0", current_bal)));
+            }
+        }
+        // Nonces vergleichen — falsche Nonces führen dazu dass TXs
+        // mit dem falschen Nonce erstellt werden und nie bestätigt werden.
+        for (addr, rebuilt_nonce) in &rebuilt.nonces {
+            let current_nonce = self.nonce(addr);
+            if current_nonce != *rebuilt_nonce {
+                mismatches.push((addr.clone(), format!("Nonce DB: {}, Chain: {}", current_nonce, rebuilt_nonce)));
             }
         }
 
         if !mismatches.is_empty() {
             eprintln!(
-                "[token] ⚠️  LEDGER-DESYNC ERKANNT: {} Accounts haben falsche Balancen!",
+                "[token] ⚠️  LEDGER-DESYNC ERKANNT: {} Abweichungen!",
                 mismatches.len()
             );
-            for (addr, current, expected) in &mismatches {
+            for (addr, detail) in &mismatches {
                 let label = if addr.len() > 20 { &addr[..16] } else { addr };
                 eprintln!(
-                    "[token]   {} — DB: {}, Chain: {} (Δ {})",
-                    label, current, expected, *current - *expected
+                    "[token]   {} — {}",
+                    label, detail
                 );
             }
             eprintln!("[token] → Ledger wird aus Chain neu aufgebaut");
@@ -1323,6 +1360,11 @@ impl TokenLedger {
     /// Setter für last_synced_block (wird nach genesis-apply gebraucht).
     pub fn set_last_synced_block(&mut self, block: u64) {
         self.last_synced_block = Some(block);
+    }
+
+    /// Setzt den Sync-Marker zurück (für Migration/Repair).
+    pub fn reset_sync_marker(&mut self) {
+        self.last_synced_block = None;
     }
 }
 

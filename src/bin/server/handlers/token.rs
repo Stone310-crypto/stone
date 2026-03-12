@@ -1187,3 +1187,25 @@ pub async fn handle_ledger_rebuild(
         "blocks_processed": blocks.len(),
     }))
 }
+
+// ─── Mempool Sync (Peer-to-Peer) ────────────────────────────────────────────
+
+/// GET /api/v1/mempool/sync — Öffentlich (keine Auth nötig)
+///
+/// Gibt alle pending TXs als vollständige TokenTx-Objekte zurück.
+/// Wird von Minern genutzt um TXs von entfernten Nodes zu synchronisieren.
+/// Sicher weil alle TXs bereits signiert sind und via Gossip öffentlich verteilt werden.
+pub async fn handle_mempool_sync(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let txs = state.node.mempool.pending_txs();
+    // Alle User-TXs zurückgeben — nur System-TXs (Reward/Mint/Memorial) ausschließen
+    let user_txs: Vec<&stone::token::TokenTx> = txs.iter()
+        .filter(|tx| !matches!(tx.tx_type,
+            stone::token::TxType::Reward
+            | stone::token::TxType::Mint
+            | stone::token::TxType::Memorial
+        ))
+        .collect();
+    (StatusCode::OK, Json(serde_json::json!(user_txs))).into_response()
+}

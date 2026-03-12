@@ -222,7 +222,15 @@ async fn main() {
                         let handle_bg = handle.clone();
                         let api_key_bg = api_key.clone();
                         tokio::spawn(async move {
-                            while let Ok(event) = event_rx.recv().await {
+                            loop {
+                                let event = match event_rx.recv().await {
+                                    Ok(ev) => ev,
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                        eprintln!("[p2p] ⚠ Event-Empfänger lag {n} Events hinterher – setze fort");
+                                        continue;
+                                    }
+                                    Err(_) => break, // Sender dropped
+                                };
                                 match event {
                                 NetworkEvent::BlockReceived { block, from_peer } => {
                                     let peer_urls: Vec<String> = {
@@ -323,10 +331,20 @@ async fn main() {
 
                                             match chain.accept_peer_block(*block, poa_ok) {
                                                 Ok(_) => {
-                                                    println!(
-                                                        "[p2p] ✓ Block #{idx} von {from_peer} in Chain aufgenommen"
-                                                    );
-                                                    if !block_txs.is_empty() {
+                                                    // Orphan-TX-Recovery
+                                                    let orphaned = std::mem::take(&mut chain.orphaned_blocks);
+                                                    if !orphaned.is_empty() {
+                                                        node_bg.mempool.requeue_orphaned_txs(&orphaned);
+                                                        // Ledger nach Single-Block-Reorg neu aufbauen (BUG-11 Fix)
+                                                        let rebuilt = stone::token::TokenLedger::rebuild_from_chain(&chain.blocks);
+                                                        let mut ledger = node_bg.token_ledger.write().unwrap();
+                                                        *ledger = rebuilt;
+                                                        eprintln!(
+                                                            "[sync] Token-Ledger nach Single-Block-Reorg neu aufgebaut: {} Accounts, Supply: {}",
+                                                            ledger.account_count(),
+                                                            ledger.total_supply()
+                                                        );
+                                                    } else if !block_txs.is_empty() {
                                                         let mut ledger = node_bg.token_ledger.write().unwrap();
                                                         // Block ist bereits in Chain aufgenommen → replay_mode
                                                         // (Nonce/Balance-Checks überspringen, Block ist finalisiert)
@@ -470,7 +488,7 @@ async fn main() {
                                         }
                                         BlockResult::Rejected => {
                                             // Peer hat ungültigen Block geliefert → Penalty
-                                            handle_bg.report_penalty(&from_peer, 50, "rejected block").await;
+                                            handle_bg.report_penalty(&from_peer, 15, "rejected block").await;
                                         }
                                         _ => {} // Stale, AlreadyKnown
                                     }
@@ -647,6 +665,136 @@ async fn main() {
                                             &from_peer[..12.min(from_peer.len())], seq,
                                         ),
                                         Err(_) => {}
+                                    }
+                                }
+
+                                // ── Range-Sync Batch (Fork-Reorg) ─────────────────
+                                NetworkEvent::RangeSyncReceived { blocks, from_peer } => {
+                                    let mut sorted = blocks;
+                                    sorted.sort_by_key(|b| b.index);
+
+                                    let reorg_result: Option<(u64, u64)> = {
+                                        let mut chain = node_bg.chain.lock().unwrap();
+                                        let local_len = chain.blocks.len();
+
+                                        // Fork-Punkt finden
+                                        let mut fork_at = 0usize;
+                                        let first_received_idx = sorted.first().map(|b| b.index as usize).unwrap_or(0);
+                                        let mut fork_before_range = false;
+                                        for block in &sorted {
+                                            let idx = block.index as usize;
+                                            if idx < local_len {
+                                                if chain.blocks[idx].hash == block.hash {
+                                                    fork_at = idx + 1;
+                                                } else {
+                                                    if idx == first_received_idx {
+                                                        // Fork liegt VOR dem Beginn des empfangenen Bereichs
+                                                        fork_before_range = true;
+                                                    }
+                                                    break;
+                                                }
+                                            } else {
+                                                fork_at = local_len;
+                                                break;
+                                            }
+                                        }
+
+                                        // Wenn der Fork vor dem empfangenen Bereich liegt,
+                                        // müssen wir den überlappenden Teil als Fork-Punkt nehmen.
+                                        // Wir vertrauen der längeren Peer-Chain und machen einen Deep-Reorg.
+                                        if fork_before_range && first_received_idx > 0 {
+                                            println!(
+                                                "[sync] ⚠️  Fork vor Range-Beginn (Block #{}) – Deep-Reorg ab Block #{}",
+                                                first_received_idx, first_received_idx
+                                            );
+                                            fork_at = first_received_idx;
+                                        }
+
+                                        let peer_new: Vec<_> = sorted.into_iter()
+                                            .filter(|b| b.index as usize >= fork_at)
+                                            .collect();
+                                        let our_after_fork = local_len.saturating_sub(fork_at);
+
+                                        if peer_new.len() > our_after_fork {
+                                            println!(
+                                                "[sync] 🔄 Range-Sync von {}: fork_at={fork_at}, lokal={local_len}, {} neue Blöcke",
+                                                &from_peer[..12.min(from_peer.len())], peer_new.len()
+                                            );
+                                            let orphaned = chain.truncate_to(fork_at as u64);
+                                            if !orphaned.is_empty() {
+                                                node_bg.mempool.requeue_orphaned_txs(&orphaned);
+                                            }
+
+                                            // Ledger komplett aus der getrunkten Chain neu aufbauen,
+                                            // damit Balancen/Nonces konsistent sind (BUG-11 Fix)
+                                            {
+                                                let rebuilt = stone::token::TokenLedger::rebuild_from_chain(&chain.blocks);
+                                                let mut ledger = node_bg.token_ledger.write().unwrap();
+                                                *ledger = rebuilt;
+                                                eprintln!(
+                                                    "[sync] Token-Ledger nach Reorg neu aufgebaut: {} Accounts, Supply: {}",
+                                                    ledger.account_count(),
+                                                    ledger.total_supply()
+                                                );
+                                            }
+
+                                            let mut applied = 0u64;
+                                            for block in peer_new {
+                                                let idx = block.index;
+                                                let txs = block.transactions.clone();
+                                                let chat_batches = block.chat_batches.clone();
+
+                                                // Equivocation-Check
+                                                {
+                                                    let mut tracker = node_bg.equivocation_tracker.lock().unwrap();
+                                                    let _ = tracker.check_and_record(
+                                                        block.index,
+                                                        &block.validator_pub_key,
+                                                        &block.hash,
+                                                    );
+                                                }
+
+                                                match chain.accept_peer_block(block, None) {
+                                                    Ok(_) => {
+                                                        applied += 1;
+                                                        if !txs.is_empty() {
+                                                            let mut ledger = node_bg.token_ledger.write().unwrap();
+                                                            ledger.replay_mode = true;
+                                                            let _receipts = ledger.apply_block_txs(&txs, idx);
+                                                            ledger.replay_mode = false;
+                                                            if let Err(e) = ledger.persist() {
+                                                                eprintln!("[token] Ledger-Persist nach Range-Sync Block #{idx}: {e}");
+                                                            }
+                                                            ledger.set_last_synced_block(idx);
+                                                            for tx in &txs {
+                                                                node_bg.mempool.mark_known(&tx.tx_id);
+                                                                node_bg.mempool.remove_tx(&tx.tx_id);
+                                                            }
+                                                        }
+                                                        // Chat-Batch-Records speichern
+                                                        for batch in &chat_batches {
+                                                            if !batch.messages.is_empty() {
+                                                                node_bg.message_pool.store_batch_record(
+                                                                    &batch.merkle_root, &batch.messages, idx,
+                                                                );
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        eprintln!("[sync] ✗ Range-Sync Block #{idx} fehlgeschlagen: {e}");
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                            Some((chain.blocks.len() as u64, applied))
+                                        } else {
+                                            None
+                                        }
+                                    }; // chain-Lock hier gedroppt
+
+                                    if let Some((new_count, applied)) = reorg_result {
+                                        handle_bg.set_chain_count(new_count).await;
+                                        println!("[sync] ✓ Range-Sync: {applied} Blöcke applied, Chain-Höhe={new_count}");
                                     }
                                 }
 

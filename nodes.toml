@@ -33,12 +33,3 @@ root    = "/home"
 path    = "/home"
 service = "stone-node"
 bins    = "stone-setup stone-master"
-
-[[node]]
-name    = "server2"
-host    = "10.1.128.189"
-user    = "root"
-port    = "22"
-path    = "/home"
-service = "stone-node"
-bins    = "stone-setup stone-master"

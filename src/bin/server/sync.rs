@@ -490,8 +490,12 @@ pub async fn pull_from_peer(node: &Arc<MasterNodeState>, peer_url: &str, api_key
                 let latest_hash = last.hash.clone();
                 let height = post_height;
                 drop(chain);
+                let sr = {
+                    let ledger = node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
+                    ledger.state_root()
+                };
                 std::thread::spawn(move || {
-                    match stone::snapshot::create_snapshot(height, &genesis_hash, &latest_hash) {
+                    match stone::snapshot::create_snapshot(height, &genesis_hash, &latest_hash, &sr) {
                         Ok((_path, meta)) => {
                             eprintln!(
                                 "[snapshot] 📸 Auto-Snapshot nach Sync bei Block #{}: {:.1} MB",

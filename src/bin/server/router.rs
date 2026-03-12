@@ -68,6 +68,7 @@ use super::handlers::{
         handle_token_transfer, handle_wallet_balance, handle_wallet_create,
         handle_wallet_info, handle_wallet_rotations,
         handle_staking_info, handle_staking_pool, handle_staker_info,
+        handle_mempool_sync,
         handle_ledger_rebuild,
     },
     trust::{
@@ -84,6 +85,7 @@ use super::handlers::{
     },
     snapshot::{
         handle_snapshot_meta, handle_snapshot_download, handle_snapshot_create,
+        handle_snapshot_state_root,
     },
     users::{handle_delete_user, handle_list_users, handle_list_users_public},
     ws::handle_websocket,
@@ -224,6 +226,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/token/supply", get(handle_token_supply))
         .route("/api/v1/token/accounts", get(handle_token_accounts))
         .route("/api/v1/token/pending", get(handle_token_pending))
+        .route("/api/v1/mempool/sync", get(handle_mempool_sync))
         .route("/api/v1/token/transfer", post(handle_token_transfer))
         .route("/api/v1/token/send", post(handle_token_send))
         .route("/api/v1/token/send-authenticated", post(handle_token_send_authenticated))
@@ -311,8 +314,7 @@ pub fn build_router(state: AppState) -> Router {
         // ─── Snapshots (Fast Sync) ──────────────────────────────────────────
         .route("/api/v1/snapshot/meta", get(handle_snapshot_meta))
         .route("/api/v1/snapshot/download", get(handle_snapshot_download))
-        .route("/api/v1/snapshot/create", post(handle_snapshot_create))
-        .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
+        .route("/api/v1/snapshot/create", post(handle_snapshot_create))        .route("/api/v1/snapshot/state_root", get(handle_snapshot_state_root))        .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
         .layer(build_cors())
         .with_state(state)
 }

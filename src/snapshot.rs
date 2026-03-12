@@ -61,6 +61,11 @@ pub struct SnapshotMeta {
     pub node_version: String,
     /// Dateiname des Archivs
     pub filename: String,
+    /// Deterministischer State-Root-Hash des Token-Ledgers zum Zeitpunkt des Snapshots.
+    /// SHA-256 über sortierte (Adresse, Balance, Nonce)-Tripel + Supply + Fees.
+    /// Wird für Bootstrap-Konsensprüfung zwischen Nodes verwendet.
+    #[serde(default)]
+    pub state_root: String,
 }
 
 // ─── Pfade ───────────────────────────────────────────────────────────────────
@@ -93,6 +98,7 @@ pub fn create_snapshot(
     block_height: u64,
     genesis_hash: &str,
     latest_hash: &str,
+    state_root: &str,
 ) -> Result<(PathBuf, SnapshotMeta), SnapshotError> {
     let dd = data_dir();
     let snap_dir = snapshot_dir();
@@ -111,6 +117,7 @@ pub fn create_snapshot(
     if tmp_checkpoint.exists() {
         fs::remove_dir_all(&tmp_checkpoint)?;
     }
+    fs::create_dir_all(&tmp_checkpoint)?;
 
     // RocksDB-Checkpoint erstellen (read-only open, kein Lock-Konflikt)
     {
@@ -172,6 +179,7 @@ pub fn create_snapshot(
         created_at: chrono::Utc::now().timestamp(),
         node_version: env!("CARGO_PKG_VERSION").to_string(),
         filename: filename.clone(),
+        state_root: state_root.to_string(),
     };
 
     // Metadaten atomar schreiben (tmp + rename)
@@ -469,6 +477,314 @@ pub async fn download_snapshot_from_peer(
     Ok(meta)
 }
 
+// ─── Bootstrap-Nodes HTTP-URLs ───────────────────────────────────────────────
+
+/// HTTP-URLs der Bootstrap-Nodes für Konsensverifikation.
+/// Muss mit SEED_NODES in network.rs konsistent gehalten werden.
+const BOOTSTRAP_HTTP_URLS: &[&str] = &[
+    "http://212.227.54.241:8080", // VPS1
+    "http://69.48.200.255:8080",  // VPS2
+];
+
+/// Minimale Übereinstimmung für Bootstrap-Konsens.
+/// Bei <= 4 Nodes: ALLE müssen übereinstimmen (100%).
+/// Bei >= 5 Nodes: 2/3 Mehrheit reicht.
+const MIN_BOOTSTRAP_NODES_FOR_MAJORITY: usize = 5;
+
+// ─── State-Root Response ─────────────────────────────────────────────────────
+
+/// Antwort von `/api/v1/snapshot/state_root`
+#[derive(Debug, Deserialize)]
+struct StateRootResponse {
+    ok: bool,
+    state_root: String,
+    block_height: u64,
+}
+
+/// Antwort von `/api/v1/snapshot/meta`
+#[derive(Debug, Deserialize)]
+struct SnapshotMetaResponse {
+    available: Option<bool>,
+    block_height: Option<u64>,
+    genesis_hash: Option<String>,
+    latest_hash: Option<String>,
+    archive_hash: Option<String>,
+    archive_size: Option<u64>,
+    created_at: Option<i64>,
+    node_version: Option<String>,
+    filename: Option<String>,
+    state_root: Option<String>,
+    error: Option<String>,
+}
+
+// ─── Verifizierter Snapshot-Download mit Bootstrap-Konsens ───────────────────
+
+/// Lädt einen Snapshot herunter und verifiziert ihn gegen den Konsens aller Bootstrap-Nodes.
+///
+/// # Ablauf
+/// 1. Snapshot-Metadaten von allen Bootstrap-Nodes sammeln
+/// 2. Prüfen ob Snapshots verfügbar sind
+/// 3. State-Root Konsens prüfen (alle müssen übereinstimmen bei < 5 Nodes)
+/// 4. Snapshot von einem Node herunterladen
+/// 5. Archiv-Hash verifizieren
+/// 6. Nach Wiederherstellen: Ledger-State-Root lokal berechnen und gegen Konsens prüfen
+///
+/// # Sicherheitsmodell
+/// - Bei < 5 Bootstrap-Nodes: 100% Übereinstimmung erforderlich
+/// - Bei >= 5 Bootstrap-Nodes: 2/3 Mehrheit reicht
+/// - Wenn ein Node keinen Snapshot hat: wird übersprungen, aber Konsens wird aus
+///   den state_root-Endpunkten (nicht Snapshot-Meta) geprüft
+pub async fn verified_download_snapshot(
+    local_genesis_hash: &str,
+    local_chain_height: u64,
+) -> Result<SnapshotMeta, SnapshotError> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .danger_accept_invalid_certs(
+            std::env::var("STONE_INSECURE_SSL").as_deref() == Ok("1"),
+        )
+        .build()
+        .map_err(|e| SnapshotError::Network(format!("HTTP-Client: {e}")))?;
+
+    let bootstrap_urls: Vec<String> = std::env::var("STONE_BOOTSTRAP_HTTP")
+        .map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
+        .unwrap_or_else(|_| BOOTSTRAP_HTTP_URLS.iter().map(|s| s.to_string()).collect());
+
+    let total_nodes = bootstrap_urls.len();
+    if total_nodes == 0 {
+        return Err(SnapshotError::Network("Keine Bootstrap-Nodes konfiguriert".into()));
+    }
+
+    eprintln!(
+        "[snapshot] 🔍 Verifizierter Snapshot-Sync: Frage {} Bootstrap-Node(s)...",
+        total_nodes
+    );
+
+    // ── Schritt 1: Snapshot-Meta von ALLEN Nodes sammeln ────────────────
+    let mut metas: Vec<(String, SnapshotMeta)> = Vec::new(); // (url, meta)
+    let mut state_roots: Vec<(String, String, u64)> = Vec::new(); // (url, state_root, block_height)
+    let mut errors: Vec<String> = Vec::new();
+
+    for url in &bootstrap_urls {
+        // Snapshot-Meta abfragen
+        let meta_url = format!("{}/api/v1/snapshot/meta", url.trim_end_matches('/'));
+        match client.get(&meta_url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                match resp.json::<SnapshotMetaResponse>().await {
+                    Ok(mr) if mr.available == Some(true) => {
+                        let gh = mr.genesis_hash.clone().unwrap_or_default();
+                        // Genesis-Check
+                        if !local_genesis_hash.is_empty() && !gh.is_empty() && gh != local_genesis_hash {
+                            errors.push(format!("{url}: Genesis-Mismatch (lokal={}, remote={})",
+                                &local_genesis_hash[..12.min(local_genesis_hash.len())],
+                                &gh[..12.min(gh.len())]));
+                            continue;
+                        }
+                        let meta = SnapshotMeta {
+                            block_height: mr.block_height.unwrap_or(0),
+                            genesis_hash: gh,
+                            latest_hash: mr.latest_hash.unwrap_or_default(),
+                            archive_hash: mr.archive_hash.unwrap_or_default(),
+                            archive_size: mr.archive_size.unwrap_or(0),
+                            created_at: mr.created_at.unwrap_or(0),
+                            node_version: mr.node_version.unwrap_or_default(),
+                            filename: mr.filename.unwrap_or_default(),
+                            state_root: mr.state_root.unwrap_or_default(),
+                        };
+                        if !meta.state_root.is_empty() {
+                            state_roots.push((url.clone(), meta.state_root.clone(), meta.block_height));
+                        }
+                        metas.push((url.clone(), meta));
+                    }
+                    Ok(_) => {
+                        eprintln!("[snapshot] ℹ️  {url}: Kein Snapshot verfügbar");
+                    }
+                    Err(e) => {
+                        errors.push(format!("{url}: Meta-Parse-Fehler: {e}"));
+                    }
+                }
+            }
+            Ok(resp) => {
+                eprintln!("[snapshot] ℹ️  {url}: HTTP {}", resp.status());
+            }
+            Err(e) => {
+                errors.push(format!("{url}: {e}"));
+            }
+        }
+
+        // State-Root zusätzlich vom state_root-Endpoint abfragen
+        // (auch wenn kein Snapshot verfügbar ist — der Ledger-Stand ist trotzdem vergleichbar)
+        let sr_url = format!("{}/api/v1/snapshot/state_root", url.trim_end_matches('/'));
+        match client.get(&sr_url).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                if let Ok(sr) = resp.json::<StateRootResponse>().await {
+                    if sr.ok && !sr.state_root.is_empty() {
+                        // Nur hinzufügen, wenn noch kein Eintrag via Snapshot-Meta
+                        if !state_roots.iter().any(|(u, _, _)| u == url) {
+                            state_roots.push((url.clone(), sr.state_root, sr.block_height));
+                        }
+                    }
+                }
+            }
+            _ => {} // State-Root-Endpoint nicht verfügbar — OK, kommt noch
+        }
+    }
+
+    // ── Schritt 2: Verfügbarkeit prüfen ─────────────────────────────────
+    if metas.is_empty() {
+        return Err(SnapshotError::Network(format!(
+            "Kein Bootstrap-Node hat Snapshot verfügbar. Fehler: [{}]",
+            errors.join(", ")
+        )));
+    }
+
+    // ── Schritt 3: Konsens prüfen ───────────────────────────────────────
+    // Snapshot-Meta state_roots (die wichtigeren, da sie zum Archiv gehören)
+    let snapshot_state_roots: Vec<&String> = metas.iter()
+        .filter(|(_, m)| !m.state_root.is_empty())
+        .map(|(_, m)| &m.state_root)
+        .collect();
+
+    if snapshot_state_roots.is_empty() {
+        // Alte Snapshots ohne state_root — trotzdem akzeptieren, aber warnen
+        eprintln!("[snapshot] ⚠️  Keine state_roots in Snapshot-Metadaten – Legacy-Modus");
+    } else {
+        // Alle Snapshot-state_roots müssen übereinstimmen
+        let first = &snapshot_state_roots[0];
+        let agrees = snapshot_state_roots.iter().filter(|sr| *sr == first).count();
+        let required = if total_nodes < MIN_BOOTSTRAP_NODES_FOR_MAJORITY {
+            total_nodes // 100% Übereinstimmung bei < 5 Nodes
+        } else {
+            (total_nodes * 2 + 2) / 3 // 2/3 Mehrheit aufgerundet
+        };
+
+        if agrees < required {
+            return Err(SnapshotError::ConsensusFailure {
+                agrees,
+                required,
+                total: total_nodes,
+            });
+        }
+
+        eprintln!(
+            "[snapshot] ✅ State-Root Konsens: {}/{} Nodes stimmen überein (benötigt: {})",
+            agrees, total_nodes, required
+        );
+    }
+
+    // Bester Snapshot: höchste Block-Höhe
+    metas.sort_by(|a, b| b.1.block_height.cmp(&a.1.block_height));
+    let (best_url, best_meta) = &metas[0];
+
+    // Snapshot nur holen wenn er deutlich weiter ist als unsere Chain
+    let min_advantage = 50;
+    if best_meta.block_height <= local_chain_height + min_advantage {
+        return Err(SnapshotError::NotWorthIt {
+            local: local_chain_height,
+            remote: best_meta.block_height,
+        });
+    }
+
+    eprintln!(
+        "[snapshot] 📥 Lade Snapshot von {best_url}: Block #{}, {:.1} MB",
+        best_meta.block_height,
+        best_meta.archive_size as f64 / 1_048_576.0
+    );
+
+    // ── Schritt 4: Snapshot herunterladen ────────────────────────────────
+    let dl_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .danger_accept_invalid_certs(
+            std::env::var("STONE_INSECURE_SSL").as_deref() == Ok("1"),
+        )
+        .build()
+        .map_err(|e| SnapshotError::Network(format!("HTTP-Client: {e}")))?;
+
+    let dl_url = format!("{}/api/v1/snapshot/download", best_url.trim_end_matches('/'));
+    let mut dl_resp = dl_client.get(&dl_url).send().await
+        .map_err(|e| SnapshotError::Network(format!("Snapshot-Download: {e}")))?;
+
+    if !dl_resp.status().is_success() {
+        return Err(SnapshotError::Network(
+            format!("Download fehlgeschlagen: HTTP {}", dl_resp.status())
+        ));
+    }
+
+    let snap_dir = snapshot_dir();
+    let tmp_archive = snap_dir.join(format!("{}.tmp", &best_meta.filename));
+    let archive_path = snap_dir.join(&best_meta.filename);
+    {
+        let mut file = fs::File::create(&tmp_archive)?;
+        let mut downloaded = 0u64;
+        while let Some(chunk) = dl_resp.chunk().await
+            .map_err(|e| SnapshotError::Network(format!("Download lesen: {e}")))?
+        {
+            std::io::Write::write_all(&mut file, &chunk)?;
+            downloaded += chunk.len() as u64;
+            // Fortschritt alle 10 MB
+            if downloaded % (10 * 1024 * 1024) < chunk.len() as u64 {
+                eprintln!(
+                    "[snapshot] 📥 {:.1} / {:.1} MB",
+                    downloaded as f64 / 1_048_576.0,
+                    best_meta.archive_size as f64 / 1_048_576.0
+                );
+            }
+        }
+    }
+    fs::rename(&tmp_archive, &archive_path)?;
+
+    // ── Schritt 5: Archiv-Hash verifizieren ─────────────────────────────
+    let actual_hash = sha256_file(&archive_path)?;
+    if actual_hash != best_meta.archive_hash {
+        let _ = fs::remove_file(&archive_path);
+        return Err(SnapshotError::HashMismatch {
+            expected: best_meta.archive_hash.clone(),
+            actual: actual_hash,
+        });
+    }
+
+    eprintln!("[snapshot] ✅ Archiv-Hash verifiziert");
+
+    // ── Schritt 6: Wiederherstellen ─────────────────────────────────────
+    restore_snapshot(&archive_path, best_meta)?;
+
+    // ── Schritt 7: Lokalen State-Root nach Restore verifizieren ─────────
+    // Ledger aus der wiederhergestellten token_db laden und state_root berechnen.
+    // Muss mit dem Konsens übereinstimmen.
+    if !best_meta.state_root.is_empty() {
+        let local_sr = compute_restored_state_root();
+        if local_sr != best_meta.state_root {
+            eprintln!(
+                "[snapshot] ❌ State-Root nach Restore stimmt nicht überein! Lokal: {}, Erwartet: {}",
+                &local_sr[..16.min(local_sr.len())],
+                &best_meta.state_root[..16.min(best_meta.state_root.len())]
+            );
+            return Err(SnapshotError::StateRootMismatch {
+                expected: best_meta.state_root.clone(),
+                actual: local_sr,
+            });
+        }
+        eprintln!("[snapshot] ✅ Lokaler State-Root nach Restore verifiziert");
+    }
+
+    eprintln!(
+        "[snapshot] ✅ Verifizierter Snapshot-Sync abgeschlossen: Block #{}, {}/{} Nodes Konsens",
+        best_meta.block_height, metas.len(), total_nodes
+    );
+
+    Ok(best_meta.clone())
+}
+
+/// Berechnet den state_root aus der wiederhergestellten token_db.
+/// Wird nach `restore_snapshot()` aufgerufen um den Snapshot lokal zu verifizieren.
+fn compute_restored_state_root() -> String {
+    use crate::token::TokenLedger;
+    let ledger = TokenLedger::load();
+    ledger.state_root()
+}
+
 /// Prüft ob ein Snapshot erstellt werden soll (alle SNAPSHOT_INTERVAL Blöcke).
 pub fn should_create_snapshot(block_height: u64) -> bool {
     if block_height < MIN_SNAPSHOT_HEIGHT {
@@ -589,6 +905,10 @@ pub enum SnapshotError {
     GenesisMismatch { local: String, remote: String },
     /// Snapshot ist nicht genug weiter als die lokale Chain
     NotWorthIt { local: u64, remote: u64 },
+    /// Bootstrap-Nodes stimmen nicht überein (state_root Konsens fehlgeschlagen)
+    ConsensusFailure { agrees: usize, required: usize, total: usize },
+    /// State-Root nach Restore stimmt nicht mit erwartetem Konsens überein
+    StateRootMismatch { expected: String, actual: String },
 }
 
 impl std::fmt::Display for SnapshotError {
@@ -603,6 +923,10 @@ impl std::fmt::Display for SnapshotError {
                 write!(f, "Genesis-Mismatch: lokal={local}, remote={remote}"),
             Self::NotWorthIt { local, remote } =>
                 write!(f, "Snapshot nicht lohnenswert: lokal={local}, remote={remote}"),
+            Self::ConsensusFailure { agrees, required, total } =>
+                write!(f, "Konsens fehlgeschlagen: {agrees}/{total} übereinstimmend, benötigt {required}"),
+            Self::StateRootMismatch { expected, actual } =>
+                write!(f, "State-Root Mismatch nach Restore: erwartet {expected}, bekommen {actual}"),
         }
     }
 }

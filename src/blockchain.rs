@@ -326,6 +326,10 @@ pub struct StoneChain {
     /// Gespeichert nach Block-Hash, max. 50 Einträge.
     /// Wird genutzt um Forks aufzulösen wenn nachfolgende Blöcke eintreffen.
     pub fork_blocks: std::collections::HashMap<String, Block>,
+    /// Temporärer Puffer für Blöcke die bei einem Reorg verwaist wurden.
+    /// Der Aufrufer kann hieraus User-TXs zurück in den Mempool führen.
+    /// Wird nach jedem `accept_peer_block` vom Aufrufer geleert.
+    pub orphaned_blocks: Vec<Block>,
 }
 
 impl StoneChain {
@@ -390,7 +394,7 @@ impl StoneChain {
                                 blocks.len(),
                                 &latest_hash[..8]
                             );
-                            return StoneChain { blocks, latest_hash, fork_blocks: std::collections::HashMap::new() };
+                            return StoneChain { blocks, latest_hash, fork_blocks: std::collections::HashMap::new(), orphaned_blocks: Vec::new() };
                         }
                     }
                     _ => {}
@@ -421,6 +425,7 @@ impl StoneChain {
             blocks: vec![genesis.clone()],
             latest_hash: genesis.hash.clone(),
             fork_blocks: std::collections::HashMap::new(),
+            orphaned_blocks: Vec::new(),
         };
         chain.persist_last_block();
         println!("[chain] Neue Stone-Chain erstellt – Genesis Block: {}...", &genesis.hash[..8]);
@@ -474,29 +479,31 @@ impl StoneChain {
     /// Kürzt die Chain auf `target_len` Blöcke (für Fork-Reorg).
     /// Entfernt alle Blöcke ab Index `target_len` und aktualisiert latest_hash.
     /// Die entfernten Blöcke werden auch aus RocksDB gelöscht.
-    pub fn truncate_to(&mut self, target_len: u64) {
+    /// Gibt die entfernten Blöcke zurück, damit ihre TXs in den Mempool
+    /// zurückgeführt werden können (Orphan-TX-Recovery).
+    pub fn truncate_to(&mut self, target_len: u64) -> Vec<Block> {
         let target = target_len as usize;
         if target >= self.blocks.len() {
-            return; // Nichts zu tun
+            return Vec::new();
         }
-        let removed = self.blocks.len() - target;
-        self.blocks.truncate(target);
+        let orphaned: Vec<Block> = self.blocks.split_off(target);
         self.latest_hash = self.blocks.last().map(|b| b.hash.clone()).unwrap_or_default();
         println!(
             "[chain] 🔄 Chain auf {} Blöcke gekürzt ({} entfernt), latest_hash={}...",
             target,
-            removed,
+            orphaned.len(),
             &self.latest_hash[..8.min(self.latest_hash.len())],
         );
         // RocksDB: entfernte Blöcke löschen
         use crate::storage::ChainStore;
         if let Ok(store) = ChainStore::open() {
-            for idx in target..target + removed {
-                if let Err(e) = store.delete_block(idx as u64) {
-                    eprintln!("[chain] ⚠ Block {idx} löschen fehlgeschlagen: {e}");
+            for block in &orphaned {
+                if let Err(e) = store.delete_block(block.index) {
+                    eprintln!("[chain] ⚠ Block {} löschen fehlgeschlagen: {e}", block.index);
                 }
             }
         }
+        orphaned
     }
 
     /// Neuen Block mit Dokumenten und Token-Transaktionen hinzufügen
@@ -719,18 +726,51 @@ impl StoneChain {
                             &block.hash[..8.min(block.hash.len())],
                             reorg_depth, incoming_cd, our_tip_cd,
                         );
-                        self.truncate_to(block.index);
+                        let orphaned = self.truncate_to(block.index);
+                        self.orphaned_blocks = orphaned;
                         // Weiter mit normaler Block-Akzeptanz
-                    } else if incoming_cd == our_tip_cd && reorg_depth == 1 && block.hash < existing.hash {
-                        // Tiebreaker bei gleicher CD und Tiefe 1: niedrigerer Hash gewinnt
-                        // (deterministische Fork-Auflösung)
-                        println!(
-                            "[chain] 🔄 Fork-Tiebreak bei Block #{}: lokal={}… peer={}… (niedrigerer Hash gewinnt)",
-                            block.index,
-                            &existing.hash[..8.min(existing.hash.len())],
-                            &block.hash[..8.min(block.hash.len())],
-                        );
-                        self.truncate_to(block.index);
+                    } else if incoming_cd == our_tip_cd && reorg_depth == 1 {
+                        // Tiebreaker bei gleicher CD und Tiefe 1:
+                        // 1. TX-Blöcke haben Vorrang vor reinen Reward-Blöcken
+                        // 2. Bei Gleichstand: niedrigerer Hash gewinnt (deterministisch)
+                        let incoming_has_user_txs = block.transactions.iter()
+                            .any(|tx| tx.tx_type != TxType::Reward && tx.tx_type != TxType::Mint);
+                        let existing_has_user_txs = existing.transactions.iter()
+                            .any(|tx| tx.tx_type != TxType::Reward && tx.tx_type != TxType::Mint);
+
+                        let prefer_incoming = if incoming_has_user_txs && !existing_has_user_txs {
+                            // Incoming hat User-TXs, bestehender nicht → Incoming gewinnt
+                            println!(
+                                "[chain] 🔄 Fork-Tiebreak bei Block #{}: Incoming hat {} User-TXs, lokal nur Rewards → Incoming gewinnt",
+                                block.index, block.transactions.iter()
+                                    .filter(|tx| tx.tx_type != TxType::Reward && tx.tx_type != TxType::Mint).count(),
+                            );
+                            true
+                        } else if !incoming_has_user_txs && existing_has_user_txs {
+                            // Bestehender hat User-TXs → behalten
+                            false
+                        } else {
+                            // Beide haben TXs oder beide nicht → Hash-Tiebreaker
+                            block.hash < existing.hash
+                        };
+
+                        if prefer_incoming {
+                            println!(
+                                "[chain] 🔄 Fork-Tiebreak bei Block #{}: lokal={}… peer={}…",
+                                block.index,
+                                &existing.hash[..8.min(existing.hash.len())],
+                                &block.hash[..8.min(block.hash.len())],
+                            );
+                            let orphaned = self.truncate_to(block.index);
+                            self.orphaned_blocks = orphaned;
+                        } else {
+                            let bi = block.index;
+                            self.store_fork_block(block);
+                            return Err(format!(
+                                "Fork bei Block #{}: Tiebreak verloren (cd gleich, bestehender Block bevorzugt) – gespeichert",
+                                bi,
+                            ));
+                        }
                     } else {
                         // Fork ist nicht schwerer → im Cache speichern
                         let bi = block.index;
@@ -806,7 +846,8 @@ impl StoneChain {
                         "[chain] 🔄 Fork-Reorg: Lokale Chain hat {} Blöcke, Fork bei #{} – ersetze {} Blöcke (cd: {} > {})",
                         local_len, fork_point, reorg_depth, incoming_cd, our_tip_cd,
                     );
-                    self.truncate_to(fork_point);
+                    let orphaned = self.truncate_to(fork_point);
+                    self.orphaned_blocks.extend(orphaned);
                     // Jetzt sollte latest_hash == block.previous_hash sein
                     if block.previous_hash != self.latest_hash {
                         return Err(format!(
@@ -1168,7 +1209,8 @@ impl StoneChain {
                 );
 
                 // Hauptchain kürzen
-                self.truncate_to(fork_point);
+                let orphaned = self.truncate_to(fork_point);
+                self.orphaned_blocks.extend(orphaned);
 
                 // Fork-Blöcke einfügen
                 for mut fb in fork_chain {

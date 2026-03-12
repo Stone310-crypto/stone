@@ -527,6 +527,63 @@ impl MasterNodeState {
 
         // Token-Ledger laden oder aus Chain rekonstruieren
         let mut ledger = TokenLedger::load();
+
+        // ── Einmalige Migration: ChatMessage-Nonce-Fix ──
+        // Älterer Code hat advance_nonce() auch für ChatMessage-TXs aufgerufen,
+        // was zu aufgeblähten Nonces führte und Transfer-TXs blockierte.
+        // Ein einmaliger Rebuild aus der Chain korrigiert alle Nonces.
+        {
+            let needs_migration = {
+                let db = crate::token::open_token_db();
+                db.map(|d| d.get(b"__mig_chatmsg_nonce_v1").ok().flatten().is_none())
+                    .unwrap_or(false)
+            };
+            if needs_migration && !chain.blocks.is_empty() {
+                println!("[token] 🔄 Nonce-Migration: Ledger wird aus Chain neu aufgebaut …");
+                ledger = TokenLedger::rebuild_from_chain(&chain.blocks);
+                if let Err(e) = ledger.persist() {
+                    eprintln!("[token] ⚠️  Persist nach Migration fehlgeschlagen: {e}");
+                }
+                if let Ok(db) = crate::token::open_token_db() {
+                    let _ = db.put(b"__mig_chatmsg_nonce_v1", b"done");
+                }
+                println!("[token] ✅ Nonce-Migration abgeschlossen");
+            }
+        }
+
+        // ── Einmalige Nonce-Repair-Migration (v2): Erzwingt Rebuild ────
+        // VPS-Nodes können nach Reorgs falsche Nonces/Balancen haben.
+        // v2 hat bei frischen Nodes nicht gegriffen (Chain war leer beim Start).
+        // v3: Erzwingt rebuild_from_chain wenn Chain vorhanden, sonst setzt
+        // last_synced_block zurück damit sync_with_chain einen Rebuild triggert.
+        {
+            let needs_repair = {
+                let db = crate::token::open_token_db();
+                db.map(|d| d.get(b"__mig_ledger_repair_v3").ok().flatten().is_none())
+                    .unwrap_or(false)
+            };
+            if needs_repair {
+                if chain.blocks.len() > 1 {
+                    // Chain hat Daten → sofort rebuilden
+                    println!("[token] 🔄 Ledger-Repair v3: Rebuild aus {} Chain-Blöcken …", chain.blocks.len());
+                    ledger = TokenLedger::rebuild_from_chain(&chain.blocks);
+                    if let Err(e) = ledger.persist() {
+                        eprintln!("[token] ⚠️  Persist nach Repair v3 fehlgeschlagen: {e}");
+                    }
+                    println!("[token] ✅ Ledger-Repair v3 abgeschlossen");
+                } else {
+                    // Chain leer (frische Node) → last_synced_block zurücksetzen
+                    // damit sync_with_chain nach dem p2p-Sync einen verify_and_repair triggert
+                    println!("[token] 🔄 Ledger-Repair v3: Chain leer, setze Sync-Marker zurück");
+                    ledger.reset_sync_marker();
+                    let _ = ledger.persist();
+                }
+                if let Ok(db) = crate::token::open_token_db() {
+                    let _ = db.put(b"__mig_ledger_repair_v3", b"done");
+                }
+            }
+        }
+
         if ledger.total_supply() == rust_decimal::Decimal::ZERO && chain.blocks.len() > 0 {
             // Versuche Rebuild aus Chain (falls DB fehlt, aber Chain TXs hat)
             ledger = TokenLedger::rebuild_from_chain(&chain.blocks);
@@ -1255,6 +1312,7 @@ impl MasterNodeState {
 
         // ── Mempool-TXs + Reward-TX sammeln ────────────────────────────
         let mut pending_txs = self.mempool.drain_all_for_block();
+        let user_tx_count = pending_txs.len(); // vor reward
 
         if reward_amount > Decimal::ZERO {
             let reward_tx = Self::create_reward_tx(&reward_wallet, reward_amount, next_index);
@@ -1266,7 +1324,46 @@ impl MasterNodeState {
         // in den Block aufgenommen werden (Double-Spend-Schutz).
         let pending_txs = {
             let ledger = self.token_ledger.read().unwrap();
-            ledger.filter_valid_txs(&pending_txs)
+            let valid = ledger.filter_valid_txs(&pending_txs);
+
+            // Abgelehnte User-TXs mit zukünftiger Nonce zurück in den Mempool legen.
+            // Diese TXs könnten gültig werden wenn vorherige TXs eintreffen.
+            let valid_ids: std::collections::HashSet<&str> =
+                valid.iter().map(|tx| tx.tx_id.as_str()).collect();
+            let mut requeued = 0usize;
+            let mut discarded = 0usize;
+            for tx in &pending_txs {
+                if valid_ids.contains(tx.tx_id.as_str()) {
+                    continue;
+                }
+                // System-TXs nicht requeuen
+                if matches!(tx.tx_type, TxType::Reward | TxType::Mint | TxType::Memorial) {
+                    continue;
+                }
+                // Nonce >= erwartet → TX könnte zukünftig gültig werden → zurücklegen
+                let expected_nonce = ledger.nonce(&tx.from);
+                if tx.nonce >= expected_nonce {
+                    self.mempool.requeue_tx(tx.clone());
+                    requeued += 1;
+                } else {
+                    discarded += 1;
+                    // Endgültig ungültige TX als "known" markieren damit
+                    // Mempool-Sync sie nicht erneut vom Peer holt.
+                    self.mempool.mark_known(&tx.tx_id);
+                    println!(
+                        "[mining] 🗑️  TX {} verworfen: Nonce {} < erwartet {} ({:?})",
+                        &tx.tx_id[..12.min(tx.tx_id.len())], tx.nonce, expected_nonce, tx.tx_type,
+                    );
+                }
+            }
+            if requeued > 0 || discarded > 0 {
+                println!(
+                    "[mining] 📊 Block-Filter: {} User-TXs gedrained, {} valid, {} requeued, {} verworfen",
+                    user_tx_count, valid.len().saturating_sub(1), requeued, discarded,
+                );
+            }
+
+            valid
         };
 
         // ── Chat-Nachrichten batchen ────────────────────────────────────
@@ -1688,6 +1785,7 @@ impl MasterNodeState {
 
         // ── Mempool-TXs + Reward-TX sammeln ──────────────────────────────
         let mut pending_txs = self.mempool.drain_all_for_block();
+        let user_tx_count = pending_txs.len(); // vor reward
 
         // Log ChatMessage TXs für Debugging
         let chat_tx_count = pending_txs.iter()
@@ -1710,7 +1808,43 @@ impl MasterNodeState {
         // ── Pre-Block-Validierung: Ungültige TXs herausfiltern ──────────
         let pending_txs = {
             let ledger = self.token_ledger.read().unwrap();
-            ledger.filter_valid_txs(&pending_txs)
+            let valid = ledger.filter_valid_txs(&pending_txs);
+
+            // Abgelehnte User-TXs mit zukünftiger Nonce zurück in den Mempool legen
+            let valid_ids: std::collections::HashSet<&str> =
+                valid.iter().map(|tx| tx.tx_id.as_str()).collect();
+            let mut requeued = 0usize;
+            let mut discarded = 0usize;
+            for tx in &pending_txs {
+                if valid_ids.contains(tx.tx_id.as_str()) {
+                    continue;
+                }
+                if matches!(tx.tx_type, TxType::Reward | TxType::Mint | TxType::Memorial) {
+                    continue;
+                }
+                let expected_nonce = ledger.nonce(&tx.from);
+                if tx.nonce >= expected_nonce {
+                    self.mempool.requeue_tx(tx.clone());
+                    requeued += 1;
+                } else {
+                    discarded += 1;
+                    // Endgültig ungültige TX als "known" markieren damit
+                    // Mempool-Sync sie nicht erneut vom Peer holt.
+                    self.mempool.mark_known(&tx.tx_id);
+                    println!(
+                        "[mining] 🗑️  TX {} verworfen: Nonce {} < erwartet {} ({:?})",
+                        &tx.tx_id[..12.min(tx.tx_id.len())], tx.nonce, expected_nonce, tx.tx_type,
+                    );
+                }
+            }
+            if requeued > 0 || discarded > 0 {
+                println!(
+                    "[mining] 📊 Block-Filter: {} User-TXs gedrained, {} valid, {} requeued, {} verworfen",
+                    user_tx_count, valid.len().saturating_sub(1), requeued, discarded,
+                );
+            }
+
+            valid
         };
 
         // Blöcke werden IMMER erzeugt — auch ohne User-TXs.
@@ -2150,10 +2284,14 @@ impl MasterNodeState {
                 let chain = self.chain.lock().unwrap();
                 chain.blocks.first().map(|b| b.hash.clone()).unwrap_or_default()
             };
+            let state_root = {
+                let ledger = self.token_ledger.read().unwrap();
+                ledger.state_root()
+            };
             let latest_hash = block.hash.clone();
             let height = block.index;
             std::thread::spawn(move || {
-                match crate::snapshot::create_snapshot(height, &genesis_hash, &latest_hash) {
+                match crate::snapshot::create_snapshot(height, &genesis_hash, &latest_hash, &state_root) {
                     Ok((_path, meta)) => {
                         eprintln!(
                             "[snapshot] 📸 Auto-Snapshot bei Block #{}: {:.1} MB",

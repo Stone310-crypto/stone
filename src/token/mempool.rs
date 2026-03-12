@@ -29,7 +29,7 @@
 use std::collections::{HashSet, VecDeque};
 use std::sync::RwLock;
 
-use super::transaction::{FeeTier, TokenTx, TxError, validate_tx};
+use super::transaction::{FeeTier, TokenTx, TxType, TxError, validate_tx};
 use super::ledger::TokenLedger;
 
 // ─── Konstanten ──────────────────────────────────────────────────────────────
@@ -160,7 +160,12 @@ impl Mempool {
         }
 
         // 4. Ledger Pre-Check (optional aber empfohlen)
+        //    ChatMessage TXs (amount=0, fee=0) überspringen Nonce/Balance —
+        //    kein Double-Spend-Risiko, Replay-Schutz via tx_id Uniqueness.
+        //    Nodes können unterschiedliche Ledger-Stände haben.
         if let Some(ledger) = ledger {
+            let skip_ledger_check = tx.tx_type == TxType::ChatMessage;
+            if !skip_ledger_check {
             // Nonce prüfen – berücksichtige bereits im Mempool befindliche TXs vom selben Sender
             let base_nonce = ledger.nonce(&tx.from);
             let pending_from_sender = inner.queue.iter()
@@ -191,6 +196,7 @@ impl Mempool {
                     required
                 )));
             }
+            } // end !skip_ledger_check
         }
 
         println!(
@@ -240,6 +246,12 @@ impl Mempool {
         }
         inner.queue = keep;
 
+        // Entnommene TXs aus known_ids entfernen → nach Block-Commit
+        // werden sie via mark_known() korrekt wieder eingetragen.
+        for tx in &to_drain {
+            inner.known_ids.remove(&tx.tx_id);
+        }
+
         if !to_drain.is_empty() {
             println!("[mempool] 📦 {} TXs für Block entnommen (Express/Priority), {} verbleibend (davon {} Standard)",
                 to_drain.len(), inner.queue.len(),
@@ -266,11 +278,28 @@ impl Mempool {
         }
         inner.queue = rest;
 
+        // Entnommene TXs aus known_ids entfernen → nach Block-Commit
+        // werden sie via mark_known() korrekt wieder eingetragen.
+        for tx in &standard {
+            inner.known_ids.remove(&tx.tx_id);
+        }
+
         if !standard.is_empty() {
             println!("[mempool] 📄 {} Standard-TXs bei Dokument-Upload entnommen",
                 standard.len());
         }
         standard
+    }
+
+    /// TX zurück in den Mempool legen (z.B. nach filter_valid_txs-Ablehnung
+    /// wegen Gap-Nonce — TX könnte gültig werden wenn vorherige TXs eintreffen).
+    /// Überspringt den Duplikat-Check weil die TX-ID bereits in known_ids ist.
+    pub fn requeue_tx(&self, tx: TokenTx) {
+        let mut inner = self.inner.write().unwrap();
+        if inner.queue.len() >= MAX_MEMPOOL_SIZE {
+            return;
+        }
+        inner.queue.push_back(tx);
     }
 
     /// Alle pending TXs entnehmen (Express + Priority + Standard).
@@ -284,6 +313,13 @@ impl Mempool {
         for tx in overflow.into_iter().rev() {
             inner.queue.push_front(tx);
         }
+
+        // Entnommene TXs aus known_ids entfernen → nach Block-Commit
+        // werden sie via mark_known() korrekt wieder eingetragen.
+        for tx in &txs {
+            inner.known_ids.remove(&tx.tx_id);
+        }
+
         if !txs.is_empty() {
             println!("[mempool] 📦 {} TXs für Mining-Block entnommen, {} verbleibend",
                 txs.len(), inner.queue.len());
@@ -336,6 +372,40 @@ impl Mempool {
     /// TX-ID als bekannt markieren (z.B. wenn sie aus einem Peer-Block kommt).
     pub fn mark_known(&self, tx_id: &str) {
         self.inner.write().unwrap().known_ids.insert(tx_id.to_string());
+    }
+
+    /// User-TXs aus verwaisten Blöcken (Reorg) zurück in den Mempool führen.
+    /// Reward/Mint/Memorial-TXs werden übersprungen.
+    /// Bereits bekannte TXs (die im neuen Fork enthalten sind) werden nicht erneut aufgenommen.
+    pub fn requeue_orphaned_txs(&self, orphaned_blocks: &[crate::blockchain::Block]) {
+        let mut requeued = 0usize;
+        for block in orphaned_blocks {
+            for tx in &block.transactions {
+                if tx.tx_type == super::transaction::TxType::Reward
+                    || tx.tx_type == super::transaction::TxType::Mint
+                    || tx.tx_type == super::transaction::TxType::Memorial
+                {
+                    continue;
+                }
+                let mut inner = self.inner.write().unwrap();
+                if inner.known_ids.contains(&tx.tx_id) {
+                    // Bereits bekannt (evtl. schon im neuen Fork bestätigt)
+                    continue;
+                }
+                if inner.queue.len() >= MAX_MEMPOOL_SIZE {
+                    break;
+                }
+                inner.known_ids.insert(tx.tx_id.clone());
+                inner.queue.push_back(tx.clone());
+                requeued += 1;
+            }
+        }
+        if requeued > 0 {
+            println!(
+                "[mempool] ♻️  {} User-TXs aus {} verwaisten Blöcken zurück in Mempool",
+                requeued, orphaned_blocks.len(),
+            );
+        }
     }
 
     // ── TTL & Eviction ────────────────────────────────────────────────────
