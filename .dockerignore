@@ -1,5 +1,8 @@
 # Build-Artefakte nicht in den Docker-Context senden
 target/
+# Ausnahme: Staging-Verzeichnisse mit den fertigen Binaries
+!target/binaries-amd64/
+!target/binaries-arm64/
 
 # Docker-Unterverzeichnis: nur README ausschließen (entrypoint.sh wird gebraucht)
 docker/README.md

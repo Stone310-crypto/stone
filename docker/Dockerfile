@@ -1,12 +1,13 @@
 # ─────────────────────────────────────────────────────────────────────────────
-# Stone Node – Docker Image
+# Stone Node – Docker Image (Multi-Arch: amd64 + arm64)
 #
-# Multi-Stage Build:
-#   1. Builder: Rust Toolchain kompiliert stone-setup + stone-master
-#   2. Runtime: Minimales Debian mit nur den nötigen Libs
+# Verwendet lokal cross-kompilierte Linux-Binaries (build_linux.sh).
+# Kein Rust-Build im Container nötig → schnell & ressourcenschonend.
 #
 # Build:
-#   docker build -f docker/Dockerfile -t stone-node .
+#   ./build_linux.sh   # erst Linux-Binaries bauen (beide Architekturen)
+#   docker build --platform linux/amd64  -f docker/Dockerfile -t stone-node:amd64  .
+#   docker build --platform linux/arm64  -f docker/Dockerfile -t stone-node:arm64  .
 #
 # Run:
 #   docker run -d -p 8080:8080 -p 4001:4001 -p 4001:4001/udp \
@@ -15,44 +16,9 @@
 #     stone-node
 # ─────────────────────────────────────────────────────────────────────────────
 
-# ── Stage 1: Builder ─────────────────────────────────────────────────────────
-FROM rust:1.85-bookworm AS builder
+FROM debian:bookworm-slim
 
-# System-Deps für RocksDB, libp2p, OpenSSL
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    cmake \
-    clang \
-    libclang-dev \
-    librocksdb-dev \
-    libsnappy-dev \
-    pkg-config \
-    && rm -rf /var/lib/apt/lists/*
-
-WORKDIR /build
-
-# Cargo.toml + Cargo.lock zuerst kopieren → Dependency-Layer cachen
-COPY Cargo.toml Cargo.lock* ./
-# Leere src erstellen damit cargo fetch funktioniert
-RUN mkdir -p src/bin && \
-    echo 'fn main() {}' > src/bin/setup.rs && \
-    echo 'fn main() {}' > src/bin/master_server.rs && \
-    echo 'fn main() {}' > src/bin/auth_server.rs && \
-    echo 'fn main() {}' > src/bin/db_dump.rs && \
-    echo 'fn main() {}' > src/bin/stone_keygen.rs && \
-    echo 'fn main() {}' > src/bin/stone_publish_update.rs && \
-    echo '' > src/lib.rs && \
-    cargo fetch 2>/dev/null || true
-
-# Echten Source kopieren
-COPY src/ src/
-
-# Release Build (nur die Binaries die wir brauchen)
-RUN cargo build --release --bin stone-setup --bin stone-master 2>&1 && \
-    strip target/release/stone-setup target/release/stone-master
-
-# ── Stage 2: Runtime ─────────────────────────────────────────────────────────
-FROM debian:bookworm-slim AS runtime
+ARG TARGETARCH
 
 # Minimal Runtime-Deps
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -70,9 +36,10 @@ RUN mkdir -p /opt/stone-node/stone_data /opt/stone-node/target/release && \
 
 WORKDIR /opt/stone-node
 
-# Binaries aus Builder kopieren
-COPY --from=builder /build/target/release/stone-setup  target/release/stone-setup
-COPY --from=builder /build/target/release/stone-master target/release/stone-master
+# Lokal cross-kompilierte Linux-Binaries reinkopieren (architektur-abhängig)
+COPY target/binaries-${TARGETARCH}/stone-setup  target/release/stone-setup
+COPY target/binaries-${TARGETARCH}/stone-master target/release/stone-master
+RUN chmod +x target/release/stone-setup target/release/stone-master
 
 # Entrypoint-Script
 COPY docker/entrypoint.sh /opt/stone-node/entrypoint.sh
