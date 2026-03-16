@@ -28,6 +28,8 @@ use super::handlers::{
         handle_mining_template, handle_mining_submit,
         handle_mining_report, handle_mining_remote_status,
     },
+    calls::{handle_send_signal, handle_get_signals},
+    audio_relay::handle_audio_relay,
     chat::{
         handle_chat_conversations, handle_chat_messages, handle_chat_pending,
         handle_chat_proof,
@@ -41,6 +43,11 @@ use super::handlers::{
         handle_chat_policy_status, handle_chat_policy_message,
         handle_chat_report, handle_chat_reports, handle_chat_report_vote,
     },
+    groups::{
+        handle_create_group, handle_list_groups, handle_get_group,
+        handle_group_send, handle_group_messages,
+        handle_add_group_member, handle_remove_group_member,
+    },
     orgs::{
         handle_accept_invite, handle_create_channel, handle_create_org,
         handle_decline_invite, handle_get_chat, handle_get_org, handle_invite,
@@ -51,7 +58,7 @@ use super::handlers::{
         handle_p2p_config, handle_p2p_dial, handle_p2p_info, handle_p2p_peers,
         handle_p2p_ping, handle_p2p_precommit, handle_p2p_proposal, handle_p2p_status,
     },
-    peers::{handle_add_peer, handle_list_peers, handle_remove_peer, handle_sync},
+    peers::{handle_add_peer, handle_list_peers, handle_register_peer, handle_remove_peer, handle_sync},
     poa::{
         handle_add_validator, handle_cast_vote, handle_consensus_status,
         handle_detect_forks, handle_list_checkpoints, handle_list_validators,
@@ -63,13 +70,13 @@ use super::handlers::{
     token::{
         handle_token_accounts, handle_token_faucet, handle_token_history,
         handle_token_pending, handle_token_send, handle_token_send_authenticated,
-        handle_token_stake, handle_token_unstake,
+
         handle_token_supply,
-        handle_token_transfer, handle_wallet_balance, handle_wallet_create,
+        handle_token_transfer, handle_tx_status, handle_wallet_balance, handle_wallet_create,
         handle_wallet_info, handle_wallet_rotations,
         handle_staking_info, handle_staking_pool, handle_staker_info,
         handle_mempool_sync,
-        handle_ledger_rebuild,
+        handle_ledger_rebuild, handle_admin_airdrop,
     },
     trust::{
         handle_trust_approve, handle_trust_check, handle_trust_history,
@@ -151,6 +158,7 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/peers",
             get(handle_list_peers).post(handle_add_peer),
         )
+        .route("/api/v1/peers/register", post(handle_register_peer))
         .route("/api/v1/peers/{idx}", delete(handle_remove_peer))
         // Sync (Admin)
         .route("/api/v1/sync", post(handle_sync))
@@ -211,6 +219,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/slashing/{validator_id}", get(handle_slashing_validator))
         // WebSocket
         .route("/ws", get(handle_websocket))
+        // Audio-Relay für Sprachanrufe
+        .route("/api/v1/call/audio/{call_id}", get(handle_audio_relay))
         // ─── Web-of-Trust ────────────────────────────────────────────────────
         // Join-Anfrage (kein Auth – neue Node meldet sich an)
         .route("/api/v1/trust/request", post(handle_trust_request))
@@ -232,18 +242,21 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/token/send-authenticated", post(handle_token_send_authenticated))
         .route("/api/v1/token/faucet", post(handle_token_faucet))
         .route("/api/v1/token/history/{address}", get(handle_token_history))
+        .route("/api/v1/token/tx/{tx_id}", get(handle_tx_status))
         .route("/api/v1/wallet/create", post(handle_wallet_create))
         .route("/api/v1/wallet/{address}/rotations", get(handle_wallet_rotations))
         .route("/api/v1/wallet/{address}", get(handle_wallet_info))
         .route("/api/v1/wallet/{address}/balance", get(handle_wallet_balance))
         // ─── Staking Pool ────────────────────────────────────────────────────
-        .route("/api/v1/token/stake", post(handle_token_stake))
-        .route("/api/v1/token/unstake", post(handle_token_unstake))
+        // SECURITY: /api/v1/token/stake und /unstake entfernt — diese Endpoints
+        // akzeptierten raw TXs ohne Auth + ohne Signaturprüfung.
+        // Staking nur über authentifizierte /api/v1/mining/stake|unstake.
         .route("/api/v1/staking/info", get(handle_staking_info))
         .route("/api/v1/staking/pool", get(handle_staking_pool))
         .route("/api/v1/staking/staker/{address}", get(handle_staker_info))
-        // ─── Admin: Ledger ───────────────────────────────────────────────────
+        // ─── Admin: Ledger & Airdrop ─────────────────────────────────────────
         .route("/api/v1/admin/ledger/rebuild", post(handle_ledger_rebuild))
+        .route("/api/v1/admin/airdrop", post(handle_admin_airdrop))
         // ─── OTA Updates ─────────────────────────────────────────────────────
         .route("/api/v1/updates/status", get(handle_update_status))
         .route("/api/v1/updates/chunk/{index}", get(handle_update_chunk))
@@ -287,7 +300,18 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/chat/contacts/requests/{id}/decline", post(handle_decline_contact_request))
         // ─── Stonecoins im Chat senden & anfragen ───────────────────
         .route("/api/v1/chat/send-coins", post(handle_chat_send_coins))
-        .route("/api/v1/chat/request-coins", post(handle_chat_request_coins))        // ─── Chat Policy (Self-Destruct, Reports, Stake-Gate) ──────────────
+        .route("/api/v1/chat/request-coins", post(handle_chat_request_coins))
+        // ─── Gruppenchats ────────────────────────────────────────────────────
+        .route("/api/v1/chat/groups", get(handle_list_groups).post(handle_create_group))
+        .route("/api/v1/chat/groups/{group_id}", get(handle_get_group))
+        .route("/api/v1/chat/groups/{group_id}/send", post(handle_group_send))
+        .route("/api/v1/chat/groups/{group_id}/messages", get(handle_group_messages))
+        .route("/api/v1/chat/groups/{group_id}/members", post(handle_add_group_member))
+        .route("/api/v1/chat/groups/{group_id}/members/{wallet}", delete(handle_remove_group_member))
+        // ─── WebRTC Call-Signaling ───────────────────────────────────────────
+        .route("/api/v1/call/signal", post(handle_send_signal))
+        .route("/api/v1/call/signal/{peer_wallet}", get(handle_get_signals))
+        // ─── Chat Policy (Self-Destruct, Reports, Stake-Gate) ──────────────
         .route("/api/v1/chat/policy/status", get(handle_chat_policy_status))
         .route("/api/v1/chat/policy/message/{msg_id}", get(handle_chat_policy_message))
         .route("/api/v1/chat/report", post(handle_chat_report))

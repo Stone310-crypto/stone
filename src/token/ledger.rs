@@ -250,6 +250,11 @@ impl TokenLedger {
         self.nonces.get(address).copied().unwrap_or(0)
     }
 
+    /// Prüft ob eine TX-ID bereits verarbeitet wurde (Duplikat-Schutz).
+    pub fn is_processed_tx(&self, tx_id: &str) -> bool {
+        self.processed_txs.contains(tx_id)
+    }
+
     /// Nonce nach einer verarbeiteten TX aktualisieren.
     /// Im Replay-Modus wird die Nonce auf das Maximum gesetzt,
     /// da Blöcke aus dem Netzwerk ggf. Lücken aufweisen.
@@ -302,12 +307,23 @@ impl TokenLedger {
         for addr in &addrs {
             let bal = self.balances.get(*addr).copied().unwrap_or(Decimal::ZERO);
             let nonce = self.nonces.get(*addr).copied().unwrap_or(0);
-            hasher.update(addr.as_bytes());
-            hasher.update(bal.to_string().as_bytes());
+            // SECURITY: Length-Prefix vor jedem Feld verhindert Hash-Kollisionen
+            // zwischen verschiedenen Ledger-Zuständen (z.B. addr="ab",bal="1"
+            // vs addr="a",bal="b1").
+            let addr_bytes = addr.as_bytes();
+            hasher.update((addr_bytes.len() as u32).to_le_bytes());
+            hasher.update(addr_bytes);
+            let bal_str = bal.to_string();
+            hasher.update((bal_str.len() as u32).to_le_bytes());
+            hasher.update(bal_str.as_bytes());
             hasher.update(nonce.to_le_bytes());
         }
-        hasher.update(self.total_supply.to_string().as_bytes());
-        hasher.update(self.total_fees_burned.to_string().as_bytes());
+        let supply_str = self.total_supply.to_string();
+        hasher.update((supply_str.len() as u32).to_le_bytes());
+        hasher.update(supply_str.as_bytes());
+        let fees_str = self.total_fees_burned.to_string();
+        hasher.update((fees_str.len() as u32).to_le_bytes());
+        hasher.update(fees_str.as_bytes());
         hex::encode(hasher.finalize())
     }
 
@@ -442,6 +458,19 @@ impl TokenLedger {
                 available: current_balance,
                 required: amount,
             });
+        }
+
+        // SECURITY: Vesting-Check — gevestete Token dürfen nicht verbrannt werden
+        if !self.replay_mode {
+            if let Some(schedule) = self.vesting_schedules.get_mut(from) {
+                let now = chrono::Utc::now().timestamp();
+                if let Err(e) = schedule.withdraw(amount, now) {
+                    return Err(LedgerError::VestingLocked {
+                        account: from.to_string(),
+                        message: e,
+                    });
+                }
+            }
         }
 
         *self.balances.entry(from.to_string()).or_insert(Decimal::ZERO) -= amount;

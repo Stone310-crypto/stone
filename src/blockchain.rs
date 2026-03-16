@@ -364,6 +364,8 @@ impl StoneChain {
 
         match open_result {
             Ok(store) if !store.is_empty() => {
+                let bc = store.block_count().unwrap_or(0);
+                eprintln!("[chain] DB geöffnet: block_count={bc}");
                 match store.read_all_blocks() {
                     Ok(blocks) if !blocks.is_empty() => {
                         let stored_genesis_hash = blocks[0].hash.clone();
@@ -397,8 +399,17 @@ impl StoneChain {
                             return StoneChain { blocks, latest_hash, fork_blocks: std::collections::HashMap::new(), orphaned_blocks: Vec::new() };
                         }
                     }
-                    _ => {}
+                    Ok(blocks) => {
+                        eprintln!("[chain] read_all_blocks returned {} blocks (empty)", blocks.len());
+                    }
+                    Err(e) => {
+                        eprintln!("[chain] read_all_blocks fehlgeschlagen: {e}");
+                    }
                 }
+            }
+            Ok(_store) => {
+                let bc = _store.block_count().unwrap_or(0);
+                eprintln!("[chain] DB geöffnet aber leer (block_count={bc})");
             }
             Err(e) => {
                 let err_msg = format!("{e}");
@@ -1582,4 +1593,53 @@ Because Dennis died of cancer and nobody could do anything.
     genesis.hash = hash.clone();
     genesis.signature = sign_hash(cluster_key, &hash);
     genesis
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bincode::config::standard;
+
+    #[test]
+    fn test_block_bincode_roundtrip() {
+        let block = genesis_block("test-key");
+        eprintln!("Block hash: {}", block.hash);
+        eprintln!("Block has {} docs, {} txs", block.documents.len(), block.transactions.len());
+
+        // Encode
+        let encoded = bincode::serde::encode_to_vec(&block, standard())
+            .expect("encode failed");
+        eprintln!("Encoded size: {} bytes", encoded.len());
+
+        // Decode
+        let (decoded, _): (Block, _) = bincode::serde::decode_from_slice(&encoded, standard())
+            .expect("decode failed");
+
+        assert_eq!(block.hash, decoded.hash);
+        assert_eq!(block.index, decoded.index);
+        assert_eq!(block.documents.len(), decoded.documents.len());
+        assert_eq!(block.transactions.len(), decoded.transactions.len());
+        eprintln!("Roundtrip OK!");
+    }
+
+    #[test]
+    fn test_decimal_bincode_roundtrip() {
+        use rust_decimal::Decimal;
+        let val = Decimal::new(12345, 2); // 123.45
+        let encoded = bincode::serde::encode_to_vec(&val, standard())
+            .expect("encode Decimal failed");
+        let (decoded, _): (Decimal, _) = bincode::serde::decode_from_slice(&encoded, standard())
+            .expect("decode Decimal failed");
+        assert_eq!(val, decoded);
+    }
+
+    #[test]
+    fn test_jsonvalue_bincode_roundtrip() {
+        let jv = JsonValue(serde_json::json!({"key": "value", "num": 42}));
+        let encoded = bincode::serde::encode_to_vec(&jv, standard())
+            .expect("encode JsonValue failed");
+        let (decoded, _): (JsonValue, _) = bincode::serde::decode_from_slice(&encoded, standard())
+            .expect("decode JsonValue failed");
+        assert_eq!(jv.0, decoded.0);
+    }
 }

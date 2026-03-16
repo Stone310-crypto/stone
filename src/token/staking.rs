@@ -31,6 +31,16 @@ use std::collections::HashMap;
 /// Minimaler Stake-Betrag: 100 STONE
 pub const MIN_STAKE: &str = "100";
 
+/// Mindest-Stake um als Validator aktiviert zu werden: 500 STONE
+/// Anti-Sybil: Fake-Nodes wären wirtschaftlich unattraktiv.
+pub const VALIDATOR_MIN_STAKE: &str = "500";
+
+/// Mindest-Stake für Snapshot-Signierung: 250 STONE
+pub const SNAPSHOT_SIGNER_MIN_STAKE: &str = "250";
+
+/// Mindest-Stake für Governance-Voting: 100 STONE
+pub const GOVERNANCE_MIN_STAKE: &str = "100";
+
 /// Lock-Periode für Unstake: 7 Tage in Sekunden
 pub const UNSTAKE_LOCK_SECS: i64 = 7 * 24 * 3600;
 
@@ -51,6 +61,115 @@ pub const EPOCHS_PER_YEAR: u64 = 1461;
 
 /// Staking-Pool-Adresse (virtueller Account)
 pub const STAKING_POOL_ADDRESS: &str = "pool:staking";
+
+// ─── Stake-Level ─────────────────────────────────────────────────────────────
+
+/// Stufe basierend auf Stake-Betrag. Bestimmt Berechtigungen im Netzwerk.
+///
+/// | Level       | Min. Stake | Rechte                                    |
+/// |-------------|------------|-------------------------------------------|
+/// | Observer    | 0 STONE    | Lesen, keine Governance                   |
+/// | Participant | 100 STONE  | Governance-Voting, Chat                   |
+/// | Guardian    | 250 STONE  | + Snapshot-Signierung                     |
+/// | Validator   | 500 STONE  | + Block-Produktion, Report-Voting         |
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StakeLevel {
+    Observer,
+    Participant,
+    Guardian,
+    Validator,
+}
+
+impl StakeLevel {
+    /// Berechnet das Stake-Level anhand des gestaketen Betrags.
+    pub fn from_stake(amount: Decimal) -> Self {
+        let validator_min: Decimal = VALIDATOR_MIN_STAKE.parse().unwrap();
+        let guardian_min: Decimal = SNAPSHOT_SIGNER_MIN_STAKE.parse().unwrap();
+        let participant_min: Decimal = GOVERNANCE_MIN_STAKE.parse().unwrap();
+
+        if amount >= validator_min {
+            StakeLevel::Validator
+        } else if amount >= guardian_min {
+            StakeLevel::Guardian
+        } else if amount >= participant_min {
+            StakeLevel::Participant
+        } else {
+            StakeLevel::Observer
+        }
+    }
+
+    /// Ob dieses Level Validator-Rechte hat (Block-Produktion, Report-Voting).
+    pub fn can_validate(&self) -> bool {
+        *self >= StakeLevel::Validator
+    }
+
+    /// Ob dieses Level Snapshots signieren darf.
+    pub fn can_sign_snapshots(&self) -> bool {
+        *self >= StakeLevel::Guardian
+    }
+
+    /// Ob dieses Level an Governance-Abstimmungen teilnehmen darf.
+    pub fn can_vote_governance(&self) -> bool {
+        *self >= StakeLevel::Participant
+    }
+
+    /// Mindest-Stake für dieses Level (als u32 für Netzwerk-Handshake).
+    pub fn min_stake(&self) -> u32 {
+        match self {
+            StakeLevel::Observer => 0,
+            StakeLevel::Participant => 100,
+            StakeLevel::Guardian => 250,
+            StakeLevel::Validator => 500,
+        }
+    }
+}
+
+impl std::fmt::Display for StakeLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StakeLevel::Observer => write!(f, "observer"),
+            StakeLevel::Participant => write!(f, "participant"),
+            StakeLevel::Guardian => write!(f, "guardian"),
+            StakeLevel::Validator => write!(f, "validator"),
+        }
+    }
+}
+
+// ─── Snapshot-Attestation ────────────────────────────────────────────────────
+
+/// Eine Signatur eines Stakers über einen Snapshot.
+/// Neue Nodes prüfen: Haben ≥2/3 der eligiblen Staker den Snapshot signiert?
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotAttestation {
+    /// Block-Höhe des Snapshots
+    pub block_height: u64,
+    /// SHA-256 des Snapshot-Archivs
+    pub archive_hash: String,
+    /// State-Root zum Zeitpunkt des Snapshots
+    pub state_root: String,
+    /// Wallet-Adresse des Signers
+    pub signer_wallet: String,
+    /// Ed25519-Signatur über "snapshot:{block_height}:{archive_hash}:{state_root}"
+    pub signature_hex: String,
+    /// Stake des Signers zum Zeitpunkt der Signatur
+    pub signer_stake: Decimal,
+    /// Unix-Timestamp
+    pub signed_at: i64,
+}
+
+/// Verifizierungsergebnis einer Snapshot-Attestation.
+#[derive(Debug, Clone)]
+pub struct SnapshotTrust {
+    /// Anzahl gültiger Attestations
+    pub valid_signatures: usize,
+    /// Gesamter Stake der Signer
+    pub attested_stake: Decimal,
+    /// Gesamter Stake aller eligiblen Signer (Guardian+)
+    pub total_eligible_stake: Decimal,
+    /// Ob das Quorum erreicht ist (≥2/3 des eligiblen Stakes)
+    pub quorum_reached: bool,
+}
 
 /// Berechnet die aktuelle dynamische APY basierend auf dem Reward-Pool-Füllstand.
 ///
@@ -138,6 +257,7 @@ pub enum StakingError {
     NotStaked { address: String },
     LockPeriodActive { available_at: i64 },
     PoolExhausted,
+    InsufficientStakeLevel { address: String, required: StakeLevel, actual: StakeLevel },
 }
 
 impl std::fmt::Display for StakingError {
@@ -153,6 +273,8 @@ impl std::fmt::Display for StakingError {
                 write!(f, "Unstake-Lock aktiv bis {}", available_at),
             StakingError::PoolExhausted =>
                 write!(f, "Reward-Pool erschöpft"),
+            StakingError::InsufficientStakeLevel { address, required, actual } =>
+                write!(f, "Adresse {} hat Level '{}', benötigt '{}'", &address[..12.min(address.len())], actual, required),
         }
     }
 }
@@ -168,9 +290,12 @@ pub struct StakingPoolInfo {
     pub current_epoch: u64,
     pub epoch_length: u64,
     pub min_stake: Decimal,
+    pub validator_min_stake: Decimal,
     pub lock_period_days: u64,
     pub estimated_apy: Decimal,
     pub reward_pool_balance: Decimal,
+    pub validator_eligible_count: usize,
+    pub guardian_eligible_count: usize,
 }
 
 /// Staker-spezifische Info für die API.
@@ -183,6 +308,7 @@ pub struct StakerInfo {
     pub staked_since: i64,
     pub unstake_requests: Vec<UnstakeRequest>,
     pub share_percent: Decimal,
+    pub stake_level: StakeLevel,
 }
 
 // ─── Implementierung ─────────────────────────────────────────────────────────
@@ -397,6 +523,13 @@ impl StakingPool {
         // Dynamische APY basierend auf Pool-Füllstand
         let apy = dynamic_apy(reward_pool_balance) * Decimal::new(100, 0);
 
+        let validator_eligible = self.stakers.values()
+            .filter(|s| StakeLevel::from_stake(s.staked_amount).can_validate())
+            .count();
+        let guardian_eligible = self.stakers.values()
+            .filter(|s| StakeLevel::from_stake(s.staked_amount).can_sign_snapshots())
+            .count();
+
         StakingPoolInfo {
             total_staked: self.total_staked,
             total_rewards_distributed: self.total_rewards_distributed,
@@ -404,9 +537,12 @@ impl StakingPool {
             current_epoch: self.current_epoch,
             epoch_length: EPOCH_LENGTH,
             min_stake: MIN_STAKE.parse().unwrap(),
+            validator_min_stake: VALIDATOR_MIN_STAKE.parse().unwrap(),
             lock_period_days: (UNSTAKE_LOCK_SECS / 86400) as u64,
             estimated_apy: apy,
             reward_pool_balance,
+            validator_eligible_count: validator_eligible,
+            guardian_eligible_count: guardian_eligible,
         }
     }
 
@@ -433,6 +569,7 @@ impl StakingPool {
                 staked_since: entry.staked_since,
                 unstake_requests,
                 share_percent: share,
+                stake_level: StakeLevel::from_stake(entry.staked_amount),
             }
         })
     }
@@ -500,6 +637,169 @@ impl StakingPool {
         actual
     }
 
+    // ── Anti-Sybil: Validator-Eligibility ─────────────────────────────────
+
+    /// Prüft ob eine Wallet-Adresse genug Stake hat um als Validator zu agieren.
+    /// Anti-Sybil: Mindestens VALIDATOR_MIN_STAKE (500 STONE).
+    pub fn is_validator_eligible(&self, wallet: &str) -> bool {
+        self.stake_level(wallet).can_validate()
+    }
+
+    /// Prüft ob eine Wallet-Adresse Snapshots signieren darf.
+    /// Mindestens SNAPSHOT_SIGNER_MIN_STAKE (250 STONE).
+    pub fn is_snapshot_signer(&self, wallet: &str) -> bool {
+        self.stake_level(wallet).can_sign_snapshots()
+    }
+
+    /// Gibt das Stake-Level einer Wallet-Adresse zurück.
+    pub fn stake_level(&self, wallet: &str) -> StakeLevel {
+        let amount = self.stakers.get(wallet)
+            .map(|s| s.staked_amount)
+            .unwrap_or(Decimal::ZERO);
+        StakeLevel::from_stake(amount)
+    }
+
+    /// Gibt alle Wallets zurück die mindestens das angegebene Level haben.
+    pub fn wallets_at_level(&self, min_level: StakeLevel) -> Vec<(String, Decimal)> {
+        self.stakers.iter()
+            .filter(|(_, entry)| StakeLevel::from_stake(entry.staked_amount) >= min_level)
+            .map(|(addr, entry)| (addr.clone(), entry.staked_amount))
+            .collect()
+    }
+
+    /// Gesamter Stake aller Wallets mit mindestens dem gegebenen Level.
+    pub fn total_stake_at_level(&self, min_level: StakeLevel) -> Decimal {
+        self.stakers.values()
+            .filter(|entry| StakeLevel::from_stake(entry.staked_amount) >= min_level)
+            .map(|entry| entry.staked_amount)
+            .sum()
+    }
+
+    // ── Snapshot-Attestation ──────────────────────────────────────────────
+
+    /// Verifiziert eine Liste von Snapshot-Attestations gegen den aktuellen Pool-Zustand.
+    ///
+    /// Gibt ein `SnapshotTrust`-Ergebnis zurück:
+    /// - Quorum erreicht wenn ≥2/3 des eligiblen Stakes (Guardian+) den Snapshot signiert hat.
+    pub fn verify_snapshot_attestations(
+        &self,
+        attestations: &[SnapshotAttestation],
+        expected_block_height: u64,
+        expected_archive_hash: &str,
+        expected_state_root: &str,
+    ) -> SnapshotTrust {
+        let total_eligible_stake = self.total_stake_at_level(StakeLevel::Guardian);
+
+        let mut valid_signatures = 0usize;
+        let mut attested_stake = Decimal::ZERO;
+        let mut seen_wallets = std::collections::HashSet::new();
+
+        for att in attestations {
+            // Prüfe ob die Attestation zum erwarteten Snapshot passt
+            if att.block_height != expected_block_height
+                || att.archive_hash != expected_archive_hash
+                || att.state_root != expected_state_root
+            {
+                continue;
+            }
+
+            // Keine Doppelzählung
+            if !seen_wallets.insert(att.signer_wallet.clone()) {
+                continue;
+            }
+
+            // Prüfe ob Signer mindestens Guardian-Level hat
+            if !self.is_snapshot_signer(&att.signer_wallet) {
+                continue;
+            }
+
+            // Signatur verifizieren: message = "snapshot:{height}:{archive_hash}:{state_root}"
+            let message = format!(
+                "snapshot:{}:{}:{}",
+                att.block_height, att.archive_hash, att.state_root
+            );
+            if crate::consensus::verify_block_signature_standalone(
+                &message,
+                &att.signer_wallet, // wallet = public_key_hex
+                &att.signature_hex,
+            ) {
+                valid_signatures += 1;
+                let stake = self.stakers.get(&att.signer_wallet)
+                    .map(|s| s.staked_amount)
+                    .unwrap_or(Decimal::ZERO);
+                attested_stake += stake;
+            }
+        }
+
+        // Quorum: ≥2/3 des eligiblen Stakes
+        let quorum_reached = if total_eligible_stake > Decimal::ZERO {
+            attested_stake * Decimal::from(3) >= total_eligible_stake * Decimal::from(2)
+        } else {
+            false
+        };
+
+        SnapshotTrust {
+            valid_signatures,
+            attested_stake,
+            total_eligible_stake,
+            quorum_reached,
+        }
+    }
+
+    // ── Governance: Stake-gewichtetes Voting ──────────────────────────────
+
+    /// Berechnet das Stimmgewicht einer Wallet für Governance/Report-Voting.
+    /// Gewicht = gestakter Betrag (≥100 STONE nötig).
+    /// Gibt 0 zurück wenn unter Mindest-Level.
+    pub fn voting_weight(&self, wallet: &str) -> Decimal {
+        let amount = self.stakers.get(wallet)
+            .map(|s| s.staked_amount)
+            .unwrap_or(Decimal::ZERO);
+        if StakeLevel::from_stake(amount).can_vote_governance() {
+            amount
+        } else {
+            Decimal::ZERO
+        }
+    }
+
+    /// Berechnet ob ein stake-gewichtetes Vote-Ergebnis die Supermajorität erreicht hat.
+    ///
+    /// `votes`: (wallet, approve) Paare
+    /// Gibt `Some(accepted)` zurück wenn genug Stake abgestimmt hat.
+    /// Gibt `None` zurück wenn noch nicht genug Stimmen.
+    pub fn evaluate_weighted_votes(
+        &self,
+        votes: &HashMap<String, bool>,
+        min_level: StakeLevel,
+    ) -> Option<bool> {
+        let total_eligible = self.total_stake_at_level(min_level);
+        if total_eligible == Decimal::ZERO {
+            return None;
+        }
+
+        let mut total_voted = Decimal::ZERO;
+        let mut approve_weight = Decimal::ZERO;
+
+        for (wallet, &approved) in votes {
+            let weight = self.voting_weight(wallet);
+            if weight > Decimal::ZERO {
+                total_voted += weight;
+                if approved {
+                    approve_weight += weight;
+                }
+            }
+        }
+
+        // Mindestens 51% des eligiblen Stakes muss abgestimmt haben
+        let quorum = total_eligible * Decimal::new(51, 2);
+        if total_voted < quorum {
+            return None;
+        }
+
+        // Ergebnis: >50% der abgegebenen Stake-Gewichte
+        Some(approve_weight * Decimal::from(2) > total_voted)
+    }
+
     // ── Persistierung ─────────────────────────────────────────────────────
 
     /// Speichert den StakingPool in RocksDB.
@@ -541,6 +841,48 @@ impl StakingPool {
             }
             _ => StakingPool::new(),
         }
+    }
+
+    /// Baut den StakingPool aus der Chain-History neu auf.
+    ///
+    /// Iteriert über alle Blöcke und wendet Stake/Unstake-TXs an.
+    /// Wird beim Start aufgerufen wenn der persistierte Pool leer ist
+    /// aber die Chain Stake-TXs enthält.
+    pub fn rebuild_from_chain(blocks: &[crate::blockchain::Block]) -> Self {
+        use super::transaction::TxType;
+        let mut pool = StakingPool::new();
+        let mut stake_count = 0u64;
+        let mut unstake_count = 0u64;
+
+        for block in blocks {
+            for tx in &block.transactions {
+                match tx.tx_type {
+                    TxType::Stake => {
+                        if pool.stake(&tx.from, tx.amount).is_ok() {
+                            stake_count += 1;
+                        }
+                    }
+                    TxType::Unstake => {
+                        if pool.request_unstake(&tx.from, tx.amount).is_ok() {
+                            unstake_count += 1;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        if stake_count > 0 || unstake_count > 0 {
+            println!(
+                "[staking] 🔄 Pool aus Chain rebuilt: {} Stakes, {} Unstakes, {} Staker, {} STONE",
+                stake_count, unstake_count, pool.stakers.len(), pool.total_staked,
+            );
+            if let Err(e) = pool.persist() {
+                eprintln!("[staking] ⚠️  Pool-Persist nach Rebuild: {e}");
+            }
+        }
+
+        pool
     }
 }
 

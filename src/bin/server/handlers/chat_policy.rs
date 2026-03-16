@@ -254,6 +254,7 @@ pub async fn handle_chat_reports(
 /// POST /api/v1/chat/report/:report_id/vote
 ///
 /// Als Validator auf einen Report abstimmen.
+/// Stake-gewichtet: Mehr Stake = mehr Stimmgewicht.
 pub async fn handle_chat_report_vote(
     State(state): State<AppState>,
     Path(report_id): Path<String>,
@@ -262,7 +263,7 @@ pub async fn handle_chat_report_vote(
     let node_id = state.node.node_id.clone();
 
     // Prüfe ob Node ein aktiver Validator ist
-    {
+    let node_wallet = {
         let vs = state.node.validator_set.read().unwrap_or_else(|e| e.into_inner());
         if !vs.is_active_validator(&node_id) {
             return (
@@ -271,12 +272,30 @@ pub async fn handle_chat_report_vote(
             )
                 .into_response();
         }
+        // Wallet-Adresse des Validators (= pub_key_hex)
+        vs.get(&node_id).map(|v| v.public_key_hex.clone()).unwrap_or_default()
+    };
+
+    // Anti-Sybil: Prüfe Stake-Level (mindestens Validator-Level = 500 STONE)
+    {
+        let pool = state.node.staking_pool.read().unwrap_or_else(|e| e.into_inner());
+        let level = pool.stake_level(&node_wallet);
+        if !level.can_validate() {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(json!({
+                    "ok": false,
+                    "error": format!("Unzureichender Stake-Level: '{}' (benötigt: 'validator', min. 500 STONE)", level),
+                })),
+            )
+                .into_response();
+        }
     }
 
     let mut policy = state.node.chat_policy.write().unwrap_or_else(|e| e.into_inner());
 
-    // Vote abgeben
-    if let Err(e) = policy.cast_vote(&report_id, &node_id, req.approve) {
+    // Vote abgeben (mit wallet als voter_id für stake-gewichtetes Voting)
+    if let Err(e) = policy.cast_vote(&report_id, &node_wallet, req.approve) {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"ok": false, "error": e})),
@@ -284,8 +303,17 @@ pub async fn handle_chat_report_vote(
             .into_response();
     }
 
-    // Versuche zu finalisieren
-    if let Some((accepted, msg_id, reported_wallet)) = policy.try_finalize_report(&report_id) {
+    // Stake-Gewichte aufbauen für gewichtetes Voting
+    let stake_weights: std::collections::HashMap<String, rust_decimal::Decimal> = {
+        let pool = state.node.staking_pool.read().unwrap_or_else(|e| e.into_inner());
+        pool.stakers.iter()
+            .filter(|(_, entry)| stone::token::staking::StakeLevel::from_stake(entry.staked_amount).can_validate())
+            .map(|(addr, entry)| (addr.clone(), entry.staked_amount))
+            .collect()
+    };
+
+    // Versuche zu finalisieren (stake-gewichtet)
+    if let Some((accepted, msg_id, reported_wallet)) = policy.try_finalize_report_weighted(&report_id, Some(&stake_weights)) {
         if accepted {
             // Content im Chat-Index löschen
             let mut idx = state.chat_index.lock().unwrap_or_else(|e| e.into_inner());

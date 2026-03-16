@@ -9,7 +9,10 @@ use serde::{Deserialize, Serialize};
 use stone::{
     auth::{User, ChallengeStore, QrLoginStore},
     blockchain::{ChunkRef, data_dir, CHUNK_SIZE, Document},
-    chat::{ChatIndex, ContactList, ContactRequestStore},
+    chat::{ChatIndex, ContactList, ContactRequestStore, ChatGroupStore, CallSignalStore},
+};
+use super::handlers::audio_relay::AudioRooms;
+use stone::{
     master_node::{MasterNodeState, PeerInfo, TrustEntry, TrustVote},
     network::NetworkHandle,
     organization::Organization,
@@ -21,7 +24,7 @@ use super::rate_limiter::RateLimits;
 
 // ─── Konstanten ──────────────────────────────────────────────────────────────
 
-pub const MAX_UPLOAD_BYTES: usize = 5 * 1024 * 1024 * 1024; // 5 GiB
+pub const MAX_UPLOAD_BYTES: usize = 100 * 1024 * 1024; // 100 MiB
 pub const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 pub const AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(30);
 pub fn peers_file() -> String {
@@ -57,6 +60,12 @@ pub struct AppState {
     pub qr_login_store: QrLoginStore,
     /// Miner-Status-Relay: Miner pushen ihren Status, Apps pollen ihn
     pub miner_status_store: MinerStatusStore,
+    /// Gruppenchats
+    pub chat_groups: Arc<Mutex<ChatGroupStore>>,
+    /// Call-Signaling (ephemeral, WebRTC)
+    pub call_signals: Arc<CallSignalStore>,
+    /// Audio-Relay Rooms (live calls)
+    pub audio_rooms: AudioRooms,
 }
 
 // ─── Miner Status Relay Store ────────────────────────────────────────────────

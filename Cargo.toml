@@ -56,6 +56,7 @@ base64  = "0.22"
 tokio   = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io"] }
 bytes   = "1.0"
+dashmap = "6"
 
 # HTTP-Server (axum – Master Node API + Auth Server)
 axum        = { version = "0.8", features = ["macros", "json", "multipart", "ws"] }
@@ -115,7 +116,7 @@ zstd            = "0.13"
 reed-solomon-erasure = "6.0"
 
 # Token-Economy (StoneCoin) – Dezimalgenau bis 8 Nachkommastellen
-rust_decimal = { version = "1.36", features = ["serde-with-str"] }
+rust_decimal = { version = "1.36", features = ["serde-str"] }
 
 # UUID für User-IDs und Organisations-IDs
 uuid = { version = "1.0", features = ["v4", "serde"] }

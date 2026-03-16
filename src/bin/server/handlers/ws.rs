@@ -1,21 +1,95 @@
 //! WebSocket event-stream handler.
+//!
+//! SECURITY: Authentifizierung via `token` Query-Parameter erforderlich.
+//! Unauthentifizierte Verbindungen werden mit 401 abgelehnt.
+//! Origin-Header wird validiert wenn STONE_CORS_ORIGINS gesetzt ist.
 
 use axum::{
-    extract::State,
+    extract::{Query, State},
     extract::ws::{Message, WebSocket, WebSocketUpgrade},
+    http::HeaderMap,
     response::IntoResponse,
 };
 use std::{sync::Arc, sync::atomic::Ordering};
 use stone::master_node::{MasterNodeState, NodeEvent};
 use tokio::sync::broadcast;
 
+use super::super::auth_middleware::{resolve_user_by_key, resolve_user_by_session_token};
 use super::super::state::AppState;
 
-/// GET /ws – WebSocket-Verbindung für Live-Events
+/// Maximale gleichzeitige WebSocket-Verbindungen
+const MAX_WS_CONNECTIONS: u64 = 200;
+
+#[derive(serde::Deserialize)]
+pub struct WsQuery {
+    /// Auth-Token (API-Key oder Session-Token)
+    pub token: Option<String>,
+}
+
+/// GET /ws?token=... – WebSocket-Verbindung für Live-Events
 pub async fn handle_websocket(
     ws: WebSocketUpgrade,
+    Query(query): Query<WsQuery>,
+    headers: HeaderMap,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
+    // SECURITY: Origin-Prüfung wenn STONE_CORS_ORIGINS konfiguriert
+    if let Ok(allowed) = std::env::var("STONE_CORS_ORIGINS") {
+        let origins: Vec<String> = allowed.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+        if !origins.is_empty() {
+            let origin = headers.get("origin").and_then(|v| v.to_str().ok()).unwrap_or("");
+            if !origin.is_empty() && !origins.iter().any(|o| o == origin) {
+                return (
+                    axum::http::StatusCode::FORBIDDEN,
+                    axum::Json(serde_json::json!({"error": "Origin nicht erlaubt"})),
+                ).into_response();
+            }
+        }
+    }
+
+    // SECURITY: Authentifizierung erforderlich
+    let token = query.token.as_deref()
+        .or_else(|| {
+            // Fallback: Authorization-Header
+            headers.get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.strip_prefix("Bearer ").or_else(|| s.strip_prefix("bearer ")))
+        })
+        .or_else(|| {
+            // Fallback: x-api-key Header
+            headers.get("x-api-key").and_then(|v| v.to_str().ok())
+        });
+
+    let token = match token {
+        Some(t) => t,
+        None => {
+            return (
+                axum::http::StatusCode::UNAUTHORIZED,
+                axum::Json(serde_json::json!({"error": "WebSocket erfordert Authentifizierung (?token=...)"})),
+            ).into_response();
+        }
+    };
+
+    // Token gegen User-DB validieren
+    let is_valid = resolve_user_by_key(token, &state.users, &state.api_key, &state.admin_key).is_some()
+        || resolve_user_by_session_token(token, &state.users, &state.api_key).is_some();
+
+    if !is_valid {
+        return (
+            axum::http::StatusCode::UNAUTHORIZED,
+            axum::Json(serde_json::json!({"error": "Ungültiges Token"})),
+        ).into_response();
+    }
+
+    // SECURITY: Max-Connections prüfen
+    let current = state.node.metrics.ws_connections.load(Ordering::Relaxed);
+    if current >= MAX_WS_CONNECTIONS {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(serde_json::json!({"error": "Max WebSocket-Verbindungen erreicht"})),
+        ).into_response();
+    }
+
     state
         .node
         .metrics
@@ -24,6 +98,7 @@ pub async fn handle_websocket(
     let events = state.node.events.subscribe();
     let node = state.node.clone();
     ws.on_upgrade(move |socket| websocket_handler(socket, events, node))
+        .into_response()
 }
 
 pub async fn websocket_handler(

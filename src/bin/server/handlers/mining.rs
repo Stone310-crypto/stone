@@ -450,11 +450,16 @@ pub async fn handle_mining_stake(
         ).into_response();
     }
 
-    // Validator-Key zum Signieren (Stake/Unstake-TXs werden nach User-Auth
-    // vom Node erstellt — Signaturprüfung für diese TX-Typen entfällt)
+    // Validator-Key zum Signieren — PubKey wird in Memo eingebettet
+    // damit andere Nodes die Signatur verifizieren können.
     let signing_key = load_or_create_validator_key();
+    let validator_pubkey = local_validator_pubkey_hex(&signing_key);
 
     // Stake-TX erstellen – from = User-Wallet
+    let stake_memo = serde_json::json!({
+        "type": "user_stake",
+        "validator": validator_pubkey,
+    }).to_string();
     let tx = match create_signed_tx(
         &signing_key,
         TxType::Stake,
@@ -463,7 +468,7 @@ pub async fn handle_mining_stake(
         amount,
         rust_decimal::Decimal::ZERO,
         nonce,
-        "User Stake".to_string(),
+        stake_memo,
     ) {
         Ok(tx) => tx,
         Err(e) => return (
@@ -570,11 +575,16 @@ pub async fn handle_mining_unstake(
         base_nonce + state.node.mempool.sender_pending_count(&user_wallet)
     };
 
-    // Validator-Key zum Signieren (Unstake-TXs werden nach User-Auth
-    // vom Node erstellt — Signaturprüfung für diese TX-Typen entfällt)
+    // Validator-Key zum Signieren — PubKey wird in Memo eingebettet
+    // damit andere Nodes die Signatur verifizieren können.
     let signing_key = load_or_create_validator_key();
+    let validator_pubkey = local_validator_pubkey_hex(&signing_key);
 
     // Unstake-TX erstellen – from = User-Wallet
+    let unstake_memo = serde_json::json!({
+        "type": "user_unstake",
+        "validator": validator_pubkey,
+    }).to_string();
     let tx = match create_signed_tx(
         &signing_key,
         TxType::Unstake,
@@ -583,7 +593,7 @@ pub async fn handle_mining_unstake(
         amount,
         rust_decimal::Decimal::ZERO,
         nonce,
-        "User Unstake".to_string(),
+        unstake_memo,
     ) {
         Ok(tx) => tx,
         Err(e) => return (

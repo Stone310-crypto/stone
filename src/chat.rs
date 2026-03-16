@@ -627,3 +627,222 @@ pub fn save_contact_requests(store: &ContactRequestStore) {
         let _ = fs::write(contact_requests_file(), json);
     }
 }
+
+// ─── Gruppenchat ─────────────────────────────────────────────────────────────
+
+fn chat_groups_file() -> String {
+    format!("{}/chat_groups.json", data_dir())
+}
+
+/// Rolle eines Mitglieds in einer Chatgruppe.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum GroupRole {
+    Admin,
+    Member,
+}
+
+/// Ein Mitglied einer Chatgruppe.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct GroupMember {
+    pub wallet: String,
+    pub user_id: String,
+    pub name: String,
+    pub role: GroupRole,
+    pub joined_at: i64,
+}
+
+/// Eine Nachricht in einer Chatgruppe.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct GroupChatEntry {
+    pub msg_id: String,
+    pub group_id: String,
+    pub from_wallet: String,
+    pub from_user_id: String,
+    pub from_name: String,
+    pub encrypted_content: String,
+    pub nonce: String,
+    pub timestamp: i64,
+}
+
+/// Eine Chatgruppe mit Mitgliedern und Nachrichten.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ChatGroup {
+    pub id: String,
+    pub name: String,
+    pub creator_wallet: String,
+    pub members: Vec<GroupMember>,
+    pub messages: Vec<GroupChatEntry>,
+    pub created_at: i64,
+}
+
+impl ChatGroup {
+    /// Prüft ob eine Wallet Mitglied ist.
+    pub fn is_member(&self, wallet: &str) -> bool {
+        self.members.iter().any(|m| m.wallet == wallet)
+    }
+
+    /// Prüft ob eine Wallet Admin ist.
+    pub fn is_admin(&self, wallet: &str) -> bool {
+        self.members.iter().any(|m| m.wallet == wallet && m.role == GroupRole::Admin)
+    }
+
+    /// Nachricht hinzufügen.
+    pub fn add_message(&mut self, entry: GroupChatEntry) {
+        self.messages.push(entry);
+    }
+
+    /// Mitglied hinzufügen.
+    pub fn add_member(&mut self, member: GroupMember) -> Result<(), &'static str> {
+        if self.is_member(&member.wallet) {
+            return Err("Bereits Mitglied");
+        }
+        self.members.push(member);
+        Ok(())
+    }
+
+    /// Mitglied entfernen (nur Admin darf das).
+    pub fn remove_member(&mut self, wallet: &str) -> Result<(), &'static str> {
+        if wallet == self.creator_wallet {
+            return Err("Ersteller kann nicht entfernt werden");
+        }
+        let before = self.members.len();
+        self.members.retain(|m| m.wallet != wallet);
+        if self.members.len() == before {
+            return Err("Mitglied nicht gefunden");
+        }
+        Ok(())
+    }
+}
+
+/// Gruppenchat-Store: Alle Chatgruppen auf dieser Node.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct ChatGroupStore {
+    pub groups: Vec<ChatGroup>,
+}
+
+impl ChatGroupStore {
+    /// Gruppe nach ID finden.
+    pub fn find(&self, group_id: &str) -> Option<&ChatGroup> {
+        self.groups.iter().find(|g| g.id == group_id)
+    }
+
+    /// Gruppe nach ID mutable finden.
+    pub fn find_mut(&mut self, group_id: &str) -> Option<&mut ChatGroup> {
+        self.groups.iter_mut().find(|g| g.id == group_id)
+    }
+
+    /// Alle Gruppen für eine Wallet.
+    pub fn groups_for(&self, wallet: &str) -> Vec<&ChatGroup> {
+        self.groups.iter().filter(|g| g.is_member(wallet)).collect()
+    }
+}
+
+pub fn load_chat_groups() -> ChatGroupStore {
+    if let Ok(data) = fs::read_to_string(chat_groups_file()) {
+        serde_json::from_str(&data).unwrap_or_default()
+    } else {
+        ChatGroupStore::default()
+    }
+}
+
+pub fn save_chat_groups(store: &ChatGroupStore) {
+    if let Ok(json) = serde_json::to_string_pretty(store) {
+        let _ = fs::create_dir_all(data_dir());
+        let _ = fs::write(chat_groups_file(), json);
+    }
+}
+
+// ─── Call-Signaling ──────────────────────────────────────────────────────────
+
+fn call_signals_file() -> String {
+    format!("{}/call_signals.json", data_dir())
+}
+
+/// Typ eines WebRTC-Signaling-Signals.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum SignalType {
+    Offer,
+    Answer,
+    IceCandidate,
+    Hangup,
+    Busy,
+    Ringing,
+}
+
+/// Ein WebRTC Call-Signal (ephemeral, wird nicht in Blöcke gemined).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct CallSignal {
+    pub call_id: String,
+    pub signal_type: SignalType,
+    pub from_wallet: String,
+    pub to_wallet: String,
+    /// Verschlüsselter SDP/ICE-Payload (AES-256-GCM, base64)
+    pub payload: String,
+    /// AES-256-GCM Nonce (base64)
+    pub nonce: String,
+    pub timestamp: i64,
+}
+
+/// TTL für Call-Signaling-Nachrichten (60 Sekunden).
+const CALL_SIGNAL_TTL_SECS: i64 = 60;
+
+/// In-Memory Signal-Store: Kurzlebige Signaling-Nachrichten pro Wallet.
+///
+/// Optimiert für hohe Concurrency (5.000+ gleichzeitige Anrufe):
+/// DashMap keyed by to_wallet → O(1) Lookup statt O(n) Scan.
+/// Thread-safe ohne externen Mutex.
+pub struct CallSignalStore {
+    /// Signale gruppiert nach Empfänger-Wallet (lock-free concurrent access)
+    signals: dashmap::DashMap<String, Vec<CallSignal>>,
+}
+
+impl Default for CallSignalStore {
+    fn default() -> Self {
+        Self { signals: dashmap::DashMap::new() }
+    }
+}
+
+impl CallSignalStore {
+    /// Signal hinzufügen.
+    pub fn add_signal(&self, signal: CallSignal) {
+        self.signals
+            .entry(signal.to_wallet.clone())
+            .or_default()
+            .push(signal);
+    }
+
+    /// Alle Signale für eine Wallet abrufen und gleichzeitig bereinigen (TTL + drain).
+    pub fn drain_for(&self, wallet: &str) -> Vec<CallSignal> {
+        let now = chrono::Utc::now().timestamp();
+        // Wallet-spezifische Signale konsumieren
+        if let Some((_, signals)) = self.signals.remove(wallet) {
+            signals.into_iter()
+                .filter(|s| now - s.timestamp < CALL_SIGNAL_TTL_SECS)
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    /// Alle Signale für einen bestimmten Anruf abrufen (read-only).
+    pub fn signals_for_call(&self, call_id: &str, wallet: &str) -> Vec<CallSignal> {
+        let now = chrono::Utc::now().timestamp();
+        self.signals.get(wallet)
+            .map(|sigs| sigs.iter()
+                .filter(|s| s.call_id == call_id && now - s.timestamp < CALL_SIGNAL_TTL_SECS)
+                .cloned()
+                .collect())
+            .unwrap_or_default()
+    }
+
+    /// Garbage-Collection: Abgelaufene Signale entfernen.
+    pub fn gc(&self) {
+        let now = chrono::Utc::now().timestamp();
+        self.signals.retain(|_, sigs| {
+            sigs.retain(|s| now - s.timestamp < CALL_SIGNAL_TTL_SECS);
+            !sigs.is_empty()
+        });
+    }
+}

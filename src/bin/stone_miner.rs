@@ -59,7 +59,7 @@ use server::{
         load_api_key, load_admin_key, load_peers_from_disk, load_trust_from_disk,
         AppState as NodeAppState, HEARTBEAT_INTERVAL,
     },
-    sync::{fetch_missing_chunks, pull_from_peer, spawn_auto_sync_task},
+    sync::{bootstrap_announce, fetch_missing_chunks, pull_from_peer, spawn_auto_sync_task, spawn_peer_health_task},
 };
 
 // ─── Embedded Dashboard HTML ─────────────────────────────────────────────────
@@ -618,7 +618,7 @@ async fn handle_p2p_event(
                 }
             };
 
-            enum BlockResult { Accepted(u64), NeedsResync, Rejected, AlreadyKnown, Stale }
+            enum BlockResult { Accepted(u64), NeedsResync, Rejected, AlreadyKnown, Stale, Fork }
 
             let result = {
                 let mut chain = node.chain.lock().unwrap();
@@ -668,6 +668,9 @@ async fn handle_p2p_event(
                                     ledger.account_count(),
                                     ledger.total_supply()
                                 );
+                                // StakingPool nach Reorg auch neu aufbauen
+                                let rebuilt_pool = stone::token::StakingPool::rebuild_from_chain(&chain.blocks);
+                                *node.staking_pool.write().unwrap() = rebuilt_pool;
                             } else if !txs.is_empty() {
                                 let mut ledger = node.token_ledger.write().unwrap();
                                 // Peer-Blöcke wurden bereits vom Netzwerk validiert →
@@ -682,6 +685,8 @@ async fn handle_p2p_event(
                                     node.mempool.remove_tx(&tx.tx_id);
                                 }
                             }
+                            // Staking-TXs im StakingPool verarbeiten (P2P-Pfad)
+                            node.apply_staking_from_txs(&txs);
                             // Chat-Batch-Records speichern (für Chat-Index)
                             for batch in &chat_batches {
                                 if !batch.messages.is_empty() {
@@ -691,6 +696,7 @@ async fn handle_p2p_event(
                                 }
                             }
                             // Validator Auto-Discovery: Nur nach Initial-Sync
+                            // SECURITY: Nur Signer mit ausreichend Stake werden aufgenommen
                             let sync_done = node.metrics.initial_sync_done.load(
                                 std::sync::atomic::Ordering::Relaxed
                             );
@@ -701,15 +707,29 @@ async fn handle_p2p_event(
                             {
                                 let mut vs = node.validator_set.write().unwrap();
                                 if vs.get(&block_signer).is_none() {
-                                    let info = stone::consensus::ValidatorInfo::new_pending(
-                                        block_signer.clone(),
-                                        block_validator_pk.clone(),
-                                    );
-                                    vs.add(info);
-                                    println!(
-                                        "[consensus] 🔗 Validator '{}' auto-discovered (pending) via Block #{}",
-                                        &block_signer, idx,
-                                    );
+                                    // Stake-Check: Signer muss mindestens VALIDATOR_MIN_STAKE haben
+                                    let has_stake = {
+                                        let pool = node.staking_pool.read().unwrap();
+                                        let min_stake: rust_decimal::Decimal = stone::token::staking::VALIDATOR_MIN_STAKE.parse().unwrap();
+                                        pool.stakers.values().any(|entry| entry.staked_amount >= min_stake)
+                                            || pool.total_staked >= min_stake
+                                    };
+                                    if has_stake {
+                                        let info = stone::consensus::ValidatorInfo::new_pending(
+                                            block_signer.clone(),
+                                            block_validator_pk.clone(),
+                                        );
+                                        vs.add(info);
+                                        println!(
+                                            "[consensus] 🔗 Validator '{}' auto-discovered (pending) via Block #{}",
+                                            &block_signer, idx,
+                                        );
+                                    } else {
+                                        eprintln!(
+                                            "[consensus] ⚠ Validator '{}' auto-discovery abgelehnt – kein ausreichender Stake im Pool",
+                                            &block_signer,
+                                        );
+                                    }
                                 }
                             }
                             BlockResult::Accepted(chain.blocks.len() as u64)
@@ -717,6 +737,12 @@ async fn handle_p2p_event(
                         Err(ref e) if e.starts_with("Stale:") => BlockResult::Stale,
                         Err(ref e) if e.starts_with("Gap:") || e.contains("previous_hash") => {
                             BlockResult::NeedsResync
+                        }
+                        Err(ref e) if e.contains("Fork") || e.contains("fork")
+                            || e.contains("nicht schwerer") || e.contains("Tiebreak")
+                            || e.contains("Reorg abgelehnt") || e.contains("Timestamp") => {
+                            eprintln!("[p2p] Block #{idx} Fork/Reorg: {e}");
+                            BlockResult::Fork
                         }
                         Err(e) => {
                             eprintln!("[p2p] Block #{idx} abgelehnt: {e}");
@@ -740,7 +766,7 @@ async fn handle_p2p_event(
                 BlockResult::Rejected => {
                     handle.report_penalty(&from_peer, 15, "rejected block").await;
                 }
-                _ => {} // AlreadyKnown, Stale — kein Penalty
+                _ => {} // AlreadyKnown, Stale, Fork — kein Penalty
             }
         }
 
@@ -796,6 +822,11 @@ async fn handle_p2p_event(
                             ledger.total_supply()
                         );
                     }
+                    // StakingPool nach fork-Reorg auch neu aufbauen
+                    {
+                        let rebuilt_pool = stone::token::StakingPool::rebuild_from_chain(&chain.blocks);
+                        *node.staking_pool.write().unwrap() = rebuilt_pool;
+                    }
 
                     let mut applied = 0u64;
                     for block in peer_new {
@@ -829,6 +860,32 @@ async fn handle_p2p_event(
                                 );
                                 continue;
                             }
+                            // SECURITY: Prüfe ob der Signer im ValidatorSet bekannt ist
+                            let vs = node.validator_set.read().unwrap();
+                            let is_known_validator = vs.validators.iter().any(|v| {
+                                v.public_key_hex == block.validator_pub_key
+                            });
+                            drop(vs);
+                            if !is_known_validator {
+                                eprintln!(
+                                    "[sync] ⚠ Block #{} Signer PubKey {}… nicht im ValidatorSet – übersprungen",
+                                    block.index,
+                                    &block.validator_pub_key[..16.min(block.validator_pub_key.len())],
+                                );
+                                continue;
+                            }
+                        }
+
+                        // SECURITY: Timestamp-Validierung (wie im Gossip-Handler)
+                        if block.index > 0 {
+                            let now = chrono::Utc::now().timestamp();
+                            if block.timestamp > now + 5 * 60 {
+                                eprintln!(
+                                    "[sync] ⚠ Block #{} liegt {}s in der Zukunft – übersprungen",
+                                    block.index, block.timestamp - now,
+                                );
+                                continue;
+                            }
                         }
 
                         match chain.accept_peer_block(block, None) {
@@ -845,6 +902,8 @@ async fn handle_p2p_event(
                                         node.mempool.remove_tx(&tx.tx_id);
                                     }
                                 }
+                                // Staking-TXs im StakingPool verarbeiten (RangeSync-Pfad)
+                                node.apply_staking_from_txs(&txs);
                             }
                             Err(e) => {
                                 eprintln!("[sync] ✗ Reorg Block #{idx} fehlgeschlagen: {e}");
@@ -865,11 +924,13 @@ async fn handle_p2p_event(
         }
 
         NetworkEvent::TxReceived { tx, from_peer } => {
-            let ledger = node.token_ledger.read().unwrap();
             let tx_id_short = tx.tx_id[..12.min(tx.tx_id.len())].to_string();
             let peer_short = from_peer[..8.min(from_peer.len())].to_string();
             let tx_type = format!("{:?}", tx.tx_type);
-            match node.mempool.add_tx(*tx, Some(&ledger)) {
+            // Kein Ledger-Check bei Gossip-TXs: Nonces können out-of-order
+            // ankommen. Echte Validierung passiert in filter_valid_txs() beim
+            // Block-Build. Signatur wurde bereits in handle_gossip_tx() geprüft.
+            match node.mempool.add_tx(*tx, None) {
                 Ok(()) => {
                     println!("[p2p] 💸 TX {} von Peer {} aufgenommen ({})",
                         tx_id_short, peer_short, tx_type);
@@ -2131,6 +2192,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     MasterNodeState::start_mining_loop(node.clone());
     spawn_auto_sync_task(node.clone(), api_key.clone(), users.clone());
 
+    // Peer-Discovery: Bei Bootstrap-Nodes registrieren & Health-Check starten
+    bootstrap_announce(&node).await;
+    spawn_peer_health_task(node.clone());
+
     // Mempool-Eviction
     {
         let ne = node.clone();
@@ -2303,7 +2368,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         challenge_store: stone::auth::ChallengeStore::new(),
         qr_login_store: stone::auth::QrLoginStore::new(),
         miner_status_store: server::state::MinerStatusStore::new(),
+        chat_groups: Arc::new(std::sync::Mutex::new(stone::chat::load_chat_groups())),
+        call_signals: Arc::new(stone::chat::CallSignalStore::default()),
+        audio_rooms: server::handlers::audio_relay::new_audio_rooms(),
     };
+
+    // Audio-Room GC: Idle-Rooms alle 60s aufräumen (Rooms ohne Aktivität > 5 Min)
+    {
+        let audio_rooms = node_app_state.audio_rooms.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                server::handlers::audio_relay::gc_idle_rooms(&audio_rooms);
+            }
+        });
+    }
 
     // Main node API
     let main_router = build_router(node_app_state);

@@ -307,6 +307,8 @@ impl ValidatorSet {
     /// - `jailed`: Set von Validator-IDs die derzeit im Jail sind.
     /// - `wallet_map`: Mapping von Validator-Node-ID → Wallet-Adresse.
     ///
+    /// **Anti-Sybil**: Validators ohne ausreichenden Stake (≥500 STONE) werden
+    /// ausgeschlossen, sofern mindestens ein qualifizierter Validator vorhanden ist.
     /// Gibt `None` zurück wenn keine aktiven Validatoren vorhanden sind.
     pub fn select_validator_weighted(
         &self,
@@ -324,6 +326,25 @@ impl ValidatorSet {
             return None;
         }
 
+        // Anti-Sybil: Filtere Validators die den Mindest-Stake nicht erreichen.
+        // Nur aktiv wenn mindestens ein Validator den Mindest-Stake hat.
+        let validator_min: rust_decimal::Decimal = crate::token::staking::VALIDATOR_MIN_STAKE.parse().unwrap();
+        let eligible: Vec<&ValidatorInfo> = active.iter()
+            .filter(|v| {
+                let wallet = wallet_map.get(&v.node_id);
+                let stake = wallet
+                    .and_then(|w| stakes.get(w))
+                    .copied()
+                    .unwrap_or(rust_decimal::Decimal::ZERO);
+                stake >= validator_min
+            })
+            .copied()
+            .collect();
+
+        // Fallback: Wenn kein Validator den Mindest-Stake hat (z.B. Testnet,
+        // oder alle gerade unter der Schwelle), nutze alle aktiven.
+        let candidates = if eligible.is_empty() { &active } else { &eligible };
+
         // SHA256-Seed (deterministisch)
         let mut hasher = Sha256::new();
         hasher.update(prev_hash.as_bytes());
@@ -335,7 +356,7 @@ impl ValidatorSet {
         let base_weight = rust_decimal::Decimal::ONE;
 
         // Gewichte berechnen: Stake + Basis (alles in ganzen STONE-Einheiten als u64)
-        let weights: Vec<u64> = active.iter().map(|v| {
+        let weights: Vec<u64> = candidates.iter().map(|v| {
             let wallet = wallet_map.get(&v.node_id);
             let stake = wallet
                 .and_then(|w| stakes.get(w))
@@ -352,8 +373,8 @@ impl ValidatorSet {
         let total_weight: u64 = weights.iter().sum();
         if total_weight == 0 {
             // Fallback: gleichmäßig
-            let idx = (seed % active.len() as u64) as usize;
-            return Some(active[idx]);
+            let idx = (seed % candidates.len() as u64) as usize;
+            return Some(candidates[idx]);
         }
 
         // Gewichtete Auswahl via kumulativer Summe
@@ -362,12 +383,12 @@ impl ValidatorSet {
         for (i, &w) in weights.iter().enumerate() {
             cumulative += w;
             if position < cumulative {
-                return Some(active[i]);
+                return Some(candidates[i]);
             }
         }
 
         // Fallback (sollte nie passieren)
-        Some(active[active.len() - 1])
+        Some(candidates[candidates.len() - 1])
     }
 
     /// Legacy-Methode: Wählt Validator ohne Stake-Gewichtung (gleichmäßig).

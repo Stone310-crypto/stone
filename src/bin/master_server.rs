@@ -45,7 +45,7 @@ use server::{
     sync_router::build_sync_router,
     rate_limiter::RateLimits,
     state::{load_api_key, load_admin_key, load_peers_from_disk, load_trust_from_disk, AppState, HEARTBEAT_INTERVAL},
-    sync::{fetch_missing_chunks, pull_from_peer, spawn_auto_sync_task},
+    sync::{bootstrap_announce, fetch_missing_chunks, pull_from_peer, spawn_auto_sync_task, spawn_peer_health_task},
 };
 
 #[tokio::main]
@@ -177,6 +177,10 @@ async fn main() {
     MasterNodeState::start_heartbeat(node.clone(), HEARTBEAT_INTERVAL);
     spawn_auto_sync_task(node.clone(), api_key.clone(), users.clone());
 
+    // Peer-Discovery: Bei Bootstrap-Nodes registrieren & Health-Check starten
+    bootstrap_announce(&node).await;
+    spawn_peer_health_task(node.clone());
+
     // Mempool-Eviction: abgelaufene TXs und known_ids periodisch bereinigen
     {
         let node_evict = node.clone();
@@ -214,6 +218,38 @@ async fn main() {
                     }
                     // Chain-Referenz setzen damit P2P-Peers Blöcke direkt serviert bekommen
                     handle.set_chain_ref(node.chain.clone()).await;
+
+                    // Eigenen Stake-Level für Relay-Priorität setzen
+                    {
+                        let wallet = node.validator_set.read().unwrap()
+                            .get(&node.node_id).map(|v| v.public_key_hex.clone())
+                            .unwrap_or_default();
+                        let level = {
+                            let pool = node.staking_pool.read().unwrap();
+                            pool.stake_level(&wallet).min_stake() as u64
+                        };
+                        handle.set_stake_level(level).await;
+                    }
+
+                    // Periodisch Stake-Level aktualisieren (alle 5 Min)
+                    {
+                        let node_sl = node.clone();
+                        let handle_sl = handle.clone();
+                        tokio::spawn(async move {
+                            let mut sl_interval = tokio::time::interval(std::time::Duration::from_secs(300));
+                            loop {
+                                sl_interval.tick().await;
+                                let wallet = node_sl.validator_set.read().unwrap()
+                                    .get(&node_sl.node_id).map(|v| v.public_key_hex.clone())
+                                    .unwrap_or_default();
+                                let level = {
+                                    let pool = node_sl.staking_pool.read().unwrap();
+                                    pool.stake_level(&wallet).min_stake() as u64
+                                };
+                                handle_sl.set_stake_level(level).await;
+                            }
+                        });
+                    }
 
                     {
                         use stone::network::NetworkEvent;
@@ -295,6 +331,7 @@ async fn main() {
                                         NeedsResync { idx: u64, from: String, err: String },
                                         Rejected,
                                         AlreadyKnown,
+                                        Fork,
                                     }
 
                                     let result = {
@@ -379,6 +416,13 @@ async fn main() {
                                                 {
                                                     let err = e.clone();
                                                     BlockResult::NeedsResync { idx, from: from_peer.clone(), err }
+                                                }
+                                                Err(ref e) if e.contains("Fork") || e.contains("fork")
+                                                    || e.contains("nicht schwerer") || e.contains("Tiebreak")
+                                                    || e.contains("Reorg abgelehnt") || e.contains("Timestamp") =>
+                                                {
+                                                    eprintln!("[p2p] Block #{idx} Fork/Reorg: {e}");
+                                                    BlockResult::Fork
                                                 }
                                                 Err(e) => {
                                                     eprintln!("[p2p] Block #{idx} abgelehnt: {e}");
@@ -490,7 +534,7 @@ async fn main() {
                                             // Peer hat ungültigen Block geliefert → Penalty
                                             handle_bg.report_penalty(&from_peer, 15, "rejected block").await;
                                         }
-                                        _ => {} // Stale, AlreadyKnown
+                                        _ => {} // Stale, AlreadyKnown, Fork
                                     }
                                 }
 
@@ -659,11 +703,24 @@ async fn main() {
 
                                 // ── Chat per Gossip empfangen ──────────
                                 NetworkEvent::ChatMessageReceived { message, from_peer } => {
+                                    let msg_clone = message.clone();
                                     match node_bg.message_pool.add_message(message) {
-                                        Ok(seq) => println!(
-                                            "[p2p] 💬 Chat von {} (seq: {})",
-                                            &from_peer[..12.min(from_peer.len())], seq,
-                                        ),
+                                        Ok(seq) => {
+                                            println!(
+                                                "[p2p] 💬 Chat von {} (seq: {})",
+                                                &from_peer[..12.min(from_peer.len())], seq,
+                                            );
+                                            // WebSocket-Push an verbundene Clients
+                                            node_bg.events.publish(stone::master_node::NodeEvent::ChatMessageReceived {
+                                                msg_id: msg_clone.msg_id.clone(),
+                                                from_wallet: msg_clone.from_wallet.clone(),
+                                                to_wallet: msg_clone.to_wallet.clone(),
+                                                from_name: msg_clone.from_name.clone(),
+                                                timestamp: msg_clone.timestamp,
+                                                channel_type: "direct".to_string(),
+                                                group_id: String::new(),
+                                            });
+                                        }
                                         Err(_) => {}
                                     }
                                 }
@@ -933,9 +990,24 @@ async fn main() {
         challenge_store: stone::auth::ChallengeStore::new(),
         qr_login_store: stone::auth::QrLoginStore::new(),
         miner_status_store: server::state::MinerStatusStore::new(),
+        chat_groups: Arc::new(std::sync::Mutex::new(stone::chat::load_chat_groups())),
+        call_signals: Arc::new(stone::chat::CallSignalStore::default()),
+        audio_rooms: server::handlers::audio_relay::new_audio_rooms(),
     };
 
     let router = build_router(state.clone());
+
+    // Audio-Room GC: Idle-Rooms alle 60s aufräumen (Rooms ohne Aktivität > 5 Min)
+    {
+        let audio_rooms = state.audio_rooms.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                server::handlers::audio_relay::gc_idle_rooms(&audio_rooms);
+            }
+        });
+    }
 
     let preferred_port: u16 = std::env::var("STONE_HTTP_PORT")
         .or_else(|_| std::env::var("STONE_PORT"))

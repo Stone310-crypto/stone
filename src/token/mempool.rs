@@ -26,7 +26,7 @@
 //! automatisch entfernt. Der bekannte TX-ID-Cache (`known_ids`) wird ebenfalls
 //! periodisch bereinigt wenn er zu groß wird.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::RwLock;
 
 use super::transaction::{FeeTier, TokenTx, TxType, TxError, validate_tx};
@@ -46,6 +46,12 @@ pub const TX_TTL_SECS: i64 = 3600;
 /// Maximale Größe des known_ids Cache bevor GC einsetzt
 const MAX_KNOWN_IDS: usize = 50_000;
 
+/// Maximale Anzahl von Requeue-Versuchen bevor TX endgültig verworfen wird
+const MAX_REQUEUE_ATTEMPTS: u32 = 3;
+
+/// SECURITY: Maximale pending TXs pro Sender (Anti-Spam)
+const MAX_PENDING_PER_SENDER: usize = 50;
+
 // ─── Mempool-Fehler ──────────────────────────────────────────────────────────
 
 #[derive(Debug)]
@@ -64,6 +70,8 @@ pub enum MempoolError {
     Expired { age_secs: i64, max_secs: i64 },
     /// TX-Timestamp liegt zu weit in der Zukunft
     FutureTimestamp { drift_secs: i64 },
+    /// SECURITY: Sender hat zu viele pending TXs
+    SenderLimitExceeded { sender: String, limit: usize },
 }
 
 impl std::fmt::Display for MempoolError {
@@ -81,6 +89,9 @@ impl std::fmt::Display for MempoolError {
             }
             MempoolError::FutureTimestamp { drift_secs } => {
                 write!(f, "TX-Timestamp liegt {drift_secs}s in der Zukunft (max 300s)")
+            }
+            MempoolError::SenderLimitExceeded { sender, limit } => {
+                write!(f, "Sender {} hat bereits {limit} pending TXs (Limit)", &sender[..12.min(sender.len())])
             }
         }
     }
@@ -107,6 +118,8 @@ struct MempoolInner {
     queue: VecDeque<TokenTx>,
     /// Bekannte TX-IDs (Duplikat-Schutz)
     known_ids: HashSet<String>,
+    /// Anzahl der Requeue-Versuche pro TX-ID
+    requeue_counts: HashMap<String, u32>,
 }
 
 impl Mempool {
@@ -116,6 +129,7 @@ impl Mempool {
             inner: RwLock::new(MempoolInner {
                 queue: VecDeque::new(),
                 known_ids: HashSet::new(),
+                requeue_counts: HashMap::new(),
             }),
         }
     }
@@ -157,6 +171,19 @@ impl Mempool {
         // 3. Kapazitäts-Limit
         if inner.queue.len() >= MAX_MEMPOOL_SIZE {
             return Err(MempoolError::Full);
+        }
+
+        // SECURITY: Per-Sender Rate-Limit (Anti-Spam)
+        {
+            let sender_pending = inner.queue.iter()
+                .filter(|ptx| ptx.from == tx.from)
+                .count();
+            if sender_pending >= MAX_PENDING_PER_SENDER {
+                return Err(MempoolError::SenderLimitExceeded {
+                    sender: tx.from.clone(),
+                    limit: MAX_PENDING_PER_SENDER,
+                });
+            }
         }
 
         // 4. Ledger Pre-Check (optional aber empfohlen)
@@ -293,13 +320,22 @@ impl Mempool {
 
     /// TX zurück in den Mempool legen (z.B. nach filter_valid_txs-Ablehnung
     /// wegen Gap-Nonce — TX könnte gültig werden wenn vorherige TXs eintreffen).
-    /// Überspringt den Duplikat-Check weil die TX-ID bereits in known_ids ist.
-    pub fn requeue_tx(&self, tx: TokenTx) {
+    /// Gibt `true` zurück wenn requeued, `false` wenn Limit erreicht.
+    pub fn requeue_tx(&self, tx: TokenTx) -> bool {
         let mut inner = self.inner.write().unwrap();
         if inner.queue.len() >= MAX_MEMPOOL_SIZE {
-            return;
+            return false;
         }
+        let count = inner.requeue_counts.entry(tx.tx_id.clone()).or_insert(0);
+        *count += 1;
+        if *count > MAX_REQUEUE_ATTEMPTS {
+            // Endgültig verwerfen nach zu vielen Versuchen
+            inner.known_ids.insert(tx.tx_id.clone());
+            return false;
+        }
+        inner.known_ids.insert(tx.tx_id.clone());
         inner.queue.push_back(tx);
+        true
     }
 
     /// Alle pending TXs entnehmen (Express + Priority + Standard).
@@ -420,7 +456,14 @@ impl Mempool {
 
         let mut inner = self.inner.write().unwrap();
         let before = inner.queue.len();
+        let evicted_ids: Vec<String> = inner.queue.iter()
+            .filter(|tx| tx.timestamp < cutoff)
+            .map(|tx| tx.tx_id.clone())
+            .collect();
         inner.queue.retain(|tx| tx.timestamp >= cutoff);
+        for id in &evicted_ids {
+            inner.requeue_counts.remove(id);
+        }
         let evicted = before - inner.queue.len();
 
         if evicted > 0 {
@@ -443,7 +486,8 @@ impl Mempool {
         // Alle TX-IDs die noch in der Queue sind behalten
         let active_ids: HashSet<String> = inner.queue.iter().map(|tx| tx.tx_id.clone()).collect();
         let before = inner.known_ids.len();
-        inner.known_ids = active_ids;
+        inner.known_ids = active_ids.clone();
+        inner.requeue_counts.retain(|id, _| active_ids.contains(id));
         let removed = before - inner.known_ids.len();
 
         if removed > 0 {

@@ -433,6 +433,9 @@ impl ChatPolicyStore {
     }
 
     /// Vote auf einen Report abgeben (Node/Validator-Stimulus).
+    ///
+    /// `voter_wallet` ist die Wallet-Adresse des Voters (statt node_id).
+    /// Wird zusammen mit `voter_id` (node_id) gespeichert.
     pub fn cast_vote(&mut self, report_id: &str, voter_id: &str, approve: bool) -> Result<(), String> {
         let report = self.reports.get_mut(report_id)
             .ok_or_else(|| "Report nicht gefunden".to_string())?;
@@ -447,10 +450,18 @@ impl ChatPolicyStore {
 
     /// Report-Ergebnis berechnen und ggf. finalisieren.
     ///
-    /// Gibt `Some((accepted, slash_needed))` zurück wenn finalisiert wurde.
-    pub fn try_finalize_report(&mut self, report_id: &str) -> Option<(bool, String, String)> {
+    /// `stake_weights`: Optionale Stake-Gewichte (wallet/node_id → STONE-Betrag).
+    /// Wenn vorhanden, wird stake-gewichtet abgestimmt.
+    /// Wenn `None`, wird klassisch pro Stimme gezählt (Legacy).
+    ///
+    /// Gibt `Some((accepted, msg_id, reported_wallet))` zurück wenn finalisiert.
+    pub fn try_finalize_report_weighted(
+        &mut self,
+        report_id: &str,
+        stake_weights: Option<&HashMap<String, Decimal>>,
+    ) -> Option<(bool, String, String)> {
         // Phase 1: Nur lesen, Ergebnis bestimmen
-        let (total, votes_cast, approve_count, created_at, msg_id, reported_wallet, is_pending) = {
+        let (total, votes_cast, created_at, msg_id, reported_wallet, is_pending, votes_clone) = {
             let report = self.reports.get(report_id)?;
             if report.status != ReportStatus::Pending {
                 return None;
@@ -458,11 +469,11 @@ impl ChatPolicyStore {
             (
                 report.total_validators.max(1),
                 report.votes.len() as u32,
-                report.votes.values().filter(|&&v| v).count() as u32,
                 report.created_at,
                 report.msg_id.clone(),
                 report.reported_wallet.clone(),
                 true,
+                report.votes.clone(),
             )
         };
 
@@ -485,18 +496,46 @@ impl ChatPolicyStore {
             return None;
         }
 
-        // Quorum erreicht?
-        let quorum_met = (votes_cast * 100) >= (total * REPORT_QUORUM_PCT);
-        if !quorum_met && votes_cast < total {
-            return None;
-        }
+        let accepted = if let Some(weights) = stake_weights {
+            // Stake-gewichtetes Voting
+            let mut total_weight = Decimal::ZERO;
+            let mut approve_weight = Decimal::ZERO;
 
-        // Mehrheit bestimmen
-        let accepted = (approve_count * 100) > (votes_cast * 50);
+            for (voter, &approved) in &votes_clone {
+                let w = weights.get(voter).copied().unwrap_or(Decimal::ONE);
+                total_weight += w;
+                if approved {
+                    approve_weight += w;
+                }
+            }
+
+            if total_weight == Decimal::ZERO {
+                return None;
+            }
+
+            // Quorum: Mindestens 51% des gewichteten Potentials müssen gestimmt haben
+            let total_potential: Decimal = weights.values().sum();
+            if total_potential > Decimal::ZERO {
+                let quorum_met = total_weight * Decimal::from(100) >= total_potential * Decimal::from(REPORT_QUORUM_PCT);
+                if !quorum_met && votes_cast < total {
+                    return None;
+                }
+            }
+
+            // Mehrheit: >50% der gewichteten Stimmen
+            approve_weight * Decimal::from(2) > total_weight
+        } else {
+            // Legacy: Ungewichtetes Voting (1 Vote = 1 Stimme)
+            let approve_count = votes_clone.values().filter(|&&v| v).count() as u32;
+            let quorum_met = (votes_cast * 100) >= (total * REPORT_QUORUM_PCT);
+            if !quorum_met && votes_cast < total {
+                return None;
+            }
+            (approve_count * 100) > (votes_cast * 50)
+        };
 
         // Phase 2: Mutieren
         if accepted {
-            // Zuerst mark_purged (braucht &mut self)
             self.mark_purged(&msg_id, &format!("report_accepted:{}", report_id));
             self.total_reports_accepted += 1;
         }
@@ -516,8 +555,9 @@ impl ChatPolicyStore {
     }
 
     /// Alle Pending Reports durchgehen und finalisieren wo möglich.
+    /// `stake_weights`: Optionale Stake-Gewichte für gewichtetes Voting.
     /// Gibt eine Liste von `(report_id, accepted, msg_id, reported_wallet)` zurück.
-    pub fn finalize_all_pending(&mut self) -> Vec<(String, bool, String, String)> {
+    pub fn finalize_all_pending(&mut self, stake_weights: Option<&HashMap<String, Decimal>>) -> Vec<(String, bool, String, String)> {
         let pending_ids: Vec<String> = self.reports
             .iter()
             .filter(|(_, r)| r.status == ReportStatus::Pending)
@@ -526,11 +566,16 @@ impl ChatPolicyStore {
 
         let mut results = Vec::new();
         for id in pending_ids {
-            if let Some((accepted, msg_id, reported_wallet)) = self.try_finalize_report(&id) {
+            if let Some((accepted, msg_id, reported_wallet)) = self.try_finalize_report_weighted(&id, stake_weights) {
                 results.push((id, accepted, msg_id, reported_wallet));
             }
         }
         results
+    }
+
+    /// Legacy-Wrapper: Finalisiert ohne Stake-Gewichtung.
+    pub fn try_finalize_report(&mut self, report_id: &str) -> Option<(bool, String, String)> {
+        self.try_finalize_report_weighted(report_id, None)
     }
 
     /// Record Slash nach einem akzeptierten Report.

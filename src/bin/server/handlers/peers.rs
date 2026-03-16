@@ -83,6 +83,96 @@ pub async fn handle_remove_peer(
     ))
 }
 
+// ─── Peer Registration (public, kein Auth) ───────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct RegisterPeerRequest {
+    pub url: String,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+/// POST /api/v1/peers/register — Öffentlich: Node meldet sich bei uns an.
+///
+/// Jeder Node kann sich ohne Auth registrieren. Die URL wird normalisiert
+/// und validiert (muss http/https sein, kein localhost/127.x).
+pub async fn handle_register_peer(
+    State(state): State<AppState>,
+    axum::Json(req): axum::Json<RegisterPeerRequest>,
+) -> impl IntoResponse {
+    let url = req.url.trim().trim_end_matches('/').to_string();
+
+    // Validierung: URL muss ein gültiges Schema haben
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"error": "URL muss mit http:// oder https:// beginnen"})),
+        );
+    }
+
+    // Keine localhost/loopback zulassen
+    let host = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .and_then(|s| s.split(':').next())
+        .unwrap_or("");
+    if host == "localhost" || host == "127.0.0.1" || host == "0.0.0.0" || host == "::1" {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"error": "Localhost nicht erlaubt"})),
+        );
+    }
+
+    // Duplikat-Check: Wenn URL schon bekannt, nur last_seen aktualisieren
+    {
+        let mut peers = state.node.peers.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(existing) = peers.iter_mut().find(|p| p.url == url) {
+            existing.last_seen = chrono::Utc::now().timestamp();
+            existing.name = req.name.or_else(|| existing.name.clone());
+            let total = peers.len();
+            drop(peers);
+            let all = state.node.get_peers();
+            save_peers(&all);
+            return (
+                StatusCode::OK,
+                axum::Json(json!({
+                    "ok": true,
+                    "registered": false,
+                    "message": "Peer bereits bekannt, last_seen aktualisiert",
+                    "peers_total": total,
+                })),
+            );
+        }
+    }
+
+    // Neuen Peer anlegen
+    let peer = PeerInfo {
+        url: url.clone(),
+        name: req.name,
+        ca: None,
+        status: PeerStatus::Healthy, // Optimistisch: wenn er uns erreicht, ist er erreichbar
+        last_seen: chrono::Utc::now().timestamp(),
+        last_hash: None,
+        block_height: 0,
+        latency_ms: None,
+        sync_failures: 0,
+    };
+
+    state.node.upsert_peer(peer);
+    let peers = state.node.get_peers();
+    save_peers(&peers);
+
+    (
+        StatusCode::CREATED,
+        axum::Json(json!({
+            "ok": true,
+            "registered": true,
+            "url": url,
+            "peers_total": peers.len(),
+        })),
+    )
+}
+
 // ─── Manual sync ─────────────────────────────────────────────────────────────
 
 #[derive(Deserialize)]

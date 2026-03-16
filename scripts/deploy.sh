@@ -1,14 +1,22 @@
 #!/usr/bin/env bash
 # ─────────────────────────────────────────────────────────────────────────────
-# Stone Node Deploy Script
+# Stone Node Deploy Script — Parallel Upload, Coordinated Restart
 # 
 # Cross-kompiliert auf macOS (ARM) → Linux (x86_64) und deployed per SSH.
-# 
+#
+# Strategie:
+#   1. Cross-Compile (einmal)
+#   2. Parallel Upload auf alle Nodes (als .staged) — kein Restart noch!
+#   3. Warten bis ALLE Uploads fertig sind
+#   4. Koordinierter Restart: alle Nodes gleichzeitig tauschen + neustarten
+#   → Minimale Versions-Divergenz zwischen den Nodes
+#
 # Usage:
 #   ./scripts/deploy.sh                  # Alle Nodes aus nodes.toml
 #   ./scripts/deploy.sh server1          # Nur einen bestimmten Node
 #   ./scripts/deploy.sh --build-only     # Nur kompilieren, nicht deployen
 #   ./scripts/deploy.sh --skip-build     # Nur deployen (Binary schon gebaut)
+#   ./scripts/deploy.sh --sequential     # Alte sequenzielle Methode
 #
 # Voraussetzungen:
 #   brew install zig
@@ -23,6 +31,7 @@ NODES_FILE="$PROJECT_DIR/nodes.toml"
 TARGET="x86_64-unknown-linux-gnu"
 BINARIES=("stone-setup" "stone-master")
 RELEASE_DIR="$PROJECT_DIR/target/$TARGET/release"
+LOG_DIR=$(mktemp -d)
 
 # Farben
 RED='\033[0;31m'
@@ -36,14 +45,16 @@ NC='\033[0m'
 
 BUILD=true
 DEPLOY=true
+SEQUENTIAL=false
 SPECIFIC_NODE=""
 
 for arg in "$@"; do
     case "$arg" in
-        --build-only)  DEPLOY=false ;;
-        --skip-build)  BUILD=false ;;
+        --build-only)   DEPLOY=false ;;
+        --skip-build)   BUILD=false ;;
+        --sequential)   SEQUENTIAL=true ;;
         --help|-h)
-            echo "Usage: $0 [node-name] [--build-only] [--skip-build]"
+            echo "Usage: $0 [node-name] [--build-only] [--skip-build] [--sequential]"
             exit 0
             ;;
         *)  SPECIFIC_NODE="$arg" ;;
@@ -105,121 +116,19 @@ if [ ! -f "$NODES_FILE" ]; then
     exit 1
 fi
 
-# Minimaler TOML-Parser (liest [[node]] Blöcke)
-deploy_to_node() {
-    local name="$1"
-    local host="$2"
-    local user="$3"
-    local port="$4"
-    local path="$5"
-    local service="$6"
-    local bins="$7"
-    local root="$8"
+# ─── Node-Daten sammeln ──────────────────────────────────────────────────────
 
-    echo -e "${BLUE}[deploy]${NC} → ${YELLOW}$name${NC} ($user@$host:$port)"
+# Arrays für alle Nodes (parallel braucht sequenziellen Zugriff)
+declare -a NODE_NAMES=()
+declare -a NODE_HOSTS=()
+declare -a NODE_USERS=()
+declare -a NODE_PORTS=()
+declare -a NODE_PATHS=()
+declare -a NODE_SERVICES=()
+declare -a NODE_BINS=()
+declare -a NODE_ROOTS=()
 
-    # SSH-Verbindung testen
-    if ! ssh -o ConnectTimeout=5 -o BatchMode=yes -p "$port" "$user@$host" "echo ok" &>/dev/null; then
-        # Fallback: mit Password-Prompt
-        echo -e "${YELLOW}[deploy]${NC}   SSH-Key nicht eingerichtet, verwende Password-Auth..."
-    fi
-
-    # Binaries hochladen
-    for bin in $bins; do
-        local src="$RELEASE_DIR/$bin"
-        if [ ! -f "$src" ]; then
-            echo -e "${RED}[deploy]${NC}   ⚠ Binary $bin nicht gefunden! Überspringe."
-            continue
-        fi
-
-        local size=$(ls -lh "$src" | awk '{print $5}')
-        echo -e "${BLUE}[deploy]${NC}   📦 Uploading $bin ($size) ..."
-        
-        # Upload als .new, dann atomar tauschen
-        scp -P "$port" -q "$src" "$user@$host:$path/$bin.new"
-        
-        ssh -p "$port" "$user@$host" bash -s <<REMOTE_SCRIPT
-            set -e
-            cd "$path"
-            
-            # Backup des aktuellen Binary
-            if [ -f "$bin" ]; then
-                cp "$bin" "$bin.bak"
-            fi
-            
-            # Atomar tauschen
-            chmod +x "$bin.new"
-            mv "$bin.new" "$bin"
-            
-            echo "  ✅ $bin deployed"
-REMOTE_SCRIPT
-    done
-
-    # Service neustarten
-    if [ -n "$service" ]; then
-        # Service-File dynamisch generieren (Pfad anpassen)
-        local service_src="$PROJECT_DIR/configs/stone-node.service"
-        if [ -f "$service_src" ]; then
-            echo -e "${BLUE}[deploy]${NC}   📄 Service-File aktualisieren (root=$root, bin=$path)..."
-            local tmp_service="/tmp/stone-node-${name}.service"
-            sed -e "s|__STONE_ROOT__|$root|g" -e "s|__STONE_PATH__|$path|g" "$service_src" > "$tmp_service"
-            scp -P "$port" -q "$tmp_service" "$user@$host:/etc/systemd/system/$service.service"
-            rm -f "$tmp_service"
-            ssh -p "$port" "$user@$host" "systemctl daemon-reload"
-        fi
-
-        echo -e "${BLUE}[deploy]${NC}   🔄 Restarting $service ..."
-        ssh -p "$port" "$user@$host" bash -s <<REMOTE_SCRIPT
-            set -e
-            systemctl restart "$service"
-            sleep 3
-            
-            if systemctl is-active --quiet "$service"; then
-                echo "  ✅ $service läuft"
-                
-                # P2P-Port Health-Check (4001 oder konfigurierter Port)
-                sleep 2
-                if command -v ss &>/dev/null; then
-                    if ss -tlnp 2>/dev/null | grep -q ":4001 "; then
-                        echo "  ✅ P2P-Port 4001 lauscht"
-                    else
-                        echo "  ⚠ P2P-Port 4001 lauscht noch nicht (normal bei langsamem Start)"
-                    fi
-                fi
-                
-                # HTTP-Port Health-Check
-                if command -v curl &>/dev/null; then
-                    if curl -sf -o /dev/null --max-time 5 http://127.0.0.1:8080/api/v1/health 2>/dev/null; then
-                        echo "  ✅ HTTP-API erreichbar"
-                    else
-                        echo "  ⚠ HTTP-API noch nicht erreichbar (normal bei langsamem Start)"
-                    fi
-                fi
-            else
-                echo "  ❌ $service gestartet aber nicht aktiv!"
-                journalctl -u "$service" --no-pager -n 20
-                
-                # Rollback
-                cd "$path"
-                for bin in $bins; do
-                    if [ -f "\$bin.bak" ]; then
-                        mv "\$bin.bak" "\$bin"
-                    fi
-                done
-                systemctl restart "$service"
-                echo "  ⚠ Rollback durchgeführt!"
-                exit 1
-            fi
-REMOTE_SCRIPT
-    fi
-    
-    echo -e "${GREEN}[deploy]${NC}   ✅ $name erfolgreich aktualisiert"
-    echo ""
-}
-
-# ─── TOML parsen & deployen ──────────────────────────────────────────────────
-
-parse_and_deploy() {
+parse_nodes() {
     local current_name="" current_host="" current_user="root"
     local current_port="22" current_path="" current_service=""
     local current_bins="stone-setup stone-master"
@@ -229,21 +138,24 @@ parse_and_deploy() {
     flush_node() {
         if [ "$in_node" = true ] && [ -n "$current_name" ] && [ -n "$current_host" ]; then
             if [ -z "$SPECIFIC_NODE" ] || [ "$SPECIFIC_NODE" = "$current_name" ]; then
-                local node_root="${current_root:-$current_path}"
-                deploy_to_node "$current_name" "$current_host" "$current_user" \
-                    "$current_port" "$current_path" "$current_service" "$current_bins" "$node_root"
+                NODE_NAMES+=("$current_name")
+                NODE_HOSTS+=("$current_host")
+                NODE_USERS+=("$current_user")
+                NODE_PORTS+=("$current_port")
+                NODE_PATHS+=("$current_path")
+                NODE_SERVICES+=("$current_service")
+                NODE_BINS+=("$current_bins")
+                NODE_ROOTS+=("${current_root:-$current_path}")
             fi
         fi
     }
 
     while IFS= read -r line || [ -n "$line" ]; do
-        # Kommentare & Leerzeilen überspringen
         line=$(echo "$line" | sed 's/#.*//' | xargs)
         [ -z "$line" ] && continue
 
         if [[ "$line" == "[[node]]" ]]; then
             flush_node
-            # Reset für neuen Node
             current_name="" current_host="" current_user="root"
             current_port="22" current_path="" current_service=""
             current_bins="stone-setup stone-master"
@@ -270,25 +182,308 @@ parse_and_deploy() {
 
     flush_node
 
-    if [ -n "$SPECIFIC_NODE" ]; then
-        # Prüfe ob der Node gefunden wurde
-        local found=false
-        while IFS= read -r line; do
-            if echo "$line" | grep -q "name.*=.*\"$SPECIFIC_NODE\""; then
-                found=true; break
-            fi
-        done < "$NODES_FILE"
-        if [ "$found" = false ]; then
-            echo -e "${RED}[error]${NC} Node '$SPECIFIC_NODE' nicht in nodes.toml gefunden!"
-            echo "  Verfügbare Nodes:"
-            grep 'name.*=' "$NODES_FILE" | sed 's/.*"\(.*\)".*/    - \1/'
-            exit 1
-        fi
+    if [ -n "$SPECIFIC_NODE" ] && [ ${#NODE_NAMES[@]} -eq 0 ]; then
+        echo -e "${RED}[error]${NC} Node '$SPECIFIC_NODE' nicht in nodes.toml gefunden!"
+        echo "  Verfügbare Nodes:"
+        grep 'name.*=' "$NODES_FILE" | sed 's/.*"\(.*\)".*/    - \1/'
+        exit 1
     fi
 }
 
-parse_and_deploy
+parse_nodes
 
-echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${GREEN}  ✅ Deploy abgeschlossen!${NC}"
-echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+TOTAL=${#NODE_NAMES[@]}
+if [ "$TOTAL" -eq 0 ]; then
+    echo -e "${RED}[error]${NC} Keine Nodes zum Deployen gefunden."
+    exit 1
+fi
+
+echo -e "${BLUE}[deploy]${NC} ${TOTAL} Node(s): ${NODE_NAMES[*]}"
+echo ""
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Phase 1: Parallel Upload (Binaries als .staged hochladen)
+# ═════════════════════════════════════════════════════════════════════════════
+
+upload_to_node() {
+    local idx="$1"
+    local name="${NODE_NAMES[$idx]}"
+    local host="${NODE_HOSTS[$idx]}"
+    local user="${NODE_USERS[$idx]}"
+    local port="${NODE_PORTS[$idx]}"
+    local path="${NODE_PATHS[$idx]}"
+    local root="${NODE_ROOTS[$idx]}"
+    local service="${NODE_SERVICES[$idx]}"
+    local bins="${NODE_BINS[$idx]}"
+    local log="$LOG_DIR/${name}.log"
+
+    {
+        echo "[upload] → $name ($user@$host:$port)"
+
+        # SSH-Verbindung testen
+        if ! ssh -o ConnectTimeout=10 -o BatchMode=yes -p "$port" "$user@$host" "echo ok" &>/dev/null; then
+            echo "[upload] ❌ SSH-Verbindung zu $name fehlgeschlagen!"
+            return 1
+        fi
+
+        # Binaries als .staged hochladen (NICHT tauschen, NICHT restarten!)
+        for bin in $bins; do
+            local src="$RELEASE_DIR/$bin"
+            if [ ! -f "$src" ]; then
+                echo "[upload] ⚠ Binary $bin nicht gefunden! Überspringe."
+                continue
+            fi
+
+            local size=$(ls -lh "$src" | awk '{print $5}')
+            echo "[upload] 📦 $bin ($size) → $name ..."
+
+            scp -P "$port" -C -q "$src" "$user@$host:$path/$bin.staged"
+            ssh -p "$port" "$user@$host" "chmod +x $path/$bin.staged"
+            echo "[upload] ✅ $bin staged auf $name"
+        done
+
+        # Service-File vorbereiten (staged)
+        local service_src="$PROJECT_DIR/configs/stone-node.service"
+        if [ -n "$service" ] && [ -f "$service_src" ]; then
+            local tmp_service="/tmp/stone-node-${name}.service"
+            sed -e "s|__STONE_ROOT__|$root|g" -e "s|__STONE_PATH__|$path|g" "$service_src" > "$tmp_service"
+            scp -P "$port" -q "$tmp_service" "$user@$host:/tmp/stone-node.service.staged"
+            rm -f "$tmp_service"
+            echo "[upload] ✅ Service-File staged auf $name"
+        fi
+
+        echo "[upload] ✅ $name bereit für Restart"
+    } > "$log" 2>&1
+
+    return $?
+}
+
+echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${CYAN}  Phase 1: Parallel Upload${NC}"
+echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo ""
+
+# Alle Uploads parallel starten
+UPLOAD_PIDS=()
+for i in $(seq 0 $((TOTAL - 1))); do
+    echo -e "${BLUE}[upload]${NC} Starte Upload → ${YELLOW}${NODE_NAMES[$i]}${NC} (${NODE_HOSTS[$i]}) ..."
+    upload_to_node "$i" &
+    UPLOAD_PIDS+=($!)
+done
+
+# Auf ALLE Uploads warten
+echo ""
+echo -e "${BLUE}[upload]${NC} Warte auf ${TOTAL} parallele Uploads ..."
+UPLOAD_FAILED=false
+for i in $(seq 0 $((TOTAL - 1))); do
+    local_name="${NODE_NAMES[$i]}"
+    local_pid="${UPLOAD_PIDS[$i]}"
+    if wait "$local_pid"; then
+        echo -e "${GREEN}[upload]${NC} ✅ ${local_name} — Upload fertig"
+    else
+        echo -e "${RED}[upload]${NC} ❌ ${local_name} — Upload fehlgeschlagen!"
+        UPLOAD_FAILED=true
+    fi
+    # Log ausgeben
+    if [ -f "$LOG_DIR/${local_name}.log" ]; then
+        sed 's/^/    /' "$LOG_DIR/${local_name}.log"
+    fi
+done
+
+echo ""
+
+if [ "$UPLOAD_FAILED" = true ]; then
+    echo -e "${RED}[error]${NC} Mindestens ein Upload fehlgeschlagen!"
+    echo -e "${RED}[error]${NC} Staged Binaries auf erfolgreichen Nodes aufräumen ..."
+    for i in $(seq 0 $((TOTAL - 1))); do
+        ssh -o ConnectTimeout=5 -p "${NODE_PORTS[$i]}" "${NODE_USERS[$i]}@${NODE_HOSTS[$i]}" \
+            "rm -f ${NODE_PATHS[$i]}/*.staged /tmp/stone-node.service.staged" 2>/dev/null || true
+    done
+    echo -e "${RED}[error]${NC} Abgebrochen. Kein Node wurde neugestartet."
+    rm -rf "$LOG_DIR"
+    exit 1
+fi
+
+echo -e "${GREEN}[upload]${NC} ✅ Alle ${TOTAL} Nodes haben Binaries empfangen"
+echo ""
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Phase 2: Koordinierter Restart (alle gleichzeitig)
+# ═════════════════════════════════════════════════════════════════════════════
+
+echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${CYAN}  Phase 2: Koordinierter Restart${NC}"
+echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo ""
+
+# Schritt 2a: Atomar tauschen auf ALLEN Nodes (parallel, ohne Restart)
+swap_on_node() {
+    local idx="$1"
+    local name="${NODE_NAMES[$idx]}"
+    local host="${NODE_HOSTS[$idx]}"
+    local user="${NODE_USERS[$idx]}"
+    local port="${NODE_PORTS[$idx]}"
+    local path="${NODE_PATHS[$idx]}"
+    local service="${NODE_SERVICES[$idx]}"
+    local bins="${NODE_BINS[$idx]}"
+
+    ssh -p "$port" "$user@$host" bash -s -- "$path" "$bins" "$service" <<'SWAP_SCRIPT'
+        set -e
+        PATH_DIR="$1"
+        BINS="$2"
+        SERVICE="$3"
+        cd "$PATH_DIR"
+
+        # Backup + Atomar tauschen
+        for bin in $BINS; do
+            if [ -f "$bin.staged" ]; then
+                [ -f "$bin" ] && cp "$bin" "$bin.bak"
+                mv "$bin.staged" "$bin"
+            fi
+        done
+
+        # Service-File tauschen
+        if [ -n "$SERVICE" ] && [ -f /tmp/stone-node.service.staged ]; then
+            mv /tmp/stone-node.service.staged "/etc/systemd/system/${SERVICE}.service"
+            systemctl daemon-reload
+        fi
+
+        echo "SWAP_OK"
+SWAP_SCRIPT
+}
+
+echo -e "${BLUE}[swap]${NC} Tausche Binaries auf allen Nodes gleichzeitig ..."
+
+SWAP_PIDS=()
+SWAP_RESULTS=()
+for i in $(seq 0 $((TOTAL - 1))); do
+    swap_on_node "$i" > "$LOG_DIR/${NODE_NAMES[$i]}_swap.log" 2>&1 &
+    SWAP_PIDS+=($!)
+done
+
+SWAP_OK=true
+for i in $(seq 0 $((TOTAL - 1))); do
+    if wait "${SWAP_PIDS[$i]}"; then
+        echo -e "${GREEN}[swap]${NC}   ✅ ${NODE_NAMES[$i]} — Binaries getauscht"
+    else
+        echo -e "${RED}[swap]${NC}   ❌ ${NODE_NAMES[$i]} — Swap fehlgeschlagen!"
+        SWAP_OK=false
+    fi
+done
+
+if [ "$SWAP_OK" != true ]; then
+    echo -e "${RED}[error]${NC} Swap fehlgeschlagen auf mindestens einem Node!"
+    echo -e "${YELLOW}[info]${NC}  Services wurden NICHT neugestartet. Manueller Eingriff nötig."
+    rm -rf "$LOG_DIR"
+    exit 1
+fi
+
+echo ""
+
+# Schritt 2b: Restart ALLE Services gleichzeitig
+restart_node() {
+    local idx="$1"
+    local name="${NODE_NAMES[$idx]}"
+    local host="${NODE_HOSTS[$idx]}"
+    local user="${NODE_USERS[$idx]}"
+    local port="${NODE_PORTS[$idx]}"
+    local path="${NODE_PATHS[$idx]}"
+    local service="${NODE_SERVICES[$idx]}"
+    local bins="${NODE_BINS[$idx]}"
+    local log="$LOG_DIR/${name}_restart.log"
+
+    {
+        if [ -z "$service" ]; then
+            echo "[restart] $name — kein Service konfiguriert, überspringe"
+            return 0
+        fi
+
+        echo "[restart] 🔄 $name — systemctl restart $service ..."
+        ssh -p "$port" "$user@$host" bash -s -- "$service" "$path" "$bins" <<'RESTART_SCRIPT'
+            set -e
+            SERVICE="$1"
+            BIN_PATH="$2"
+            BINS="$3"
+
+            systemctl restart "$SERVICE"
+            sleep 3
+
+            if systemctl is-active --quiet "$SERVICE"; then
+                echo "✅ $SERVICE läuft"
+
+                # Health-Checks
+                sleep 2
+                if command -v ss &>/dev/null; then
+                    if ss -tlnp 2>/dev/null | grep -q ":4001 "; then
+                        echo "✅ P2P-Port 4001 lauscht"
+                    else
+                        echo "⚠ P2P-Port 4001 noch nicht bereit"
+                    fi
+                fi
+                if command -v curl &>/dev/null; then
+                    if curl -sf -o /dev/null --max-time 5 http://127.0.0.1:8080/api/v1/health 2>/dev/null; then
+                        echo "✅ HTTP-API erreichbar"
+                    else
+                        echo "⚠ HTTP-API noch nicht erreichbar"
+                    fi
+                fi
+            else
+                echo "❌ $SERVICE nicht aktiv! Rollback ..."
+                journalctl -u "$SERVICE" --no-pager -n 15
+                cd "$BIN_PATH"
+                for bin in $BINS; do
+                    if [ -f "$bin.bak" ]; then
+                        mv "$bin.bak" "$bin"
+                    fi
+                done
+                systemctl restart "$SERVICE"
+                echo "⚠ Rollback durchgeführt"
+                exit 1
+            fi
+RESTART_SCRIPT
+        echo "[restart] ✅ $name — online"
+    } > "$log" 2>&1
+
+    return $?
+}
+
+echo -e "${BLUE}[restart]${NC} Starte alle ${TOTAL} Services gleichzeitig ..."
+
+RESTART_PIDS=()
+for i in $(seq 0 $((TOTAL - 1))); do
+    restart_node "$i" &
+    RESTART_PIDS+=($!)
+done
+
+# Auf alle Restarts warten
+ALL_OK=true
+for i in $(seq 0 $((TOTAL - 1))); do
+    local_name="${NODE_NAMES[$i]}"
+    if wait "${RESTART_PIDS[$i]}"; then
+        echo -e "${GREEN}[restart]${NC} ✅ ${local_name} — online"
+    else
+        echo -e "${RED}[restart]${NC} ❌ ${local_name} — Restart fehlgeschlagen (Rollback aktiv)"
+        ALL_OK=false
+    fi
+    if [ -f "$LOG_DIR/${local_name}_restart.log" ]; then
+        sed 's/^/    /' "$LOG_DIR/${local_name}_restart.log"
+    fi
+done
+
+echo ""
+
+# Aufräumen
+rm -rf "$LOG_DIR"
+
+# ─── Ergebnis ─────────────────────────────────────────────────────────────────
+
+if [ "$ALL_OK" = true ]; then
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${GREEN}  ✅ Deploy abgeschlossen! Alle ${TOTAL} Nodes auf v${VERSION}${NC}"
+    echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+else
+    echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${RED}  ⚠ Deploy teilweise fehlgeschlagen! Logs prüfen.${NC}"
+    echo -e "${RED}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    exit 1
+fi

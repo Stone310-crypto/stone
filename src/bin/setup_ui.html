@@ -136,6 +136,13 @@ textarea{resize:vertical;min-height:80px;font-family:monospace;font-size:13px}
 .shard-doc .sd-title{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .shard-doc .sd-meta{color:var(--muted);font-size:11px;white-space:nowrap}
 
+/* Send Panel */
+.send-panel{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media(max-width:600px){.send-panel{grid-template-columns:1fr}}
+.send-card{background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:20px}
+.send-card h3{font-size:16px;margin-bottom:12px}
+.tx-result{margin-top:12px;padding:12px;background:rgba(63,185,80,.1);border:1px solid var(--green);border-radius:8px;font-size:13px;display:none;word-break:break-all}
+
 /* ─── Update Panel ─── */
 .update-card{position:relative;overflow:hidden}
 .update-card .update-badge{position:absolute;top:16px;right:16px;padding:4px 12px;border-radius:20px;font-size:12px;font-weight:600;letter-spacing:.5px}
@@ -563,6 +570,24 @@ textarea{resize:vertical;min-height:80px;font-family:monospace;font-size:13px}
         </div>
       </div>
     </div>
+
+    <!-- ═══ Send STONE ═══ -->
+    <div class="send-panel">
+      <div class="send-card">
+        <h3>📤 STONE senden</h3>
+        <label>Empfänger-Adresse (64 hex)</label>
+        <input type="text" id="send-to" placeholder="abc123...def456" maxlength="64">
+        <label>Betrag (STONE)</label>
+        <input type="number" id="send-amount" placeholder="0.0" min="0" step="0.0001">
+        <div class="error" id="send-error"></div>
+        <div class="tx-result" id="send-result"></div>
+        <button class="btn btn-primary btn-block" onclick="doSend()">Senden</button>
+      </div>
+      <div class="send-card">
+        <h3>🌐 Seed-Peers</h3>
+        <ul class="peer-list" id="dash-peer-list"><li>—</li></ul>
+      </div>
+    </div>
   </div>
 
   <!-- ═══════════════════ SETTINGS ═══════════════════ -->
@@ -963,6 +988,28 @@ async function triggerShardRepair() {
   btn.textContent = '🔧 Repair';
   // Auto-refresh nach 3s
   setTimeout(refreshDashboard, 3000);
+}
+
+// ── Send ──
+async function doSend() {
+  hideError('send-error');
+  document.getElementById('send-result').style.display='none';
+  const to = document.getElementById('send-to').value.trim();
+  const amount = parseFloat(document.getElementById('send-amount').value) || 0;
+  if (!to || to.length !== 64) { showError('send-error', 'Empfänger-Adresse muss 64 hex Zeichen sein'); return; }
+  if (amount <= 0) { showError('send-error', 'Betrag muss > 0 sein'); return; }
+  try {
+    const { data } = await api('/api/send', 'POST', { to, amount });
+    if (!data.ok) { showError('send-error', data.error || 'Unbekannter Fehler'); return; }
+    const el = document.getElementById('send-result');
+    el.innerHTML = '✅ Gesendet! TX: <br>' + data.tx_hash;
+    el.style.display = 'block';
+    document.getElementById('send-to').value = '';
+    document.getElementById('send-amount').value = '';
+    refreshDashboard();
+  } catch(e) {
+    showError('send-error', 'Netzwerk-Fehler: ' + e.message);
+  }
 }
 
 // ── Settings ──

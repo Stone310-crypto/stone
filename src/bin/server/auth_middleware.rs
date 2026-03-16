@@ -66,7 +66,7 @@ pub fn resolve_user_by_key(
 }
 
 /// Löst einen User anhand eines Session-Tokens auf (Challenge-Response Auth).
-fn resolve_user_by_session_token(
+pub fn resolve_user_by_session_token(
     token: &str,
     users: &Arc<Mutex<Vec<User>>>,
     cluster_key: &str,

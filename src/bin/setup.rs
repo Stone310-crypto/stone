@@ -53,7 +53,7 @@ use server::{
         load_api_key, load_admin_key, load_peers_from_disk, load_trust_from_disk,
         AppState as NodeAppState, HEARTBEAT_INTERVAL,
     },
-    sync::{fetch_missing_chunks, pull_from_peer, spawn_auto_sync_task},
+    sync::{bootstrap_announce, fetch_missing_chunks, pull_from_peer, spawn_auto_sync_task, spawn_peer_health_task},
 };
 
 const CONFIG_FILE: &str = "node_config.json";
@@ -350,6 +350,10 @@ async fn start_full_node(state: SetupState) {
     MasterNodeState::start_heartbeat(node.clone(), HEARTBEAT_INTERVAL);
     spawn_auto_sync_task(node.clone(), api_key.clone(), users.clone());
 
+    // Peer-Discovery: Bei Bootstrap-Nodes registrieren & Health-Check starten
+    bootstrap_announce(&node).await;
+    spawn_peer_health_task(node.clone());
+
     // Mempool-Eviction
     {
         let node_evict = node.clone();
@@ -637,6 +641,9 @@ async fn start_full_node(state: SetupState) {
         challenge_store: stone::auth::ChallengeStore::new(),
         qr_login_store: stone::auth::QrLoginStore::new(),
         miner_status_store: server::state::MinerStatusStore::new(),
+        chat_groups: Arc::new(std::sync::Mutex::new(stone::chat::load_chat_groups())),
+        call_signals: Arc::new(stone::chat::CallSignalStore::default()),
+        audio_rooms: server::handlers::audio_relay::new_audio_rooms(),
     };
 
     *state.node_state.write().await = Some(node_app_state.clone());
@@ -754,6 +761,7 @@ async fn handle_p2p_event(
                 NeedsResync { idx: u64, from: String, err: String },
                 Rejected,
                 AlreadyKnown,
+                Fork,
             }
 
             let result = {
@@ -800,6 +808,9 @@ async fn handle_p2p_event(
                                     ledger.account_count(),
                                     ledger.total_supply()
                                 );
+                                // StakingPool nach Reorg auch neu aufbauen
+                                let rebuilt_pool = stone::token::StakingPool::rebuild_from_chain(&chain.blocks);
+                                *node.staking_pool.write().unwrap() = rebuilt_pool;
                             } else if !txs.is_empty() {
                                 let mut ledger = node.token_ledger.write().unwrap();
                                 // Peer-Blöcke wurden bereits vom Netzwerk validiert →
@@ -814,6 +825,8 @@ async fn handle_p2p_event(
                                     node.mempool.remove_tx(&tx.tx_id);
                                 }
                             }
+                            // Staking-TXs im StakingPool verarbeiten (P2P-Pfad)
+                            node.apply_staking_from_txs(&txs);
                             // Chat-Batch-Records speichern (für Chat-Index)
                             for batch in &chat_batches {
                                 if !batch.messages.is_empty() {
@@ -855,6 +868,12 @@ async fn handle_p2p_event(
                             let err = e.clone();
                             BlockResult::NeedsResync { idx, from: from_peer.clone(), err }
                         }
+                        Err(ref e) if e.contains("Fork") || e.contains("fork")
+                            || e.contains("nicht schwerer") || e.contains("Tiebreak")
+                            || e.contains("Reorg abgelehnt") || e.contains("Timestamp") => {
+                            eprintln!("[p2p] Block #{idx} Fork/Reorg: {e}");
+                            BlockResult::Fork
+                        }
                         Err(e) => { eprintln!("[p2p] Block #{idx} abgelehnt: {e}"); BlockResult::Rejected }
                     }
                 }
@@ -886,7 +905,7 @@ async fn handle_p2p_event(
                 BlockResult::Rejected => {
                     handle.report_penalty(&from_peer, 15, "rejected block").await;
                 }
-                _ => {} // Stale, AlreadyKnown
+                _ => {} // Stale, AlreadyKnown, Fork
             }
         }
 
@@ -941,6 +960,11 @@ async fn handle_p2p_event(
                             ledger.total_supply()
                         );
                     }
+                    // StakingPool nach fork-Reorg auch neu aufbauen
+                    {
+                        let rebuilt_pool = stone::token::StakingPool::rebuild_from_chain(&chain.blocks);
+                        *node.staking_pool.write().unwrap() = rebuilt_pool;
+                    }
 
                     let mut applied = 0u64;
                     for block in peer_new {
@@ -991,6 +1015,8 @@ async fn handle_p2p_event(
                                         node.mempool.remove_tx(&tx.tx_id);
                                     }
                                 }
+                                // Staking-TXs im StakingPool verarbeiten (RangeSync-Pfad)
+                                node.apply_staking_from_txs(&txs);
                                 // Chat-Batch-Records speichern
                                 for batch in &chat_batches {
                                     if !batch.messages.is_empty() {

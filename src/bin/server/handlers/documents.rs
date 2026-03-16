@@ -540,21 +540,34 @@ pub async fn handle_upload_document(
                     title = field.file_name().map(|s| s.to_string());
                     content_type_override = field.content_type().map(|s| s.to_string());
                 }
-                file_data = Some(
-                    field
-                        .bytes()
-                        .await
-                        .map_err(|e| {
-                            (
-                                StatusCode::BAD_REQUEST,
-                                axum::Json(
-                                    json!({"error": format!("Datei lesen fehlgeschlagen: {e}")}),
-                                ),
-                            )
-                                .into_response()
-                        })?
-                        .to_vec(),
-                );
+                // SECURITY: Streamendes Lesen mit Größenlimit (100 MiB)
+                // verhindert OOM durch übergroße Uploads.
+                const MAX_FILE_BYTES: usize = 100 * 1024 * 1024;
+                let mut buf = Vec::new();
+                let mut stream = field;
+                use futures_util::StreamExt;
+                while let Some(chunk_result) = stream.next().await {
+                    let chunk = chunk_result.map_err(|e| {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            axum::Json(
+                                json!({"error": format!("Datei lesen fehlgeschlagen: {e}")}),
+                            ),
+                        )
+                            .into_response()
+                    })?;
+                    if buf.len() + chunk.len() > MAX_FILE_BYTES {
+                        return Err((
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            axum::Json(
+                                json!({"error": format!("Datei zu groß (max {} MiB)", MAX_FILE_BYTES / 1024 / 1024)}),
+                            ),
+                        )
+                            .into_response());
+                    }
+                    buf.extend_from_slice(&chunk);
+                }
+                file_data = Some(buf);
             }
             "title" => {
                 title = Some(field.text().await.map_err(|e| {

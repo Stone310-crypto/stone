@@ -23,7 +23,7 @@ pub use genesis::{apply_genesis, GenesisConfig, NetworkMode, SupplyInfo};
 pub use ledger::{AccountInfo, LedgerError, TokenLedger, TxReceipt, VestingSchedule};
 pub use mempool::{Mempool, MempoolError, MempoolStats};
 pub use reputation::{ReputationRegistry, ReputationSummary, NodeReputationInfo};
-pub use staking::{StakingPool, StakingPoolInfo, StakerInfo, StakingError};
+pub use staking::{StakingPool, StakingPoolInfo, StakerInfo, StakingError, StakeLevel, SnapshotAttestation, SnapshotTrust};
 pub use transaction::{FeeTier, TokenTx, TxError, TxType, compute_tx_id, create_signed_tx, default_chain_id, validate_tx, verify_tx_signature};
 pub use wallet::{Wallet, WalletError, WalletInfo};
 

@@ -94,15 +94,12 @@ pub async fn handle_snapshot_create(
 ) -> Result<impl IntoResponse, Response> {
     require_admin(&headers, &state)?;
 
-    let (height, genesis, latest, sr) = {
+    let (height, genesis, latest) = {
         let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
         let h = chain.blocks.last().map(|b| b.index).unwrap_or(0);
         let g = chain.blocks.first().map(|b| b.hash.clone()).unwrap_or_default();
         let l = chain.latest_hash.clone();
-        drop(chain);
-        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
-        let s = ledger.state_root();
-        (h, g, l, s)
+        (h, g, l)
     };
 
     if height < stone::snapshot::MIN_SNAPSHOT_HEIGHT {
@@ -116,7 +113,7 @@ pub async fn handle_snapshot_create(
 
     // Snapshot im Blocking-Thread erstellen (IO-intensiv)
     let result = tokio::task::spawn_blocking(move || {
-        stone::snapshot::create_snapshot(height, &genesis, &latest, &sr)
+        stone::snapshot::create_snapshot(height, &genesis, &latest)
     }).await;
 
     match result {

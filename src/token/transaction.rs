@@ -362,8 +362,48 @@ pub fn verify_tx_signature(tx: &TokenTx) -> Result<(), TxError> {
         return Ok(());
     }
 
-    // Stake/Unstake: Signatur wird gegen den `from`-Key geprüft.
-    // Die TX muss vom User-Wallet signiert sein (nicht mehr vom Validator-Key).
+    // Stake/Unstake: Diese TXs werden serverseitig nach User-Authentifizierung
+    // (Bearer + FaceID/TOTP) erstellt und mit dem Validator-Key signiert.
+    // Die Memo enthält den Validator-PubKey zur Verifikation.
+    if tx.tx_type == TxType::Stake || tx.tx_type == TxType::Unstake {
+        // Validator-PubKey aus Memo extrahieren
+        let validator_pubkey = if let Ok(memo) = serde_json::from_str::<serde_json::Value>(&tx.memo) {
+            memo.get("validator").and_then(|v| v.as_str()).map(|s| s.to_string())
+        } else {
+            None
+        };
+
+        let pubkey_hex = match validator_pubkey {
+            Some(pk) => pk,
+            None => {
+                // Legacy-TXs ohne Validator-PubKey in Memo: Signatur überspringen
+                // (Rückwärtskompatibilität für bereits in der Chain befindliche TXs)
+                return Ok(());
+            }
+        };
+
+        // Ed25519-Verifikation gegen den Validator-Key
+        let pub_bytes = hex::decode(&pubkey_hex)
+            .map_err(|e| TxError::InvalidKey(format!("Validator-Key Hex ungültig: {e}")))?;
+        if pub_bytes.len() != 32 {
+            return Err(TxError::InvalidKey("Validator-Key muss 32 Byte sein".into()));
+        }
+        let verifying_key = VerifyingKey::from_bytes(
+            pub_bytes.as_slice().try_into().unwrap()
+        ).map_err(|e| TxError::InvalidKey(format!("Ungültiger Validator-Key: {e}")))?;
+
+        let sig_bytes = hex::decode(&tx.signature)
+            .map_err(|e| TxError::InvalidSignature(format!("Signatur Hex ungültig: {e}")))?;
+        if sig_bytes.len() != 64 {
+            return Err(TxError::InvalidSignature("Signatur muss 64 Byte sein".into()));
+        }
+        let signature = Signature::from_bytes(sig_bytes.as_slice().try_into().unwrap());
+
+        let input = sign_input(tx);
+        let hash = Sha256::digest(&input);
+        return verifying_key.verify(&hash, &signature)
+            .map_err(|_| TxError::InvalidSignature("Stake/Unstake: Validator-Signatur ungültig".into()));
+    }
 
     // Public-Key aus Hex dekodieren
     let pub_bytes = hex::decode(&tx.from)

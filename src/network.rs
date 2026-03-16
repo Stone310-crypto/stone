@@ -466,6 +466,10 @@ pub enum NetworkCommand {
         points: u32,
         reason: String,
     },
+
+    /// Eigenen Stake-Level setzen (wird von MasterNode periodisch aufgerufen).
+    /// Beeinflusst Relay-Priorität: höherer Stake = Peers bevorzugen uns als Sync-Quelle.
+    SetStakeLevel(u64),
 }
 
 impl std::fmt::Debug for NetworkCommand {
@@ -486,6 +490,7 @@ impl std::fmt::Debug for NetworkCommand {
             Self::PublishGossip { topic, .. } => write!(f, "PublishGossip({topic})"),
             Self::SetChainRef(_) => write!(f, "SetChainRef(..)"),
             Self::ReportPenalty { peer_id_str, points, .. } => write!(f, "ReportPenalty({peer_id_str}, {points})"),
+            Self::SetStakeLevel(level) => write!(f, "SetStakeLevel({level})"),
         }
     }
 }
@@ -587,6 +592,10 @@ pub struct PeerInfo {
     pub last_seen: i64,
     /// Anzahl empfangener Blöcke von diesem Peer
     pub blocks_received: u64,
+    /// Stake-Level des Peers (0=Observer, 100=Participant, 250=Guardian, 500=Validator)
+    /// Wird via SyncHandshake bekanntgegeben.
+    #[serde(default)]
+    pub stake_level: u64,
 }
 
 // ─── Request/Response Typen ───────────────────────────────────────────────────
@@ -1059,6 +1068,12 @@ struct SwarmTask {
     /// Erwarteter nächster Block-Index für den Sync (= unsere Chain-Höhe beim Sync-Start)
     sync_expected_next: u64,
 
+    // ─── Stake-basierte Relay-Priorität ──────────────────────────────────
+
+    /// Eigener Stake-Level (wird von MasterNode periodisch gesetzt).
+    /// 0=Observer, 100=Participant, 250=Guardian, 500=Validator
+    local_stake_level: u64,
+
     // ─── Reconnect-Backoff ───────────────────────────────────────────────
 
     /// Per-Peer exponentieller Backoff für Reconnect-Versuche.
@@ -1525,6 +1540,7 @@ impl SwarmTask {
                     connected: false,
                     last_seen: now,
                     blocks_received: 0,
+                    stake_level: 0,
                 });
                 entry.connected = true;
                 entry.last_seen = now;
@@ -1647,6 +1663,29 @@ impl SwarmTask {
             StoneBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. }) => {
                 let addrs: Vec<String> = info.listen_addrs.iter().map(|a| a.to_string()).collect();
                 println!("[p2p] Identify: {peer_id} – agent={}", info.agent_version);
+
+                // SECURITY: Protokoll-Version prüfen. Peers mit inkompatibler
+                // Major-Version werden getrennt um Chain-Korruption zu verhindern.
+                {
+                    let our_major = STONE_PROTOCOL_VERSION.split('/').nth(1)
+                        .and_then(|v| v.split('.').next());
+                    let peer_major = if info.agent_version.starts_with("stone/") {
+                        info.agent_version.strip_prefix("stone/")
+                            .and_then(|v| v.split('.').next())
+                    } else {
+                        None
+                    };
+                    if let (Some(ours), Some(theirs)) = (our_major, peer_major) {
+                        if ours != theirs {
+                            eprintln!(
+                                "[p2p] ⚠ Peer {peer_id} hat inkompatible Version {} (wir: {}) – Verbindung getrennt",
+                                info.agent_version, STONE_PROTOCOL_VERSION,
+                            );
+                            let _ = self.swarm.disconnect_peer_id(peer_id);
+                            return;
+                        }
+                    }
+                }
 
                 // Nur routable Adressen in Kademlia eintragen:
                 // - Öffentliche IPs (nicht 127.x, nicht 10.x, nicht 192.168.x, nicht 100.64-127.x CGNAT)
@@ -3058,10 +3097,13 @@ impl SwarmTask {
             self.pending_chain_info.retain(|_, peer_id| connected_ids.contains(peer_id));
         }
 
-        let connected: Vec<PeerId> = self.peers.iter()
+        // Verbundene Peers nach Stake-Level sortieren (höchster Stake zuerst).
+        // Bei Chain-Sync werden damit höher-gestakte Peers bevorzugt angefragt.
+        let mut connected: Vec<(PeerId, u64)> = self.peers.iter()
             .filter(|(_, info)| info.connected)
-            .map(|(pid, _)| *pid)
+            .map(|(pid, info)| (*pid, info.stake_level))
             .collect();
+        connected.sort_by(|a, b| b.1.cmp(&a.1));
 
         if connected.is_empty() {
             return;
@@ -3073,7 +3115,7 @@ impl SwarmTask {
         // (auch GossipSub-Handshake senden für Peers die hinter UNS sind)
         self.send_sync_handshake();
 
-        for peer_id in connected {
+        for (peer_id, _stake) in connected {
             // Nicht doppelt anfragen wenn schon eine Anfrage läuft
             if self.pending_chain_info.values().any(|p| *p == peer_id) {
                 continue;
@@ -3102,6 +3144,7 @@ impl SwarmTask {
             peer_id: self.swarm.local_peer_id().to_string(),
             genesis_hash,
             protocol_version: Some(STONE_PROTOCOL_VERSION.to_string()),
+            stake_level: self.local_stake_level,
         };
         if let Ok(data) = serde_json::to_vec(&msg) {
             let topic = IdentTopic::new(TOPIC_SYNC_HANDSHAKE);
@@ -3123,6 +3166,11 @@ impl SwarmTask {
 
         if msg.peer_id == self.swarm.local_peer_id().to_string() {
             return; // eigene Nachricht
+        }
+
+        // Stake-Level des Peers aktualisieren (Relay-Priorität)
+        if let Some(peer) = self.peers.get_mut(&source) {
+            peer.stake_level = msg.stake_level;
         }
 
         // ── Protokoll-Version prüfen ──────────────────────────────────────
@@ -3361,6 +3409,7 @@ impl SwarmTask {
                             connected: true,
                             last_seen: now,
                             blocks_received: 0,
+                            stake_level: 0,
                         });
                     }
                 }
@@ -3463,6 +3512,11 @@ impl SwarmTask {
                 }
                 false
             }
+
+            NetworkCommand::SetStakeLevel(level) => {
+                self.local_stake_level = level;
+                false
+            }
         }
     }
 }
@@ -3483,6 +3537,9 @@ struct SyncHandshake {
     /// Protokoll-Version (z.B. "stone/0.7") – inkompatible Versionen werden abgelehnt
     #[serde(default)]
     protocol_version: Option<String>,
+    /// Stake-Level dieses Nodes (0/100/250/500) – höhere Stake = bevorzugter Sync-Partner
+    #[serde(default)]
+    stake_level: u64,
 }
 
 // ─── Gossipsub: Topics abonnieren ─────────────────────────────────────────────
@@ -3665,6 +3722,12 @@ impl NetworkHandle {
             reason: reason.to_string(),
         }).await;
     }
+
+    /// Eigenen Stake-Level setzen (Relay-Priorität).
+    /// Peers bevorzugen höher-gestakte Nodes als Sync-Quelle.
+    pub async fn set_stake_level(&self, level: u64) {
+        let _ = self.cmd_tx.send(NetworkCommand::SetStakeLevel(level)).await;
+    }
 }
 
 // ─── start_network ────────────────────────────────────────────────────────────
@@ -3749,6 +3812,7 @@ pub async fn start_network(
         sync_buffer: std::collections::BTreeMap::new(),
         sync_buffer_last_insert: None,
         sync_expected_next: 0,
+        local_stake_level: 0,
         reconnect_backoff: HashMap::new(),
     };
 

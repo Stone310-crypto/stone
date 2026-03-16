@@ -490,12 +490,8 @@ pub async fn pull_from_peer(node: &Arc<MasterNodeState>, peer_url: &str, api_key
                 let latest_hash = last.hash.clone();
                 let height = post_height;
                 drop(chain);
-                let sr = {
-                    let ledger = node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
-                    ledger.state_root()
-                };
                 std::thread::spawn(move || {
-                    match stone::snapshot::create_snapshot(height, &genesis_hash, &latest_hash, &sr) {
+                    match stone::snapshot::create_snapshot(height, &genesis_hash, &latest_hash) {
                         Ok((_path, meta)) => {
                             eprintln!(
                                 "[snapshot] 📸 Auto-Snapshot nach Sync bei Block #{}: {:.1} MB",
@@ -838,4 +834,181 @@ pub fn sync_chain_accounts_to_users(
         save_users(&local);
         println!("[sync] 📋 {added} Chain-Accounts in lokale User-Liste synchronisiert");
     }
+}
+
+// ─── Peer Discovery: Bootstrap Announce & Health Check ───────────────────────
+
+/// Hardcoded Bootstrap-Nodes für Peer-Registrierung.
+const BOOTSTRAP_URLS: &[&str] = &[
+    "http://212.227.54.241:8080",
+    "http://69.48.200.255:8080",
+];
+
+/// Registriert diesen Node bei allen Bootstrap-Nodes via POST /api/v1/peers/register.
+/// Wird einmalig beim Start aufgerufen. Fehler werden still ignoriert.
+pub async fn bootstrap_announce(node: &Arc<MasterNodeState>) {
+    let self_url = match resolve_self_url() {
+        Some(url) => url,
+        None => {
+            eprintln!("[peer-discovery] ⚠️  Kein STONE_PUBLIC_URL/STONE_PUBLIC_IP gesetzt – Bootstrap-Announce übersprungen");
+            return;
+        }
+    };
+
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .danger_accept_invalid_certs(
+            std::env::var("STONE_INSECURE_SSL").map(|v| v == "1").unwrap_or(false),
+        )
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+
+    let body = serde_json::json!({
+        "url": self_url,
+        "name": node.node_id.clone(),
+    });
+
+    for bootstrap_url in BOOTSTRAP_URLS {
+        // Nicht bei sich selbst registrieren
+        if self_url.contains(bootstrap_url.trim_start_matches("http://").split(':').next().unwrap_or("")) {
+            continue;
+        }
+        let url = format!("{}/api/v1/peers/register", bootstrap_url);
+        match client.post(&url).json(&body).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                eprintln!("[peer-discovery] ✅ Bei {} registriert", bootstrap_url);
+            }
+            Ok(resp) => {
+                eprintln!("[peer-discovery] ⚠️  {} → HTTP {}", bootstrap_url, resp.status());
+            }
+            Err(e) => {
+                eprintln!("[peer-discovery] ⚠️  {} nicht erreichbar: {}", bootstrap_url, e);
+            }
+        }
+    }
+}
+
+/// Startet einen Hintergrund-Task der alle 5 Minuten:
+/// 1. Alle bekannten Peers via GET /api/v1/health pingt
+/// 2. Erreichbare Peers auf Healthy setzt + last_seen aktualisiert
+/// 3. Nicht erreichbare Peers als Unreachable markiert
+/// 4. Peers die >1h nicht gesehen wurden, entfernt (Cleanup)
+pub fn spawn_peer_health_task(node: Arc<MasterNodeState>) {
+    use super::state::save_peers;
+
+    tokio::spawn(async move {
+        // Erst 2 Minuten warten bis Node vollständig gestartet ist
+        tokio::time::sleep(Duration::from_secs(120)).await;
+
+        let mut interval = tokio::time::interval(Duration::from_secs(300)); // 5 min
+        loop {
+            interval.tick().await;
+
+            let peers = node.get_peers();
+            if peers.is_empty() {
+                continue;
+            }
+
+            let client = match reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .danger_accept_invalid_certs(
+                    std::env::var("STONE_INSECURE_SSL").map(|v| v == "1").unwrap_or(false),
+                )
+                .build()
+            {
+                Ok(c) => c,
+                Err(_) => continue,
+            };
+
+            let now = chrono::Utc::now().timestamp();
+            let mut changed = false;
+
+            for peer in &peers {
+                let health_url = format!("{}/api/v1/health", peer.url);
+                let start = Instant::now();
+
+                let (is_healthy, block_height) = match client.get(&health_url).send().await {
+                    Ok(resp) if resp.status().is_success() => {
+                        // Versuche block_height aus der Health-Response zu lesen
+                        let height = resp.json::<serde_json::Value>().await.ok()
+                            .and_then(|v| v.get("block_height").and_then(|h| h.as_u64()))
+                            .unwrap_or(0);
+                        (true, height)
+                    }
+                    _ => (false, 0),
+                };
+
+                let latency = start.elapsed().as_millis();
+
+                // Peer-Status aktualisieren
+                {
+                    let mut all = node.peers.write().unwrap_or_else(|e| e.into_inner());
+                    if let Some(p) = all.iter_mut().find(|p| p.url == peer.url) {
+                        if is_healthy {
+                            p.status = PeerStatus::Healthy;
+                            p.last_seen = now;
+                            p.latency_ms = Some(latency);
+                            p.block_height = block_height;
+                            p.sync_failures = 0;
+                        } else {
+                            p.status = PeerStatus::Unreachable;
+                            p.sync_failures = p.sync_failures.saturating_add(1);
+                        }
+                        changed = true;
+                    }
+                }
+            }
+
+            // Cleanup: Peers entfernen die >1h nicht gesehen wurden
+            // (aber Bootstrap-Nodes behalten)
+            {
+                let mut all = node.peers.write().unwrap_or_else(|e| e.into_inner());
+                let before = all.len();
+                all.retain(|p| {
+                    // Bootstrap-Nodes immer behalten
+                    if BOOTSTRAP_URLS.iter().any(|b| p.url.contains(b.trim_start_matches("http://").split(':').next().unwrap_or(""))) {
+                        return true;
+                    }
+                    // Nie gesehene Peers (last_seen == 0) 30 min Gnadenfrist
+                    if p.last_seen == 0 {
+                        return true; // Wird beim nächsten Health-Check geprüft
+                    }
+                    // >1h nicht gesehen → entfernen
+                    now - p.last_seen < 3600
+                });
+                if all.len() < before {
+                    changed = true;
+                    eprintln!("[peer-health] 🧹 {} tote Peers entfernt", before - all.len());
+                }
+            }
+
+            if changed {
+                let all = node.get_peers();
+                save_peers(&all);
+                let healthy = all.iter().filter(|p| p.status == PeerStatus::Healthy).count();
+                eprintln!("[peer-health] 📊 {}/{} Peers healthy", healthy, all.len());
+            }
+        }
+    });
+}
+
+/// Bestimmt die eigene öffentliche URL aus Env-Variablen.
+fn resolve_self_url() -> Option<String> {
+    if let Ok(url) = std::env::var("STONE_PUBLIC_URL") {
+        let url = url.trim().to_string();
+        if !url.is_empty() {
+            return Some(url);
+        }
+    }
+    if let Ok(ip) = std::env::var("STONE_PUBLIC_IP") {
+        let ip = ip.trim().to_string();
+        if !ip.is_empty() {
+            let port = std::env::var("STONE_PORT").unwrap_or_else(|_| "8080".into());
+            return Some(format!("http://{}:{}", ip, port));
+        }
+    }
+    None
 }

@@ -398,6 +398,28 @@ pub enum NodeEvent {
         slashed_amount: String,
         timestamp: i64,
     },
+    // ─── Chat Events ──────────────────────────────────────────────────────────
+    /// Chat-Nachricht empfangen (für Echtzeit-Push an WebSocket-Clients)
+    ChatMessageReceived {
+        msg_id: String,
+        from_wallet: String,
+        to_wallet: String,
+        from_name: String,
+        timestamp: i64,
+        /// "direct" | "group"
+        channel_type: String,
+        /// Gruppen-ID falls Gruppennachricht, sonst leer
+        group_id: String,
+    },
+    // ─── Call-Signaling Events ────────────────────────────────────────────────
+    /// WebRTC Call-Signal empfangen (Offer/Answer/ICE/Hangup)
+    CallSignalReceived {
+        call_id: String,
+        signal_type: String,
+        from_wallet: String,
+        to_wallet: String,
+        timestamp: i64,
+    },
 }
 
 // ─── Event-Bus ───────────────────────────────────────────────────────────────
@@ -604,7 +626,22 @@ impl MasterNodeState {
         }
 
         let started_at = Utc::now().timestamp();
-        let staking_pool = crate::token::StakingPool::load();
+        let mut staking_pool = crate::token::StakingPool::load();
+        // Pool-Konsistenz prüfen: Wenn der Pool leer ist oder total_staked
+        // von der tatsächlichen pool:staking-Balance im Ledger abweicht,
+        // den Pool aus der Chain-History komplett neu aufbauen.
+        if !chain.blocks.is_empty() {
+            let pool_balance = ledger.balance(crate::token::staking::STAKING_POOL_ADDRESS);
+            if staking_pool.stakers.is_empty() || staking_pool.total_staked != pool_balance {
+                if staking_pool.total_staked != pool_balance {
+                    println!(
+                        "[staking] ⚠️  Pool-Desync: total_staked={}, pool:staking-Balance={} → Rebuild",
+                        staking_pool.total_staked, pool_balance,
+                    );
+                }
+                staking_pool = crate::token::StakingPool::rebuild_from_chain(&chain.blocks);
+            }
+        }
         let reputation_registry = ReputationRegistry::load();
         let chat_policy = ChatPolicyStore::load();
         let state = Arc::new(Self {
@@ -1033,6 +1070,38 @@ impl MasterNodeState {
         self.peers.read().unwrap().clone()
     }
 
+    /// Staking-TXs aus einem Block im StakingPool verarbeiten + persistieren.
+    /// Wird von allen Block-Ingestion-Pfaden aufgerufen (lokal, P2P, RangeSync).
+    pub fn apply_staking_from_txs(&self, txs: &[crate::token::TokenTx]) {
+        use crate::token::TxType;
+        let mut pool = self.staking_pool.write().unwrap();
+        let mut changed = false;
+        for tx in txs {
+            match tx.tx_type {
+                TxType::Stake => {
+                    if let Err(e) = pool.stake(&tx.from, tx.amount) {
+                        eprintln!("[staking] Stake fehlgeschlagen für {}: {e}", &tx.from[..12.min(tx.from.len())]);
+                    } else {
+                        changed = true;
+                    }
+                }
+                TxType::Unstake => {
+                    if let Err(e) = pool.request_unstake(&tx.from, tx.amount) {
+                        eprintln!("[staking] Unstake fehlgeschlagen für {}: {e}", &tx.from[..12.min(tx.from.len())]);
+                    } else {
+                        changed = true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if changed {
+            if let Err(e) = pool.persist() {
+                eprintln!("[staking] Pool-Persist fehlgeschlagen: {e}");
+            }
+        }
+    }
+
     /// Chain-Zusammenfassung für API-Antworten
     pub fn chain_summary(&self) -> ChainSummary {
         let chain = self.chain.lock().unwrap();
@@ -1340,11 +1409,24 @@ impl MasterNodeState {
                 if matches!(tx.tx_type, TxType::Reward | TxType::Mint | TxType::Memorial) {
                     continue;
                 }
+                // Bereits verarbeitete TXs (Duplikate) endgültig verwerfen
+                if ledger.is_processed_tx(&tx.tx_id) {
+                    discarded += 1;
+                    self.mempool.mark_known(&tx.tx_id);
+                    continue;
+                }
                 // Nonce >= erwartet → TX könnte zukünftig gültig werden → zurücklegen
                 let expected_nonce = ledger.nonce(&tx.from);
                 if tx.nonce >= expected_nonce {
-                    self.mempool.requeue_tx(tx.clone());
-                    requeued += 1;
+                    if self.mempool.requeue_tx(tx.clone()) {
+                        requeued += 1;
+                    } else {
+                        discarded += 1;
+                        println!(
+                            "[mining] 🗑️  TX {} endgültig verworfen: Requeue-Limit erreicht (Nonce {} erwartet {})",
+                            &tx.tx_id[..12.min(tx.tx_id.len())], tx.nonce, expected_nonce,
+                        );
+                    }
                 } else {
                     discarded += 1;
                     // Endgültig ungültige TX als "known" markieren damit
@@ -1822,10 +1904,23 @@ impl MasterNodeState {
                 if matches!(tx.tx_type, TxType::Reward | TxType::Mint | TxType::Memorial) {
                     continue;
                 }
+                // Bereits verarbeitete TXs (Duplikate) endgültig verwerfen
+                if ledger.is_processed_tx(&tx.tx_id) {
+                    discarded += 1;
+                    self.mempool.mark_known(&tx.tx_id);
+                    continue;
+                }
                 let expected_nonce = ledger.nonce(&tx.from);
                 if tx.nonce >= expected_nonce {
-                    self.mempool.requeue_tx(tx.clone());
-                    requeued += 1;
+                    if self.mempool.requeue_tx(tx.clone()) {
+                        requeued += 1;
+                    } else {
+                        discarded += 1;
+                        println!(
+                            "[mining] 🗑️  TX {} endgültig verworfen: Requeue-Limit erreicht (Nonce {} erwartet {})",
+                            &tx.tx_id[..12.min(tx.tx_id.len())], tx.nonce, expected_nonce,
+                        );
+                    }
                 } else {
                     discarded += 1;
                     // Endgültig ungültige TX als "known" markieren damit
@@ -2172,24 +2267,7 @@ impl MasterNodeState {
             ledger.set_current_validator(None);
 
             // ── Staking-TXs im StakingPool verarbeiten ────────────────────
-            {
-                let mut pool = self.staking_pool.write().unwrap();
-                for tx in &block.transactions {
-                    match tx.tx_type {
-                        TxType::Stake => {
-                            if let Err(e) = pool.stake(&tx.from, tx.amount) {
-                                eprintln!("[staking] Stake fehlgeschlagen für {}: {e}", &tx.from[..12.min(tx.from.len())]);
-                            }
-                        }
-                        TxType::Unstake => {
-                            if let Err(e) = pool.request_unstake(&tx.from, tx.amount) {
-                                eprintln!("[staking] Unstake fehlgeschlagen für {}: {e}", &tx.from[..12.min(tx.from.len())]);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            }
+            self.apply_staking_from_txs(&block.transactions);
 
             if !receipts.is_empty() {
                 if let Err(e) = ledger.persist() {
@@ -2284,14 +2362,10 @@ impl MasterNodeState {
                 let chain = self.chain.lock().unwrap();
                 chain.blocks.first().map(|b| b.hash.clone()).unwrap_or_default()
             };
-            let state_root = {
-                let ledger = self.token_ledger.read().unwrap();
-                ledger.state_root()
-            };
             let latest_hash = block.hash.clone();
             let height = block.index;
             std::thread::spawn(move || {
-                match crate::snapshot::create_snapshot(height, &genesis_hash, &latest_hash, &state_root) {
+                match crate::snapshot::create_snapshot(height, &genesis_hash, &latest_hash) {
                     Ok((_path, meta)) => {
                         eprintln!(
                             "[snapshot] 📸 Auto-Snapshot bei Block #{}: {:.1} MB",
@@ -2774,8 +2848,15 @@ impl MasterNodeState {
             }
         }
 
-        // 3. Pending Reports finalisieren (Timeout etc.)
-        let finalized = policy.finalize_all_pending();
+        // 3. Pending Reports finalisieren (Timeout etc.) – stake-gewichtet
+        let stake_weights: std::collections::HashMap<String, rust_decimal::Decimal> = {
+            let pool = state.staking_pool.read().unwrap();
+            pool.stakers.iter()
+                .filter(|(_, entry)| crate::token::StakeLevel::from_stake(entry.staked_amount).can_validate())
+                .map(|(addr, entry)| (addr.clone(), entry.staked_amount))
+                .collect()
+        };
+        let finalized = policy.finalize_all_pending(Some(&stake_weights));
         for (report_id, accepted, msg_id, reported_wallet) in &finalized {
             if *accepted {
                 // Content im Chat-Index löschen

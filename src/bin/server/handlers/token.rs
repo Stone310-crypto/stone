@@ -578,6 +578,80 @@ pub async fn handle_token_history(
     }))
 }
 
+// ─── TX-Status (by TX-ID) ───────────────────────────────────────────────────
+
+/// GET /api/v1/token/tx/:tx_id
+///
+/// Gibt den Status einer Transaktion zurück:
+/// - `confirmed`: TX in der Chain gefunden (mit Details)
+/// - `pending`: TX im Mempool, wartet auf Block
+/// - `unknown`: TX weder in Chain noch im Mempool
+pub async fn handle_tx_status(
+    State(state): State<AppState>,
+    Path(tx_id): Path<String>,
+) -> impl IntoResponse {
+    let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
+    let chain_height = chain.blocks.len() as u64;
+
+    // 1. In der Chain suchen
+    for block in chain.blocks.iter().rev() {
+        if let Some(tx) = block.transactions.iter().find(|t| t.tx_id == tx_id) {
+            let confirmations = chain_height.saturating_sub(block.index);
+            return Json(serde_json::json!({
+                "ok": true,
+                "status": "confirmed",
+                "tx_id": tx.tx_id,
+                "tx_type": tx.tx_type,
+                "from": tx.from,
+                "to": tx.to,
+                "amount": tx.amount.to_string(),
+                "fee": tx.fee.to_string(),
+                "nonce": tx.nonce,
+                "timestamp": tx.timestamp,
+                "memo": tx.memo,
+                "block_index": block.index,
+                "confirmations": confirmations,
+            }));
+        }
+    }
+    drop(chain);
+
+    // 2. Im Mempool suchen
+    let pending = state.node.mempool.pending_txs();
+    if let Some(tx) = pending.iter().find(|t| t.tx_id == tx_id) {
+        return Json(serde_json::json!({
+            "ok": true,
+            "status": "pending",
+            "tx_id": tx.tx_id,
+            "tx_type": tx.tx_type,
+            "from": tx.from,
+            "to": tx.to,
+            "amount": tx.amount.to_string(),
+            "fee": tx.fee.to_string(),
+            "nonce": tx.nonce,
+            "timestamp": tx.timestamp,
+            "memo": tx.memo,
+        }));
+    }
+
+    // 3. Bekannt aber schon verarbeitet?
+    if state.node.mempool.is_known(&tx_id) {
+        return Json(serde_json::json!({
+            "ok": true,
+            "status": "confirmed",
+            "tx_id": tx_id,
+            "message": "TX wurde verarbeitet (Details nicht mehr im Mempool)",
+        }));
+    }
+
+    Json(serde_json::json!({
+        "ok": false,
+        "status": "unknown",
+        "tx_id": tx_id,
+        "error": "Transaktion nicht gefunden",
+    }))
+}
+
 // ─── Key-Rotation Info ───────────────────────────────────────────────────────
 
 /// GET /api/v1/wallet/:address/rotations
@@ -979,107 +1053,10 @@ pub async fn handle_token_send_authenticated(
 
 // ─── Staking API-Handler ─────────────────────────────────────────────────────
 
-/// POST /api/v1/token/stake
-///
-/// Nimmt eine bereits signierte Stake-TX entgegen und schiebt sie in den Mempool.
-pub async fn handle_token_stake(
-    State(state): State<AppState>,
-    Json(req): Json<TransferRequest>,
-) -> impl IntoResponse {
-    let tx = req.tx;
-
-    if tx.tx_type != TxType::Stake {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": "TX-Typ muss 'Stake' sein",
-            })),
-        );
-    }
-
-    // In Mempool aufnehmen
-    let result = {
-        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
-        state.node.mempool.add_tx(tx.clone(), Some(&ledger))
-    };
-
-    match result {
-        Ok(()) => {
-            if let Some(ref net) = state.network {
-                let net = net.clone();
-                let tx_clone = tx.clone();
-                tokio::spawn(async move { net.broadcast_tx(tx_clone).await; });
-            }
-            (
-                StatusCode::ACCEPTED,
-                Json(serde_json::json!({
-                    "ok": true,
-                    "status": "pending",
-                    "tx_id": tx.tx_id,
-                    "from": tx.from,
-                    "amount": tx.amount.to_string(),
-                    "message": "Stake-TX im Mempool – wird beim nächsten Block verarbeitet",
-                })),
-            )
-        }
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
-        ),
-    }
-}
-
-/// POST /api/v1/token/unstake
-///
-/// Nimmt eine bereits signierte Unstake-TX entgegen und schiebt sie in den Mempool.
-pub async fn handle_token_unstake(
-    State(state): State<AppState>,
-    Json(req): Json<TransferRequest>,
-) -> impl IntoResponse {
-    let tx = req.tx;
-
-    if tx.tx_type != TxType::Unstake {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": "TX-Typ muss 'Unstake' sein",
-            })),
-        );
-    }
-
-    let result = {
-        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
-        state.node.mempool.add_tx(tx.clone(), Some(&ledger))
-    };
-
-    match result {
-        Ok(()) => {
-            if let Some(ref net) = state.network {
-                let net = net.clone();
-                let tx_clone = tx.clone();
-                tokio::spawn(async move { net.broadcast_tx(tx_clone).await; });
-            }
-            (
-                StatusCode::ACCEPTED,
-                Json(serde_json::json!({
-                    "ok": true,
-                    "status": "pending",
-                    "tx_id": tx.tx_id,
-                    "from": tx.from,
-                    "amount": tx.amount.to_string(),
-                    "lock_period_days": 7,
-                    "message": "Unstake-TX im Mempool – 7 Tage Lock-Periode nach Verarbeitung",
-                })),
-            )
-        }
-        Err(e) => (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
-        ),
-    }
-}
+// SECURITY: handle_token_stake und handle_token_unstake wurden entfernt.
+// Diese Endpoints akzeptierten raw TXs ohne Auth und ohne Signaturprüfung.
+// Staking/Unstaking erfolgt ausschließlich über die authentifizierten
+// /api/v1/mining/stake und /api/v1/mining/unstake Endpoints.
 
 /// GET /api/v1/staking/info
 ///
@@ -1148,6 +1125,7 @@ pub async fn handle_staker_info(
                     "staked_since": 0,
                     "unstake_requests": [],
                     "share_percent": "0",
+                    "stake_level": "observer",
                 },
             })),
         ),
@@ -1208,4 +1186,170 @@ pub async fn handle_mempool_sync(
         ))
         .collect();
     (StatusCode::OK, Json(serde_json::json!(user_txs))).into_response()
+}
+
+// ─── Admin Airdrop (aus beliebigem Pool) ─────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct AirdropRequest {
+    /// Empfänger-Adresse (64 Hex-Zeichen)
+    pub to: String,
+    /// Betrag in STONE (z.B. "5000000")
+    pub amount: String,
+    /// Quell-Pool (z.B. "pool:founders", "pool:community", "pool:treasury")
+    #[serde(default = "default_airdrop_pool")]
+    pub from_pool: String,
+    /// Optionale Notiz
+    #[serde(default)]
+    pub memo: String,
+}
+
+fn default_airdrop_pool() -> String {
+    "pool:founders".to_string()
+}
+
+/// POST /api/v1/admin/airdrop
+///
+/// Admin-Only: Verteilt STONE aus einem Pool-Konto an eine Wallet.
+/// Benötigt `x-api-key` Header mit dem Admin-Key.
+///
+/// Body: `{ "to": "<hex64>", "amount": "1000", "from_pool": "pool:founders", "memo": "Beta Airdrop" }`
+pub async fn handle_admin_airdrop(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<AirdropRequest>,
+) -> impl IntoResponse {
+    // Admin-Auth erforderlich
+    if let Err(e) = require_admin(&headers, &state) {
+        return e.into_response();
+    }
+
+    // Adress-Validierung
+    if req.to.len() != 64 || !req.to.chars().all(|c| c.is_ascii_hexdigit()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "Ungültige Empfänger-Adresse: muss 64 Hex-Zeichen sein",
+            })),
+        ).into_response();
+    }
+
+    // Pool-Validierung: nur bekannte Pools erlauben
+    let allowed_pools = [
+        "pool:founders", "pool:community", "pool:treasury",
+        "pool:liquidity", "pool:node_operators",
+    ];
+    if !allowed_pools.contains(&req.from_pool.as_str()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!("Ungültiger Pool: {}. Erlaubt: {:?}", req.from_pool, allowed_pools),
+            })),
+        ).into_response();
+    }
+
+    // Betrag parsen
+    let amount: rust_decimal::Decimal = match req.amount.parse() {
+        Ok(a) => a,
+        Err(_) => return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": "Ungültiger Betrag" })),
+        ).into_response(),
+    };
+
+    if amount <= rust_decimal::Decimal::ZERO {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": "Betrag muss positiv sein" })),
+        ).into_response();
+    }
+
+    // Pool-Balance prüfen
+    {
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
+        let available = ledger.balance(&req.from_pool);
+        if available < amount {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!("{} hat nur {} STONE verfügbar", req.from_pool, available),
+                    "available": available.to_string(),
+                })),
+            ).into_response();
+        }
+    }
+
+    // Nonce berechnen
+    let nonce = {
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
+        ledger.nonce(&req.from_pool) + state.node.mempool.sender_pending_count(&req.from_pool)
+    };
+
+    let memo = if req.memo.is_empty() {
+        format!("Admin Airdrop aus {}", req.from_pool)
+    } else {
+        req.memo.clone()
+    };
+
+    // TX erstellen (Pool-Signatur wird in verify_tx_signature übersprungen)
+    let mut tx = TokenTx {
+        tx_id: String::new(),
+        tx_type: TxType::Transfer,
+        from: req.from_pool.clone(),
+        to: req.to.clone(),
+        amount,
+        fee: rust_decimal::Decimal::ZERO,
+        nonce,
+        timestamp: chrono::Utc::now().timestamp(),
+        signature: "admin-airdrop".to_string(),
+        memo,
+        chain_id: default_chain_id(),
+        fee_tier: stone::token::FeeTier::Standard,
+    };
+    tx.tx_id = compute_tx_id(&tx);
+
+    let tx_id = tx.tx_id.clone();
+
+    // In Mempool aufnehmen
+    let result = {
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
+        state.node.mempool.add_tx(tx.clone(), Some(&ledger))
+    };
+
+    match result {
+        Ok(()) => {
+            println!(
+                "[airdrop] ✈️  {} STONE: {} → {} (TX: {}…)",
+                amount, req.from_pool, &req.to[..16], &tx_id[..12]
+            );
+
+            // P2P Broadcast
+            if let Some(ref net) = state.network {
+                let net = net.clone();
+                let tx_clone = tx;
+                tokio::spawn(async move {
+                    net.broadcast_tx(tx_clone).await;
+                });
+            }
+
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "tx_id": tx_id,
+                    "from": req.from_pool,
+                    "to": req.to,
+                    "amount": amount.to_string(),
+                    "message": "Airdrop-TX im Mempool – wird beim nächsten Block verarbeitet",
+                })),
+            ).into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
+        ).into_response(),
+    }
 }
