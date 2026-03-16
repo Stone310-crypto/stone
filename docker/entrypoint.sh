@@ -30,10 +30,16 @@ HTTP_PORT="${STONE_HTTP_PORT:-8080}"
 P2P_PORT="${STONE_P2P_PORT:-4001}"
 
 DATA_DIR="/opt/stone-node/stone_data"
-CONFIG_FILE="/opt/stone-node/node_config.json"
-
 BINARY="/opt/stone-node/target/release/stone-setup"
 UPDATE_BINARY="$DATA_DIR/updates/stone-setup"
+
+# ── Arbeitsverzeichnis = Volume ──────────────────────────────────────────────
+# stone-setup schreibt node_config.json ins CWD. Damit die Config bei Restarts
+# erhalten bleibt, setzen wir CWD auf das gemountete Volume.
+mkdir -p "$DATA_DIR"
+cd "$DATA_DIR"
+
+CONFIG_FILE="$DATA_DIR/node_config.json"
 
 # ── OTA-Update: Prüfe ob ein neues Binary auf dem Volume liegt ───────────────
 
@@ -77,7 +83,7 @@ if [ -f "$CONFIG_FILE" ]; then
         export STONE_P2P_LISTEN="/ip4/0.0.0.0/tcp/$P2P_PORT"
         export STONE_DATA_DIR="$DATA_DIR"
         # QUIC lauscht automatisch auf demselben Port (UDP)
-        exec /opt/stone-node/target/release/stone-setup
+        exec "$BINARY"
     fi
 fi
 
@@ -96,7 +102,7 @@ SETUP_PID=$!
 
 # Warten bis die API erreichbar ist
 echo "⏳ Warte auf Setup-API..."
-for i in $(seq 1 30); do
+for i in $(seq 1 60); do
     if curl -sf "http://localhost:$HTTP_PORT/api/status" >/dev/null 2>&1; then
         echo "✅ Setup-API erreichbar"
         break
@@ -141,27 +147,27 @@ fi
 
 # 3) Storage konfigurieren
 echo "💾 Setze Storage: ${STORAGE_GB} GB"
-curl -sf -X POST "$API/api/setup/storage" \
+curl -sf --max-time 10 -X POST "$API/api/setup/storage" \
     -H "Content-Type: application/json" \
     -H "Authorization: Bearer $TOKEN" \
-    -d "{\"offered_gb\": $STORAGE_GB}" >/dev/null
+    -d "{\"offered_gb\": $STORAGE_GB}" >/dev/null || echo "⚠️  Storage-Konfiguration fehlgeschlagen (nicht kritisch)"
 
 # 4) Seed-Peers setzen (falls angegeben)
 if [ -n "$SEED_PEERS" ]; then
     # Komma-separiert → JSON-Array
     PEERS_JSON=$(echo "$SEED_PEERS" | tr ',' '\n' | sed 's/^/"/;s/$/"/' | tr '\n' ',' | sed 's/,$//')
-    echo "🔗 Setze Seed-Peers: $SEED_PEERS"
-    curl -sf -X POST "$API/api/setup/peers" \
+    echo "🔗 Setze Seed-Peers..."
+    curl -sf --max-time 10 -X POST "$API/api/setup/peers" \
         -H "Content-Type: application/json" \
         -H "Authorization: Bearer $TOKEN" \
-        -d "{\"seed_peers\": [$PEERS_JSON]}" >/dev/null
+        -d "{\"seed_peers\": [$PEERS_JSON]}" >/dev/null || echo "⚠️  Seed-Peers fehlgeschlagen (nicht kritisch)"
 fi
 
 # 5) Setup abschließen → startet Full-Node im Hintergrund
 echo "🚀 Schließe Setup ab..."
-curl -sf -X POST "$API/api/setup/finish" \
+curl -sf --max-time 10 -X POST "$API/api/setup/finish" \
     -H "Content-Type: application/json" \
-    -H "Authorization: Bearer $TOKEN" >/dev/null
+    -H "Authorization: Bearer $TOKEN" >/dev/null || echo "⚠️  Finish-Call fehlgeschlagen"
 
 echo ""
 echo "  ┌─────────────────────────────────────────────────────┐"
@@ -175,5 +181,12 @@ echo "  └───────────────────────
 echo ""
 
 # stone-setup läuft bereits im Hintergrund mit Full-Node
-# → wir warten auf den Prozess
-wait $SETUP_PID
+# → wir warten auf den Prozess. Falls er sich beendet (z.B. Transition
+#   Setup→Full-Node), starten wir ihn neu im Full-Node-Modus.
+wait $SETUP_PID || true
+
+# Falls stone-setup sich nach finish beendet hat → im Full-Node-Modus neu starten
+if [ -f "$CONFIG_FILE" ]; then
+    echo "🔄 Starte Full-Node-Modus..."
+    exec "$BINARY"
+fi
