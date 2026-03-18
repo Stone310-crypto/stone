@@ -541,6 +541,10 @@ pub struct MasterMetrics {
     pub chat_messages_mined: AtomicU64,
     /// Initialer Peer-Sync abgeschlossen (Mining erst danach starten)
     pub initial_sync_done: AtomicBool,
+    /// Sync-Fortschritt: Chain-Höhe zu Beginn des aktuellen Syncs
+    pub syncing_from_height: AtomicU64,
+    /// Sync-Fortschritt: Ziel-Chain-Höhe des aktuellen Syncs (0 = kein Sync aktiv)
+    pub syncing_to_height: AtomicU64,
 }
 
 impl MasterNodeState {
@@ -605,7 +609,6 @@ impl MasterNodeState {
                 }
             }
         }
-
         if ledger.total_supply() == rust_decimal::Decimal::ZERO && chain.blocks.len() > 0 {
             // Versuche Rebuild aus Chain (falls DB fehlt, aber Chain TXs hat)
             ledger = TokenLedger::rebuild_from_chain(&chain.blocks);
@@ -1063,6 +1066,26 @@ impl MasterNodeState {
     pub fn replace_peers(&self, peers: Vec<PeerInfo>) {
         let mut locked = self.peers.write().unwrap();
         *locked = peers;
+    }
+    /// Statische Hilfsfunktion: PeerInfo-Objekt direkt als UNREACHABLE markieren.
+    pub fn mark_peer_unhealthy(peer: &mut PeerInfo) {
+        if peer.status != PeerStatus::Unreachable {
+            peer.mark_unreachable();
+            println!(
+                "[network] ⚠️  Peer '{}' markiert als UNREACHABLE ({} Sync-Fehler)",
+                peer.url, peer.sync_failures
+            );
+        }
+    }
+
+    /// Instanz-Methode: Peer per URL als UNREACHABLE markieren.
+    /// Löst ein PeerStatusChanged-Event aus wenn sich der Status ändert.
+    pub fn mark_peer_unhealthy_by_url(&self, url: &str) {
+        self.set_peer_status(url, PeerStatus::Unreachable);
+        let mut peers = self.peers.write().unwrap();
+        if let Some(p) = peers.iter_mut().find(|p| p.url == url) {
+            p.sync_failures = p.sync_failures.saturating_add(1);
+        }
     }
 
     /// Peers lesen

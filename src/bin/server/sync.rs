@@ -95,6 +95,10 @@ pub async fn pull_from_peer(node: &Arc<MasterNodeState>, peer_url: &str, api_key
         return;
     }
 
+    // Sync-Fortschritt im Metrics-State festhalten (sichtbar im Dashboard)
+    node.metrics.syncing_from_height.store(local_height, std::sync::atomic::Ordering::Relaxed);
+    node.metrics.syncing_to_height.store(peer_height, std::sync::atomic::Ordering::Relaxed);
+
     // ── Genesis-Check: Block #0 vom Peer holen und vergleichen ──
     {
         let gen_url = format!(
@@ -519,6 +523,8 @@ pub async fn pull_from_peer(node: &Arc<MasterNodeState>, peer_url: &str, api_key
     if let Some(p) = peers.iter_mut().find(|p| p.url == peer_url) {
         p.mark_healthy(latest_hash, local_height + added, latency);
     }
+    // Sync abgeschlossen → Fortschritt zurücksetzen
+    node.metrics.syncing_to_height.store(0, std::sync::atomic::Ordering::Relaxed);
     node.metrics.sync_success.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
@@ -612,11 +618,33 @@ pub fn spawn_auto_sync_task(
         let mut chain_sync_counter: u64 = 0;
         loop {
             interval.tick().await;
-            let peers = node.get_peers();
-            for peer in &peers {
-                pull_from_peer(&node, &peer.url, &api_key).await;
-                pull_users_from_peer(&peer.url, &api_key, &users).await;
+            let mut peers = node.get_peers();
+
+            // Peer mit der längsten bekannten Chain zuerst synchen (Issue #7).
+            // Bei Initial-Sync (syncing_to_height > 0) oder wenn initial_sync_done
+            // noch nicht gesetzt ist, wählen wir immer den best-known Peer.
+            peers.sort_by(|a, b| b.block_height.cmp(&a.block_height));
+
+            let initial_done = node.metrics.initial_sync_done.load(std::sync::atomic::Ordering::Relaxed);
+
+            if !initial_done {
+                // Initial-Sync: Nur vom besten Peer holen um Race Conditions zu vermeiden.
+                // Sobald pull_from_peer initial_sync_done setzt, sind wir fertig.
+                if let Some(best) = peers.first() {
+                    pull_from_peer(&node, &best.url, &api_key).await;
+                    pull_users_from_peer(&best.url, &api_key, &users).await;
+                } else {
+                    // Keine Peers → trotzdem als "done" markieren damit Mining startet
+                    node.metrics.initial_sync_done.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            } else {
+                // Normal-Betrieb: alle Peers synchen (aber besten zuerst)
+                for peer in &peers {
+                    pull_from_peer(&node, &peer.url, &api_key).await;
+                    pull_users_from_peer(&peer.url, &api_key, &users).await;
+                }
             }
+
             // Push eigene User an alle erreichbaren Peers (wichtig wenn wir
             // hinter NAT sind und Peers uns nicht pullen können)
             push_all_users_to_peers(&peers.iter().map(|p| p.url.clone()).collect::<Vec<_>>(), &users).await;

@@ -358,6 +358,9 @@ async fn handle_miner_stats(State(state): State<MinerWebState>) -> impl IntoResp
             "peers_total": peers_total,
             "p2p_active": state.network_active,
             "chain_valid": chain_valid,
+            "initial_sync_done": state.node.metrics.initial_sync_done.load(std::sync::atomic::Ordering::Relaxed),
+            "syncing_from_height": state.node.metrics.syncing_from_height.load(std::sync::atomic::Ordering::Relaxed),
+            "syncing_to_height": state.node.metrics.syncing_to_height.load(std::sync::atomic::Ordering::Relaxed),
         },
         "system": system,
         "pow": pow,
@@ -587,9 +590,13 @@ async fn handle_p2p_event(
                 .filter(|p| p.is_healthy())
                 .map(|p| p.url.clone())
                 .collect();
-            for url in &peer_urls {
-                fetch_missing_chunks(&block, url, api_key).await;
-            }
+            let block_for_chunks = block.clone();
+            let api_key_bg = api_key.clone();
+            tokio::spawn(async move {
+                for url in peer_urls {
+                    fetch_missing_chunks(&block_for_chunks, &url, &api_key_bg).await;
+                }
+            });
 
             let poa_ok = {
                 let syncing = !node.metrics.initial_sync_done.load(std::sync::atomic::Ordering::Relaxed);
@@ -758,9 +765,25 @@ async fn handle_p2p_event(
                     let n = node.clone();
                     let k = api_key.clone();
                     tokio::spawn(async move {
-                        for p in n.get_peers().iter().filter(|p| p.is_healthy()) {
-                            pull_from_peer(&n, &p.url, &k).await;
-                        }
+                        // Peer mit der längsten Chain zuerst, parallel (max 3) —
+                        // kein sequenzielles Warten auf jeden Peer (Issue #6)
+                        let mut sync_peers: Vec<_> = n.get_peers()
+                            .into_iter()
+                            .filter(|p| p.is_healthy())
+                            .collect();
+                        sync_peers.sort_by(|a, b| b.block_height.cmp(&a.block_height));
+                        let urls: Vec<String> = sync_peers.into_iter()
+                            .take(3)
+                            .map(|p| p.url)
+                            .collect();
+                        let handles: Vec<_> = urls.into_iter().map(|url| {
+                            let nn = n.clone();
+                            let kk = k.clone();
+                            tokio::spawn(async move {
+                                pull_from_peer(&nn, &url, &kk).await;
+                            })
+                        }).collect();
+                        for h in handles { let _ = h.await; }
                     });
                 }
                 BlockResult::Rejected => {
@@ -943,36 +966,73 @@ async fn handle_p2p_event(
         }
 
         NetworkEvent::PeerIdentified { peer_id, addresses, .. } => {
-            let http_port = std::env::var("STONE_PORT")
-                .ok().and_then(|v| v.parse::<u16>().ok()).unwrap_or(1);
-            let mut ip: Option<String> = None;
+            // IPv4 bevorzugen, IPv6 als Fallback (beide aber akzeptieren)
+            let mut ipv4: Option<String> = None;
+            let mut ipv6: Option<String> = None;
+
             for addr in &addresses {
                 let parts: Vec<&str> = addr.split('/').collect();
                 for (i, part) in parts.iter().enumerate() {
                     if *part == "ip4" {
                         if let Some(found) = parts.get(i + 1) {
-                            if *found != "127.0.0.1" && *found != "0.0.0.0" {
-                                ip = Some(found.to_string());
-                                break;
+                            if *found != "127.0.0.1" && *found != "0.0.0.0" && ipv4.is_none() {
+                                ipv4 = Some(found.to_string());
+                            }
+                        }
+                    } else if *part == "ip6" {
+                        if let Some(found) = parts.get(i + 1) {
+                            // Loopback und link-local überspringen
+                            if *found != "::1" && !found.starts_with("fe80") && ipv6.is_none() {
+                                ipv6 = Some(format!("[{}]", found));
                             }
                         }
                     }
                 }
-                if ip.is_some() { break; }
             }
-            if let Some(ip) = ip {
-                let url = format!("http://{}:{}", ip, http_port);
-                let mut peer_info = PeerInfo::new(&url);
-                peer_info.name = Some(peer_id[..12.min(peer_id.len())].to_string());
-                node.upsert_peer(peer_info);
-                if let Ok(json) = serde_json::to_string_pretty(&node.get_peers()) {
-                    let _ = std::fs::write(format!("{}/peers.json", data_dir()), json);
+
+            let ip_str = ipv4.or(ipv6);
+
+            if let Some(ref ip) = ip_str {
+                // Bekannte Peer-URLs nach IP prüfen (Deduplizierung über alle Ports/Peer-IDs)
+                let known_peers = node.get_peers();
+                let ip_already_known = known_peers.iter().any(|p| {
+                    // URL enthält die IP (bei IPv6 geklammert)
+                    p.url.contains(ip.trim_start_matches('[').trim_end_matches(']'))
+                });
+
+                if !ip_already_known {
+                    // Kandidaten-Ports in Prioritätsreihenfolge
+                    let candidate_ports = [8081u16, 8080, 3030];
+                    for port in candidate_ports {
+                        let url = format!("http://{}:{}", ip, port);
+                        if !known_peers.iter().any(|p| p.url.trim_end_matches('/') == url.trim_end_matches('/')) {
+                            let mut peer_info = PeerInfo::new(&url);
+                            peer_info.name = Some(peer_id[..12.min(peer_id.len())].to_string());
+                            node.upsert_peer(peer_info);
+                            eprintln!("[p2p] 🔍 Neuer Peer entdeckt: {} ({})", &peer_id[..12.min(peer_id.len())], url);
+                            break;
+                        }
+                    }
                 }
             }
         }
 
-        NetworkEvent::PeerConnected { peer_id, .. } => {
-            eprintln!("[p2p] Peer verbunden: {}", &peer_id[..12.min(peer_id.len())]);
+        NetworkEvent::PeerConnected { peer_id, addr: _ } => {
+            let local_height = node.chain.lock().unwrap().blocks.len() as u64;
+            // Handshake: eigene Version + Chain-Höhe via Gossip ankündigen
+            let handshake = serde_json::json!({
+                "type": "handshake",
+                "version": env!("CARGO_PKG_VERSION"),
+                "chain_height": local_height,
+                "node_id": &node.node_id,
+            });
+            if let Ok(data) = serde_json::to_vec(&handshake) {
+                handle.publish_gossip("chain-info", data).await;
+            }
+            eprintln!(
+                "[p2p] 🤝 Peer verbunden: {} (handshake gesendet, lokal: #{})",
+                &peer_id[..12.min(peer_id.len())], local_height
+            );
         }
 
         NetworkEvent::ChatMessageReceived { message, from_peer } => {
@@ -984,9 +1044,23 @@ async fn handle_p2p_event(
                 Err(_) => {}
             }
         }
-
+        NetworkEvent::PeerDisconnected { peer_id, .. } => {
+            let pid_short = &peer_id[..12.min(peer_id.len())];
+            // Nur den getrennten Peer als Unreachable markieren – NICHT alle Peers löschen.
+            let peers = node.get_peers();
+            for peer in &peers {
+                if peer.name.as_deref() == Some(pid_short) {
+                    node.mark_peer_unhealthy_by_url(&peer.url);
+                    eprintln!("[p2p] 🔌 Peer getrennt: {} ({})", pid_short, peer.url);
+                }
+            }
+            if peers.iter().all(|p| p.name.as_deref() != Some(pid_short)) {
+                eprintln!("[p2p] 🔌 Peer getrennt: {} (kein HTTP-Peer bekannt)", pid_short);
+            }
+        },
         _ => {}
     }
+
 }
 
 // ─── Storage Challenge Worker (Proof-of-Spacetime) ──────────────────────────
