@@ -648,6 +648,32 @@ async fn start_full_node(state: SetupState) {
 
     *state.node_state.write().await = Some(node_app_state.clone());
 
+    // ── Public API Port (nur /api/v1/* — kein Dashboard) ────────────────
+    // Für externen Zugriff via Cloudflare Tunnel (chain.unrooted.dev).
+    // Dashboard bleibt nur auf dem Haupt-Port (8080) erreichbar.
+    {
+        let api_port: u16 = std::env::var("STONE_API_PORT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(3080);
+
+        let api_router = build_router(node_app_state.clone());
+
+        match tokio::net::TcpListener::bind(SocketAddr::from(([0, 0, 0, 0], api_port))).await {
+            Ok(api_listener) => {
+                println!("[node] 🌐 Public API auf 0.0.0.0:{api_port} (nur /api/v1/*, kein Dashboard)");
+                tokio::spawn(async move {
+                    axum::serve(api_listener, api_router)
+                        .await
+                        .expect("API-Server Fehler");
+                });
+            }
+            Err(e) => {
+                eprintln!("[node] ⚠ API-Port {api_port} konnte nicht gebunden werden: {e}");
+            }
+        }
+    }
+
     // ── Hintergrund-Task: Chat-Index nach Sync aktualisieren ────────────
     {
         let chat_idx = node_app_state.chat_index.clone();

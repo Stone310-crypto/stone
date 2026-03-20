@@ -231,14 +231,14 @@ pub struct UnstakeRequest {
 
 // ─── Staking-Pool ────────────────────────────────────────────────────────────
 
-/// Der Staking-Pool verwaltet alle Stakes, Rewards und Unstake-Requests.
+/// Der Staking-Pool verwaltet alle Stakes, Rewards, Delegations und Unstake-Requests.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct StakingPool {
     /// Alle aktiven Staker: wallet_address → StakerEntry
     pub stakers: HashMap<String, StakerEntry>,
     /// Ausstehende Unstake-Requests
     pub unstake_queue: Vec<UnstakeRequest>,
-    /// Gesamter Pool-Betrag (Summe aller Stakes)
+    /// Gesamter Pool-Betrag (Summe aller Stakes + Delegations)
     pub total_staked: Decimal,
     /// Gesamte bisher ausgeschüttete Rewards
     pub total_rewards_distributed: Decimal,
@@ -246,6 +246,39 @@ pub struct StakingPool {
     pub current_epoch: u64,
     /// Letzter Block in dem eine Epoch verarbeitet wurde
     pub last_epoch_block: u64,
+    /// Delegationen: delegator_wallet → DelegationEntry
+    #[serde(default)]
+    pub delegations: HashMap<String, DelegationEntry>,
+    /// Gesamtes delegiertes Volumen
+    #[serde(default)]
+    pub total_delegated: Decimal,
+}
+
+// ─── Delegation (Split Validator) ────────────────────────────────────────────
+
+/// Eine Delegation: Ein Coin-Halter delegiert Kapital an eine Validator-Node.
+///
+/// Split-Modell:
+/// - Node-Betreiber stellt Infrastruktur
+/// - Delegator stellt Kapital
+/// - Rewards werden nach `split_pct` aufgeteilt:
+///   `split_pct`% gehen an den Delegator, Rest an den Validator
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct DelegationEntry {
+    /// Wallet des Delegators
+    pub delegator: String,
+    /// Wallet des Validators (Node-Betreiber)
+    pub validator: String,
+    /// Delegierter Betrag
+    pub amount: Decimal,
+    /// Anteil des Delegators an den Rewards (0-100%)
+    pub split_pct: u8,
+    /// Zeitpunkt der Delegation (Unix-Timestamp)
+    pub delegated_since: i64,
+    /// Bisher verdiente Rewards (Delegator-Anteil)
+    pub pending_rewards: Decimal,
+    /// Gesamte bisherige Rewards
+    pub total_rewards: Decimal,
 }
 
 // ─── Fehler ──────────────────────────────────────────────────────────────────
@@ -323,6 +356,8 @@ impl StakingPool {
             total_rewards_distributed: Decimal::ZERO,
             current_epoch: 0,
             last_epoch_block: 0,
+            delegations: HashMap::new(),
+            total_delegated: Decimal::ZERO,
         }
     }
 
@@ -479,14 +514,17 @@ impl StakingPool {
             }
         }
 
+        // Delegation-Rewards: Split zwischen Delegator und Validator
+        self.distribute_delegation_rewards(capped_reward);
+
         self.total_rewards_distributed += total_distributed;
         self.current_epoch += 1;
         self.last_epoch_block = current_block;
 
         let current_apy_pct = (dynamic_apy(reward_pool_balance) * Decimal::new(100, 0)).round_dp(2);
         println!(
-            "[staking] 💰 Epoch #{}: {} STONE Rewards an {} Staker ({}% APY, Pool: {})",
-            self.current_epoch, total_distributed, stakers.len(), current_apy_pct, reward_pool_balance,
+            "[staking] 💰 Epoch #{}: {} STONE Rewards an {} Staker + {} Delegatoren ({}% APY, Pool: {})",
+            self.current_epoch, total_distributed, stakers.len(), self.delegations.len(), current_apy_pct, reward_pool_balance,
         );
 
         total_distributed
@@ -602,6 +640,195 @@ impl StakingPool {
         }
 
         Ok(amount)
+    }
+
+    // ── Delegation (Split Validator Node) ─────────────────────────────────
+
+    /// Delegiert Coins von einem Delegator an eine Validator-Node.
+    ///
+    /// Split-Modell: Der Delegator bekommt `split_pct`% der Rewards,
+    /// der Validator-Betreiber den Rest. Default: 70% Delegator / 30% Validator.
+    ///
+    /// Die Balance-Verschiebung (wallet → pool) wird vom Ledger erledigt!
+    pub fn delegate(
+        &mut self,
+        delegator: &str,
+        validator: &str,
+        amount: Decimal,
+        split_pct: u8,
+    ) -> Result<(), StakingError> {
+        let min: Decimal = MIN_STAKE.parse().unwrap();
+
+        // Delegation-Key: delegator → validator
+        let key = format!("{}→{}", delegator, validator);
+
+        let current = self.delegations.get(&key)
+            .map(|d| d.amount)
+            .unwrap_or(Decimal::ZERO);
+
+        if current + amount < min {
+            return Err(StakingError::BelowMinimum { amount: current + amount, min });
+        }
+
+        let split = split_pct.min(100);
+
+        let entry = self.delegations.entry(key).or_insert_with(|| DelegationEntry {
+            delegator: delegator.to_string(),
+            validator: validator.to_string(),
+            amount: Decimal::ZERO,
+            split_pct: split,
+            delegated_since: Utc::now().timestamp(),
+            pending_rewards: Decimal::ZERO,
+            total_rewards: Decimal::ZERO,
+        });
+
+        entry.amount += amount;
+        entry.split_pct = split; // Aktualisiere Split bei nachträglicher Delegation
+        self.total_delegated += amount;
+        self.total_staked += amount;
+
+        // Validator bekommt den delegierten Betrag zu seinem effektiven Stake
+        let validator_entry = self.stakers.entry(validator.to_string()).or_insert_with(|| StakerEntry {
+            address: validator.to_string(),
+            staked_amount: Decimal::ZERO,
+            total_rewards: Decimal::ZERO,
+            pending_rewards: Decimal::ZERO,
+            staked_since: Utc::now().timestamp(),
+            last_reward_epoch: self.current_epoch,
+        });
+        validator_entry.staked_amount += amount;
+
+        println!(
+            "[staking] 🤝 Delegation: {} STONE von {} → {} (Split: {}% Delegator)",
+            amount,
+            &delegator[..12.min(delegator.len())],
+            &validator[..12.min(validator.len())],
+            split
+        );
+
+        Ok(())
+    }
+
+    /// Undelegation: Delegation zurückziehen → 7-Tage Escrow.
+    pub fn request_undelegate(
+        &mut self,
+        delegator: &str,
+        validator: &str,
+        amount: Decimal,
+    ) -> Result<UnstakeRequest, StakingError> {
+        let key = format!("{}→{}", delegator, validator);
+
+        let entry = self.delegations.get_mut(&key)
+            .ok_or_else(|| StakingError::NotStaked { address: delegator.to_string() })?;
+
+        if entry.amount < amount {
+            return Err(StakingError::InsufficientStake {
+                address: delegator.to_string(),
+                staked: entry.amount,
+                requested: amount,
+            });
+        }
+
+        entry.amount -= amount;
+        self.total_delegated -= amount;
+        self.total_staked -= amount;
+
+        // Vom Validator-Stake abziehen
+        if let Some(vs) = self.stakers.get_mut(validator) {
+            vs.staked_amount -= amount.min(vs.staked_amount);
+            if vs.staked_amount == Decimal::ZERO && vs.pending_rewards == Decimal::ZERO {
+                self.stakers.remove(validator);
+            }
+        }
+
+        // Leere Delegation entfernen
+        if entry.amount == Decimal::ZERO && entry.pending_rewards == Decimal::ZERO {
+            self.delegations.remove(&key);
+        }
+
+        let now = Utc::now().timestamp();
+        let request = UnstakeRequest {
+            address: delegator.to_string(),
+            amount,
+            requested_at: now,
+            available_at: now + UNSTAKE_LOCK_SECS,
+        };
+
+        self.unstake_queue.push(request.clone());
+
+        println!(
+            "[staking] 📤 Undelegation: {} STONE {} → {} (verfügbar in {} Tagen)",
+            amount,
+            &delegator[..12.min(delegator.len())],
+            &validator[..12.min(validator.len())],
+            UNSTAKE_LOCK_SECS / 86400,
+        );
+
+        Ok(request)
+    }
+
+    /// Verteilt Delegation-Rewards nach Split-Vereinbarung.
+    ///
+    /// Wird NACH der normalen Staker-Verteilung aufgerufen.
+    /// Der Validator hat bereits den vollen Reward für delegierte Coins
+    /// erhalten → wir verschieben `split_pct%` davon zum Delegator.
+    fn distribute_delegation_rewards(&mut self, capped_reward: Decimal) {
+        if self.total_delegated == Decimal::ZERO || self.delegations.is_empty() {
+            return;
+        }
+
+        let keys: Vec<String> = self.delegations.keys().cloned().collect();
+        for key in &keys {
+            if let Some(entry) = self.delegations.get_mut(key) {
+                if entry.amount <= Decimal::ZERO {
+                    continue;
+                }
+                // Anteil dieser Delegation am Gesamtpool
+                let share = entry.amount / self.total_staked;
+                let reward_from_delegation = (capped_reward * share).round_dp(8);
+
+                if reward_from_delegation > Decimal::ZERO {
+                    // Delegator bekommt split_pct% des durch seine Delegation
+                    // generierten Rewards (wird vom Validator-Anteil abgezogen)
+                    let delegator_reward = (reward_from_delegation
+                        * Decimal::from(entry.split_pct as u64)
+                        / Decimal::from(100u64))
+                    .round_dp(8);
+
+                    entry.pending_rewards += delegator_reward;
+                    entry.total_rewards += delegator_reward;
+
+                    // Vom Validator abziehen (hat ihn bereits im Haupt-Loop bekommen)
+                    if let Some(vs) = self.stakers.get_mut(&entry.validator) {
+                        let deduct = delegator_reward.min(vs.pending_rewards);
+                        vs.pending_rewards -= deduct;
+                        vs.total_rewards -= deduct;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Alle Delegationen eines Delegators.
+    pub fn delegations_of(&self, delegator: &str) -> Vec<&DelegationEntry> {
+        self.delegations.values()
+            .filter(|d| d.delegator == delegator)
+            .collect()
+    }
+
+    /// Alle Delegationen an einen Validator.
+    pub fn delegations_to(&self, validator: &str) -> Vec<&DelegationEntry> {
+        self.delegations.values()
+            .filter(|d| d.validator == validator)
+            .collect()
+    }
+
+    /// Effektiver Stake eines Validators (eigener Stake + Delegationen).
+    pub fn effective_stake(&self, validator: &str) -> Decimal {
+        let own = self.stakers.get(validator)
+            .map(|s| s.staked_amount)
+            .unwrap_or(Decimal::ZERO);
+        own
     }
 
     // ── Slashing ──────────────────────────────────────────────────────────
@@ -853,6 +1080,7 @@ impl StakingPool {
         let mut pool = StakingPool::new();
         let mut stake_count = 0u64;
         let mut unstake_count = 0u64;
+        let mut delegate_count = 0u64;
 
         for block in blocks {
             for tx in &block.transactions {
@@ -867,15 +1095,25 @@ impl StakingPool {
                             unstake_count += 1;
                         }
                     }
+                    TxType::Delegate => {
+                        if pool.delegate(&tx.from, &tx.to, tx.amount, 70).is_ok() {
+                            delegate_count += 1;
+                        }
+                    }
+                    TxType::Undelegate => {
+                        if pool.request_undelegate(&tx.from, &tx.to, tx.amount).is_ok() {
+                            delegate_count += 1;
+                        }
+                    }
                     _ => {}
                 }
             }
         }
 
-        if stake_count > 0 || unstake_count > 0 {
+        if stake_count > 0 || unstake_count > 0 || delegate_count > 0 {
             println!(
-                "[staking] 🔄 Pool aus Chain rebuilt: {} Stakes, {} Unstakes, {} Staker, {} STONE",
-                stake_count, unstake_count, pool.stakers.len(), pool.total_staked,
+                "[staking] 🔄 Pool aus Chain rebuilt: {} Stakes, {} Unstakes, {} Delegations, {} Staker, {} STONE",
+                stake_count, unstake_count, delegate_count, pool.stakers.len(), pool.total_staked,
             );
             if let Err(e) = pool.persist() {
                 eprintln!("[staking] ⚠️  Pool-Persist nach Rebuild: {e}");

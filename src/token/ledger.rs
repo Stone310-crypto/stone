@@ -739,7 +739,8 @@ impl TokenLedger {
         if !self.replay_mode
             && (tx.tx_type == TxType::Transfer || tx.tx_type == TxType::Burn || tx.tx_type == TxType::RotateKey
             || tx.tx_type == TxType::AccountRegister || tx.tx_type == TxType::AccountUpdate
-            || tx.tx_type == TxType::Stake || tx.tx_type == TxType::Unstake)
+            || tx.tx_type == TxType::Stake || tx.tx_type == TxType::Unstake
+            || tx.tx_type == TxType::Delegate || tx.tx_type == TxType::Undelegate)
         {
             // Prüfen ob der Key durch Rotation invalidiert wurde
             if let Some(active) = self.resolve_active_key(&tx.from) {
@@ -882,12 +883,89 @@ impl TokenLedger {
                 // Eternal Memorial TX – keine Balance-Änderung, nur Präsenz im Block
             }
             TxType::ChatMessage => {
-                // Verschlüsselte Chat-Nachricht – keine Balance-Änderung.
-                // ChatMessages nehmen NICHT am Nonce-Sequenzsystem teil:
-                // Sie überspringen die Nonce-Validierung (damit Nodes mit
-                // veraltetem Ledger-Stand chatten können), daher dürfen
-                // sie die Nonce auch nicht inkrementieren — sonst entstehen
-                // Lücken für Transfer-TXs die auf die gleiche Nonce angewiesen sind.
+                // Chat-Nachricht: Gebühr von 0.0001 STONE wird vom Sender abgezogen.
+                // Die Gebühr geht an die verarbeitende Node (über den Fee-Split).
+                // Onboarding-Wallets (gesperrt) dürfen Chat-Fees bezahlen.
+                let msg_fee = Decimal::new(1, 4); // 0.0001 STONE
+                let sender_balance = self.balance(&tx.from);
+                let locked_addr = format!("locked:{}", tx.from);
+                let locked_balance = self.balance(&locked_addr);
+
+                if sender_balance >= msg_fee {
+                    // Freie Balance zuerst belasten
+                    *self.balances.entry(tx.from.clone()).or_insert(Decimal::ZERO) -= msg_fee;
+                    self.apply_fee_split(msg_fee);
+                } else if locked_balance >= msg_fee {
+                    // Onboarding-Guthaben verwenden (gesperrte Coins nur für Msg-Fees)
+                    *self.balances.entry(locked_addr).or_insert(Decimal::ZERO) -= msg_fee;
+                    self.apply_fee_split(msg_fee);
+                }
+                // Kein Nonce-Inkrement: ChatMessages überspringen die Nonce-Validierung
+                // damit Nodes mit veraltetem Ledger-Stand chatten können.
+            }
+            TxType::Onboard => {
+                // Onboarding: 0.5 STONE aus pool:onboarding → neue Wallet (gesperrt).
+                // Gesperrte Coins können NUR für Message-Fees verwendet werden.
+                let pool_addr = "pool:onboarding";
+                let pool_balance = self.balance(pool_addr);
+                if pool_balance < tx.amount {
+                    return Err(LedgerError::InsufficientBalance {
+                        account: pool_addr.to_string(),
+                        available: pool_balance,
+                        required: tx.amount,
+                    });
+                }
+                *self.balances.entry(pool_addr.to_string()).or_insert(Decimal::ZERO) -= tx.amount;
+                // Auf eine gesperrte Adresse gutschreiben (locked:{wallet})
+                let locked_addr = format!("locked:{}", tx.to);
+                *self.balances.entry(locked_addr).or_insert(Decimal::ZERO) += tx.amount;
+                println!(
+                    "[token] 🎁 Onboard: {} STONE → {} (gesperrt, nur für Message-Fees)",
+                    tx.amount, &tx.to[..16.min(tx.to.len())]
+                );
+            }
+            TxType::Delegate => {
+                // Delegation: Coins von Delegator an eine Validator-Node delegieren.
+                // Coins gehen auf pool:staking, werden aber dem Validator zugeordnet.
+                let total_debit = tx.amount + tx.fee;
+                let balance = self.balance(&tx.from);
+                if balance < total_debit {
+                    return Err(LedgerError::InsufficientBalance {
+                        account: tx.from.clone(),
+                        available: balance,
+                        required: total_debit,
+                    });
+                }
+                *self.balances.entry(tx.from.clone()).or_insert(Decimal::ZERO) -= total_debit;
+                *self.balances.entry(super::staking::STAKING_POOL_ADDRESS.to_string())
+                    .or_insert(Decimal::ZERO) += tx.amount;
+                if tx.fee > Decimal::ZERO {
+                    self.apply_fee_split(tx.fee);
+                }
+                self.advance_nonce(&tx.from, tx.nonce);
+            }
+            TxType::Undelegate => {
+                // Undelegation: Delegation zurückziehen → 7-Tage Escrow.
+                let pool_balance = self.balance(super::staking::STAKING_POOL_ADDRESS);
+                if pool_balance < tx.amount {
+                    return Err(LedgerError::InsufficientBalance {
+                        account: super::staking::STAKING_POOL_ADDRESS.to_string(),
+                        available: pool_balance,
+                        required: tx.amount,
+                    });
+                }
+                *self.balances.entry(super::staking::STAKING_POOL_ADDRESS.to_string())
+                    .or_insert(Decimal::ZERO) -= tx.amount;
+                if tx.fee > Decimal::ZERO {
+                    let balance = self.balance(&tx.from);
+                    if balance >= tx.fee {
+                        *self.balances.entry(tx.from.clone()).or_insert(Decimal::ZERO) -= tx.fee;
+                        self.apply_fee_split(tx.fee);
+                    }
+                }
+                *self.balances.entry(format!("escrow:unstake:{}", tx.from))
+                    .or_insert(Decimal::ZERO) += tx.amount;
+                self.advance_nonce(&tx.from, tx.nonce);
             }
         }
 
@@ -1464,28 +1542,34 @@ impl TokenLedger {
         }
     }
 
-    /// Interne Fee-Split-Logik: 50% burn, 30% Validator, 20% Node-Operator-Pool.
+    /// Interne Fee-Split-Logik: 40% Miner, 30% Staker-Pool, 20% burn, 10% Node-Operator-Pool.
     fn apply_fee_split(&mut self, fee: Decimal) {
-        let (burn, validator_share, pool_share) = super::reputation::split_fee(fee);
+        let (burn, miner_share, staker_share, pool_share) = super::reputation::split_fee(fee);
 
-        // 50% verbrennen
+        // 20% verbrennen (Deflation)
         if burn > Decimal::ZERO {
             self.total_supply -= burn;
             self.total_fees_burned += burn;
         }
 
-        // 30% → aktueller Block-Validator
-        if validator_share > Decimal::ZERO {
+        // 40% → Block-Miner (aktueller Validator)
+        if miner_share > Decimal::ZERO {
             if let Some(ref vw) = self.current_block_validator {
-                *self.balances.entry(vw.clone()).or_insert(Decimal::ZERO) += validator_share;
+                *self.balances.entry(vw.clone()).or_insert(Decimal::ZERO) += miner_share;
             } else {
-                // Kein Validator bekannt → auch verbrennen
-                self.total_supply -= validator_share;
-                self.total_fees_burned += validator_share;
+                // Kein Validator bekannt → verbrennen
+                self.total_supply -= miner_share;
+                self.total_fees_burned += miner_share;
             }
         }
 
-        // 20% → Node-Operator-Pool
+        // 30% → Staker-Fee-Pool (wird proportional nach Stake verteilt)
+        if staker_share > Decimal::ZERO {
+            *self.balances.entry(super::reputation::STAKER_FEE_POOL.to_string())
+                .or_insert(Decimal::ZERO) += staker_share;
+        }
+
+        // 10% → Node-Operator-Pool (Reputation-gewichtet verteilt)
         if pool_share > Decimal::ZERO {
             *self.balances.entry(super::reputation::NODE_OPERATOR_POOL.to_string())
                 .or_insert(Decimal::ZERO) += pool_share;

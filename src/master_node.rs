@@ -516,6 +516,10 @@ pub struct MasterNodeState {
     /// Aktuelles Mining-Template (für externe Miner).
     /// Enthält einen vorbereiteten Block ohne PoW-Lösung.
     pub current_mining_template: RwLock<Option<(MiningTemplate, Block)>>,
+    /// Governance: Trusted Node Registry, Proposals, Dual-Voting, Multisig
+    pub governance: RwLock<crate::token::GovernanceStore>,
+    /// Gaming-Economy: Game-Wallets, NFT-Items, Marktplatz, Sessions
+    pub game_economy: RwLock<crate::token::GameEconomyStore>,
 }
 
 #[derive(Default)]
@@ -690,6 +694,8 @@ impl MasterNodeState {
             block_broadcast_tx: Mutex::new(None),
             equivocation_tracker: Mutex::new(EquivocationTracker::new()),
             current_mining_template: RwLock::new(None),
+            governance: RwLock::new(crate::token::GovernanceStore::load()),
+            game_economy: RwLock::new(crate::token::GameEconomyStore::load()),
         });
 
         // Nach Restart: Prüfen ob die lokale Chain aktuell genug ist.
@@ -1111,6 +1117,22 @@ impl MasterNodeState {
                 TxType::Unstake => {
                     if let Err(e) = pool.request_unstake(&tx.from, tx.amount) {
                         eprintln!("[staking] Unstake fehlgeschlagen für {}: {e}", &tx.from[..12.min(tx.from.len())]);
+                    } else {
+                        changed = true;
+                    }
+                }
+                TxType::Delegate => {
+                    // Default-Split: 70% Delegator / 30% Validator
+                    let split_pct = 70u8;
+                    if let Err(e) = pool.delegate(&tx.from, &tx.to, tx.amount, split_pct) {
+                        eprintln!("[staking] Delegate fehlgeschlagen für {}: {e}", &tx.from[..12.min(tx.from.len())]);
+                    } else {
+                        changed = true;
+                    }
+                }
+                TxType::Undelegate => {
+                    if let Err(e) = pool.request_undelegate(&tx.from, &tx.to, tx.amount) {
+                        eprintln!("[staking] Undelegate fehlgeschlagen für {}: {e}", &tx.from[..12.min(tx.from.len())]);
                     } else {
                         changed = true;
                     }

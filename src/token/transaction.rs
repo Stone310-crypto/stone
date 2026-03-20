@@ -66,6 +66,19 @@ pub enum TxType {
     /// `from` = Sender-Wallet, `to` = Empfänger-Wallet, `amount` = 0,
     /// `memo` = JSON: {"msg_id":"…","encrypted":"…","nonce":"…"}
     ChatMessage,
+    /// Onboarding: 0.5 STONE aus pool:onboarding → neue Wallet (gesperrt).
+    /// Gesperrte Coins können NUR für Message-Fees (0.0001 STONE) verwendet werden.
+    /// `from` = "pool:onboarding", `to` = Empfänger-Wallet, `amount` = 0.5
+    Onboard,
+    /// Delegation: Coins an eine Validator-Node delegieren (Split-Validator).
+    /// Delegator stellt Kapital, Node-Betreiber die Infrastruktur.
+    /// Fee-Rewards werden nach vereinbartem Split geteilt.
+    /// `from` = Delegator-Wallet, `to` = Validator-Wallet, `amount` = Delegationsbetrag
+    /// `memo` = JSON: {"validator":"<pubkey>","split_pct":<0-100>}
+    Delegate,
+    /// Undelegation: Delegation zurückziehen → 7-Tage Escrow.
+    /// `from` = Delegator-Wallet, `to` = Validator-Wallet, `amount` = Betrag
+    Undelegate,
 }
 
 // ─── Fee-Tier ────────────────────────────────────────────────────────────────
@@ -135,6 +148,9 @@ impl std::fmt::Display for TxType {
             TxType::Unstake         => write!(f, "unstake"),
             TxType::Memorial        => write!(f, "memorial"),
             TxType::ChatMessage     => write!(f, "chat_message"),
+            TxType::Onboard         => write!(f, "onboard"),
+            TxType::Delegate        => write!(f, "delegate"),
+            TxType::Undelegate      => write!(f, "undelegate"),
         }
     }
 }
@@ -290,10 +306,13 @@ pub fn create_signed_tx(
         if amount != Decimal::ZERO {
             return Err(TxError::InvalidAmount(format!("{tx_type}: Betrag muss 0 sein")));
         }
-    } else if tx_type == TxType::Stake || tx_type == TxType::Unstake {
-        // Stake/Unstake: amount muss positiv sein, to wird auf pool:staking gesetzt
+    } else if tx_type == TxType::Stake || tx_type == TxType::Unstake
+        || tx_type == TxType::Delegate || tx_type == TxType::Undelegate
+        || tx_type == TxType::Onboard
+    {
+        // Stake/Unstake/Delegate/Undelegate/Onboard: amount muss positiv sein
         if amount <= Decimal::ZERO {
-            return Err(TxError::InvalidAmount("Stake-Betrag muss positiv sein".into()));
+            return Err(TxError::InvalidAmount("Betrag muss positiv sein".into()));
         }
     } else if amount <= Decimal::ZERO {
         return Err(TxError::InvalidAmount("Betrag muss positiv sein".into()));
@@ -351,9 +370,14 @@ pub fn verify_tx_signature(tx: &TokenTx) -> Result<(), TxError> {
         return Ok(());
     }
 
-    // Pool-Konten (pool:community, pool:staking, etc.) haben keine privaten Schlüssel.
-    // Transfers von Pool-Konten werden nur serverseitig erstellt (z.B. Faucet).
+    // Pool-Konten (pool:community, pool:staking, pool:onboarding, etc.) haben keine privaten Schlüssel.
+    // Transfers von Pool-Konten werden nur serverseitig erstellt (z.B. Faucet, Onboarding).
     if tx.from.starts_with("pool:") {
+        return Ok(());
+    }
+
+    // Onboard-Transaktionen: System-TX, keine User-Signatur
+    if tx.tx_type == TxType::Onboard {
         return Ok(());
     }
 
@@ -362,10 +386,12 @@ pub fn verify_tx_signature(tx: &TokenTx) -> Result<(), TxError> {
         return Ok(());
     }
 
-    // Stake/Unstake: Diese TXs werden serverseitig nach User-Authentifizierung
+    // Stake/Unstake/Delegate/Undelegate: Diese TXs werden serverseitig nach User-Authentifizierung
     // (Bearer + FaceID/TOTP) erstellt und mit dem Validator-Key signiert.
     // Die Memo enthält den Validator-PubKey zur Verifikation.
-    if tx.tx_type == TxType::Stake || tx.tx_type == TxType::Unstake {
+    if tx.tx_type == TxType::Stake || tx.tx_type == TxType::Unstake
+        || tx.tx_type == TxType::Delegate || tx.tx_type == TxType::Undelegate
+    {
         // Validator-PubKey aus Memo extrahieren
         let validator_pubkey = if let Ok(memo) = serde_json::from_str::<serde_json::Value>(&tx.memo) {
             memo.get("validator").and_then(|v| v.as_str()).map(|s| s.to_string())
@@ -461,9 +487,12 @@ pub fn validate_tx(tx: &TokenTx) -> Result<(), TxError> {
         if tx.amount != Decimal::ZERO {
             return Err(TxError::InvalidAmount(format!("{}: Betrag muss 0 sein", tx.tx_type)));
         }
-    } else if tx.tx_type == TxType::Stake || tx.tx_type == TxType::Unstake {
+    } else if tx.tx_type == TxType::Stake || tx.tx_type == TxType::Unstake
+        || tx.tx_type == TxType::Delegate || tx.tx_type == TxType::Undelegate
+        || tx.tx_type == TxType::Onboard
+    {
         if tx.amount <= Decimal::ZERO {
-            return Err(TxError::InvalidAmount("Stake-Betrag muss positiv sein".into()));
+            return Err(TxError::InvalidAmount("Betrag muss positiv sein".into()));
         }
     } else if tx.amount <= Decimal::ZERO {
         return Err(TxError::InvalidAmount("Betrag muss positiv sein".into()));

@@ -4,13 +4,13 @@
 //!
 //! ## Supply-Verteilung (50.000.000 STONE)
 //!
-//! | Pool            | Anteil | STONE      | Vesting         |
-//! |-----------------|--------|------------|-----------------|
-//! | Storage Rewards | 60%    | 30.000.000 | ~10 Jahre Emission |
-//! | Treasury / Dev  | 15%    |  7.500.000 | 3 Jahre linear   |
-//! | Community       | 10%    |  5.000.000 | Sofort           |
-//! | Founders        | 10%    |  5.000.000 | 4 Jahre linear   |
-//! | Liquidity       |  5%    |  2.500.000 | Sofort           |
+//! | Pool             | Anteil | STONE      | Vesting         |
+//! |------------------|--------|------------|-------------------|
+//! | Storage Rewards  | 60%    | 30.000.000 | ~10 Jahre Emission |
+//! | Treasury / Dev   | 15%    |  7.500.000 | 3 Jahre linear    |
+//! | Onboarding       | 10%    |  5.000.000 | Sofort (gesperrt)  |
+//! | Founders         | 10%    |  5.000.000 | 4 Jahre linear    |
+//! | Liquidity        |  5%    |  2.500.000 | Sofort            |
 //!
 //! ## Netzwerk-Modus
 //!
@@ -132,9 +132,9 @@ impl GenesisConfig {
                 vesting_months: 0, // Testnet: kein Vesting
             },
             GenesisAllocation {
-                address: "pool:community".into(),
-                amount: total * Decimal::new(10, 2), // 10%
-                label: "Community Fund".into(),
+                address: "pool:onboarding".into(),
+                amount: total * Decimal::new(10, 2), // 10% = 5.000.000 STONE
+                label: "Onboarding Pool (0.5 STONE/User, gesperrt)".into(),
                 vesting_months: 0,
             },
             GenesisAllocation {
@@ -170,9 +170,9 @@ impl GenesisConfig {
                 vesting_months: 36, // 3 Jahre
             },
             GenesisAllocation {
-                address: "pool:community".into(),
+                address: "pool:onboarding".into(),
                 amount: total * Decimal::new(10, 2),
-                label: "Community Fund".into(),
+                label: "Onboarding Pool (0.5 STONE/User, gesperrt)".into(),
                 vesting_months: 0,
             },
             GenesisAllocation {

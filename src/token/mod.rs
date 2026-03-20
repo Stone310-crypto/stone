@@ -10,7 +10,9 @@
 //! - `mempool`     – Thread-safe TX-Queue für Block-Integration
 //! - `wallet`      – Ed25519 Wallet: Keypair-Gen, Mnemonic-Recovery, TX-Signierung
 
+pub mod game_economy;
 pub mod genesis;
+pub mod governance;
 pub mod ledger;
 pub mod mempool;
 pub mod reputation;
@@ -20,6 +22,8 @@ pub mod wallet;
 
 // Re-exports für bequemen Zugriff
 pub use genesis::{apply_genesis, GenesisConfig, NetworkMode, SupplyInfo};
+pub use game_economy::{GameEconomyStore, GameEconomyError, GameItem, GameWallet, MarketListing, SdkSession, GamePermission, RegisteredGame, ConsentRequest, AuditLogEntry};
+pub use governance::{GovernanceStore, GovernanceInfo, GovernanceError, Proposal, ProposalCategory, ProposalStatus, TrustedNode, TrustedNodeStatus};
 pub use ledger::{AccountInfo, LedgerError, TokenLedger, TxReceipt, VestingSchedule};
 pub use mempool::{Mempool, MempoolError, MempoolStats};
 pub use reputation::{ReputationRegistry, ReputationSummary, NodeReputationInfo};

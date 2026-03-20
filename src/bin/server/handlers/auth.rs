@@ -89,7 +89,7 @@ pub async fn handle_signup(
                 "api_key_hash": api_key_hash,
             }).to_string();
 
-            if let Ok(tx) = stone::token::create_signed_tx(
+            if let Ok(mut tx) = stone::token::create_signed_tx(
                 &signing_key,
                 stone::token::TxType::AccountRegister,
                 wallet.clone(),
@@ -99,6 +99,8 @@ pub async fn handle_signup(
                 nonce,
                 memo,
             ) {
+                // Priority damit der TX sofort in den nächsten Block kommt
+                tx.fee_tier = stone::token::transaction::FeeTier::Priority;
                 // Direkt in den nächsten Block aufnehmen (via Mempool)
                 if let Err(e) = node.mempool.add_tx(tx.clone(), None) {
                     eprintln!("[auth] AccountRegister TX → Mempool fehlgeschlagen: {e}");
@@ -284,7 +286,7 @@ pub async fn handle_login(
                             "name": user_name,
                             "api_key_hash": api_key_hash,
                         }).to_string();
-                        if let Ok(tx) = stone::token::create_signed_tx(
+                        if let Ok(mut tx) = stone::token::create_signed_tx(
                             &signing_key,
                             stone::token::TxType::AccountRegister,
                             w.clone(),
@@ -294,6 +296,7 @@ pub async fn handle_login(
                             nonce,
                             memo,
                         ) {
+                            tx.fee_tier = stone::token::transaction::FeeTier::Priority;
                             if let Err(e) = node.mempool.add_tx(tx.clone(), None) {
                                 eprintln!("[auth] Auto-Register TX fehlgeschlagen für {user_name}: {e}");
                             } else {
@@ -308,11 +311,106 @@ pub async fn handle_login(
 
         return (StatusCode::OK, axum::Json(resp));
     }
+
+    // ── Fallback: Wallet aus Phrase ableiten (bestehende Wallet ohne lokalen User) ──
+    let wallet_addr = stone::auth::wallet_address_from_phrase(&req.phrase);
+    if !wallet_addr.is_empty() {
+        // Prüfe ob die Wallet on-chain existiert (Balance > 0 oder AccountRegister TX)
+        let (is_on_chain, chain_name) = {
+            let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
+            let registered = ledger.all_registered_accounts();
+            if let Some(name) = registered.get(&wallet_addr) {
+                (true, name.clone())
+            } else if ledger.balance(&wallet_addr) > rust_decimal::Decimal::ZERO {
+                (true, String::new())
+            } else {
+                (false, String::new())
+            }
+        };
+
+        let display_name = if !chain_name.is_empty() {
+            chain_name
+        } else {
+            format!("Wallet-{}", &wallet_addr[..8])
+        };
+
+        // User-Eintrag erstellen und speichern
+        let new_id = format!("u-{}", uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("0000"));
+        let new_user = stone::auth::User {
+            id: new_id.clone(),
+            name: display_name.clone(),
+            api_key: hash.clone(),
+            phrase_hash: hash,
+            quota_bytes: stone::auth::default_quota_bytes(),
+            wallet_address: wallet_addr.clone(),
+            account_type: stone::auth::default_account_type(),
+            org_id: String::new(),
+            org_role: String::new(),
+        };
+        users.push(new_user);
+        save_users(&users);
+
+        let resp = json!({
+            "id": new_id,
+            "name": display_name,
+            "api_key": users.last().map(|u| &u.api_key).unwrap(),
+            "wallet_address": wallet_addr,
+        });
+
+        println!("[auth] 🔗 Bestehende Wallet verknüpft: {} (on-chain: {})", &wallet_addr[..16], is_on_chain);
+
+        // Auto-Register on-chain falls nötig
+        if !is_on_chain {
+            let user_name = display_name;
+            let api_key_hash = users.last().map(|u| u.api_key.clone()).unwrap_or_default();
+            let node = state.node.clone();
+            let phrase = req.phrase.clone();
+            let w = wallet_addr.clone();
+            tokio::spawn(async move {
+                if let Ok(mnemonic) = bip39::Mnemonic::parse_in(bip39::Language::English, &phrase) {
+                    let entropy = mnemonic.to_entropy();
+                    let key_bytes: [u8; 32] = if entropy.len() == 32 {
+                        entropy.try_into().unwrap()
+                    } else {
+                        use sha2::{Digest, Sha256};
+                        let hash: [u8; 32] = Sha256::digest(&entropy).into();
+                        hash
+                    };
+                    let signing_key = ed25519_dalek::SigningKey::from_bytes(&key_bytes);
+                    let nonce = {
+                        let ledger = node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
+                        let base = ledger.nonce(&w);
+                        base + node.mempool.sender_pending_count(&w)
+                    };
+                    let memo = serde_json::json!({
+                        "name": user_name,
+                        "api_key_hash": api_key_hash,
+                    }).to_string();
+                    if let Ok(mut tx) = stone::token::create_signed_tx(
+                        &signing_key,
+                        stone::token::TxType::AccountRegister,
+                        w.clone(),
+                        w.clone(),
+                        rust_decimal::Decimal::ZERO,
+                        rust_decimal::Decimal::ZERO,
+                        nonce,
+                        memo,
+                    ) {
+                        tx.fee_tier = stone::token::transaction::FeeTier::Priority;
+                        let _ = node.mempool.add_tx(tx, None);
+                    }
+                }
+            });
+        }
+
+        return (StatusCode::OK, axum::Json(resp));
+    }
+
     drop(users);
     (
         StatusCode::NOT_FOUND,
         axum::Json(
-            json!({"error": "Phrase nicht bekannt – bitte zuerst registrieren"}),
+            json!({"error": "Ungültige Phrase"}),
         ),
     )
 }

@@ -3,6 +3,7 @@
 pub mod audio_relay;
 pub mod auth;
 pub mod blocks;
+pub mod game;
 pub mod calls;
 pub mod chat;
 pub mod chat_policy;

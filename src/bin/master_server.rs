@@ -89,7 +89,7 @@ async fn main() {
 
     // ── Bootstrap-Nodes laden ─────────────────────────────────────────────────
     // Quellen (in Priorität):
-    //   1) STONE_BOOTSTRAP_NODES env (komma-separiert: "http://1.2.3.4:8080,http://5.6.7.8:8080")
+    //   1) STONE_BOOTSTRAP_NODES env (komma-separiert: "http://1.2.3.4:3080,http://5.6.7.8:3080")
     //   2) node_config.json → "bootstrap_nodes": ["http://..."]
     // Bootstrap-Nodes werden als Peers hinzugefügt (falls nicht schon vorhanden)
     {
@@ -449,7 +449,7 @@ async fn main() {
                                             let http_port = std::env::var("STONE_PORT")
                                                 .ok()
                                                 .and_then(|v| v.parse::<u16>().ok())
-                                                .unwrap_or(8080);
+                                                .unwrap_or(3080);
                                             // Eigene öffentliche IP ermitteln, um Resync-an-sich-selbst zu vermeiden
                                             let own_public_ip = std::env::var("STONE_PUBLIC_IP").unwrap_or_default();
                                             let mut resolved_url: Option<String> = None;
@@ -582,7 +582,7 @@ async fn main() {
                                     let http_port = std::env::var("STONE_PORT")
                                         .ok()
                                         .and_then(|v| v.parse::<u16>().ok())
-                                        .unwrap_or(8080);
+                                        .unwrap_or(3080);
                                     let mut ip: Option<String> = None;
                                     for addr in &addresses {
                                         let parts: Vec<&str> = addr.split('/').collect();
@@ -1013,7 +1013,7 @@ async fn main() {
         .or_else(|_| std::env::var("STONE_PORT"))
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(8080);
+        .unwrap_or(3080);
 
     // ── Public Sync Port (kein Auth, für Node-zu-Node Kommunikation) ─────
     let sync_port: u16 = std::env::var("STONE_SYNC_PORT")

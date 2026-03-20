@@ -13,7 +13,7 @@ use super::super::auth_middleware::require_user;
 use super::super::state::AppState;
 
 use stone::consensus::{load_or_create_validator_key, local_validator_pubkey_hex};
-use stone::token::transaction::{create_signed_tx, TxType};
+use stone::token::transaction::{create_signed_tx, FeeTier, TxType};
 
 // ─── Request-Typen ────────────────────────────────────────────────────────────
 
@@ -345,7 +345,7 @@ pub async fn handle_mining_withdraw(
         nonce,
         memo,
     ) {
-        Ok(tx) => tx,
+        Ok(mut tx) => { tx.fee_tier = FeeTier::Priority; tx }
         Err(e) => return (
             StatusCode::INTERNAL_SERVER_ERROR,
             axum::Json(json!({
@@ -470,7 +470,7 @@ pub async fn handle_mining_stake(
         nonce,
         stake_memo,
     ) {
-        Ok(tx) => tx,
+        Ok(mut tx) => { tx.fee_tier = FeeTier::Priority; tx }
         Err(e) => return (
             StatusCode::INTERNAL_SERVER_ERROR,
             axum::Json(json!({ "ok": false, "error": format!("TX-Erstellung: {e}") })),
@@ -595,7 +595,7 @@ pub async fn handle_mining_unstake(
         nonce,
         unstake_memo,
     ) {
-        Ok(tx) => tx,
+        Ok(mut tx) => { tx.fee_tier = FeeTier::Priority; tx }
         Err(e) => return (
             StatusCode::INTERNAL_SERVER_ERROR,
             axum::Json(json!({ "ok": false, "error": format!("TX-Erstellung: {e}") })),

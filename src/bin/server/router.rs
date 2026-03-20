@@ -87,6 +87,39 @@ use super::handlers::{
         handle_update_chunk, handle_update_config, handle_update_download,
         handle_update_install, handle_update_publish, handle_update_status,
     },
+    game::{
+        // SDK Developer
+        handle_sdk_register, handle_sdk_quick_register,
+        handle_sdk_game_info, handle_sdk_game_status,
+        // SDK Consent
+        handle_sdk_consent_request, handle_sdk_consent_pending,
+        handle_sdk_consent_approve, handle_sdk_consent_reject,
+        // SDK Wallet
+        handle_sdk_wallet_create, handle_sdk_wallet_link, handle_sdk_wallet_balance,
+        handle_sdk_wallet_transactions, handle_sdk_wallet_send,
+        handle_sdk_wallet_withdraw, handle_sdk_nft_inventory,
+        handle_sdk_wallet_freeze, handle_sdk_wallet_unfreeze,
+        handle_sdk_wallet_set_limit,
+        // SDK TX
+        handle_sdk_buy_item, handle_sdk_sell_item, handle_sdk_transfer,
+        handle_sdk_batch_tx, handle_sdk_tx_status,
+        // SDK Market
+        handle_sdk_market_listings, handle_sdk_market_list,
+        handle_sdk_market_delist, handle_sdk_market_offer,
+        handle_sdk_market_history, handle_sdk_market_floor,
+        // SDK Game
+        handle_sdk_game_reward, handle_sdk_game_burn,
+        handle_sdk_game_leaderboard, handle_sdk_tournament_prize,
+        // SDK Auth
+        handle_sdk_link_wallet, handle_sdk_session, handle_sdk_revoke,
+        handle_sdk_permissions, handle_sdk_audit_log,
+        // SDK Player Dashboard
+        handle_sdk_player_wallets, handle_sdk_player_activity,
+        // SDK Developer Dashboard
+        handle_sdk_developer_dashboard,
+        // SDK Shop
+        handle_sdk_shop_buy, handle_sdk_shop_create_item, handle_sdk_shop_catalog,
+    },
     reputation::{
         handle_reputation_status, handle_reputation_nodes, handle_reputation_node,
     },
@@ -338,7 +371,64 @@ pub fn build_router(state: AppState) -> Router {
         // ─── Snapshots (Fast Sync) ──────────────────────────────────────────
         .route("/api/v1/snapshot/meta", get(handle_snapshot_meta))
         .route("/api/v1/snapshot/download", get(handle_snapshot_download))
-        .route("/api/v1/snapshot/create", post(handle_snapshot_create))        .route("/api/v1/snapshot/state_root", get(handle_snapshot_state_root))        .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
+        .route("/api/v1/snapshot/create", post(handle_snapshot_create))
+        .route("/api/v1/snapshot/state_root", get(handle_snapshot_state_root))
+        // ─── SDK ────────────────────────────────────────────────────────────
+        // Developer
+        .route("/api/v1/sdk/register", post(handle_sdk_register))
+        .route("/api/v1/sdk/quick-register", post(handle_sdk_quick_register))
+        .route("/api/v1/sdk/game/{game_id}", get(handle_sdk_game_info))
+        .route("/api/v1/sdk/game/{game_id}/status", post(handle_sdk_game_status))
+        // Consent
+        .route("/api/v1/sdk/consent/request", post(handle_sdk_consent_request))
+        .route("/api/v1/sdk/consent/pending", get(handle_sdk_consent_pending))
+        .route("/api/v1/sdk/consent/approve", post(handle_sdk_consent_approve))
+        .route("/api/v1/sdk/consent/reject", post(handle_sdk_consent_reject))
+        // Wallet
+        .route("/api/v1/sdk/wallet/create", post(handle_sdk_wallet_create))
+        .route("/api/v1/sdk/wallet/link", post(handle_sdk_wallet_link))
+        .route("/api/v1/sdk/wallet/balance", get(handle_sdk_wallet_balance))
+        .route("/api/v1/sdk/wallet/transactions", get(handle_sdk_wallet_transactions))
+        .route("/api/v1/sdk/wallet/send", post(handle_sdk_wallet_send))
+        .route("/api/v1/sdk/wallet/withdraw", post(handle_sdk_wallet_withdraw))
+        .route("/api/v1/sdk/wallet/nft-inventory", get(handle_sdk_nft_inventory))
+        .route("/api/v1/sdk/wallet/freeze", post(handle_sdk_wallet_freeze))
+        .route("/api/v1/sdk/wallet/unfreeze", post(handle_sdk_wallet_unfreeze))
+        .route("/api/v1/sdk/wallet/set-limit", post(handle_sdk_wallet_set_limit))
+        // TX
+        .route("/api/v1/sdk/tx/buy-item", post(handle_sdk_buy_item))
+        .route("/api/v1/sdk/tx/sell-item", post(handle_sdk_sell_item))
+        .route("/api/v1/sdk/tx/transfer", post(handle_sdk_transfer))
+        .route("/api/v1/sdk/tx/batch", post(handle_sdk_batch_tx))
+        .route("/api/v1/sdk/tx/status/{tx_id}", get(handle_sdk_tx_status))
+        // Market
+        .route("/api/v1/sdk/market/listings", get(handle_sdk_market_listings))
+        .route("/api/v1/sdk/market/list", post(handle_sdk_market_list))
+        .route("/api/v1/sdk/market/delist", post(handle_sdk_market_delist))
+        .route("/api/v1/sdk/market/offer", post(handle_sdk_market_offer))
+        .route("/api/v1/sdk/market/history/{item_id}", get(handle_sdk_market_history))
+        .route("/api/v1/sdk/market/floor/{category}", get(handle_sdk_market_floor))
+        // Game
+        .route("/api/v1/sdk/game/reward", post(handle_sdk_game_reward))
+        .route("/api/v1/sdk/game/burn", post(handle_sdk_game_burn))
+        .route("/api/v1/sdk/game/leaderboard", get(handle_sdk_game_leaderboard))
+        .route("/api/v1/sdk/game/tournament/prize", post(handle_sdk_tournament_prize))
+        // Auth
+        .route("/api/v1/sdk/auth/link-wallet", post(handle_sdk_link_wallet))
+        .route("/api/v1/sdk/auth/session", post(handle_sdk_session))
+        .route("/api/v1/sdk/auth/revoke", post(handle_sdk_revoke))
+        .route("/api/v1/sdk/auth/permissions", get(handle_sdk_permissions))
+        .route("/api/v1/sdk/auth/audit-log", get(handle_sdk_audit_log))
+        // Player Dashboard
+        .route("/api/v1/sdk/player/wallets", get(handle_sdk_player_wallets))
+        .route("/api/v1/sdk/player/activity", get(handle_sdk_player_activity))
+        // Developer Dashboard
+        .route("/api/v1/sdk/developer/dashboard", get(handle_sdk_developer_dashboard))
+        // In-Game Shop
+        .route("/api/v1/sdk/shop/catalog", get(handle_sdk_shop_catalog))
+        .route("/api/v1/sdk/shop/item", post(handle_sdk_shop_create_item))
+        .route("/api/v1/sdk/shop/buy", post(handle_sdk_shop_buy))
+        .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
         .layer(build_cors())
         .with_state(state)
 }
