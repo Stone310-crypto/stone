@@ -611,6 +611,18 @@ impl ContactRequestStore {
     pub fn find(&self, request_id: &str) -> Option<&ContactRequest> {
         self.requests.iter().find(|r| r.id == request_id)
     }
+
+    /// Alte abgeschlossene Anfragen bereinigen. Behält max `keep` erledigte Einträge.
+    pub fn gc_old_requests(&mut self, keep: usize) {
+        let (pending, mut done): (Vec<_>, Vec<_>) = self.requests
+            .drain(..)
+            .partition(|r| r.status == ContactRequestStatus::Pending);
+        // Neueste zuerst behalten
+        done.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        done.truncate(keep);
+        self.requests = pending;
+        self.requests.extend(done);
+    }
 }
 
 pub fn load_contact_requests() -> ContactRequestStore {
@@ -788,6 +800,9 @@ pub struct CallSignal {
 /// TTL für Call-Signaling-Nachrichten (60 Sekunden).
 const CALL_SIGNAL_TTL_SECS: i64 = 60;
 
+/// Maximale Signale pro Empfänger-Wallet (Anti-Flood).
+const MAX_SIGNALS_PER_WALLET: usize = 100;
+
 /// In-Memory Signal-Store: Kurzlebige Signaling-Nachrichten pro Wallet.
 ///
 /// Optimiert für hohe Concurrency (5.000+ gleichzeitige Anrufe):
@@ -807,10 +822,16 @@ impl Default for CallSignalStore {
 impl CallSignalStore {
     /// Signal hinzufügen.
     pub fn add_signal(&self, signal: CallSignal) {
-        self.signals
+        let mut entry = self.signals
             .entry(signal.to_wallet.clone())
-            .or_default()
-            .push(signal);
+            .or_default();
+        // Abgelaufene erst entfernen, dann Limit prüfen
+        let now = chrono::Utc::now().timestamp();
+        entry.retain(|s| now - s.timestamp < CALL_SIGNAL_TTL_SECS);
+        if entry.len() >= MAX_SIGNALS_PER_WALLET {
+            return; // Drop — Wallet hat zu viele pending Signale
+        }
+        entry.push(signal);
     }
 
     /// Alle Signale für eine Wallet abrufen und gleichzeitig bereinigen (TTL + drain).

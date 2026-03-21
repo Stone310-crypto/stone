@@ -2197,6 +2197,19 @@ struct TokenEconomyInfo {
     staker_count: usize,
     estimated_apy: f64,
     reward_pool_balance: f64,
+    // Staking-Details
+    fee_pool_balance: f64,
+    node_operator_pool_balance: f64,
+    your_stake: f64,
+    your_pending_rewards: f64,
+    your_stake_level: String,
+    your_total_rewards: f64,
+    validator_eligible_count: usize,
+    guardian_eligible_count: usize,
+    node_operator_fee_multiplier: f64,
+    total_delegated: f64,
+    epoch: u64,
+    epoch_length: u64,
 }
 
 #[derive(Serialize)]
@@ -2338,8 +2351,25 @@ async fn api_dashboard(State(state): State<SetupState>) -> Json<DashboardData> {
         let ledger = ns.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
         let supply = SupplyInfo::from_ledger(&ledger);
         let reward_pool = ledger.balance("pool:storage_rewards");
+        let fee_pool = ledger.balance(stone::token::reputation::STAKER_FEE_POOL);
+        let node_op_pool = ledger.balance(stone::token::reputation::NODE_OPERATOR_POOL);
         let staking = ns.node.staking_pool.read().unwrap_or_else(|e| e.into_inner());
         let pool_info = staking.pool_info(reward_pool);
+        let wallet = cfg.wallet_address.clone();
+        let (your_stake, your_pending, your_total, your_level) = if !wallet.is_empty() {
+            if let Some(info) = staking.staker_info(&wallet) {
+                (
+                    info.staked_amount.to_string().parse().unwrap_or(0.0),
+                    info.pending_rewards.to_string().parse().unwrap_or(0.0),
+                    info.total_rewards.to_string().parse().unwrap_or(0.0),
+                    info.stake_level.to_string(),
+                )
+            } else {
+                (0.0, 0.0, 0.0, "observer".to_string())
+            }
+        } else {
+            (0.0, 0.0, 0.0, "observer".to_string())
+        };
         TokenEconomyInfo {
             total_supply: supply.total_supply.to_string().parse().unwrap_or(0.0),
             max_supply: supply.max_supply.to_string().parse().unwrap_or(0.0),
@@ -2351,12 +2381,30 @@ async fn api_dashboard(State(state): State<SetupState>) -> Json<DashboardData> {
             staker_count: pool_info.staker_count,
             estimated_apy: pool_info.estimated_apy.to_string().parse().unwrap_or(0.0),
             reward_pool_balance: pool_info.reward_pool_balance.to_string().parse().unwrap_or(0.0),
+            fee_pool_balance: fee_pool.to_string().parse().unwrap_or(0.0),
+            node_operator_pool_balance: node_op_pool.to_string().parse().unwrap_or(0.0),
+            your_stake,
+            your_pending_rewards: your_pending,
+            your_stake_level: your_level,
+            your_total_rewards: your_total,
+            validator_eligible_count: pool_info.validator_eligible_count,
+            guardian_eligible_count: pool_info.guardian_eligible_count,
+            node_operator_fee_multiplier: stone::token::staking::NODE_OPERATOR_FEE_MULTIPLIER.parse().unwrap_or(1.5),
+            total_delegated: staking.total_delegated.to_string().parse().unwrap_or(0.0),
+            epoch: staking.current_epoch,
+            epoch_length: stone::token::staking::EPOCH_LENGTH,
         }
     } else {
         TokenEconomyInfo {
             total_supply: 0.0, max_supply: 50_000_000.0, circulating: 0.0, burned: 0.0,
             fees_burned: 0.0, accounts: 0, total_staked: 0.0, staker_count: 0,
             estimated_apy: 0.0, reward_pool_balance: 0.0,
+            fee_pool_balance: 0.0, node_operator_pool_balance: 0.0,
+            your_stake: 0.0, your_pending_rewards: 0.0,
+            your_stake_level: "observer".to_string(), your_total_rewards: 0.0,
+            validator_eligible_count: 0, guardian_eligible_count: 0,
+            node_operator_fee_multiplier: 1.5, total_delegated: 0.0,
+            epoch: 0, epoch_length: 720,
         }
     };
 

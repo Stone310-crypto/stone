@@ -311,6 +311,24 @@ impl ChatPolicyStore {
         }
     }
 
+    /// GC: Bereits gelöschte TTL-Einträge entfernen die älter als `max_age_secs` sind.
+    /// Verhindert dass `ttl_entries` unbegrenzt wächst.
+    /// Gibt die Anzahl entfernter Einträge zurück.
+    pub fn gc_purged_entries(&mut self, max_age_secs: i64) -> usize {
+        let cutoff = Utc::now().timestamp() - max_age_secs;
+        let before = self.ttl_entries.len();
+        self.ttl_entries.retain(|_, e| {
+            // Behalten wenn: noch nicht gelöscht, oder gelöscht aber noch jung genug
+            !e.content_purged || e.expires_at > cutoff
+        });
+        let removed = before - self.ttl_entries.len();
+        if removed > 0 {
+            println!("[chat-policy] 🧹 GC: {} alte TTL-Einträge entfernt, {} verbleibend",
+                removed, self.ttl_entries.len());
+        }
+        removed
+    }
+
     // ─── Report-Management ────────────────────────────────────────────────
 
     /// Neuen Report erstellen.
@@ -546,6 +564,9 @@ impl ChatPolicyStore {
             self.report_archive.drain(0..100);
         }
 
+        // Finalisierten Report aus der aktiven Map entfernen (nur Archiv behalten)
+        self.reports.remove(report_id);
+
         Some((accepted, msg_id, reported_wallet))
     }
 
@@ -575,7 +596,11 @@ impl ChatPolicyStore {
 
     /// Record Slash nach einem akzeptierten Report.
     pub fn record_slash(&mut self, report_id: &str, amount: Decimal) {
+        // Prüfe sowohl aktive Reports als auch Archiv
         if let Some(report) = self.reports.get_mut(report_id) {
+            report.slashed_amount = amount;
+            self.total_slashed += amount;
+        } else if let Some(report) = self.report_archive.iter_mut().rev().find(|r| r.report_id == report_id) {
             report.slashed_amount = amount;
             self.total_slashed += amount;
         }
@@ -595,7 +620,7 @@ impl ChatPolicyStore {
         self.ttl_entries.get(msg_id)
     }
 
-    /// Alle aktiven Reports auflistenr.
+    /// Alle aktiven Reports auflisten.
     pub fn active_reports(&self) -> Vec<&MessageReport> {
         self.reports.values()
             .filter(|r| r.status == ReportStatus::Pending)
@@ -750,6 +775,9 @@ pub fn gc_expired_messages(
             purged
         );
     }
+
+    // Periodisch alte gepurgte Einträge aufräumen (behalte 7 Tage nach Ablauf)
+    policy.gc_purged_entries(7 * 24 * 3600);
 
     purged
 }

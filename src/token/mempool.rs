@@ -367,13 +367,21 @@ impl Mempool {
     pub fn remove_tx(&self, tx_id: &str) {
         let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
         inner.queue.retain(|tx| tx.tx_id != tx_id);
+        inner.requeue_counts.remove(tx_id);
         // known_ids behalten für Duplikat-Schutz
     }
 
     /// Alle TXs eines bestimmten Senders entfernen (z.B. nach Nonce-Reset).
     pub fn remove_sender_txs(&self, sender: &str) {
         let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
+        let removed_ids: Vec<String> = inner.queue.iter()
+            .filter(|tx| tx.from == sender)
+            .map(|tx| tx.tx_id.clone())
+            .collect();
         inner.queue.retain(|tx| tx.from != sender);
+        for id in &removed_ids {
+            inner.requeue_counts.remove(id);
+        }
     }
 
     /// Anzahl der pending TXs.
@@ -388,7 +396,7 @@ impl Mempool {
     pub fn sender_pending_count(&self, sender: &str) -> u64 {
         self.inner
             .read()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .queue
             .iter()
             .filter(|tx| tx.from == sender)
@@ -414,8 +422,9 @@ impl Mempool {
     /// Reward/Mint/Memorial-TXs werden übersprungen.
     /// Bereits bekannte TXs (die im neuen Fork enthalten sind) werden nicht erneut aufgenommen.
     pub fn requeue_orphaned_txs(&self, orphaned_blocks: &[crate::blockchain::Block]) {
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
         let mut requeued = 0usize;
-        for block in orphaned_blocks {
+        'outer: for block in orphaned_blocks {
             for tx in &block.transactions {
                 if tx.tx_type == super::transaction::TxType::Reward
                     || tx.tx_type == super::transaction::TxType::Mint
@@ -423,13 +432,11 @@ impl Mempool {
                 {
                     continue;
                 }
-                let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
                 if inner.known_ids.contains(&tx.tx_id) {
-                    // Bereits bekannt (evtl. schon im neuen Fork bestätigt)
                     continue;
                 }
                 if inner.queue.len() >= MAX_MEMPOOL_SIZE {
-                    break;
+                    break 'outer;
                 }
                 inner.known_ids.insert(tx.tx_id.clone());
                 inner.queue.push_back(tx.clone());

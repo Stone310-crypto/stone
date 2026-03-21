@@ -10,21 +10,33 @@
   --bg:#0d1117;--card:#161b22;--border:#30363d;--accent:#58a6ff;
   --green:#3fb950;--red:#f85149;--orange:#d29922;--text:#e6edf3;
   --muted:#8b949e;--input-bg:#0d1117;--nav-bg:#010409;
+  --purple:#bc8cff;--cyan:#56d4dd;
 }
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;
   background:var(--bg);color:var(--text);min-height:100vh;margin:0}
 
+/* ─── Animations ─── */
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.6}}
+@keyframes glow{0%,100%{box-shadow:0 0 8px rgba(88,166,255,.08)}50%{box-shadow:0 0 20px rgba(88,166,255,.15)}}
+@keyframes slideUp{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
+@keyframes shimmer{from{background-position:200% 0}to{background-position:-200% 0}}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+@keyframes statusPulse{0%,100%{box-shadow:0 0 0 0 rgba(63,185,80,.4)}70%{box-shadow:0 0 0 8px rgba(63,185,80,0)}}
+
 /* ─── Navbar ─── */
 .navbar{background:var(--nav-bg);border-bottom:1px solid var(--border);padding:0 24px;
-  display:flex;align-items:center;height:56px;position:sticky;top:0;z-index:100}
+  display:flex;align-items:center;height:56px;position:sticky;top:0;z-index:100;
+  backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px)}
 .nav-logo{font-size:18px;font-weight:700;color:var(--accent);margin-right:32px;display:flex;align-items:center;gap:8px}
+.nav-logo .logo-icon{font-size:22px;filter:drop-shadow(0 0 6px rgba(88,166,255,.4))}
 .nav-links{display:flex;gap:4px}
 .nav-links button{background:none;border:none;color:var(--muted);font-size:14px;padding:8px 16px;
-  border-radius:6px;cursor:pointer;transition:all .2s;font-weight:500}
+  border-radius:6px;cursor:pointer;transition:all .2s;font-weight:500;position:relative}
 .nav-links button:hover{color:var(--text);background:var(--card)}
 .nav-links button.active{color:var(--text);background:var(--card)}
+.nav-links button.active::after{content:'';position:absolute;bottom:-1px;left:50%;transform:translateX(-50%);width:24px;height:2px;background:var(--accent);border-radius:1px}
 .nav-wallet{margin-left:auto;display:flex;align-items:center;gap:16px;font-size:13px}
-.nav-balance{color:var(--green);font-weight:700;font-size:15px}
+.nav-balance{color:var(--green);font-weight:700;font-size:15px;transition:color .3s}
 .nav-addr{color:var(--muted);font-family:monospace;font-size:11px;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 
 /* ─── Layout ─── */
@@ -32,39 +44,44 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,san
 .hidden{display:none!important}
 
 /* ─── Cards ─── */
-.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:28px;margin-bottom:20px}
+.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:28px;margin-bottom:20px;
+  transition:border-color .3s,box-shadow .3s;animation:slideUp .4s ease-out}
+.card:hover{border-color:rgba(88,166,255,.15);box-shadow:0 4px 24px rgba(0,0,0,.2)}
 .card h2{font-size:20px;margin-bottom:8px}
 .card p.sub{color:var(--muted);font-size:14px;margin-bottom:20px}
 label{display:block;font-size:13px;color:var(--muted);margin-bottom:6px;margin-top:16px}
 label:first-of-type{margin-top:0}
 input[type=text],input[type=password],input[type=number],textarea{
   width:100%;padding:10px 12px;background:var(--input-bg);border:1px solid var(--border);
-  border-radius:8px;color:var(--text);font-size:14px;outline:none;transition:border .2s}
-input:focus,textarea:focus{border-color:var(--accent)}
+  border-radius:8px;color:var(--text);font-size:14px;outline:none;transition:border .2s,box-shadow .2s}
+input:focus,textarea:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(88,166,255,.1)}
 textarea{resize:vertical;min-height:80px;font-family:monospace;font-size:13px}
 .btn{display:inline-block;padding:10px 24px;border:none;border-radius:8px;font-size:14px;
-  font-weight:600;cursor:pointer;transition:background .2s;text-align:center}
+  font-weight:600;cursor:pointer;transition:all .2s;text-align:center;position:relative;overflow:hidden}
+.btn::after{content:'';position:absolute;inset:0;background:linear-gradient(120deg,transparent 30%,rgba(255,255,255,.08) 50%,transparent 70%);
+  transform:translateX(-100%);transition:transform .5s}
+.btn:hover::after{transform:translateX(100%)}
 .btn-block{width:100%;margin-top:20px}
 .btn-primary{background:var(--accent);color:#fff}
-.btn-primary:hover{background:#79c0ff}
+.btn-primary:hover{background:#79c0ff;transform:translateY(-1px);box-shadow:0 4px 12px rgba(88,166,255,.3)}
 .btn-green{background:var(--green);color:#fff}
-.btn-green:hover{background:#56d364}
+.btn-green:hover{background:#56d364;transform:translateY(-1px);box-shadow:0 4px 12px rgba(63,185,80,.3)}
 .btn-sm{padding:8px 16px;font-size:13px}
 .btn-outline{background:transparent;border:1px solid var(--border);color:var(--muted)}
 .btn-outline:hover{border-color:var(--accent);color:var(--accent)}
 .error{color:var(--red);font-size:13px;margin-top:8px;display:none}
 .success{color:var(--green);font-size:13px;margin-top:8px;display:none}
 .steps{display:flex;gap:8px;margin-bottom:24px}
-.step{flex:1;height:4px;border-radius:2px;background:var(--border);transition:background .3s}
-.step.done{background:var(--green)}
-.step.active{background:var(--accent)}
+.step{flex:1;height:4px;border-radius:2px;background:var(--border);transition:background .4s,box-shadow .4s}
+.step.done{background:var(--green);box-shadow:0 0 8px rgba(63,185,80,.3)}
+.step.active{background:var(--accent);box-shadow:0 0 8px rgba(88,166,255,.3)}
 .mnemonic-box{background:var(--bg);border:1px solid var(--orange);border-radius:8px;
   padding:16px;margin-top:12px;font-family:monospace;font-size:15px;line-height:1.8;
   word-spacing:6px;text-align:center;color:var(--orange);user-select:all}
 .mnemonic-warn{color:var(--red);font-size:12px;margin-top:8px;text-align:center}
 .wallet-addr{color:var(--green);font-size:13px;font-family:monospace;word-break:break-all;margin-top:4px}
 .pw-rules{font-size:12px;color:var(--muted);margin-top:6px}
-.pw-rules span{display:inline-block;margin-right:8px}
+.pw-rules span{display:inline-block;margin-right:8px;transition:color .2s}
 .pw-rules span.ok{color:var(--green)}
 .pw-rules span.fail{color:var(--red)}
 
@@ -72,9 +89,11 @@ textarea{resize:vertical;min-height:80px;font-family:monospace;font-size:13px}
 .dash-grid-6{display:grid;grid-template-columns:repeat(6,1fr);gap:12px;margin-bottom:20px}
 @media(max-width:900px){.dash-grid-6{grid-template-columns:repeat(3,1fr)}}
 @media(max-width:500px){.dash-grid-6{grid-template-columns:1fr 1fr}}
-.stat{background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:18px}
+.stat{background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:18px;
+  transition:all .3s;position:relative;overflow:hidden}
+.stat:hover{border-color:rgba(88,166,255,.2);transform:translateY(-2px);box-shadow:0 4px 16px rgba(0,0,0,.3)}
 .stat .label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.6px}
-.stat .value{font-size:24px;font-weight:700;margin-top:6px}
+.stat .value{font-size:24px;font-weight:700;margin-top:6px;transition:color .3s}
 .stat .value.green{color:var(--green)}
 .stat .value.accent{color:var(--accent)}
 .stat .value.orange{color:var(--orange)}
@@ -83,15 +102,18 @@ textarea{resize:vertical;min-height:80px;font-family:monospace;font-size:13px}
 /* Metric grid (inside cards) */
 .metric-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:16px}
 @media(max-width:700px){.metric-grid{grid-template-columns:repeat(2,1fr)}}
-.metric-item{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px;display:flex;flex-direction:column;gap:4px}
+.metric-item{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px;
+  display:flex;flex-direction:column;gap:4px;transition:border-color .3s}
+.metric-item:hover{border-color:rgba(88,166,255,.2)}
 .mi-label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px}
 .mi-val{font-size:18px;font-weight:700;color:var(--text)}
 .mi-val.green{color:var(--green)}
 .mi-val.accent{color:var(--accent)}
+.mi-val.purple{color:var(--purple)}
 
 /* Progress bars */
 .progress-bar-outer{background:var(--border);border-radius:6px;height:10px;overflow:hidden}
-.progress-bar-inner{background:var(--accent);height:100%;border-radius:6px;transition:width .5s}
+.progress-bar-inner{background:var(--accent);height:100%;border-radius:6px;transition:width .8s ease-out}
 .progress-bar-inner.green-bar{background:var(--green)}
 
 /* Tags */
@@ -102,6 +124,8 @@ textarea{resize:vertical;min-height:80px;font-family:monospace;font-size:13px}
 .peer-table th{text-align:left;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px;padding:8px 12px;border-bottom:1px solid var(--border)}
 .peer-table td{padding:8px 12px;border-bottom:1px solid var(--border);color:var(--text);font-family:monospace;font-size:12px}
 .peer-table td:nth-child(2){font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif}
+.peer-table tr{transition:background .2s}
+.peer-table tbody tr:hover{background:rgba(88,166,255,.04)}
 .peer-status{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600}
 .peer-status.healthy{background:rgba(63,185,80,.15);color:var(--green)}
 .peer-status.unhealthy{background:rgba(248,81,73,.15);color:var(--red)}
@@ -127,7 +151,8 @@ textarea{resize:vertical;min-height:80px;font-family:monospace;font-size:13px}
 .shard-stat .ss-val{font-size:20px;font-weight:700;margin-bottom:2px}
 .shard-stat .ss-label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
 .shard-doc-list{margin-top:14px;max-height:240px;overflow-y:auto}
-.shard-doc{display:flex;align-items:center;gap:10px;padding:8px 12px;border-bottom:1px solid var(--border);font-size:13px}
+.shard-doc{display:flex;align-items:center;gap:10px;padding:8px 12px;border-bottom:1px solid var(--border);font-size:13px;transition:background .2s}
+.shard-doc:hover{background:rgba(88,166,255,.04)}
 .shard-doc:last-child{border-bottom:none}
 .shard-doc .sd-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
 .shard-doc .sd-dot.healthy{background:var(--green)}
@@ -139,9 +164,37 @@ textarea{resize:vertical;min-height:80px;font-family:monospace;font-size:13px}
 /* Send Panel */
 .send-panel{display:grid;grid-template-columns:1fr 1fr;gap:16px}
 @media(max-width:600px){.send-panel{grid-template-columns:1fr}}
-.send-card{background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:20px}
+.send-card{background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:20px;transition:border-color .3s}
+.send-card:hover{border-color:rgba(88,166,255,.15)}
 .send-card h3{font-size:16px;margin-bottom:12px}
 .tx-result{margin-top:12px;padding:12px;background:rgba(63,185,80,.1);border:1px solid var(--green);border-radius:8px;font-size:13px;display:none;word-break:break-all}
+
+/* ─── Staking Card ─── */
+.staking-card{position:relative;overflow:hidden}
+.staking-card::before{content:'';position:absolute;top:0;left:0;right:0;height:3px;
+  background:linear-gradient(90deg,var(--green),var(--accent),var(--purple));opacity:.6}
+.staking-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:16px}
+@media(max-width:600px){.staking-grid{grid-template-columns:1fr}}
+.staking-col{background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:16px}
+.staking-col h3{font-size:15px;margin-bottom:12px;display:flex;align-items:center;gap:8px}
+.stake-level-badge{display:inline-block;padding:3px 10px;border-radius:12px;font-size:12px;font-weight:600;text-transform:capitalize}
+.stake-level-badge.observer{background:rgba(139,148,158,.15);color:var(--muted)}
+.stake-level-badge.participant{background:rgba(88,166,255,.12);color:var(--accent)}
+.stake-level-badge.guardian{background:rgba(188,140,255,.12);color:var(--purple)}
+.stake-level-badge.validator{background:rgba(63,185,80,.15);color:var(--green)}
+.fee-split-bar{display:flex;height:12px;border-radius:6px;overflow:hidden;gap:2px;margin:8px 0}
+.fee-split-bar div{height:100%;border-radius:4px;transition:width .5s}
+.fee-split-legend{display:flex;flex-wrap:wrap;gap:10px;font-size:11px;color:var(--muted)}
+.fee-split-legend span{display:flex;align-items:center;gap:4px}
+.fee-split-legend .dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+.staking-metric{display:flex;justify-content:space-between;align-items:center;padding:8px 0;
+  border-bottom:1px solid rgba(48,54,61,.5);font-size:13px}
+.staking-metric:last-child{border-bottom:none}
+.staking-metric .sm-label{color:var(--muted)}
+.staking-metric .sm-val{font-weight:600;font-variant-numeric:tabular-nums}
+.sm-val.green{color:var(--green)}
+.sm-val.accent{color:var(--accent)}
+.sm-val.purple{color:var(--purple)}
 
 /* ─── Update Panel ─── */
 .update-card{position:relative;overflow:hidden}
@@ -152,7 +205,6 @@ textarea{resize:vertical;min-height:80px;font-family:monospace;font-size:13px}
 .update-badge.ready{background:rgba(63,185,80,.15);color:var(--green);animation:pulse 2s infinite}
 .update-badge.installing{background:rgba(210,153,34,.15);color:var(--orange)}
 .update-badge.failed{background:rgba(248,81,73,.12);color:var(--red)}
-@keyframes pulse{0%,100%{opacity:1}50%{opacity:.6}}
 .update-info{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:16px}
 @media(max-width:600px){.update-info{grid-template-columns:1fr}}
 .update-info-item{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px}
@@ -175,13 +227,20 @@ textarea{resize:vertical;min-height:80px;font-family:monospace;font-size:13px}
 .net-stats-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:14px}
 @media(max-width:700px){.net-stats-grid{grid-template-columns:repeat(2,1fr)}}
 @media(max-width:400px){.net-stats-grid{grid-template-columns:1fr}}
-.net-stat{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px;text-align:center}
+.net-stat{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px;text-align:center;transition:border-color .3s}
+.net-stat:hover{border-color:rgba(88,166,255,.2)}
 .net-stat .ns-val{font-size:18px;font-weight:700;margin-bottom:2px}
 .net-stat .ns-label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
 .net-stat .ns-val.in{color:var(--green)}
 .net-stat .ns-val.out{color:var(--accent)}
 .net-detail-row{display:flex;gap:20px;margin-top:14px;font-size:13px;color:var(--muted);flex-wrap:wrap}
 .net-detail-row span strong{color:var(--text)}
+
+/* ─── Status dot alive ─── */
+.status-dot-alive{animation:statusPulse 2s ease-out infinite}
+
+/* ─── Node status banner glow ─── */
+.node-banner-online{animation:glow 3s ease-in-out infinite}
 </style>
 </head>
 <body>
@@ -412,6 +471,83 @@ textarea{resize:vertical;min-height:80px;font-family:monospace;font-size:13px}
         </div>
         <div class="progress-bar-outer">
           <div class="progress-bar-inner" id="t-supply-bar" style="width:0%"></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ═══ Staking & Rewards ═══ -->
+    <div class="card staking-card">
+      <h2 style="margin-bottom:4px">🥩 Staking &amp; Rewards</h2>
+      <p class="sub">Dein Einsatz im Netzwerk und die aktuelle Fee-Verteilung.</p>
+
+      <div class="staking-grid">
+        <!-- Left: Your Stake -->
+        <div class="staking-col">
+          <h3>Dein Stake <span class="stake-level-badge observer" id="sk-level-badge">Observer</span></h3>
+          <div class="staking-metric">
+            <span class="sm-label">Staked</span>
+            <span class="sm-val green" id="sk-your-stake">0 STONE</span>
+          </div>
+          <div class="staking-metric">
+            <span class="sm-label">Pending Rewards</span>
+            <span class="sm-val" style="color:var(--orange)" id="sk-pending-rewards">0 STONE</span>
+          </div>
+          <div class="staking-metric">
+            <span class="sm-label">Lifetime Rewards</span>
+            <span class="sm-val accent" id="sk-total-rewards">0 STONE</span>
+          </div>
+          <div class="staking-metric">
+            <span class="sm-label">Validators</span>
+            <span class="sm-val" id="sk-validators">0</span>
+          </div>
+          <div class="staking-metric">
+            <span class="sm-label">Guardians</span>
+            <span class="sm-val" id="sk-guardians">0</span>
+          </div>
+        </div>
+
+        <!-- Right: Fee Distribution -->
+        <div class="staking-col">
+          <h3>Fee-Verteilung</h3>
+          <div class="fee-split-bar">
+            <div style="width:20%;background:var(--red)" title="Burn 20%"></div>
+            <div style="width:40%;background:var(--green)" title="Miner 40%"></div>
+            <div style="width:30%;background:var(--accent)" title="Staker 30%"></div>
+            <div style="width:10%;background:var(--purple)" title="Node Ops 10%"></div>
+          </div>
+          <div class="fee-split-legend">
+            <span><span class="dot" style="background:var(--red)"></span>20% Burn</span>
+            <span><span class="dot" style="background:var(--green)"></span>40% Miner</span>
+            <span><span class="dot" style="background:var(--accent)"></span>30% Staker</span>
+            <span><span class="dot" style="background:var(--purple)"></span>10% Node Ops</span>
+          </div>
+          <div class="staking-metric" style="margin-top:12px">
+            <span class="sm-label">Fee Pool (Staker)</span>
+            <span class="sm-val accent" id="sk-fee-pool">0 STONE</span>
+          </div>
+          <div class="staking-metric">
+            <span class="sm-label">Node-Op Pool</span>
+            <span class="sm-val purple" id="sk-nodeop-pool">0 STONE</span>
+          </div>
+          <div class="staking-metric">
+            <span class="sm-label">Op-Bonus</span>
+            <span class="sm-val" id="sk-op-multiplier">1.5×</span>
+          </div>
+          <div class="staking-metric">
+            <span class="sm-label">Epoch</span>
+            <span class="sm-val" id="sk-epoch">—</span>
+          </div>
+        </div>
+      </div>
+
+      <!-- Epoch progress bar -->
+      <div style="margin-top:16px">
+        <div style="display:flex;justify-content:space-between;font-size:12px;color:var(--muted);margin-bottom:6px">
+          <span>Epoch-Fortschritt</span>
+          <span id="sk-epoch-info">— / —</span>
+        </div>
+        <div class="progress-bar-outer">
+          <div class="progress-bar-inner" id="sk-epoch-bar" style="width:0%;background:var(--purple)"></div>
         </div>
       </div>
     </div>
@@ -831,6 +967,37 @@ async function refreshDashboard() {
     const supplyPct = te.max_supply > 0 ? (te.total_supply / te.max_supply * 100) : 0;
     document.getElementById('t-supply-bar').style.width = supplyPct.toFixed(1) + '%';
     document.getElementById('t-supply-pct').textContent = supplyPct.toFixed(2) + '% von ' + fmtStone(te.max_supply);
+
+    // ── Staking & Rewards card ──
+    const skLevel = (te.your_stake_level || 'observer').toLowerCase();
+    const badge = document.getElementById('sk-level-badge');
+    badge.className = 'stake-level-badge ' + skLevel;
+    const levelLabels = {observer:'Observer',participant:'Participant',guardian:'Guardian',validator:'Validator'};
+    badge.textContent = levelLabels[skLevel] || skLevel;
+    document.getElementById('sk-your-stake').textContent = fmtStone(te.your_stake || 0) + ' STONE';
+    document.getElementById('sk-pending-rewards').textContent = fmtStone(te.your_pending_rewards || 0) + ' STONE';
+    document.getElementById('sk-total-rewards').textContent = fmtStone(te.your_total_rewards || 0) + ' STONE';
+    document.getElementById('sk-validators').textContent = fmtNum(te.validator_eligible_count || 0);
+    document.getElementById('sk-guardians').textContent = fmtNum(te.guardian_eligible_count || 0);
+    document.getElementById('sk-fee-pool').textContent = fmtStone(te.fee_pool_balance || 0) + ' STONE';
+    document.getElementById('sk-nodeop-pool').textContent = fmtStone(te.node_operator_pool_balance || 0) + ' STONE';
+    document.getElementById('sk-op-multiplier').textContent = (te.node_operator_fee_multiplier || 1.5).toFixed(1) + '×';
+    const epoch = te.epoch || 0;
+    const epochLen = te.epoch_length || 720;
+    document.getElementById('sk-epoch').textContent = epoch;
+    const epochBlock = data.block_count % epochLen;
+    const epochPct = epochLen > 0 ? (epochBlock / epochLen * 100) : 0;
+    document.getElementById('sk-epoch-bar').style.width = epochPct.toFixed(1) + '%';
+    document.getElementById('sk-epoch-info').textContent = epochBlock + ' / ' + epochLen + ' Blöcke';
+
+    // ── Animated status dot ──
+    if (data.node_running) {
+      dot.classList.add('status-dot-alive');
+      document.getElementById('node-status-banner').classList.add('node-banner-online');
+    } else {
+      dot.classList.remove('status-dot-alive');
+      document.getElementById('node-status-banner').classList.remove('node-banner-online');
+    }
 
     // Shard Health
     renderShardHealth(data.shard_health);
