@@ -10,11 +10,6 @@
 //! - **Mutual Report**: Beide Parteien melden → sofortiges Content-Löschen
 //! - **Single Report**: Reporter liefert Decryption-Key, Nodes stimmen ab
 //!   Bei Mehrheit → Content gelöscht, bei Missbrauch → Reporter-Slash
-//!
-//! ## 3. Stake-Gate
-//! Messenger-Zugang erfordert ein Minimum-Stake (z.B. 5 STONE).
-//! Bei erfolgreichem Report → Stake des Verursachers wird geslasht (20%).
-//! Slash fließt in `pool:node_operators` (= Fee-Share-System).
 
 use chrono::Utc;
 use rust_decimal::Decimal;
