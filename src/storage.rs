@@ -591,13 +591,16 @@ impl StoneStore {
     }
 
     /// Sammelt alle von der aktuellen Chain referenzierten Chunk-Hashes.
+    /// Iteriert Block-für-Block statt die gesamte Chain in den Speicher zu laden.
     pub fn referenced_chunks(&self) -> Result<std::collections::HashSet<String>, StorageError> {
-        let blocks = self.chain.read_all_blocks()?;
+        let count = self.chain.block_count()?;
         let mut hashes = std::collections::HashSet::new();
-        for block in &blocks {
-            for doc in &block.documents {
-                for ch in &doc.chunks {
-                    hashes.insert(ch.hash.clone());
+        for i in 0..count {
+            if let Ok(block) = self.chain.read_block(i) {
+                for doc in &block.documents {
+                    for ch in &doc.chunks {
+                        hashes.insert(ch.hash.clone());
+                    }
                 }
             }
         }
@@ -1248,8 +1251,9 @@ pub async fn rebalance_shards(
             )
             .await;
 
-        // Holder registrieren (wird durch ShardStored-Event bestätigt)
-        registry.add_holder(&action.chunk_hash, action.shard_index, &action.target_peer);
+        // Holder wird NICHT sofort registriert — erst wenn der Peer via
+        // ShardStored-Event bestätigt, dass der Shard tatsächlich gespeichert
+        // wurde (analog zu distribute_shards).
         migrated += 1;
     }
 

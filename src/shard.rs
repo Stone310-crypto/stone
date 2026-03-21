@@ -180,9 +180,22 @@ impl ShardStore {
         Ok(Self { base_dir })
     }
 
-    /// Pfad zu einem Shard.
-    fn shard_path(&self, chunk_hash: &str, shard_index: u8) -> PathBuf {
-        self.base_dir.join(chunk_hash).join(format!("{shard_index}"))
+    /// Validiert dass ein chunk_hash nur aus Hex-Zeichen besteht.
+    /// Verhindert Path-Traversal-Angriffe über manipulierte Hashes (z.B. "../../etc").
+    fn validate_chunk_hash(hash: &str) -> Result<()> {
+        if hash.is_empty() || !hash.bytes().all(|b| b.is_ascii_hexdigit()) {
+            bail!(
+                "Ungültiges chunk_hash-Format: '{}'",
+                &hash[..hash.len().min(20)]
+            );
+        }
+        Ok(())
+    }
+
+    /// Pfad zu einem Shard (mit Validierung).
+    fn shard_path(&self, chunk_hash: &str, shard_index: u8) -> Result<PathBuf> {
+        Self::validate_chunk_hash(chunk_hash)?;
+        Ok(self.base_dir.join(chunk_hash).join(format!("{shard_index}")))
     }
 
     /// Speichert einen Shard lokal.
@@ -192,11 +205,12 @@ impl ShardStore {
         shard_index: u8,
         data: &[u8],
     ) -> Result<String> {
+        Self::validate_chunk_hash(chunk_hash)?;
         let dir = self.base_dir.join(chunk_hash);
         std::fs::create_dir_all(&dir)?;
 
         let hash = shard_hash(data);
-        let path = self.shard_path(chunk_hash, shard_index);
+        let path = self.shard_path(chunk_hash, shard_index)?;
         std::fs::write(&path, data)?;
 
         Ok(hash)
@@ -224,7 +238,7 @@ impl ShardStore {
 
     /// Liest einen lokalen Shard und verifiziert optional seinen Hash.
     pub fn read_shard(&self, chunk_hash: &str, shard_index: u8) -> Result<Vec<u8>> {
-        let path = self.shard_path(chunk_hash, shard_index);
+        let path = self.shard_path(chunk_hash, shard_index)?;
         std::fs::read(&path)
             .with_context(|| format!("Shard {chunk_hash}/{shard_index} nicht gefunden"))
     }
@@ -251,11 +265,16 @@ impl ShardStore {
 
     /// Prüft ob ein bestimmter Shard lokal vorhanden ist.
     pub fn has_shard(&self, chunk_hash: &str, shard_index: u8) -> bool {
-        self.shard_path(chunk_hash, shard_index).exists()
+        self.shard_path(chunk_hash, shard_index)
+            .map(|p| p.exists())
+            .unwrap_or(false)
     }
 
     /// Gibt alle lokal vorhandenen Shard-Indices für einen Chunk zurück.
     pub fn local_shard_indices(&self, chunk_hash: &str) -> Vec<u8> {
+        if Self::validate_chunk_hash(chunk_hash).is_err() {
+            return Vec::new();
+        }
         let dir = self.base_dir.join(chunk_hash);
         if !dir.exists() {
             return Vec::new();
@@ -395,6 +414,7 @@ impl ShardStore {
 
     /// Entfernt alle Shards für einen bestimmten Chunk.
     pub fn remove_chunk_shards(&self, chunk_hash: &str) -> Result<u64> {
+        Self::validate_chunk_hash(chunk_hash)?;
         let dir = self.base_dir.join(chunk_hash);
         if !dir.exists() {
             return Ok(0);
@@ -768,6 +788,15 @@ impl ShardHolderRegistry {
         if let Ok(json) = serde_json::to_string_pretty(&*map) {
             let _ = std::fs::write(&self.persist_path, json);
         }
+    }
+
+    /// Entfernt Einträge für Chunks die nicht mehr in der Chain referenziert werden.
+    /// Gibt die Anzahl der entfernten Chunk-Einträge zurück.
+    pub fn gc(&self, referenced_chunks: &std::collections::HashSet<String>) -> usize {
+        let mut map = self.entries.write().unwrap_or_else(|e| e.into_inner());
+        let before = map.len();
+        map.retain(|chunk_hash, _| referenced_chunks.contains(chunk_hash));
+        before - map.len()
     }
 
     /// Exportiert die Registry als flache Liste (für Gossipsub-Broadcast).
