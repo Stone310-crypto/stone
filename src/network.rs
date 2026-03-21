@@ -126,13 +126,16 @@ pub const DEFAULT_P2P_PORT: u16 = 7654;
 /// VPS1 (212.227.54.241) ist der primäre Bootstrap und muss immer zuerst stehen.
 /// VPS2 (69.48.200.255) ist der sekundäre Bootstrap (Redundanz).
 const SEED_NODES: &[&str] = &[
-    // ── VPS1 (212.227.54.241) – primärer Bootstrap + Relay, immer online ───
-    // Dieser Node hat Port 4001 offen und ist der zentrale Relay für NAT-Nodes.
+    // ── VPS1 (212.227.54.241 / 2a02:2479:a0:fa00::1) – primärer Bootstrap + Relay ───
     "/ip4/212.227.54.241/tcp/4001/p2p/12D3KooWNz9GTNsFks567mHaQLKR4Ai6MCiw5WUDWAgvny1ow4tJ",
     "/ip4/212.227.54.241/udp/4001/quic-v1/p2p/12D3KooWNz9GTNsFks567mHaQLKR4Ai6MCiw5WUDWAgvny1ow4tJ",
-    // ── VPS2 (69.48.200.255) – sekundärer Bootstrap + Relay ───
+    "/ip6/2a02:2479:a0:fa00::1/tcp/4001/p2p/12D3KooWNz9GTNsFks567mHaQLKR4Ai6MCiw5WUDWAgvny1ow4tJ",
+    "/ip6/2a02:2479:a0:fa00::1/udp/4001/quic-v1/p2p/12D3KooWNz9GTNsFks567mHaQLKR4Ai6MCiw5WUDWAgvny1ow4tJ",
+    // ── VPS2 (69.48.200.255 / 2607:f1c0:f074:4300::1) – sekundärer Bootstrap + Relay ───
     "/ip4/69.48.200.255/tcp/4001/p2p/12D3KooWQ4yo42uYwihPAJx1qXm85rTVVXEbH5oWu4GHrrNMs564",
     "/ip4/69.48.200.255/udp/4001/quic-v1/p2p/12D3KooWQ4yo42uYwihPAJx1qXm85rTVVXEbH5oWu4GHrrNMs564",
+    "/ip6/2607:f1c0:f074:4300::1/tcp/4001/p2p/12D3KooWQ4yo42uYwihPAJx1qXm85rTVVXEbH5oWu4GHrrNMs564",
+    "/ip6/2607:f1c0:f074:4300::1/udp/4001/quic-v1/p2p/12D3KooWQ4yo42uYwihPAJx1qXm85rTVVXEbH5oWu4GHrrNMs564",
 ];
 
 /// Gibt das aktive Daten-Verzeichnis zurück.
@@ -1215,6 +1218,17 @@ enum NatStatus {
     Private,
 }
 
+/// Prüft ob eine IPv6-Adresse nicht global routbar ist (Link-Local, ULA, etc.)
+fn is_ipv6_non_global(ip: &std::net::Ipv6Addr) -> bool {
+    let seg = ip.segments();
+    // Link-Local: fe80::/10
+    (seg[0] & 0xffc0) == 0xfe80
+    // Unique Local (ULA): fc00::/7
+    || (seg[0] & 0xfe00) == 0xfc00
+    // Site-Local (deprecated): fec0::/10
+    || (seg[0] & 0xffc0) == 0xfec0
+}
+
 /// Entfernt die `/p2p/<PeerId>`-Komponente am Ende einer Multiaddr.
 /// mDNS liefert Adressen wie `/ip4/1.2.3.4/tcp/7654/p2p/12D3Koo…`.
 /// libp2p lehnt es ab, wenn man diese an `DialOpts::peer_id(...).addresses(…)`
@@ -1287,7 +1301,7 @@ impl SwarmTask {
             }
         }
 
-        // Dual-Stack: wenn IPv6 konfiguriert, zusätzlich auf IPv4 lauschen
+        // Dual-Stack: Bei IPv4-Config zusätzlich IPv6 TCP versuchen (und umgekehrt)
         if self.config.listen_addr.starts_with("/ip6/") {
             // Port aus listen_addr extrahieren
             let port = listen_addr.iter().find_map(|p| {
@@ -1301,6 +1315,20 @@ impl SwarmTask {
             match self.swarm.listen_on(ipv4_addr.clone()) {
                 Ok(_) => println!("[p2p] Dual-Stack: lausche zusätzlich auf {ipv4_addr}"),
                 Err(e) => eprintln!("[p2p] ⚠️  IPv4-Dual-Stack fehlgeschlagen: {e}"),
+            }
+        } else {
+            // IPv4-Config → auch IPv6-TCP versuchen (Dual-Stack)
+            let port = listen_addr.iter().find_map(|p| {
+                if let libp2p::multiaddr::Protocol::Tcp(port) = p {
+                    Some(port)
+                } else {
+                    None
+                }
+            }).unwrap_or(DEFAULT_P2P_PORT);
+            let ipv6_addr: Multiaddr = format!("/ip6/::/tcp/{port}").parse().unwrap();
+            match self.swarm.listen_on(ipv6_addr) {
+                Ok(_) => println!("[p2p] Dual-Stack: lausche zusätzlich auf IPv6 TCP/{port}"),
+                Err(_) => {} // IPv6 oft nicht verfügbar – kein Fehler
             }
         }
 
@@ -1703,7 +1731,10 @@ impl SwarmTask {
                                     && !(ip.octets()[0] == 100 && ip.octets()[1] >= 64 && ip.octets()[1] <= 127)
                             }
                             libp2p::multiaddr::Protocol::Ip6(ip) => {
-                                !ip.is_loopback() && !ip.is_unspecified()
+                                !ip.is_loopback()
+                                    && !ip.is_unspecified()
+                                    // Link-Local (fe80::/10) und ULA (fc00::/7) sind nicht global routbar
+                                    && !is_ipv6_non_global(&ip)
                             }
                             _ => false,
                         }
@@ -1738,7 +1769,7 @@ impl SwarmTask {
                             matches!(p,
                                 libp2p::multiaddr::Protocol::Ip4(ip) if !ip.is_private() && !ip.is_loopback()
                             ) || matches!(p,
-                                libp2p::multiaddr::Protocol::Ip6(ip) if !ip.is_loopback()
+                                libp2p::multiaddr::Protocol::Ip6(ip) if !ip.is_loopback() && !is_ipv6_non_global(&ip)
                             )
                         })
                     }) {
@@ -2170,7 +2201,7 @@ impl SwarmTask {
                                         if !ip.is_private() && !ip.is_loopback() && !ip.is_unspecified()
                                 ) || matches!(p,
                                     libp2p::multiaddr::Protocol::Ip6(ip)
-                                        if !ip.is_loopback() && !ip.is_unspecified()
+                                        if !ip.is_loopback() && !ip.is_unspecified() && !is_ipv6_non_global(&ip)
                                 )
                             });
                             if is_public {
@@ -2510,7 +2541,7 @@ impl SwarmTask {
                 a.iter().any(|p| {
                     matches!(p,
                         libp2p::multiaddr::Protocol::Ip4(ip) if !ip.is_private() && !ip.is_loopback()
-                    ) || matches!(p, libp2p::multiaddr::Protocol::Ip6(ip) if !ip.is_loopback())
+                    ) || matches!(p, libp2p::multiaddr::Protocol::Ip6(ip) if !ip.is_loopback() && !is_ipv6_non_global(&ip))
                 })
             });
 
@@ -2612,6 +2643,40 @@ impl SwarmTask {
                     latency_ms: None,
                     error: Some("Timeout (cleanup)".to_string()),
                 });
+            }
+        }
+
+        // 6. Pending-Shard-Lists: verwaiste Einträge für nicht-verbundene Peers aufräumen
+        {
+            let before = self.pending_shard_lists.len();
+            self.pending_shard_lists.retain(|_, (_, _reply)| {
+                // oneshot::Sender::is_closed() prüfen: wenn Receiver gedroppt → aufräumen
+                // Da wir keinen Timestamp haben, entfernen wir Einträge deren Receiver weg ist.
+                !_reply.is_closed()
+            });
+            let removed = before - self.pending_shard_lists.len();
+            if removed > 0 {
+                println!("[p2p] 🧹 {} verwaiste Shard-List-Anfragen aufgeräumt", removed);
+            }
+        }
+
+        // 7. Inaktive Peers entfernen: Peers die >1h nicht gesehen und disconnected
+        {
+            let now_ts = chrono::Utc::now().timestamp();
+            const INACTIVE_PEER_TIMEOUT_SECS: i64 = 3600; // 1 Stunde
+            let stale_peers: Vec<PeerId> = self.peers.iter()
+                .filter(|(_, info)| {
+                    !info.connected
+                        && info.last_seen > 0
+                        && (now_ts - info.last_seen) > INACTIVE_PEER_TIMEOUT_SECS
+                })
+                .map(|(pid, _)| *pid)
+                .collect();
+            if !stale_peers.is_empty() {
+                for pid in &stale_peers {
+                    self.peers.remove(pid);
+                }
+                println!("[p2p] 🧹 {} inaktive Peers entfernt (>1h nicht gesehen)", stale_peers.len());
             }
         }
     }

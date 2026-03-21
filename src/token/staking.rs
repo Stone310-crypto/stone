@@ -62,6 +62,18 @@ pub const EPOCHS_PER_YEAR: u64 = 1461;
 /// Staking-Pool-Adresse (virtueller Account)
 pub const STAKING_POOL_ADDRESS: &str = "pool:staking";
 
+/// Gebühren-Bonus-Multiplikator für aktive Node-Betreiber.
+///
+/// Node-Betreiber erhalten diesen Faktor auf ihren gewichteten Gebühren-Anteil.
+/// Bei 1.5 bekommt ein Node-Betreiber 50% mehr Gebühren-Rewards pro STONE
+/// als ein reiner Staker ohne eigene Node.
+///
+/// | Rolle          | Gewichtung pro STONE | Effekt                |
+/// |----------------|----------------------|-----------------------|
+/// | Staker         | 1.0×                 | Basis-Gebührenanteil  |
+/// | Node-Betreiber | 1.5×                 | +50% Gebührenbonus    |
+pub const NODE_OPERATOR_FEE_MULTIPLIER: &str = "1.5";
+
 // ─── Stake-Level ─────────────────────────────────────────────────────────────
 
 /// Stufe basierend auf Stake-Betrag. Bestimmt Berechtigungen im Netzwerk.
@@ -528,6 +540,87 @@ impl StakingPool {
         );
 
         total_distributed
+    }
+
+    // ── Gebühren-Verteilung (Fee Revenue Sharing) ─────────────────────────
+
+    /// Verteilt akkumulierte TX-Gebühren aus `pool:staker_fees` an alle Staker.
+    ///
+    /// Node-Betreiber erhalten einen Bonus-Multiplikator ([`NODE_OPERATOR_FEE_MULTIPLIER`])
+    /// auf ihren gewichteten Anteil, sodass sie pro STONE mehr Gebühren bekommen.
+    ///
+    /// Gibt eine Liste von `(wallet_address, amount)` zurück.
+    /// Die Ledger-Gutschrift (pool:staker_fees → wallet) muss extern passieren!
+    pub fn distribute_fee_income(
+        &mut self,
+        fee_pool_balance: Decimal,
+        node_operator_wallets: &std::collections::HashSet<String>,
+    ) -> Vec<(String, Decimal)> {
+        if fee_pool_balance <= Decimal::ZERO || self.stakers.is_empty() {
+            return Vec::new();
+        }
+
+        let multiplier: Decimal = NODE_OPERATOR_FEE_MULTIPLIER.parse().unwrap();
+        let staker_addrs: Vec<String> = self.stakers.keys().cloned().collect();
+
+        // 1. Gewichteten Gesamtstake berechnen
+        let mut weighted_total = Decimal::ZERO;
+        for addr in &staker_addrs {
+            if let Some(entry) = self.stakers.get(addr) {
+                if entry.staked_amount <= Decimal::ZERO {
+                    continue;
+                }
+                let weight = if node_operator_wallets.contains(addr) {
+                    entry.staked_amount * multiplier
+                } else {
+                    entry.staked_amount
+                };
+                weighted_total += weight;
+            }
+        }
+
+        if weighted_total <= Decimal::ZERO {
+            return Vec::new();
+        }
+
+        // 2. Proportional nach gewichtetem Stake verteilen
+        let mut distributions: Vec<(String, Decimal)> = Vec::new();
+        let mut distributed = Decimal::ZERO;
+        let mut node_op_count = 0usize;
+
+        for addr in &staker_addrs {
+            if let Some(entry) = self.stakers.get_mut(addr) {
+                if entry.staked_amount <= Decimal::ZERO {
+                    continue;
+                }
+                let is_operator = node_operator_wallets.contains(addr);
+                let weight = if is_operator {
+                    entry.staked_amount * multiplier
+                } else {
+                    entry.staked_amount
+                };
+                let share = weight / weighted_total;
+                let reward = (fee_pool_balance * share).round_dp(8);
+
+                if reward > Decimal::ZERO {
+                    entry.total_rewards += reward;
+                    distributions.push((addr.clone(), reward));
+                    distributed += reward;
+                    if is_operator {
+                        node_op_count += 1;
+                    }
+                }
+            }
+        }
+
+        if distributed > Decimal::ZERO {
+            println!(
+                "[staking] 💸 Gebühren-Verteilung: {} STONE an {} Staker ({} Node-Ops mit {}x Bonus)",
+                distributed, distributions.len(), node_op_count, multiplier,
+            );
+        }
+
+        distributions
     }
 
     // ── Fällige Unstakes verarbeiten ──────────────────────────────────────

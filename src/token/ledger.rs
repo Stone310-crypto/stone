@@ -1542,6 +1542,24 @@ impl TokenLedger {
         }
     }
 
+    /// Gutschreibung eines Fee-Rewards aus pool:staker_fees.
+    ///
+    /// Transferiert `amount` von pool:staker_fees → Staker-Wallet.
+    pub fn credit_fee_reward(&mut self, address: &str, amount: Decimal) -> Result<(), LedgerError> {
+        let pool = super::reputation::STAKER_FEE_POOL;
+        let pool_balance = self.balance(pool);
+        if pool_balance < amount {
+            return Err(LedgerError::InsufficientBalance {
+                account: pool.to_string(),
+                available: pool_balance,
+                required: amount,
+            });
+        }
+        *self.balances.entry(pool.to_string()).or_insert(Decimal::ZERO) -= amount;
+        *self.balances.entry(address.to_string()).or_insert(Decimal::ZERO) += amount;
+        Ok(())
+    }
+
     /// Interne Fee-Split-Logik: 40% Miner, 30% Staker-Pool, 20% burn, 10% Node-Operator-Pool.
     fn apply_fee_split(&mut self, fee: Decimal) {
         let (burn, miner_share, staker_share, pool_share) = super::reputation::split_fee(fee);

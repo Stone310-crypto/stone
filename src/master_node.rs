@@ -1153,17 +1153,30 @@ impl MasterNodeState {
         }
     }
 
-    /// Chain-Zusammenfassung für API-Antworten
+    /// Chain-Zusammenfassung für API-Antworten.
+    ///
+    /// HINWEIS: `is_valid` prüft nur den letzten Block (O(1)) statt die gesamte
+    /// Chain (O(n)). Volle Chain-Verifikation via `chain.verify()` sollte nur
+    /// bei Admin-Requests oder Startup verwendet werden.
     pub fn chain_summary(&self) -> ChainSummary {
         let chain = self.chain.lock().unwrap_or_else(|e| e.into_inner());
         let total_docs: usize = chain
             .list_all_documents()
             .len();
+        // Schnell-Check: letzter Block konsistent? (O(1) statt O(n))
+        let is_valid = if chain.blocks.len() >= 2 {
+            let last = &chain.blocks[chain.blocks.len() - 1];
+            let prev = &chain.blocks[chain.blocks.len() - 2];
+            last.previous_hash == prev.hash
+                && last.hash == crate::blockchain::calculate_hash(last)
+        } else {
+            true
+        };
         ChainSummary {
             block_height: chain.blocks.len() as u64,
             latest_hash: chain.latest_hash.clone(),
             total_documents: total_docs as u64,
-            is_valid: chain.verify(&self.cluster_key),
+            is_valid,
         }
     }
 
@@ -2587,7 +2600,7 @@ impl MasterNodeState {
     fn post_block_staking(state: &Arc<Self>, block: &Block) {
         let mut pool = state.staking_pool.write().unwrap_or_else(|e| e.into_inner());
 
-        // 1. Epoch-Rewards verteilen
+        // 1. Epoch-Rewards verteilen (APY aus pool:storage_rewards)
         let reward_pool_balance = {
             let ledger = state.token_ledger.read().unwrap_or_else(|e| e.into_inner());
             ledger.balance("pool:storage_rewards")
@@ -2595,20 +2608,48 @@ impl MasterNodeState {
         let distributed = pool.process_epoch(block.index, reward_pool_balance);
         if distributed > rust_decimal::Decimal::ZERO {
             let mut ledger = state.token_ledger.write().unwrap_or_else(|e| e.into_inner());
+            let mut credited: Vec<String> = Vec::new();
             for (addr, entry) in &pool.stakers {
                 if entry.pending_rewards > rust_decimal::Decimal::ZERO {
                     if let Err(e) = ledger.credit_staking_reward(addr, entry.pending_rewards) {
-                        eprintln!("[staking] Reward-Gutschrift fehlgeschlagen: {e}");
+                        eprintln!("[staking] Reward-Gutschrift fehlgeschlagen für {}: {e}", &addr[..12.min(addr.len())]);
+                    } else {
+                        credited.push(addr.clone());
                     }
                 }
             }
             drop(ledger);
-            for entry in pool.stakers.values_mut() {
-                entry.pending_rewards = rust_decimal::Decimal::ZERO;
+            // Nur erfolgreich gutgeschriebene Rewards nullen
+            for addr in &credited {
+                if let Some(entry) = pool.stakers.get_mut(addr) {
+                    entry.pending_rewards = rust_decimal::Decimal::ZERO;
+                }
             }
         }
 
-        // 2. Fällige Unstakes freigeben
+        // 2. Gebühren-Verteilung aus pool:staker_fees (alle Staker, Node-Ops mit Bonus)
+        let fee_pool_balance = {
+            let ledger = state.token_ledger.read().unwrap_or_else(|e| e.into_inner());
+            ledger.balance(crate::token::reputation::STAKER_FEE_POOL)
+        };
+        if fee_pool_balance > rust_decimal::Decimal::ZERO {
+            let node_op_wallets = {
+                let registry = state.reputation_registry.read().unwrap_or_else(|e| e.into_inner());
+                registry.active_operator_wallets()
+            };
+            let fee_payouts = pool.distribute_fee_income(fee_pool_balance, &node_op_wallets);
+            if !fee_payouts.is_empty() {
+                let mut ledger = state.token_ledger.write().unwrap_or_else(|e| e.into_inner());
+                for (addr, amount) in &fee_payouts {
+                    if let Err(e) = ledger.credit_fee_reward(addr, *amount) {
+                        eprintln!("[staking] Fee-Reward an {}… fehlgeschlagen: {e}",
+                            &addr[..12.min(addr.len())]);
+                    }
+                }
+            }
+        }
+
+        // 3. Fällige Unstakes freigeben
         let matured = pool.drain_matured_unstakes();
         if !matured.is_empty() {
             let mut ledger = state.token_ledger.write().unwrap_or_else(|e| e.into_inner());
@@ -2620,8 +2661,9 @@ impl MasterNodeState {
             }
         }
 
-        // 3. StakingPool persistieren
-        if distributed > rust_decimal::Decimal::ZERO || !matured.is_empty() {
+        // 4. StakingPool persistieren
+        let fee_distributed = fee_pool_balance > rust_decimal::Decimal::ZERO;
+        if distributed > rust_decimal::Decimal::ZERO || fee_distributed || !matured.is_empty() {
             if let Err(e) = pool.persist() {
                 eprintln!("[staking] Pool-Persist: {e}");
             }
@@ -3179,7 +3221,7 @@ impl MasterNodeState {
     pub fn trust_pending(&self) -> Vec<TrustEntry> {
         self.trust_registry
             .read()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .filter(|e| e.status == TrustStatus::Pending)
             .cloned()
@@ -3195,7 +3237,7 @@ impl MasterNodeState {
     pub fn is_trusted(&self, peer_id: &str) -> bool {
         self.trust_registry
             .read()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .any(|e| e.peer_id == peer_id && e.status == TrustStatus::Active)
     }

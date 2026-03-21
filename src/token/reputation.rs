@@ -232,6 +232,17 @@ impl ReputationRegistry {
         current_block >= self.last_distribution_block + DISTRIBUTION_INTERVAL
     }
 
+    /// Gibt die Wallet-Adressen aller aktiven Node-Betreiber zurück.
+    ///
+    /// "Aktiv" = in den letzten 10 Minuten gesehen UND Score > 0.
+    pub fn active_operator_wallets(&self) -> std::collections::HashSet<String> {
+        let now = Utc::now().timestamp();
+        self.nodes.values()
+            .filter(|n| now - n.last_seen < 600 && n.computed_score > 0)
+            .map(|n| n.wallet_address.clone())
+            .collect()
+    }
+
     /// Berechnet die Ausschüttung aus `pool:node_operators`.
     ///
     /// Gibt eine Liste von (wallet_address, amount) zurück.
