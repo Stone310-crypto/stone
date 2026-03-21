@@ -72,6 +72,11 @@ pub async fn handle_snapshot_download(
         ).into_response()
     })?;
 
+    // Tatsächliche Dateigröße für Content-Length (statt Meta, die veraltet sein kann)
+    let actual_size = file.metadata().await
+        .map(|m| m.len())
+        .unwrap_or(meta.archive_size);
+
     let stream = ReaderStream::new(file);
     let body = Body::from_stream(stream);
 
@@ -81,7 +86,7 @@ pub async fn handle_snapshot_download(
         [
             (header::CONTENT_TYPE, "application/zstd".to_string()),
             (header::CONTENT_DISPOSITION, content_disposition),
-            (header::CONTENT_LENGTH, meta.archive_size.to_string()),
+            (header::CONTENT_LENGTH, actual_size.to_string()),
         ],
         body,
     ))
@@ -160,7 +165,8 @@ pub async fn handle_snapshot_state_root(
         chain.blocks.last().map(|b| b.index).unwrap_or(0)
     };
 
-    // Wenn eine bestimmte Block-Höhe angefragt wird, prüfen ob wir so weit sind
+    // Wenn eine bestimmte Block-Höhe angefragt wird, muss sie exakt mit unserer übereinstimmen.
+    // Historische State-Lookups sind nicht möglich (Ledger hält nur aktuellen Stand).
     if let Some(requested) = q.block_height {
         if requested > chain_height {
             return (
@@ -168,6 +174,19 @@ pub async fn handle_snapshot_state_root(
                 axum::Json(json!({
                     "ok": false,
                     "error": format!("Angefragte Höhe {} > lokale Chain-Höhe {}", requested, chain_height),
+                })),
+            ).into_response();
+        }
+        if requested < chain_height {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(json!({
+                    "ok": false,
+                    "error": format!(
+                        "Historischer State-Root nicht verfügbar. Angefragt: {}, aktuell: {}. \
+                         Nur der aktuelle Ledger-Stand kann abgefragt werden.",
+                        requested, chain_height
+                    ),
                 })),
             ).into_response();
         }

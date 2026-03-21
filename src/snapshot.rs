@@ -551,11 +551,22 @@ pub async fn download_snapshot_from_peer(
     let snap_dir = snapshot_dir();
     let tmp_archive_path = snap_dir.join(format!("{}.tmp", &meta.filename));
     let archive_path = snap_dir.join(&meta.filename);
+    // Max erlaubte Größe: archive_size + 10% Toleranz, mindestens 1 MB
+    let max_download = meta.archive_size.saturating_add(meta.archive_size / 10).max(1_048_576);
     {
         let mut file = fs::File::create(&tmp_archive_path)?;
+        let mut downloaded = 0u64;
         while let Some(chunk) = dl_resp.chunk().await
             .map_err(|e| SnapshotError::Network(format!("Snapshot-Download lesen: {e}")))?
         {
+            downloaded += chunk.len() as u64;
+            if downloaded > max_download {
+                let _ = fs::remove_file(&tmp_archive_path);
+                return Err(SnapshotError::Network(format!(
+                    "Download abgebrochen: {} Bytes überschreitet Limit {} (archive_size={})",
+                    downloaded, max_download, meta.archive_size
+                )));
+            }
             std::io::Write::write_all(&mut file, &chunk)?;
         }
     }
@@ -842,14 +853,23 @@ pub async fn verified_download_snapshot(
     let snap_dir = snapshot_dir();
     let tmp_archive = snap_dir.join(format!("{}.tmp", &best_meta.filename));
     let archive_path = snap_dir.join(&best_meta.filename);
+    // Max erlaubte Größe: archive_size + 10% Toleranz, mindestens 1 MB
+    let max_download = best_meta.archive_size.saturating_add(best_meta.archive_size / 10).max(1_048_576);
     {
         let mut file = fs::File::create(&tmp_archive)?;
         let mut downloaded = 0u64;
         while let Some(chunk) = dl_resp.chunk().await
             .map_err(|e| SnapshotError::Network(format!("Download lesen: {e}")))?
         {
-            std::io::Write::write_all(&mut file, &chunk)?;
             downloaded += chunk.len() as u64;
+            if downloaded > max_download {
+                let _ = fs::remove_file(&tmp_archive);
+                return Err(SnapshotError::Network(format!(
+                    "Download abgebrochen: {} Bytes überschreitet Limit {} (archive_size={})",
+                    downloaded, max_download, best_meta.archive_size
+                )));
+            }
+            std::io::Write::write_all(&mut file, &chunk)?;
             // Fortschritt alle 10 MB
             if downloaded % (10 * 1024 * 1024) < chunk.len() as u64 {
                 eprintln!(

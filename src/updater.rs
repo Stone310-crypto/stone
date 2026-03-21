@@ -55,6 +55,9 @@ pub const TOPIC_UPDATES: &str = "stone/updates/v1";
 /// Verzeichnis für heruntergeladene Updates relativ zu data_dir
 const UPDATES_DIR: &str = "updates";
 
+/// Maximale Binary-Größe (500 MiB) – verhindert RAM-Erschöpfung bei manipulierten Manifesten
+const MAX_BINARY_SIZE: u64 = 500 * 1024 * 1024;
+
 /// Trusted-Keys-Datei (hex-kodierte Ed25519 public keys, eine pro Zeile)
 const TRUSTED_KEYS_FILE: &str = "trusted_update_keys.txt";
 
@@ -209,7 +212,15 @@ impl UpdateManager {
         // 2. Signatur prüfen
         self.verify_signature(&manifest)?;
 
-        // 3. Bereits bekannt?
+        // 3. Binary-Größe prüfen
+        if manifest.binary_size > MAX_BINARY_SIZE {
+            return Err(format!(
+                "Binary zu groß: {} Bytes (max {})",
+                manifest.binary_size, MAX_BINARY_SIZE
+            ));
+        }
+
+        // 4. Bereits bekannt?
         if let Some(ref existing) = self.manifest {
             if existing.version == manifest.version && existing.binary_hash == manifest.binary_hash {
                 return Ok(false); // Bereits bekannt
@@ -224,10 +235,10 @@ impl UpdateManager {
             println!("[updater] 📝 Changelog: {}", manifest.changelog);
         }
 
-        // 4. Vorherige Chunks verwerfen
+        // 5. Vorherige Chunks verwerfen
         self.chunks.clear();
 
-        // 5. Manifest speichern
+        // 6. Manifest speichern
         self.manifest = Some(manifest);
         self.state = UpdateState::Available;
 
@@ -522,6 +533,22 @@ impl UpdateManager {
         // Signatur prüfen
         self.verify_signature(&manifest)?;
 
+        // Version prüfen – kein Downgrade erlauben
+        if !is_newer_version(&manifest.version, CURRENT_VERSION) {
+            return Err(format!(
+                "Downgrade nicht erlaubt: v{} ist nicht neuer als v{}",
+                manifest.version, CURRENT_VERSION
+            ));
+        }
+
+        // Binary-Größe prüfen
+        if manifest.binary_size > MAX_BINARY_SIZE {
+            return Err(format!(
+                "Binary zu groß: {} Bytes (max {})",
+                manifest.binary_size, MAX_BINARY_SIZE
+            ));
+        }
+
         // Chunks validieren
         for (idx, data) in &chunk_data {
             if *idx >= manifest.chunk_hashes.len() {
@@ -674,21 +701,35 @@ impl UpdateManager {
                             manifest.version
                         );
 
-                        // Chunks laden
+                        // Chunks laden + Hash verifizieren
                         let update_dir = updates_dir.join(latest);
                         let mut chunks = HashMap::new();
-                        for (idx, _hash) in manifest.chunk_hashes.iter().enumerate() {
+                        let mut corrupted = 0usize;
+                        for (idx, expected_hash) in manifest.chunk_hashes.iter().enumerate() {
                             let chunk_path = update_dir.join(format!("chunk_{idx:04}.bin"));
                             if let Ok(data) = fs::read(&chunk_path) {
-                                chunks.insert(idx, data);
+                                let actual_hash = sha256_hex(&data);
+                                if actual_hash == *expected_hash {
+                                    chunks.insert(idx, data);
+                                } else {
+                                    eprintln!(
+                                        "[updater] ⚠ Chunk {idx} korrupt (erwartet {}…, erhalten {}…) – wird erneut geladen",
+                                        &expected_hash[..16], &actual_hash[..16]
+                                    );
+                                    corrupted += 1;
+                                    let _ = fs::remove_file(&chunk_path);
+                                }
                             }
+                        }
+                        if corrupted > 0 {
+                            eprintln!("[updater] ⚠ {corrupted} korrupte Chunk(s) entfernt");
                         }
 
                         if chunks.len() == manifest.chunk_hashes.len() {
                             self.manifest = Some(manifest);
                             self.chunks = chunks;
-                            self.state = UpdateState::Ready;
-                            println!("[updater] ✓ Alle Chunks vorhanden → Update bereit");
+                            self.state = UpdateState::Verifying;
+                            println!("[updater] ✓ Alle Chunks vorhanden → Verifizierung nötig");
                         } else {
                             self.manifest = Some(manifest);
                             self.state = UpdateState::Available;
