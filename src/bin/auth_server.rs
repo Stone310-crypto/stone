@@ -423,7 +423,7 @@ async fn register_node(
     State(state): State<AppState>,
     Json(req): Json<RegisterReq>,
 ) -> impl IntoResponse {
-    let mut reg = state.reg.lock().unwrap();
+    let mut reg = state.reg.lock().unwrap_or_else(|e| e.into_inner());
     let info = NodeInfo {
         name: req.name.clone(),
         url: req.url.clone(),
@@ -438,13 +438,13 @@ async fn register_node(
 }
 
 async fn list_nodes(State(state): State<AppState>) -> impl IntoResponse {
-    let reg = state.reg.lock().unwrap();
+    let reg = state.reg.lock().unwrap_or_else(|e| e.into_inner());
     let list: Vec<NodeInfo> = reg.nodes.values().cloned().collect();
     Json(serde_json::json!({ "nodes": list }))
 }
 
 async fn allow_node(State(state): State<AppState>, Path(url): Path<String>) -> impl IntoResponse {
-    let mut reg = state.reg.lock().unwrap();
+    let mut reg = state.reg.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(n) = reg.nodes.get_mut(&url) {
         n.allowed = true;
         n.quarantine = false;
@@ -459,7 +459,7 @@ async fn allow_node(State(state): State<AppState>, Path(url): Path<String>) -> i
 }
 
 async fn deny_node(State(state): State<AppState>, Path(url): Path<String>) -> impl IntoResponse {
-    let mut reg = state.reg.lock().unwrap();
+    let mut reg = state.reg.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(n) = reg.nodes.get_mut(&url) {
         n.allowed = false;
         n.quarantine = false;
@@ -477,7 +477,7 @@ async fn quarantine_node(
     State(state): State<AppState>,
     Path(url): Path<String>,
 ) -> impl IntoResponse {
-    let mut reg = state.reg.lock().unwrap();
+    let mut reg = state.reg.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(n) = reg.nodes.get_mut(&url) {
         n.quarantine = true;
         save_registry(&reg);
@@ -494,7 +494,7 @@ async fn unquarantine_node(
     State(state): State<AppState>,
     Path(url): Path<String>,
 ) -> impl IntoResponse {
-    let mut reg = state.reg.lock().unwrap();
+    let mut reg = state.reg.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(n) = reg.nodes.get_mut(&url) {
         n.quarantine = false;
         save_registry(&reg);
@@ -508,7 +508,7 @@ async fn unquarantine_node(
 }
 
 async fn allow_status(State(state): State<AppState>, Path(url): Path<String>) -> impl IntoResponse {
-    let reg = state.reg.lock().unwrap();
+    let reg = state.reg.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(n) = reg.nodes.get(&url) {
         return Json(serde_json::json!({ "allowed": n.allowed, "quarantine": n.quarantine }))
             .into_response();
@@ -524,7 +524,7 @@ async fn issue_token(
     State(state): State<AppState>,
     Json(req): Json<TokenReq>,
 ) -> impl IntoResponse {
-    let reg = state.reg.lock().unwrap();
+    let reg = state.reg.lock().unwrap_or_else(|e| e.into_inner());
     let ttl = req.ttl_secs.unwrap_or(3600).min(24 * 3600);
     let tok = sign_token(&reg.secret, &req.role, ttl);
     Json(tok)
@@ -547,7 +547,7 @@ async fn request_cert(
 ) -> impl IntoResponse {
     // Auth: x-auth-token (role=admin) oder x-ca-provision (secret) ODER provision_secrets[name]
     let mut ok = false;
-    let reg_guard = state.reg.lock().unwrap();
+    let reg_guard = state.reg.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(h) = headers.get("x-auth-token") {
         if let Ok(tok) = h.to_str() {
             ok = verify_token(tok, &reg_guard.secret, "admin");
@@ -600,7 +600,7 @@ async fn cluster_key(
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
     let mut ok = false;
-    let reg_guard = state.reg.lock().unwrap();
+    let reg_guard = state.reg.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(h) = headers.get("x-auth-token") {
         if let Ok(tok) = h.to_str() {
             ok = verify_token(tok, &reg_guard.secret, "admin");
@@ -625,7 +625,7 @@ async fn get_genesis(
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
     let mut ok = false;
-    let reg_guard = state.reg.lock().unwrap();
+    let reg_guard = state.reg.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(h) = headers.get("x-auth-token") {
         if let Ok(tok) = h.to_str() {
             ok = verify_token(tok, &reg_guard.secret, "admin");
@@ -672,7 +672,7 @@ async fn post_node_metrics(
     headers: axum::http::HeaderMap,
     Json(payload): Json<NodeMetricsPayload>,
 ) -> impl IntoResponse {
-    let reg_guard = state.reg.lock().unwrap();
+    let reg_guard = state.reg.lock().unwrap_or_else(|e| e.into_inner());
     let mut ok = false;
     if let Some(h) = headers.get("x-api-key") {
         if let Ok(k) = h.to_str() {
@@ -689,7 +689,7 @@ async fn post_node_metrics(
     }
     drop(reg_guard);
 
-    let mut map = state.metrics.lock().unwrap();
+    let mut map = state.metrics.lock().unwrap_or_else(|e| e.into_inner());
     let entry = NodeMetricsEntry {
         node: payload.node.clone(),
         url: payload.url.clone(),
@@ -715,7 +715,7 @@ async fn list_node_metrics(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
 ) -> impl IntoResponse {
-    let reg_guard = state.reg.lock().unwrap();
+    let reg_guard = state.reg.lock().unwrap_or_else(|e| e.into_inner());
     let mut ok = false;
     if let Some(h) = headers.get("x-auth-token") {
         if let Ok(tok) = h.to_str() {
@@ -729,7 +729,7 @@ async fn list_node_metrics(
         )
             .into_response();
     }
-    let map = state.metrics.lock().unwrap();
+    let map = state.metrics.lock().unwrap_or_else(|e| e.into_inner());
     let list: Vec<NodeMetricsEntry> = map.values().cloned().collect();
     Json(serde_json::json!({ "metrics": list })).into_response()
 }

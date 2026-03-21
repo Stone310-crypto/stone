@@ -332,9 +332,9 @@ async fn start_full_node(state: SetupState) {
 
     // On-Chain Account-Registry: Merge Chain-registrierte Accounts mit lokalen Users
     {
-        let ledger = node.token_ledger.read().unwrap();
+        let ledger = node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
         if ledger.registered_account_count() > 0 {
-            let mut local = users.lock().unwrap();
+            let mut local = users.lock().unwrap_or_else(|e| e.into_inner());
             let merged = stone::auth::rebuild_users_from_ledger(&ledger, &local);
             let chain_count = ledger.registered_account_count();
             *local = merged;
@@ -392,7 +392,7 @@ async fn start_full_node(state: SetupState) {
             };
             if let Some(handle) = maybe_handle {
                 println!("[node] ✅ P2P gestartet – PeerId: {}", handle.local_peer_id);
-                let count = node.chain.lock().unwrap().blocks.len() as u64;
+                let count = node.chain.lock().unwrap_or_else(|e| e.into_inner()).blocks.len() as u64;
                 handle.set_chain_count(count).await;
                 // Chain-Referenz setzen damit P2P-Peers Blöcke direkt serviert bekommen
                 handle.set_chain_ref(node.chain.clone()).await;
@@ -416,7 +416,7 @@ async fn start_full_node(state: SetupState) {
                 {
                     let (broadcast_tx, mut broadcast_rx) =
                         tokio::sync::mpsc::unbounded_channel::<stone::blockchain::Block>();
-                    *node.block_broadcast_tx.lock().unwrap() = Some(broadcast_tx);
+                    *node.block_broadcast_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(broadcast_tx);
                     let net_bc = handle.clone();
                     tokio::spawn(async move {
                         while let Some(block) = broadcast_rx.recv().await {
@@ -444,7 +444,7 @@ async fn start_full_node(state: SetupState) {
                 interval.tick().await;
                 // Alle EC-Chunks aus der Chain sammeln
                 let chunk_hashes: Vec<(String, u8)> = {
-                    let chain = scan_node.chain.lock().unwrap();
+                    let chain = scan_node.chain.lock().unwrap_or_else(|e| e.into_inner());
                     let mut hashes = Vec::new();
                     for block in &chain.blocks {
                         for doc in &block.documents {
@@ -542,7 +542,7 @@ async fn start_full_node(state: SetupState) {
             loop {
                 interval.tick().await;
                 let (should_install, version) = {
-                    let um = sched_updater.read().unwrap();
+                    let um = sched_updater.read().unwrap_or_else(|e| e.into_inner());
                     let hour = match um.config.auto_update_hour {
                         Some(h) => h,
                         None => continue,
@@ -562,7 +562,7 @@ async fn start_full_node(state: SetupState) {
                     let now = chrono::Local::now();
                     last_install_date = now.format("%Y-%m-%d").to_string();
                     let install_result = {
-                        let mut um = sched_updater.write().unwrap();
+                        let mut um = sched_updater.write().unwrap_or_else(|e| e.into_inner());
                         um.install()
                     };
                     match install_result {
@@ -614,7 +614,7 @@ async fn start_full_node(state: SetupState) {
         orgs: Arc::new(std::sync::Mutex::new(stone::organization::load_orgs())),
         chat_index: {
             let mut idx = stone::chat::load_chat_index();
-            let chain = node.chain.lock().unwrap();
+            let chain = node.chain.lock().unwrap_or_else(|e| e.into_inner());
             let chain_len = chain.blocks.len() as u64;
             println!("[chat-index] 🔍 Startup: chain_len={}, last_indexed_block={}", chain_len, idx.last_indexed_block);
             if idx.last_indexed_block > 0 && chain_len > 0 && idx.last_indexed_block >= chain_len {
@@ -647,6 +647,18 @@ async fn start_full_node(state: SetupState) {
     };
 
     *state.node_state.write().await = Some(node_app_state.clone());
+
+    // Audio-Room GC: Idle-Rooms alle 60s aufräumen (Rooms ohne Aktivität > 5 Min)
+    {
+        let audio_rooms = node_app_state.audio_rooms.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                interval.tick().await;
+                server::handlers::audio_relay::gc_idle_rooms(&audio_rooms);
+            }
+        });
+    }
 
     // ── Public API Port (nur /api/v1/* — kein Dashboard) ────────────────
     // Für externen Zugriff via Cloudflare Tunnel (chain.unrooted.dev).
@@ -682,7 +694,7 @@ async fn start_full_node(state: SetupState) {
         tokio::spawn(async move {
             // Warten bis die Chain synchronisiert ist
             tokio::time::sleep(std::time::Duration::from_secs(15)).await;
-            let chain = chain_ref.lock().unwrap();
+            let chain = chain_ref.lock().unwrap_or_else(|e| e.into_inner());
             let mut idx = chat_idx.lock().unwrap_or_else(|e| e.into_inner());
             let chain_len = chain.blocks.len() as u64;
             if chain_len <= 1 { return; }
@@ -755,13 +767,13 @@ async fn handle_p2p_event(
                 if syncing {
                     None // PoA bei Sync überspringen
                 } else {
-                    let vs = node.validator_set.read().unwrap();
+                    let vs = node.validator_set.read().unwrap_or_else(|e| e.into_inner());
                     // Kein sinnvolles PoA möglich wenn ValidatorSet leer ist
                     // oder nur den eigenen Validator enthält
                     if vs.validators.is_empty() || vs.active_count() <= 1 { None }
                     else {
                         let (prev_hash, last_block_ts) = {
-                            let chain = node.chain.lock().unwrap();
+                            let chain = node.chain.lock().unwrap_or_else(|e| e.into_inner());
                             let ph = chain.blocks.last().map(|b| b.hash.clone()).unwrap_or_else(|| "genesis".into());
                             let ts = chain.blocks.last().map(|b| b.timestamp);
                             (ph, ts)
@@ -791,7 +803,7 @@ async fn handle_p2p_event(
             }
 
             let result = {
-                let mut chain = node.chain.lock().unwrap();
+                let mut chain = node.chain.lock().unwrap_or_else(|e| e.into_inner());
                 let already = chain.blocks.iter().any(|b| b.hash == block.hash);
                 if already {
                     BlockResult::AlreadyKnown
@@ -804,7 +816,7 @@ async fn handle_p2p_event(
 
                     // Equivocation-Check vor Block-Akzeptanz
                     {
-                        let mut tracker = node.equivocation_tracker.lock().unwrap();
+                        let mut tracker = node.equivocation_tracker.lock().unwrap_or_else(|e| e.into_inner());
                         if let Some(evidence) = tracker.check_and_record(
                             block.index,
                             &block.validator_pub_key,
@@ -827,7 +839,7 @@ async fn handle_p2p_event(
                                 node.mempool.requeue_orphaned_txs(&orphaned);
                                 // Ledger nach Single-Block-Reorg neu aufbauen (BUG-11 Fix)
                                 let rebuilt = stone::token::TokenLedger::rebuild_from_chain(&chain.blocks);
-                                let mut ledger = node.token_ledger.write().unwrap();
+                                let mut ledger = node.token_ledger.write().unwrap_or_else(|e| e.into_inner());
                                 *ledger = rebuilt;
                                 eprintln!(
                                     "[sync] Token-Ledger nach Single-Block-Reorg neu aufgebaut: {} Accounts, Supply: {}",
@@ -836,9 +848,9 @@ async fn handle_p2p_event(
                                 );
                                 // StakingPool nach Reorg auch neu aufbauen
                                 let rebuilt_pool = stone::token::StakingPool::rebuild_from_chain(&chain.blocks);
-                                *node.staking_pool.write().unwrap() = rebuilt_pool;
+                                *node.staking_pool.write().unwrap_or_else(|e| e.into_inner()) = rebuilt_pool;
                             } else if !txs.is_empty() {
-                                let mut ledger = node.token_ledger.write().unwrap();
+                                let mut ledger = node.token_ledger.write().unwrap_or_else(|e| e.into_inner());
                                 // Peer-Blöcke wurden bereits vom Netzwerk validiert →
                                 // replay_mode aktivieren um Nonce-Checks zu überspringen
                                 // (bei Initial-Sync hat der Ledger noch nicht alle Nonces)
@@ -872,7 +884,7 @@ async fn handle_p2p_event(
                                 && !block_validator_pk.is_empty()
                                 && block_signer != node.node_id
                             {
-                                let mut vs = node.validator_set.write().unwrap();
+                                let mut vs = node.validator_set.write().unwrap_or_else(|e| e.into_inner());
                                 if vs.get(&block_signer).is_none() {
                                     // Auto-Discovery: als pending registrieren (active=false)
                                     let info = stone::consensus::ValidatorInfo::new_pending(
@@ -942,7 +954,7 @@ async fn handle_p2p_event(
 
             // Chain-Lock in eigenem Scope → wird vor .await gedroppt
             let reorg_result: Option<(u64, u64)> = {
-                let mut chain = node.chain.lock().unwrap();
+                let mut chain = node.chain.lock().unwrap_or_else(|e| e.into_inner());
                 let local_len = chain.blocks.len();
 
                 let mut fork_at = 0usize;
@@ -978,7 +990,7 @@ async fn handle_p2p_event(
                     // Ledger komplett aus der getrunkten Chain neu aufbauen (BUG-11 Fix)
                     {
                         let rebuilt = stone::token::TokenLedger::rebuild_from_chain(&chain.blocks);
-                        let mut ledger = node.token_ledger.write().unwrap();
+                        let mut ledger = node.token_ledger.write().unwrap_or_else(|e| e.into_inner());
                         *ledger = rebuilt;
                         eprintln!(
                             "[sync] Token-Ledger nach Reorg neu aufgebaut: {} Accounts, Supply: {}",
@@ -989,7 +1001,7 @@ async fn handle_p2p_event(
                     // StakingPool nach fork-Reorg auch neu aufbauen
                     {
                         let rebuilt_pool = stone::token::StakingPool::rebuild_from_chain(&chain.blocks);
-                        *node.staking_pool.write().unwrap() = rebuilt_pool;
+                        *node.staking_pool.write().unwrap_or_else(|e| e.into_inner()) = rebuilt_pool;
                     }
 
                     let mut applied = 0u64;
@@ -1002,7 +1014,7 @@ async fn handle_p2p_event(
 
                         // Equivocation-Check
                         {
-                            let mut tracker = node.equivocation_tracker.lock().unwrap();
+                            let mut tracker = node.equivocation_tracker.lock().unwrap_or_else(|e| e.into_inner());
                             let _ = tracker.check_and_record(
                                 block.index,
                                 &block.validator_pub_key,
@@ -1031,7 +1043,7 @@ async fn handle_p2p_event(
                             Ok(_) => {
                                 applied += 1;
                                 if !txs.is_empty() {
-                                    let mut ledger = node.token_ledger.write().unwrap();
+                                    let mut ledger = node.token_ledger.write().unwrap_or_else(|e| e.into_inner());
                                     ledger.replay_mode = true;
                                     let _receipts = ledger.apply_block_txs(&txs, idx);
                                     ledger.replay_mode = false;
@@ -1071,7 +1083,7 @@ async fn handle_p2p_event(
         }
 
         NetworkEvent::TxReceived { tx, from_peer } => {
-            let ledger = node.token_ledger.read().unwrap();
+            let ledger = node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
             match node.mempool.add_tx(*tx, Some(&ledger)) {
                 Ok(()) => println!("[p2p] 💸 TX von {from_peer} (mempool={})", node.mempool.pending_count()),
                 Err(e) => { if !format!("{e}").contains("Duplikat") { eprintln!("[p2p] TX abgelehnt: {e}"); } }
@@ -1125,7 +1137,7 @@ async fn handle_p2p_event(
             if let Some(updater_ref) = updater {
                 match serde_json::from_slice::<stone::updater::UpdateManifest>(&manifest_json) {
                     Ok(manifest) => {
-                        let mut um = updater_ref.write().unwrap();
+                        let mut um = updater_ref.write().unwrap_or_else(|e| e.into_inner());
                         match um.receive_manifest(manifest.clone()) {
                             Ok(true) => {
                                 println!(
@@ -1160,7 +1172,7 @@ async fn handle_p2p_event(
                                                     if let Ok(resp) = client.get(&chunk_url).send().await {
                                                         if resp.status().is_success() {
                                                             if let Ok(data) = resp.bytes().await {
-                                                                let mut um = updater_clone.write().unwrap();
+                                                                let mut um = updater_clone.write().unwrap_or_else(|e| e.into_inner());
                                                                 if um.store_chunk(idx, data.to_vec()).is_ok() {
                                                                     println!("[updater] ✓ Chunk {idx} heruntergeladen");
                                                                     break;
@@ -1171,7 +1183,7 @@ async fn handle_p2p_event(
                                                 }
                                             }
                                             // Verifizieren
-                                            let mut um = updater_clone.write().unwrap();
+                                            let mut um = updater_clone.write().unwrap_or_else(|e| e.into_inner());
                                             if um.missing_chunks().is_empty() {
                                                 if let Err(e) = um.verify_and_prepare() {
                                                     eprintln!("[updater] Verifizierung: {e}");
@@ -1327,7 +1339,7 @@ async fn repair_degraded_shards(
 
     // Alle EC-Chunks aus der Blockchain sammeln
     let ec_chunks: Vec<(String, u8, u8)> = {
-        let chain = node.chain.lock().unwrap();
+        let chain = node.chain.lock().unwrap_or_else(|e| e.into_inner());
         let mut chunks = Vec::new();
         for block in &chain.blocks {
             for doc in &block.documents {
@@ -1533,7 +1545,7 @@ struct UpdateStatusResponse {
 async fn api_update_status(State(state): State<SetupState>) -> Json<UpdateStatusResponse> {
     let ns = state.node_state.read().await;
     if let Some(ref ns) = *ns {
-        let um = ns.updater.read().unwrap();
+        let um = ns.updater.read().unwrap_or_else(|e| e.into_inner());
         let progress = um.progress();
         let manifest = progress.manifest.as_ref();
         let is_available = manifest.is_some();
@@ -1586,7 +1598,7 @@ async fn api_update_download(State(state): State<SetupState>) -> (StatusCode, Js
     match ns.as_ref() {
         Some(ns) => {
             let (missing, manifest_version) = {
-                let um = ns.updater.read().unwrap();
+                let um = ns.updater.read().unwrap_or_else(|e| e.into_inner());
                 let missing = um.missing_chunks();
                 let version = um.manifest.as_ref().map(|m| m.version.clone());
                 (missing, version)
@@ -1601,7 +1613,7 @@ async fn api_update_download(State(state): State<SetupState>) -> (StatusCode, Js
 
             if missing.is_empty() {
                 // Alle Chunks vorhanden → verifizieren
-                let mut um = ns.updater.write().unwrap();
+                let mut um = ns.updater.write().unwrap_or_else(|e| e.into_inner());
                 if !matches!(um.state, stone::updater::UpdateState::Ready) {
                     if let Err(e) = um.verify_and_prepare() {
                         return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
@@ -1638,7 +1650,7 @@ async fn api_update_download(State(state): State<SetupState>) -> (StatusCode, Js
                         if let Ok(resp) = client.get(&chunk_url).send().await {
                             if resp.status().is_success() {
                                 if let Ok(data) = resp.bytes().await {
-                                    let mut um = updater_clone.write().unwrap();
+                                    let mut um = updater_clone.write().unwrap_or_else(|e| e.into_inner());
                                     if um.store_chunk(idx, data.to_vec()).is_ok() {
                                         println!("[updater] ✓ Chunk {idx} heruntergeladen");
                                         break;
@@ -1649,7 +1661,7 @@ async fn api_update_download(State(state): State<SetupState>) -> (StatusCode, Js
                     }
                 }
                 // Verifizieren wenn komplett
-                let mut um = updater_clone.write().unwrap();
+                let mut um = updater_clone.write().unwrap_or_else(|e| e.into_inner());
                 if um.missing_chunks().is_empty() {
                     println!("[updater] ✓ Alle Chunks heruntergeladen – verifiziere...");
                     if let Err(e) = um.verify_and_prepare() {
@@ -1678,7 +1690,7 @@ async fn api_update_install(State(state): State<SetupState>) -> (StatusCode, Jso
         Some(ns) => {
             // Erst verifizieren
             {
-                let mut um = ns.updater.write().unwrap();
+                let mut um = ns.updater.write().unwrap_or_else(|e| e.into_inner());
                 if um.manifest.is_none() {
                     return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
                         "ok": false, "error": "Kein Update verfügbar"
@@ -1695,7 +1707,7 @@ async fn api_update_install(State(state): State<SetupState>) -> (StatusCode, Jso
             }
             // Installieren
             {
-                let mut um = ns.updater.write().unwrap();
+                let mut um = ns.updater.write().unwrap_or_else(|e| e.into_inner());
                 // Version vor install() holen, weil install() manifest auf None setzt
                 let version = um.manifest.as_ref()
                     .map(|m| m.version.clone())
@@ -1762,7 +1774,7 @@ async fn api_update_config(
     let ns = state.node_state.read().await;
     match ns.as_ref() {
         Some(ns) => {
-            let mut um = ns.updater.write().unwrap();
+            let mut um = ns.updater.write().unwrap_or_else(|e| e.into_inner());
             if let Some(ad) = body.auto_download {
                 um.config.auto_download = ad;
             }
@@ -2231,12 +2243,12 @@ async fn api_dashboard(State(state): State<SetupState>) -> Json<DashboardData> {
     let ns = state.node_state.read().await;
     let (node_running, block_count, peers_connected, p2p_peer_id, mempool_size, real_balance) =
         if let Some(ref ns) = *ns {
-            let bc = ns.node.chain.lock().unwrap().blocks.len() as u64;
+            let bc = ns.node.chain.lock().unwrap_or_else(|e| e.into_inner()).blocks.len() as u64;
             let pc = ns.node.get_peers().into_iter().filter(|p| p.is_healthy()).count();
             let pid = ns.network.as_ref().map(|h| h.local_peer_id.to_string()).unwrap_or_default();
             let ms = ns.node.mempool.pending_count();
             let bal = {
-                let ledger = ns.node.token_ledger.read().unwrap();
+                let ledger = ns.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
                 let addr = cfg.wallet_address.clone();
                 if !addr.is_empty() {
                     let d = ledger.balance(&addr);
@@ -2250,7 +2262,7 @@ async fn api_dashboard(State(state): State<SetupState>) -> Json<DashboardData> {
 
     // ── Mining-Info ─────────────────────────────────────────────────────
     let mining = if let Some(ref ns) = *ns {
-        let chain = ns.node.chain.lock().unwrap();
+        let chain = ns.node.chain.lock().unwrap_or_else(|e| e.into_inner());
         let bc = chain.blocks.len() as u64;
         let difficulty = get_current_pow_difficulty(&chain.blocks, bc);
         let pow_type = if bc >= ARGON2_POW_ACTIVATION_BLOCK { "Argon2id" } else { "SHA256 Lite" };
@@ -2260,7 +2272,7 @@ async fn api_dashboard(State(state): State<SetupState>) -> Json<DashboardData> {
 
         // Current reward
         let reward_pool = {
-            let ledger = ns.node.token_ledger.read().unwrap();
+            let ledger = ns.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
             ledger.balance("pool:storage_rewards")
         };
         let current_reward = MasterNodeState::calculate_block_reward(bc, reward_pool);
@@ -2300,10 +2312,10 @@ async fn api_dashboard(State(state): State<SetupState>) -> Json<DashboardData> {
 
     // ── Token Economy ───────────────────────────────────────────────────
     let token_economy = if let Some(ref ns) = *ns {
-        let ledger = ns.node.token_ledger.read().unwrap();
+        let ledger = ns.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
         let supply = SupplyInfo::from_ledger(&ledger);
         let reward_pool = ledger.balance("pool:storage_rewards");
-        let staking = ns.node.staking_pool.read().unwrap();
+        let staking = ns.node.staking_pool.read().unwrap_or_else(|e| e.into_inner());
         let pool_info = staking.pool_info(reward_pool);
         TokenEconomyInfo {
             total_supply: supply.total_supply.to_string().parse().unwrap_or(0.0),
@@ -2351,7 +2363,7 @@ async fn api_dashboard(State(state): State<SetupState>) -> Json<DashboardData> {
         let registry = &ns.node.shard_registry;
 
         // Blockchain EC-Daten analysieren, Registry für Verfügbarkeit nutzen
-        let chain = ns.node.chain.lock().unwrap();
+        let chain = ns.node.chain.lock().unwrap_or_else(|e| e.into_inner());
         let mut ec_documents = 0u64;
         let mut ec_chunks = 0u64;
         let mut total_shards_blockchain = 0u64;
@@ -2577,7 +2589,7 @@ async fn api_send(
         let addr = cfg.wallet_address.clone();
         drop(cfg);
         if !addr.is_empty() {
-            let ledger = ns.node.token_ledger.read().unwrap();
+            let ledger = ns.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
             let d = ledger.balance(&addr);
             d.to_string().parse::<f64>().unwrap_or(0.0)
         } else { 0.0 }

@@ -159,9 +159,9 @@ async fn main() {
 
     // On-Chain Account-Registry: Merge Chain-registrierte Accounts mit lokalen Users
     {
-        let ledger = node.token_ledger.read().unwrap();
+        let ledger = node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
         if ledger.registered_account_count() > 0 {
-            let mut local = users.lock().unwrap();
+            let mut local = users.lock().unwrap_or_else(|e| e.into_inner());
             let merged = stone::auth::rebuild_users_from_ledger(&ledger, &local);
             let chain_count = ledger.registered_account_count();
             *local = merged;
@@ -213,7 +213,7 @@ async fn main() {
                     );
 
                     {
-                        let count = node.chain.lock().unwrap().blocks.len() as u64;
+                        let count = node.chain.lock().unwrap_or_else(|e| e.into_inner()).blocks.len() as u64;
                         handle.set_chain_count(count).await;
                     }
                     // Chain-Referenz setzen damit P2P-Peers Blöcke direkt serviert bekommen
@@ -221,11 +221,11 @@ async fn main() {
 
                     // Eigenen Stake-Level für Relay-Priorität setzen
                     {
-                        let wallet = node.validator_set.read().unwrap()
+                        let wallet = node.validator_set.read().unwrap_or_else(|e| e.into_inner())
                             .get(&node.node_id).map(|v| v.public_key_hex.clone())
                             .unwrap_or_default();
                         let level = {
-                            let pool = node.staking_pool.read().unwrap();
+                            let pool = node.staking_pool.read().unwrap_or_else(|e| e.into_inner());
                             pool.stake_level(&wallet).min_stake() as u64
                         };
                         handle.set_stake_level(level).await;
@@ -239,11 +239,11 @@ async fn main() {
                             let mut sl_interval = tokio::time::interval(std::time::Duration::from_secs(300));
                             loop {
                                 sl_interval.tick().await;
-                                let wallet = node_sl.validator_set.read().unwrap()
+                                let wallet = node_sl.validator_set.read().unwrap_or_else(|e| e.into_inner())
                                     .get(&node_sl.node_id).map(|v| v.public_key_hex.clone())
                                     .unwrap_or_default();
                                 let level = {
-                                    let pool = node_sl.staking_pool.read().unwrap();
+                                    let pool = node_sl.staking_pool.read().unwrap_or_else(|e| e.into_inner());
                                     pool.stake_level(&wallet).min_stake() as u64
                                 };
                                 handle_sl.set_stake_level(level).await;
@@ -290,12 +290,12 @@ async fn main() {
                                         if syncing {
                                             None // PoA bei Sync überspringen
                                         } else {
-                                            let vs = node_bg.validator_set.read().unwrap();
+                                            let vs = node_bg.validator_set.read().unwrap_or_else(|e| e.into_inner());
                                             if vs.validators.is_empty() {
                                                 None
                                             } else {
                                                 let (prev_hash, last_block_ts) = {
-                                                    let chain = node_bg.chain.lock().unwrap();
+                                                    let chain = node_bg.chain.lock().unwrap_or_else(|e| e.into_inner());
                                                     let ph = chain.blocks.last().map(|b| b.hash.clone()).unwrap_or_else(|| "genesis".into());
                                                     let ts = chain.blocks.last().map(|b| b.timestamp);
                                                     (ph, ts)
@@ -335,7 +335,7 @@ async fn main() {
                                     }
 
                                     let result = {
-                                        let mut chain = node_bg.chain.lock().unwrap();
+                                        let mut chain = node_bg.chain.lock().unwrap_or_else(|e| e.into_inner());
                                         let already_known =
                                             chain.blocks.iter().any(|b| b.hash == block.hash);
                                         if already_known {
@@ -347,7 +347,7 @@ async fn main() {
 
                                             // Equivocation-Check vor Block-Akzeptanz
                                             {
-                                                let mut tracker = node_bg.equivocation_tracker.lock().unwrap();
+                                                let mut tracker = node_bg.equivocation_tracker.lock().unwrap_or_else(|e| e.into_inner());
                                                 if let Some(evidence) = tracker.check_and_record(
                                                     block.index,
                                                     &block.validator_pub_key,
@@ -374,7 +374,7 @@ async fn main() {
                                                         node_bg.mempool.requeue_orphaned_txs(&orphaned);
                                                         // Ledger nach Single-Block-Reorg neu aufbauen (BUG-11 Fix)
                                                         let rebuilt = stone::token::TokenLedger::rebuild_from_chain(&chain.blocks);
-                                                        let mut ledger = node_bg.token_ledger.write().unwrap();
+                                                        let mut ledger = node_bg.token_ledger.write().unwrap_or_else(|e| e.into_inner());
                                                         *ledger = rebuilt;
                                                         eprintln!(
                                                             "[sync] Token-Ledger nach Single-Block-Reorg neu aufgebaut: {} Accounts, Supply: {}",
@@ -382,7 +382,7 @@ async fn main() {
                                                             ledger.total_supply()
                                                         );
                                                     } else if !block_txs.is_empty() {
-                                                        let mut ledger = node_bg.token_ledger.write().unwrap();
+                                                        let mut ledger = node_bg.token_ledger.write().unwrap_or_else(|e| e.into_inner());
                                                         // Block ist bereits in Chain aufgenommen → replay_mode
                                                         // (Nonce/Balance-Checks überspringen, Block ist finalisiert)
                                                         ledger.replay_mode = true;
@@ -540,7 +540,7 @@ async fn main() {
 
                                 // ── Token-TX per Gossipsub empfangen → in Mempool ──
                                 NetworkEvent::TxReceived { tx, from_peer } => {
-                                    let ledger = node_bg.token_ledger.read().unwrap();
+                                    let ledger = node_bg.token_ledger.read().unwrap_or_else(|e| e.into_inner());
                                     match node_bg.mempool.add_tx(*tx, Some(&ledger)) {
                                         Ok(()) => {
                                             println!(
@@ -731,7 +731,7 @@ async fn main() {
                                     sorted.sort_by_key(|b| b.index);
 
                                     let reorg_result: Option<(u64, u64)> = {
-                                        let mut chain = node_bg.chain.lock().unwrap();
+                                        let mut chain = node_bg.chain.lock().unwrap_or_else(|e| e.into_inner());
                                         let local_len = chain.blocks.len();
 
                                         // Fork-Punkt finden
@@ -786,7 +786,7 @@ async fn main() {
                                             // damit Balancen/Nonces konsistent sind (BUG-11 Fix)
                                             {
                                                 let rebuilt = stone::token::TokenLedger::rebuild_from_chain(&chain.blocks);
-                                                let mut ledger = node_bg.token_ledger.write().unwrap();
+                                                let mut ledger = node_bg.token_ledger.write().unwrap_or_else(|e| e.into_inner());
                                                 *ledger = rebuilt;
                                                 eprintln!(
                                                     "[sync] Token-Ledger nach Reorg neu aufgebaut: {} Accounts, Supply: {}",
@@ -803,7 +803,7 @@ async fn main() {
 
                                                 // Equivocation-Check
                                                 {
-                                                    let mut tracker = node_bg.equivocation_tracker.lock().unwrap();
+                                                    let mut tracker = node_bg.equivocation_tracker.lock().unwrap_or_else(|e| e.into_inner());
                                                     let _ = tracker.check_and_record(
                                                         block.index,
                                                         &block.validator_pub_key,
@@ -815,7 +815,7 @@ async fn main() {
                                                     Ok(_) => {
                                                         applied += 1;
                                                         if !txs.is_empty() {
-                                                            let mut ledger = node_bg.token_ledger.write().unwrap();
+                                                            let mut ledger = node_bg.token_ledger.write().unwrap_or_else(|e| e.into_inner());
                                                             ledger.replay_mode = true;
                                                             let _receipts = ledger.apply_block_txs(&txs, idx);
                                                             ledger.replay_mode = false;
@@ -968,7 +968,7 @@ async fn main() {
         chat_index: {
             let mut idx = stone::chat::load_chat_index();
             // Chat-Index aus der Chain aufbauen/aktualisieren
-            let chain = node.chain.lock().unwrap();
+            let chain = node.chain.lock().unwrap_or_else(|e| e.into_inner());
             let chain_len = chain.blocks.len() as u64;
             if idx.last_indexed_block > 0 && chain_len > 0 && idx.last_indexed_block >= chain_len {
                 println!("[chat-index] ⚠️ Chain-Reset erkannt beim Start! last_indexed_block={} aber chain hat nur {} Blöcke. Rebuild...", idx.last_indexed_block, chain_len);

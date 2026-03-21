@@ -95,7 +95,7 @@ pub async fn handle_create_group(
 
     // User-Daten der Mitglieder auflösen
     {
-        let users = state.users.lock().unwrap();
+        let users = state.users.lock().unwrap_or_else(|e| e.into_inner());
         for wallet in &req.members {
             if wallet == &user.wallet_address {
                 continue; // Ersteller schon drin
@@ -126,7 +126,7 @@ pub async fn handle_create_group(
     };
 
     {
-        let mut store = state.chat_groups.lock().unwrap();
+        let mut store = state.chat_groups.lock().unwrap_or_else(|e| e.into_inner());
         store.groups.push(group);
         save_chat_groups(&store);
     }
@@ -151,7 +151,7 @@ pub async fn handle_list_groups(
         Err(e) => return e.into_response(),
     };
 
-    let store = state.chat_groups.lock().unwrap();
+    let store = state.chat_groups.lock().unwrap_or_else(|e| e.into_inner());
     let groups: Vec<_> = store.groups_for(&user.wallet_address)
         .into_iter()
         .map(|g| {
@@ -190,7 +190,7 @@ pub async fn handle_get_group(
         Err(e) => return e.into_response(),
     };
 
-    let store = state.chat_groups.lock().unwrap();
+    let store = state.chat_groups.lock().unwrap_or_else(|e| e.into_inner());
     let group = match store.find(&group_id) {
         Some(g) => g,
         None => return (
@@ -274,7 +274,7 @@ pub async fn handle_group_send(
     };
 
     {
-        let mut store = state.chat_groups.lock().unwrap();
+        let mut store = state.chat_groups.lock().unwrap_or_else(|e| e.into_inner());
         let group = match store.find_mut(&group_id) {
             Some(g) => g,
             None => return (
@@ -327,7 +327,7 @@ pub async fn handle_group_messages(
         Err(e) => return e.into_response(),
     };
 
-    let store = state.chat_groups.lock().unwrap();
+    let store = state.chat_groups.lock().unwrap_or_else(|e| e.into_inner());
     let group = match store.find(&group_id) {
         Some(g) => g,
         None => return (
@@ -395,7 +395,7 @@ pub async fn handle_add_group_member(
 
     // User-Daten des neuen Mitglieds auflösen
     let (uid, uname) = {
-        let users = state.users.lock().unwrap();
+        let users = state.users.lock().unwrap_or_else(|e| e.into_inner());
         users.iter()
             .find(|u| u.wallet_address == req.wallet)
             .map(|u| (u.id.clone(), u.name.clone()))
@@ -411,7 +411,7 @@ pub async fn handle_add_group_member(
     };
 
     {
-        let mut store = state.chat_groups.lock().unwrap();
+        let mut store = state.chat_groups.lock().unwrap_or_else(|e| e.into_inner());
         let group = match store.find_mut(&group_id) {
             Some(g) => g,
             None => return (
@@ -458,7 +458,7 @@ pub async fn handle_remove_group_member(
     };
 
     {
-        let mut store = state.chat_groups.lock().unwrap();
+        let mut store = state.chat_groups.lock().unwrap_or_else(|e| e.into_inner());
         let group = match store.find_mut(&group_id) {
             Some(g) => g,
             None => return (

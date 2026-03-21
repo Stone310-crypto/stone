@@ -779,9 +779,9 @@ pub async fn handle_mining_template(
 ) -> impl IntoResponse {
     // Prüfe ob bereits ein aktuelles Template existiert
     let existing = {
-        let tmpl = state.node.current_mining_template.read().unwrap();
+        let tmpl = state.node.current_mining_template.read().unwrap_or_else(|e| e.into_inner());
         tmpl.as_ref().map(|(t, _)| {
-            let chain = state.node.chain.lock().unwrap();
+            let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
             let current_height = chain.blocks.len() as u64;
             (t.clone(), current_height)
         })
@@ -852,7 +852,7 @@ pub async fn handle_mining_submit(
 
             // Block via P2P-Gossipsub broadcasten
             {
-                let tx = state.node.block_broadcast_tx.lock().unwrap();
+                let tx = state.node.block_broadcast_tx.lock().unwrap_or_else(|e| e.into_inner());
                 if let Some(ref sender) = *tx {
                     let _ = sender.send(block.clone());
                 }

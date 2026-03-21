@@ -692,7 +692,7 @@ impl ShardHolderRegistry {
 
     /// Registriert einen Holder für einen bestimmten Shard.
     pub fn add_holder(&self, chunk_hash: &str, shard_index: u8, peer_id: &str) {
-        let mut map = self.entries.write().unwrap();
+        let mut map = self.entries.write().unwrap_or_else(|e| e.into_inner());
         let chunk_entry = map.entry(chunk_hash.to_string()).or_default();
         let holders = chunk_entry.entry(shard_index).or_default();
         if !holders.contains(&peer_id.to_string()) {
@@ -709,7 +709,7 @@ impl ShardHolderRegistry {
 
     /// Gibt alle Holder für einen bestimmten Shard zurück.
     pub fn holders_for(&self, chunk_hash: &str, shard_index: u8) -> Vec<String> {
-        let map = self.entries.read().unwrap();
+        let map = self.entries.read().unwrap_or_else(|e| e.into_inner());
         map.get(chunk_hash)
             .and_then(|m| m.get(&shard_index))
             .cloned()
@@ -719,7 +719,7 @@ impl ShardHolderRegistry {
     /// Gibt die Anzahl der bekannten Holder für einen Chunk zurück (über alle Shards).
     /// Returned: Anzahl Shards mit mindestens einem Holder.
     pub fn available_shards_for_chunk(&self, chunk_hash: &str) -> usize {
-        let map = self.entries.read().unwrap();
+        let map = self.entries.read().unwrap_or_else(|e| e.into_inner());
         map.get(chunk_hash)
             .map(|m| m.values().filter(|h| !h.is_empty()).count())
             .unwrap_or(0)
@@ -727,12 +727,12 @@ impl ShardHolderRegistry {
 
     /// Gibt alle Chunk-Hashes zurück die in der Registry sind.
     pub fn all_chunks(&self) -> Vec<String> {
-        self.entries.read().unwrap().keys().cloned().collect()
+        self.entries.read().unwrap_or_else(|e| e.into_inner()).keys().cloned().collect()
     }
 
     /// Entfernt einen Holder von allen seinen Shards (z.B. wenn Peer offline geht).
     pub fn remove_holder(&self, peer_id: &str) {
-        let mut map = self.entries.write().unwrap();
+        let mut map = self.entries.write().unwrap_or_else(|e| e.into_inner());
         for chunk_map in map.values_mut() {
             for holders in chunk_map.values_mut() {
                 holders.retain(|h| h != peer_id);
@@ -743,7 +743,7 @@ impl ShardHolderRegistry {
     /// Setzt die Holder-Liste für einen bestimmten Chunk+Shard komplett neu
     /// (z.B. nach einem ListShards-Scan).
     pub fn set_holders(&self, chunk_hash: &str, shard_index: u8, holders: Vec<String>) {
-        let mut map = self.entries.write().unwrap();
+        let mut map = self.entries.write().unwrap_or_else(|e| e.into_inner());
         let chunk_entry = map.entry(chunk_hash.to_string()).or_default();
         chunk_entry.insert(shard_index, holders);
     }
@@ -764,7 +764,7 @@ impl ShardHolderRegistry {
 
     /// Persistiert die Registry auf Disk.
     pub fn persist(&self) {
-        let map = self.entries.read().unwrap();
+        let map = self.entries.read().unwrap_or_else(|e| e.into_inner());
         if let Ok(json) = serde_json::to_string_pretty(&*map) {
             let _ = std::fs::write(&self.persist_path, json);
         }
@@ -772,7 +772,7 @@ impl ShardHolderRegistry {
 
     /// Exportiert die Registry als flache Liste (für Gossipsub-Broadcast).
     pub fn export_flat(&self) -> Vec<ShardHolder> {
-        let map = self.entries.read().unwrap();
+        let map = self.entries.read().unwrap_or_else(|e| e.into_inner());
         let now = chrono::Utc::now().timestamp();
         let mut out = Vec::new();
         for (chunk_hash, shard_map) in map.iter() {
@@ -817,7 +817,7 @@ impl ShardHolderRegistry {
             return Vec::new();
         }
 
-        let map = self.entries.read().unwrap();
+        let map = self.entries.read().unwrap_or_else(|e| e.into_inner());
         let mut actions = Vec::new();
 
         for (chunk_hash, shard_map) in map.iter() {

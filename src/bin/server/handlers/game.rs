@@ -602,7 +602,7 @@ pub async fn handle_sdk_wallet_transactions(
     State(state): State<AppState>,
     axum::extract::Query(q): axum::extract::Query<TxHistoryQuery>,
 ) -> impl IntoResponse {
-    let chain = state.node.chain.lock().unwrap();
+    let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
     let limit = q.limit.unwrap_or(50).min(200);
     let mut txs: Vec<serde_json::Value> = Vec::new();
 
@@ -1230,7 +1230,7 @@ pub async fn handle_sdk_tx_status(
         }));
     }
 
-    let chain = state.node.chain.lock().unwrap();
+    let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
     for block in chain.blocks.iter().rev() {
         if let Some(tx) = block.transactions.iter().find(|t| t.tx_id == tx_id) {
             return Json(serde_json::json!({

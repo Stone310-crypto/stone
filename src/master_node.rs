@@ -606,10 +606,14 @@ impl MasterNodeState {
                     // damit sync_with_chain nach dem p2p-Sync einen verify_and_repair triggert
                     println!("[token] 🔄 Ledger-Repair v3: Chain leer, setze Sync-Marker zurück");
                     ledger.reset_sync_marker();
-                    let _ = ledger.persist();
+                    if let Err(e) = ledger.persist() {
+                        eprintln!("[token] ⚠️  Persist nach Sync-Marker-Reset fehlgeschlagen: {e}");
+                    }
                 }
                 if let Ok(db) = crate::token::open_token_db() {
-                    let _ = db.put(b"__mig_ledger_repair_v3", b"done");
+                    if let Err(e) = db.put(b"__mig_ledger_repair_v3", b"done") {
+                        eprintln!("[token] ⚠️  Migration-Marker v3 schreiben fehlgeschlagen: {e}");
+                    }
                 }
             }
         }
@@ -704,7 +708,7 @@ impl MasterNodeState {
         // Ansonsten: Initial-Sync abwarten (max 240s), damit wir nicht
         // auf einem veralteten Fork minen.
         {
-            let chain = state.chain.lock().unwrap();
+            let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
             let chain_len = chain.blocks.len();
             let last_block_age = chain.blocks.last()
                 .map(|b| {
@@ -745,7 +749,7 @@ impl MasterNodeState {
         {
             let signing_key = load_or_create_validator_key();
             let pub_key_hex = local_validator_pubkey_hex(&signing_key);
-            let mut vs = state.validator_set.write().unwrap();
+            let mut vs = state.validator_set.write().unwrap_or_else(|e| e.into_inner());
             if vs.get(&node_id).is_none() {
                 use crate::consensus::ValidatorInfo;
                 // Erster Node im Netzwerk → sofort aktiv (Bootstrap).
@@ -800,8 +804,8 @@ impl MasterNodeState {
         // registrieren. Verhindert dass tote Nodes aus alten Blöcken
         // die Validator-Rotation stören.
         {
-            let chain = state.chain.lock().unwrap();
-            let mut vs = state.validator_set.write().unwrap();
+            let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+            let mut vs = state.validator_set.write().unwrap_or_else(|e| e.into_inner());
             let mut discovered = 0u32;
             let start = chain.blocks.len().saturating_sub(20);
             for block in &chain.blocks[start..] {
@@ -843,7 +847,7 @@ impl MasterNodeState {
     ) {
         // Stakes aus StakingPool
         let stakes: HashMap<String, rust_decimal::Decimal> = {
-            let pool = self.staking_pool.read().unwrap();
+            let pool = self.staking_pool.read().unwrap_or_else(|e| e.into_inner());
             pool.stakers.iter()
                 .map(|(addr, entry)| (addr.clone(), entry.staked_amount))
                 .collect()
@@ -851,14 +855,14 @@ impl MasterNodeState {
 
         // Jailed aus SlashingStore
         let jailed: std::collections::HashSet<String> = {
-            let ss = self.slashing_store.read().unwrap();
+            let ss = self.slashing_store.read().unwrap_or_else(|e| e.into_inner());
             ss.jailed.keys().cloned().collect()
         };
 
         // Wallet-Map: Alle bekannten Validatoren → public_key_hex als Wallet
         let mut wallet_map = HashMap::new();
         {
-            let vs = self.validator_set.read().unwrap();
+            let vs = self.validator_set.read().unwrap_or_else(|e| e.into_inner());
             for v in &vs.validators {
                 if v.active && !v.public_key_hex.is_empty() {
                     wallet_map.insert(v.node_id.clone(), v.public_key_hex.clone());
@@ -903,7 +907,7 @@ impl MasterNodeState {
         //
         // Schritt 1: Chain-Daten holen (eigener Scope → chain wird gedroppt)
         let (next_index, prev_hash_owned) = {
-            let chain = self.chain.lock().unwrap();
+            let chain = self.chain.lock().unwrap_or_else(|e| e.into_inner());
             let idx = chain.blocks.len() as u64;
             let hash = chain.blocks.last()
                 .map(|b| b.hash.clone())
@@ -912,7 +916,7 @@ impl MasterNodeState {
         };
         // Schritt 2: Validator-Prüfung (chain NICHT gehalten)
         let should_sign = {
-            let vs = self.validator_set.read().unwrap();
+            let vs = self.validator_set.read().unwrap_or_else(|e| e.into_inner());
             if !vs.validators.is_empty() {
                 if !vs.is_active_validator(&self.node_id) {
                     return Err(format!(
@@ -945,7 +949,7 @@ impl MasterNodeState {
 
         // ── Chain + Ledger + Signierung (chain gelockt) ──────────────────────
         let block = {
-            let mut chain = self.chain.lock().unwrap();
+            let mut chain = self.chain.lock().unwrap_or_else(|e| e.into_inner());
             let mut block = chain.add_documents(
                 documents.clone(),
                 tombstones.clone(),
@@ -958,7 +962,7 @@ impl MasterNodeState {
 
             // Token-TXs im Ledger verarbeiten (chain → ledger: korrekte Reihenfolge)
             if !block.transactions.is_empty() {
-                let mut ledger = self.token_ledger.write().unwrap();
+                let mut ledger = self.token_ledger.write().unwrap_or_else(|e| e.into_inner());
                 let receipts = ledger.apply_block_txs(&block.transactions, block.index);
                 if !receipts.is_empty() {
                     if let Err(e) = ledger.persist() {
@@ -978,7 +982,9 @@ impl MasterNodeState {
                 // Signierter Block in RocksDB aktualisieren (mit WAL-Sync)
                 use crate::storage::ChainStore;
                 if let Ok(store) = ChainStore::open() {
-                    let _ = store.write_block_sync(&block);
+                    if let Err(e) = store.write_block_sync(&block) {
+                        eprintln!("[chain] ⚠️  RocksDB write_block_sync fehlgeschlagen: {e}");
+                    }
                 }
                 // In-memory chain aktualisieren
                 if let Some(last) = chain.blocks.last_mut() {
@@ -992,7 +998,7 @@ impl MasterNodeState {
 
         // ── Validator-Statistik aktualisieren (chain NICHT gehalten) ─────────
         if should_sign {
-            let mut vs_w = self.validator_set.write().unwrap();
+            let mut vs_w = self.validator_set.write().unwrap_or_else(|e| e.into_inner());
             if let Some(v) = vs_w.get_mut(&self.node_id) {
                 v.blocks_signed += 1;
                 vs_w.save();
@@ -1045,7 +1051,7 @@ impl MasterNodeState {
 
     /// Peer hinzufügen oder aktualisieren
     pub fn upsert_peer(&self, peer: PeerInfo) {
-        let mut peers = self.peers.write().unwrap();
+        let mut peers = self.peers.write().unwrap_or_else(|e| e.into_inner());
         if let Some(existing) = peers.iter_mut().find(|p| p.url == peer.url) {
             *existing = peer;
         } else {
@@ -1055,7 +1061,7 @@ impl MasterNodeState {
 
     /// Peer-Status aktualisieren
     pub fn set_peer_status(&self, url: &str, status: PeerStatus) {
-        let mut peers = self.peers.write().unwrap();
+        let mut peers = self.peers.write().unwrap_or_else(|e| e.into_inner());
         if let Some(p) = peers.iter_mut().find(|p| p.url == url) {
             let changed = p.status != status;
             p.status = status.clone();
@@ -1070,7 +1076,7 @@ impl MasterNodeState {
 
     /// Alle Peers entfernen und neu setzen
     pub fn replace_peers(&self, peers: Vec<PeerInfo>) {
-        let mut locked = self.peers.write().unwrap();
+        let mut locked = self.peers.write().unwrap_or_else(|e| e.into_inner());
         *locked = peers;
     }
     /// Statische Hilfsfunktion: PeerInfo-Objekt direkt als UNREACHABLE markieren.
@@ -1088,7 +1094,7 @@ impl MasterNodeState {
     /// Löst ein PeerStatusChanged-Event aus wenn sich der Status ändert.
     pub fn mark_peer_unhealthy_by_url(&self, url: &str) {
         self.set_peer_status(url, PeerStatus::Unreachable);
-        let mut peers = self.peers.write().unwrap();
+        let mut peers = self.peers.write().unwrap_or_else(|e| e.into_inner());
         if let Some(p) = peers.iter_mut().find(|p| p.url == url) {
             p.sync_failures = p.sync_failures.saturating_add(1);
         }
@@ -1096,14 +1102,14 @@ impl MasterNodeState {
 
     /// Peers lesen
     pub fn get_peers(&self) -> Vec<PeerInfo> {
-        self.peers.read().unwrap().clone()
+        self.peers.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Staking-TXs aus einem Block im StakingPool verarbeiten + persistieren.
     /// Wird von allen Block-Ingestion-Pfaden aufgerufen (lokal, P2P, RangeSync).
     pub fn apply_staking_from_txs(&self, txs: &[crate::token::TokenTx]) {
         use crate::token::TxType;
-        let mut pool = self.staking_pool.write().unwrap();
+        let mut pool = self.staking_pool.write().unwrap_or_else(|e| e.into_inner());
         let mut changed = false;
         for tx in txs {
             match tx.tx_type {
@@ -1149,7 +1155,7 @@ impl MasterNodeState {
 
     /// Chain-Zusammenfassung für API-Antworten
     pub fn chain_summary(&self) -> ChainSummary {
-        let chain = self.chain.lock().unwrap();
+        let chain = self.chain.lock().unwrap_or_else(|e| e.into_inner());
         let total_docs: usize = chain
             .list_all_documents()
             .len();
@@ -1163,7 +1169,7 @@ impl MasterNodeState {
 
     /// Metriken für API
     pub fn snapshot_metrics(&self) -> MasterMetricsSnapshot {
-        let peers = self.peers.read().unwrap();
+        let peers = self.peers.read().unwrap_or_else(|e| e.into_inner());
         let healthy = peers.iter().filter(|p| p.is_healthy()).count();
         MasterMetricsSnapshot {
             requests_total: self.metrics.requests_total.load(Ordering::Relaxed),
@@ -1277,7 +1283,7 @@ impl MasterNodeState {
         &self,
         chain: &StoneChain,
     ) -> Vec<crate::storage_proof::ChallengeResponse> {
-        let pending = self.pending_challenge_responses.lock().unwrap();
+        let pending = self.pending_challenge_responses.lock().unwrap_or_else(|e| e.into_inner());
         if pending.is_empty() {
             return Vec::new();
         }
@@ -1346,7 +1352,7 @@ impl MasterNodeState {
             return;
         }
         let id_set: std::collections::HashSet<&str> = committed_ids.iter().map(|s| s.as_str()).collect();
-        let mut pending = self.pending_challenge_responses.lock().unwrap();
+        let mut pending = self.pending_challenge_responses.lock().unwrap_or_else(|e| e.into_inner());
         pending.retain(|r| !id_set.contains(r.challenge_id.as_str()));
     }
 
@@ -1408,18 +1414,18 @@ impl MasterNodeState {
 
         // Reward-Wallet bestimmen
         let reward_wallet = {
-            let mw = self.mining_wallet.read().unwrap();
+            let mw = self.mining_wallet.read().unwrap_or_else(|e| e.into_inner());
             mw.clone().unwrap_or_else(|| validator_wallet.clone())
         };
 
         // ── Block-Reward berechnen ──────────────────────────────────────
         let (reward_amount, next_index, _prev_hash) = {
-            let chain = self.chain.lock().unwrap();
+            let chain = self.chain.lock().unwrap_or_else(|e| e.into_inner());
             let next_idx = chain.blocks.len() as u64;
             let prev = chain.blocks.last()
                 .map(|b| b.hash.clone())
                 .unwrap_or_else(|| "genesis".into());
-            let ledger = self.token_ledger.read().unwrap();
+            let ledger = self.token_ledger.read().unwrap_or_else(|e| e.into_inner());
             let pool_balance = ledger.balance("pool:storage_rewards");
             (Self::calculate_block_reward(next_idx, pool_balance), next_idx, prev)
         };
@@ -1437,7 +1443,7 @@ impl MasterNodeState {
         // Verhindert dass TXs mit unzureichender Balance oder falscher Nonce
         // in den Block aufgenommen werden (Double-Spend-Schutz).
         let pending_txs = {
-            let ledger = self.token_ledger.read().unwrap();
+            let ledger = self.token_ledger.read().unwrap_or_else(|e| e.into_inner());
             let valid = ledger.filter_valid_txs(&pending_txs);
 
             // Abgelehnte User-TXs mit zukünftiger Nonce zurück in den Mempool legen.
@@ -1514,7 +1520,7 @@ impl MasterNodeState {
 
         // ── Block vorbereiten (ohne PoW) ────────────────────────────────
         let signer = self.node_id.clone();
-        let chain = self.chain.lock().unwrap();
+        let chain = self.chain.lock().unwrap_or_else(|e| e.into_inner());
         let mut block = chain.prepare_block(
             Vec::new(),
             Vec::new(),
@@ -1534,16 +1540,16 @@ impl MasterNodeState {
 
         // ── Storage Challenges ──────────────────────────────────────────
         {
-            let chain = self.chain.lock().unwrap();
+            let chain = self.chain.lock().unwrap_or_else(|e| e.into_inner());
             let chunk_refs = crate::storage_proof::collect_chunk_refs(&chain);
             if !chunk_refs.is_empty() {
-                let vs = self.validator_set.read().unwrap();
+                let vs = self.validator_set.read().unwrap_or_else(|e| e.into_inner());
                 let mut known_wallets: Vec<String> = vs.validators.iter()
                     .filter(|v| v.active)
                     .filter_map(|v| if v.public_key_hex.is_empty() { None } else { Some(v.public_key_hex.clone()) })
                     .collect();
                 {
-                    let trust = self.trust_registry.read().unwrap();
+                    let trust = self.trust_registry.read().unwrap_or_else(|e| e.into_inner());
                     for entry in trust.iter() {
                         if !entry.public_key_hex.is_empty() && !known_wallets.contains(&entry.public_key_hex) {
                             known_wallets.push(entry.public_key_hex.clone());
@@ -1561,7 +1567,7 @@ impl MasterNodeState {
                     let challenge_reward: Decimal = crate::storage_proof::CHALLENGE_REWARD
                         .parse().unwrap_or(Decimal::new(5, 1));
                     let pool_balance = {
-                        let ledger = self.token_ledger.read().unwrap();
+                        let ledger = self.token_ledger.read().unwrap_or_else(|e| e.into_inner());
                         ledger.balance("pool:storage_rewards")
                     };
                     let mut total = Decimal::ZERO;
@@ -1599,14 +1605,14 @@ impl MasterNodeState {
 
         // ── PoW-Difficulty bestimmen ────────────────────────────────────
         let difficulty = {
-            let chain = self.chain.lock().unwrap();
+            let chain = self.chain.lock().unwrap_or_else(|e| e.into_inner());
             crate::consensus::get_current_pow_difficulty(&chain.blocks, block.index)
         };
         block.pow_difficulty = difficulty;
 
         // ── PoS/PoW Hybrid: Effektive Difficulty berechnen ───────────────
         let eff_difficulty = {
-            let pool = self.staking_pool.read().unwrap();
+            let pool = self.staking_pool.read().unwrap_or_else(|e| e.into_inner());
             let miner_stake = pool.stakers.get(&validator_wallet)
                 .map(|e| e.staked_amount)
                 .unwrap_or(rust_decimal::Decimal::ZERO);
@@ -1617,7 +1623,7 @@ impl MasterNodeState {
 
         // ── Kumulative Difficulty setzen ─────────────────────────────────
         {
-            let chain = self.chain.lock().unwrap();
+            let chain = self.chain.lock().unwrap_or_else(|e| e.into_inner());
             let parent_cd = chain.blocks.last()
                 .map(|b| b.cumulative_difficulty)
                 .unwrap_or(0);
@@ -1656,7 +1662,7 @@ impl MasterNodeState {
 
         // Template + Block speichern
         {
-            let mut tmpl = self.current_mining_template.write().unwrap();
+            let mut tmpl = self.current_mining_template.write().unwrap_or_else(|e| e.into_inner());
             *tmpl = Some((template.clone(), block));
         }
 
@@ -1675,7 +1681,7 @@ impl MasterNodeState {
     ) -> Result<Block, String> {
         // Template laden und prüfen
         let (template, mut block) = {
-            let tmpl = self.current_mining_template.read().unwrap();
+            let tmpl = self.current_mining_template.read().unwrap_or_else(|e| e.into_inner());
             match tmpl.as_ref() {
                 Some((t, b)) => {
                     if t.template_id != submission.template_id {
@@ -1689,14 +1695,14 @@ impl MasterNodeState {
 
         // Chain-Konsistenz: Ist der Block noch der nächste?
         {
-            let chain = self.chain.lock().unwrap();
+            let chain = self.chain.lock().unwrap_or_else(|e| e.into_inner());
             let expected = chain.blocks.len() as u64;
             if block.index != expected {
                 // Template ist veraltet (zwischenzeitlich neuer Block empfangen)
                 // TXs zurück in Mempool
                 self.restore_block_txs(&block);
                 // Template invalidieren
-                *self.current_mining_template.write().unwrap() = None;
+                *self.current_mining_template.write().unwrap_or_else(|e| e.into_inner()) = None;
                 return Err(format!(
                     "Block #{} veraltet (Chain ist bei #{})", block.index, expected
                 ));
@@ -1736,7 +1742,7 @@ impl MasterNodeState {
         block.validator_signature = sign_block(&signing_key, &block.hash);
 
         // Template invalidieren (wurde gelöst)
-        *self.current_mining_template.write().unwrap() = None;
+        *self.current_mining_template.write().unwrap_or_else(|e| e.into_inner()) = None;
 
         // Block committen
         self.commit_mining_block(block.clone())?;
@@ -1795,7 +1801,7 @@ impl MasterNodeState {
 
     /// Gibt die aktive Reward-Wallet zurück: mining_wallet falls gesetzt, sonst validator_wallet.
     pub fn effective_reward_wallet(&self) -> String {
-        let mw = self.mining_wallet.read().unwrap();
+        let mw = self.mining_wallet.read().unwrap_or_else(|e| e.into_inner());
         if let Some(ref wallet) = *mw {
             wallet.clone()
         } else {
@@ -1816,14 +1822,14 @@ impl MasterNodeState {
 
         // ── Reward-Wallet bestimmen: gebundene Mining-Wallet oder Validator-Wallet
         let reward_wallet = {
-            let mw = self.mining_wallet.read().unwrap();
+            let mw = self.mining_wallet.read().unwrap_or_else(|e| e.into_inner());
             mw.clone().unwrap_or_else(|| validator_wallet.clone())
         };
 
         // ── PoA-Check: Round-Robin Validator-Rotation + Lite-PoW Fallback ──
         // Lock-Ordnung: chain zuerst (Daten cachen) → drop → dann validator_set
         let (chain_next_index, _chain_prev_hash) = {
-            let chain = self.chain.lock().unwrap();
+            let chain = self.chain.lock().unwrap_or_else(|e| e.into_inner());
             let idx = chain.blocks.len() as u64;
             let hash = chain.blocks.last()
                 .map(|b| b.hash.clone())
@@ -1835,7 +1841,7 @@ impl MasterNodeState {
         //          aktive Validator mit einem gelösten PoW-Puzzle einspringen.
         let mut is_pow_fallback = false;
         {
-            let vs = self.validator_set.read().unwrap();
+            let vs = self.validator_set.read().unwrap_or_else(|e| e.into_inner());
             if !vs.validators.is_empty() {
                 if !vs.is_active_validator(&self.node_id) {
                     return Err("Mining: Node ist kein aktiver Validator".into());
@@ -1872,7 +1878,7 @@ impl MasterNodeState {
                     // Nicht unser Slot.
                     // Prüfe ob der primäre Validator seinen Slot verpasst hat.
                     let last_block_age = {
-                        let chain = self.chain.lock().unwrap();
+                        let chain = self.chain.lock().unwrap_or_else(|e| e.into_inner());
                         chain.blocks.last()
                             .map(|b| (Utc::now().timestamp() - b.timestamp) as u64)
                             .unwrap_or(u64::MAX)
@@ -1903,9 +1909,9 @@ impl MasterNodeState {
 
         // ── Block-Reward berechnen ────────────────────────────────────────
         let (reward_amount, next_index) = {
-            let chain = self.chain.lock().unwrap();
+            let chain = self.chain.lock().unwrap_or_else(|e| e.into_inner());
             let next_idx = chain.blocks.len() as u64;
-            let ledger = self.token_ledger.read().unwrap();
+            let ledger = self.token_ledger.read().unwrap_or_else(|e| e.into_inner());
             let pool_balance = ledger.balance("pool:storage_rewards");
             (Self::calculate_block_reward(next_idx, pool_balance), next_idx)
         };
@@ -1934,7 +1940,7 @@ impl MasterNodeState {
 
         // ── Pre-Block-Validierung: Ungültige TXs herausfiltern ──────────
         let pending_txs = {
-            let ledger = self.token_ledger.read().unwrap();
+            let ledger = self.token_ledger.read().unwrap_or_else(|e| e.into_inner());
             let valid = ledger.filter_valid_txs(&pending_txs);
 
             // Abgelehnte User-TXs mit zukünftiger Nonce zurück in den Mempool legen
@@ -2029,7 +2035,7 @@ impl MasterNodeState {
 
         // ── Block vorbereiten (ohne Commit in die Chain) ──────────────────
         let signer = self.node_id.clone();
-        let chain = self.chain.lock().unwrap();
+        let chain = self.chain.lock().unwrap_or_else(|e| e.into_inner());
         let mut block = chain.prepare_block(
             Vec::new(),
             Vec::new(),
@@ -2051,14 +2057,14 @@ impl MasterNodeState {
             let chunk_refs = crate::storage_proof::collect_chunk_refs(&chain);
             if !chunk_refs.is_empty() {
                 // Bekannte Validator-Wallets sammeln
-                let vs = self.validator_set.read().unwrap();
+                let vs = self.validator_set.read().unwrap_or_else(|e| e.into_inner());
                 let mut known_wallets: Vec<String> = vs.validators.iter()
                     .filter(|v| v.active)
                     .filter_map(|v| if v.public_key_hex.is_empty() { None } else { Some(v.public_key_hex.clone()) })
                     .collect();
                 // Auch Peers' Wallets aus Trust-Registry einbeziehen
                 {
-                    let trust = self.trust_registry.read().unwrap();
+                    let trust = self.trust_registry.read().unwrap_or_else(|e| e.into_inner());
                     for entry in trust.iter() {
                         if !entry.public_key_hex.is_empty() && !known_wallets.contains(&entry.public_key_hex) {
                             known_wallets.push(entry.public_key_hex.clone());
@@ -2107,7 +2113,7 @@ impl MasterNodeState {
                     let challenge_reward: Decimal = crate::storage_proof::CHALLENGE_REWARD
                         .parse().unwrap_or(Decimal::new(5, 1)); // 0.5 STONE Fallback
                     let pool_balance = {
-                        let ledger = self.token_ledger.read().unwrap();
+                        let ledger = self.token_ledger.read().unwrap_or_else(|e| e.into_inner());
                         ledger.balance("pool:storage_rewards")
                     };
                     for resp in &responses {
@@ -2153,14 +2159,14 @@ impl MasterNodeState {
 
                 // ── Shard-Repair-Rewards: Miner die degradierte Shards repariert haben ──
                 let pending_repairs: Vec<crate::storage_proof::RepairReward> = {
-                    let mut repairs = self.pending_repair_rewards.lock().unwrap();
+                    let mut repairs = self.pending_repair_rewards.lock().unwrap_or_else(|e| e.into_inner());
                     std::mem::take(&mut *repairs)
                 };
                 if !pending_repairs.is_empty() {
                     let repair_reward: Decimal = crate::storage_proof::REPAIR_REWARD
                         .parse().unwrap_or(Decimal::new(25, 2)); // 0.25 STONE Fallback
                     let pool_balance_now = {
-                        let ledger = self.token_ledger.read().unwrap();
+                        let ledger = self.token_ledger.read().unwrap_or_else(|e| e.into_inner());
                         ledger.balance("pool:storage_rewards")
                     };
                     let mut repair_rewards_total = Decimal::ZERO;
@@ -2241,7 +2247,7 @@ impl MasterNodeState {
                 get_current_pow_difficulty, solve_argon2_pow,
                 ARGON2_POW_ACTIVATION_BLOCK,
             };
-            let chain_ref = self.chain.lock().unwrap();
+            let chain_ref = self.chain.lock().unwrap_or_else(|e| e.into_inner());
             let difficulty = get_current_pow_difficulty(&chain_ref.blocks, block.index);
             drop(chain_ref);
 
@@ -2289,7 +2295,7 @@ impl MasterNodeState {
 
         // ── Block in die Chain einfügen ───────────────────────────────────
         {
-            let mut chain = self.chain.lock().unwrap();
+            let mut chain = self.chain.lock().unwrap_or_else(|e| e.into_inner());
             // Prüfe dass Block zum nächsten Index passt
             let expected_idx = chain.blocks.len() as u64;
             if block.index != expected_idx {
@@ -2302,7 +2308,7 @@ impl MasterNodeState {
 
         // ── Token-TXs im Ledger verarbeiten ──────────────────────────────
         if !block.transactions.is_empty() {
-            let mut ledger = self.token_ledger.write().unwrap();
+            let mut ledger = self.token_ledger.write().unwrap_or_else(|e| e.into_inner());
             // Fee-Split: Validator-Wallet setzen BEVOR TXs verarbeitet werden
             ledger.set_current_validator(Some(validator_wallet.clone()));
             // TXs wurden bereits durch filter_valid_txs() validiert →
@@ -2343,7 +2349,7 @@ impl MasterNodeState {
 
         // ── Validator-Statistik aktualisieren ─────────────────────────────
         {
-            let mut vs_w = self.validator_set.write().unwrap();
+            let mut vs_w = self.validator_set.write().unwrap_or_else(|e| e.into_inner());
             if let Some(v) = vs_w.get_mut(&self.node_id) {
                 v.blocks_signed += 1;
                 vs_w.save();
@@ -2404,7 +2410,7 @@ impl MasterNodeState {
             && crate::network::is_bootstrap_node()
         {
             let genesis_hash = {
-                let chain = self.chain.lock().unwrap();
+                let chain = self.chain.lock().unwrap_or_else(|e| e.into_inner());
                 chain.blocks.first().map(|b| b.hash.clone()).unwrap_or_default()
             };
             let latest_hash = block.hash.clone();
@@ -2486,9 +2492,9 @@ impl MasterNodeState {
 
                 // Nicht minen wenn Peers weiter sind
                 {
-                    let our_height = state.chain.lock().unwrap().blocks.len() as u64;
+                    let our_height = state.chain.lock().unwrap_or_else(|e| e.into_inner()).blocks.len() as u64;
                     let max_peer_height = {
-                        let peers = state.peers.read().unwrap();
+                        let peers = state.peers.read().unwrap_or_else(|e| e.into_inner());
                         peers.iter()
                             .filter(|p| p.is_healthy())
                             .map(|p| p.block_height)
@@ -2497,13 +2503,13 @@ impl MasterNodeState {
                     };
                     if max_peer_height > our_height + 1 {
                         // Template invalidieren wenn wir hinterher sind
-                        *state.current_mining_template.write().unwrap() = None;
+                        *state.current_mining_template.write().unwrap_or_else(|e| e.into_inner()) = None;
                         continue;
                     }
                 }
 
                 // Mempool: abgelaufene TXs bereinigen (alle 30s)
-                let current_height = state.chain.lock().unwrap().blocks.len() as u64;
+                let current_height = state.chain.lock().unwrap_or_else(|e| e.into_inner()).blocks.len() as u64;
                 if current_height != last_template_height {
                     let evicted = state.mempool.evict_expired();
                     if evicted > 0 {
@@ -2515,7 +2521,7 @@ impl MasterNodeState {
                 {
                     let pending = state.mempool.pending_count();
                     if pending > 0 {
-                        let chain = state.chain.lock().unwrap();
+                        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
                         if let Some(last) = chain.blocks.last() {
                             let age = Utc::now().timestamp() - last.timestamp;
                             if age > (TARGET_BLOCK_TIME_SECS as i64 * 5) {
@@ -2533,7 +2539,7 @@ impl MasterNodeState {
                 // 1. Noch kein Template vorhanden, oder
                 // 2. Neuer Block seit letztem Template (Height hat sich geändert)
                 let needs_new_template = {
-                    let tmpl = state.current_mining_template.read().unwrap();
+                    let tmpl = state.current_mining_template.read().unwrap_or_else(|e| e.into_inner());
                     match tmpl.as_ref() {
                         Some((t, _)) => t.block_index != current_height,
                         None => true,
@@ -2557,7 +2563,7 @@ impl MasterNodeState {
                 // Checkpoint-Prüfung
                 if current_height > 0 && current_height % 100 == 0 {
                     let block = {
-                        let chain = state.chain.lock().unwrap();
+                        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
                         chain.blocks.last().cloned()
                     };
                     if let Some(block) = block {
@@ -2579,16 +2585,16 @@ impl MasterNodeState {
 
     /// Staking Epoch-Verarbeitung nach einem committed Block.
     fn post_block_staking(state: &Arc<Self>, block: &Block) {
-        let mut pool = state.staking_pool.write().unwrap();
+        let mut pool = state.staking_pool.write().unwrap_or_else(|e| e.into_inner());
 
         // 1. Epoch-Rewards verteilen
         let reward_pool_balance = {
-            let ledger = state.token_ledger.read().unwrap();
+            let ledger = state.token_ledger.read().unwrap_or_else(|e| e.into_inner());
             ledger.balance("pool:storage_rewards")
         };
         let distributed = pool.process_epoch(block.index, reward_pool_balance);
         if distributed > rust_decimal::Decimal::ZERO {
-            let mut ledger = state.token_ledger.write().unwrap();
+            let mut ledger = state.token_ledger.write().unwrap_or_else(|e| e.into_inner());
             for (addr, entry) in &pool.stakers {
                 if entry.pending_rewards > rust_decimal::Decimal::ZERO {
                     if let Err(e) = ledger.credit_staking_reward(addr, entry.pending_rewards) {
@@ -2605,7 +2611,7 @@ impl MasterNodeState {
         // 2. Fällige Unstakes freigeben
         let matured = pool.drain_matured_unstakes();
         if !matured.is_empty() {
-            let mut ledger = state.token_ledger.write().unwrap();
+            let mut ledger = state.token_ledger.write().unwrap_or_else(|e| e.into_inner());
             for req in &matured {
                 ledger.release_unstake_escrow(&req.address, req.amount);
             }
@@ -2633,7 +2639,7 @@ impl MasterNodeState {
             SLASH_JAIL_DURATION_SECS,
         };
 
-        let mut slash_store = state.slashing_store.write().unwrap();
+        let mut slash_store = state.slashing_store.write().unwrap_or_else(|e| e.into_inner());
 
         // 1. Block-Signer als aktiv markieren
         if !block.signer.is_empty() {
@@ -2651,7 +2657,7 @@ impl MasterNodeState {
 
         // 3. Downtime-Check für alle aktiven Validatoren
         let validators: Vec<(String, Option<String>)> = {
-            let vs = state.validator_set.read().unwrap();
+            let vs = state.validator_set.read().unwrap_or_else(|e| e.into_inner());
             vs.validators.iter()
                 .filter(|v| v.active)
                 .filter(|v| v.node_id != block.signer) // Signer ist ja aktiv
@@ -2670,7 +2676,7 @@ impl MasterNodeState {
                 let wallet_addr = Self::resolve_validator_wallet(state, vid);
 
                 let slashed_amount = if let Some(ref wallet) = wallet_addr {
-                    let mut pool = state.staking_pool.write().unwrap();
+                    let mut pool = state.staking_pool.write().unwrap_or_else(|e| e.into_inner());
                     let stake = pool.stakers.get(wallet)
                         .map(|s| s.staked_amount)
                         .unwrap_or(rust_decimal::Decimal::ZERO);
@@ -2691,7 +2697,7 @@ impl MasterNodeState {
 
                 // Validator deaktivieren (Jail)
                 {
-                    let mut vs = state.validator_set.write().unwrap();
+                    let mut vs = state.validator_set.write().unwrap_or_else(|e| e.into_inner());
                     vs.set_active(vid, false);
                 }
 
@@ -2721,7 +2727,7 @@ impl MasterNodeState {
 
         // Validator-NodeId via pub_key auflösen
         let (validator_id, wallet_addr) = {
-            let vs = state.validator_set.read().unwrap();
+            let vs = state.validator_set.read().unwrap_or_else(|e| e.into_inner());
             let found = vs.validators.iter().find(|v| v.public_key_hex == evidence.validator_pub_key);
             match found {
                 Some(v) => (v.node_id.clone(), Self::resolve_validator_wallet(state, &v.node_id)),
@@ -2736,7 +2742,7 @@ impl MasterNodeState {
         };
 
         let slashed_amount = if let Some(ref wallet) = wallet_addr {
-            let mut pool = state.staking_pool.write().unwrap();
+            let mut pool = state.staking_pool.write().unwrap_or_else(|e| e.into_inner());
             let stake = pool.stakers.get(wallet)
                 .map(|s| s.staked_amount)
                 .unwrap_or(rust_decimal::Decimal::ZERO);
@@ -2747,7 +2753,7 @@ impl MasterNodeState {
             rust_decimal::Decimal::ZERO
         };
 
-        let mut slash_store = state.slashing_store.write().unwrap();
+        let mut slash_store = state.slashing_store.write().unwrap_or_else(|e| e.into_inner());
         let record = slash_store.record_slash(
             &validator_id,
             wallet_addr.as_deref(),
@@ -2759,7 +2765,7 @@ impl MasterNodeState {
 
         // Validator deaktivieren
         {
-            let mut vs = state.validator_set.write().unwrap();
+            let mut vs = state.validator_set.write().unwrap_or_else(|e| e.into_inner());
             vs.set_active(&validator_id, false);
         }
 
@@ -2787,7 +2793,7 @@ impl MasterNodeState {
     /// 3. Alle Scores neu berechnen
     /// 4. Falls Distribution-Intervall erreicht: Pool ausschütten
     fn post_block_reputation(state: &Arc<Self>, block: &Block) {
-        let mut registry = state.reputation_registry.write().unwrap();
+        let mut registry = state.reputation_registry.write().unwrap_or_else(|e| e.into_inner());
 
         // 1. Block-Signer registrieren & Heartbeat
         if !block.signer.is_empty() {
@@ -2816,13 +2822,13 @@ impl MasterNodeState {
         // 3. Distribution prüfen (alle 720 Blöcke)
         if registry.distribution_due(block.index) {
             let pool_balance = {
-                let ledger = state.token_ledger.read().unwrap();
+                let ledger = state.token_ledger.read().unwrap_or_else(|e| e.into_inner());
                 ledger.balance(crate::token::reputation::NODE_OPERATOR_POOL)
             };
 
             let payouts = registry.calculate_distribution(pool_balance, block.index);
             if !payouts.is_empty() {
-                let mut ledger = state.token_ledger.write().unwrap();
+                let mut ledger = state.token_ledger.write().unwrap_or_else(|e| e.into_inner());
                 let mut total_paid = rust_decimal::Decimal::ZERO;
                 for (addr, amount) in &payouts {
                     if let Err(e) = ledger.credit_operator_reward(addr, *amount) {
@@ -2856,7 +2862,7 @@ impl MasterNodeState {
     /// 2. Garbage Collection: Abgelaufene Nachrichten-Content löschen
     /// 3. Pending Reports prüfen und ggf. finalisieren
     fn post_block_chat_policy(state: &Arc<Self>, block: &Block, chat_index: Option<&std::sync::Arc<std::sync::Mutex<crate::chat::ChatIndex>>>) {
-        let mut policy = state.chat_policy.write().unwrap();
+        let mut policy = state.chat_policy.write().unwrap_or_else(|e| e.into_inner());
 
         // 1. Neue ChatMessage-TXs tracken
         for tx in &block.transactions {
@@ -2886,7 +2892,7 @@ impl MasterNodeState {
 
         // 2. Garbage Collection: Abgelaufene Nachrichten-Content löschen
         if let Some(chat_idx_arc) = chat_index {
-            let mut chat_idx = chat_idx_arc.lock().unwrap();
+            let mut chat_idx = chat_idx_arc.lock().unwrap_or_else(|e| e.into_inner());
             let purged = crate::chat_policy::gc_expired_messages(&mut policy, &mut chat_idx);
             if purged > 0 {
                 crate::chat::save_chat_index(&chat_idx);
@@ -2895,7 +2901,7 @@ impl MasterNodeState {
 
         // 3. Pending Reports finalisieren (Timeout etc.) – stake-gewichtet
         let stake_weights: std::collections::HashMap<String, rust_decimal::Decimal> = {
-            let pool = state.staking_pool.read().unwrap();
+            let pool = state.staking_pool.read().unwrap_or_else(|e| e.into_inner());
             pool.stakers.iter()
                 .filter(|(_, entry)| crate::token::StakeLevel::from_stake(entry.staked_amount).can_validate())
                 .map(|(addr, entry)| (addr.clone(), entry.staked_amount))
@@ -2906,14 +2912,14 @@ impl MasterNodeState {
             if *accepted {
                 // Content im Chat-Index löschen
                 if let Some(chat_idx_arc) = chat_index {
-                    let mut chat_idx = chat_idx_arc.lock().unwrap();
+                    let mut chat_idx = chat_idx_arc.lock().unwrap_or_else(|e| e.into_inner());
                     crate::chat_policy::purge_message_content(&mut chat_idx, msg_id);
                     crate::chat::save_chat_index(&chat_idx);
                 }
 
                 // Slash
                 let slash_amount = {
-                    let pool = state.staking_pool.read().unwrap();
+                    let pool = state.staking_pool.read().unwrap_or_else(|e| e.into_inner());
                     let staked = pool.stakers.get(reported_wallet)
                         .map(|s| s.staked_amount)
                         .unwrap_or(Decimal::ZERO);
@@ -2922,13 +2928,15 @@ impl MasterNodeState {
                 };
 
                 if slash_amount > Decimal::ZERO {
-                    let mut pool = state.staking_pool.write().unwrap();
+                    let mut pool = state.staking_pool.write().unwrap_or_else(|e| e.into_inner());
                     let actual = pool.slash(reported_wallet, slash_amount);
                     drop(pool);
 
-                    let mut ledger = state.token_ledger.write().unwrap();
+                    let mut ledger = state.token_ledger.write().unwrap_or_else(|e| e.into_inner());
                     ledger.credit_to_operator_pool(actual);
-                    let _ = ledger.persist();
+                    if let Err(e) = ledger.persist() {
+                        eprintln!("[token] ⚠️  Ledger persist nach Slash fehlgeschlagen: {e}");
+                    }
 
                     println!(
                         "[chat-policy] ⚖️  Report {} auto-finalisiert: {} STONE geslasht",
@@ -2962,7 +2970,7 @@ impl MasterNodeState {
     /// Finality-Checkpoint nach einem committed Block erstellen (alle CHECKPOINT_INTERVAL Blöcke).
     async fn post_block_checkpoint(state: &Arc<Self>, block: &Block) {
         let should_create = {
-            let store = state.checkpoint_store.read().unwrap();
+            let store = state.checkpoint_store.read().unwrap_or_else(|e| e.into_inner());
             store.should_create_checkpoint(block.index)
         };
         if !should_create {
@@ -2970,7 +2978,7 @@ impl MasterNodeState {
         }
 
         let required = {
-            let vs = state.validator_set.read().unwrap();
+            let vs = state.validator_set.read().unwrap_or_else(|e| e.into_inner());
             let active = vs.active_count();
             if active <= 1 { 1 } else { (active * 2) / 3 + 1 }
         };
@@ -2987,7 +2995,7 @@ impl MasterNodeState {
 
         let finalized = checkpoint.is_finalized();
         {
-            let mut store = state.checkpoint_store.write().unwrap();
+            let mut store = state.checkpoint_store.write().unwrap_or_else(|e| e.into_inner());
             store.add_or_update(checkpoint.clone());
         }
 
@@ -3005,7 +3013,7 @@ impl MasterNodeState {
 
         // An Peers broadcasten (fire-and-forget, async)
         let peer_urls: Vec<String> = {
-            let peers = state.peers.read().unwrap();
+            let peers = state.peers.read().unwrap_or_else(|e| e.into_inner());
             peers.iter()
                 .filter(|p| p.is_healthy())
                 .map(|p| p.url.clone())
@@ -3048,7 +3056,7 @@ impl MasterNodeState {
         public_key_hex: String,
         name: Option<String>,
     ) -> Result<(), String> {
-        let mut reg = self.trust_registry.write().unwrap();
+        let mut reg = self.trust_registry.write().unwrap_or_else(|e| e.into_inner());
         if reg.iter().any(|e| e.peer_id == peer_id) {
             return Err(format!("peer_id '{peer_id}' bereits in der Trust-Registry"));
         }
@@ -3072,7 +3080,7 @@ impl MasterNodeState {
     ) -> Result<TrustStatus, String> {
         // Abstimmung ins History-Log schreiben
         {
-            let mut history = self.trust_history.lock().unwrap();
+            let mut history = self.trust_history.lock().unwrap_or_else(|e| e.into_inner());
             history.push(TrustVote {
                 voter_peer_id: voter_peer_id.to_string(),
                 target_peer_id: target_peer_id.to_string(),
@@ -3081,7 +3089,7 @@ impl MasterNodeState {
             });
         }
 
-        let mut reg = self.trust_registry.write().unwrap();
+        let mut reg = self.trust_registry.write().unwrap_or_else(|e| e.into_inner());
         let entry = reg
             .iter_mut()
             .find(|e| e.peer_id == target_peer_id)
@@ -3104,7 +3112,7 @@ impl MasterNodeState {
 
         // Quorum: Anzahl aktiver Validators als Referenz (min 1)
         let active_validators = {
-            let vs = self.validator_set.read().unwrap();
+            let vs = self.validator_set.read().unwrap_or_else(|e| e.into_inner());
             vs.validators.iter().filter(|v| v.active).count().max(1)
         };
         let threshold = (active_validators / 2) + 1;
@@ -3159,7 +3167,7 @@ impl MasterNodeState {
 
     /// Zusammenfassung für NodeStatusResponse
     pub fn trust_summary(&self) -> TrustSummary {
-        let reg = self.trust_registry.read().unwrap();
+        let reg = self.trust_registry.read().unwrap_or_else(|e| e.into_inner());
         TrustSummary {
             active: reg.iter().filter(|e| e.status == TrustStatus::Active).count(),
             pending: reg.iter().filter(|e| e.status == TrustStatus::Pending).count(),
@@ -3180,7 +3188,7 @@ impl MasterNodeState {
 
     /// Gibt die Abstimmungshistorie zurück
     pub fn trust_history_snapshot(&self) -> Vec<TrustVote> {
-        self.trust_history.lock().unwrap().clone()
+        self.trust_history.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
     /// Prüft ob eine peer_id aktiv vertrauenswürdig ist

@@ -224,7 +224,7 @@ struct MinerWebState {
 impl MinerWebState {
     fn add_log(&self, msg: String) {
         let ts = Local::now().format("%H:%M:%S");
-        let mut logs = self.logs.write().unwrap();
+        let mut logs = self.logs.write().unwrap_or_else(|e| e.into_inner());
         logs.push(format!("[{ts}] {msg}"));
         if logs.len() > 300 {
             let excess = logs.len() - 300;
@@ -245,7 +245,7 @@ impl MinerWebState {
     }
 
     fn block_height(&self) -> u64 {
-        self.node.chain.lock().unwrap().blocks.len() as u64
+        self.node.chain.lock().unwrap_or_else(|e| e.into_inner()).blocks.len() as u64
     }
 
     fn blocks_mined(&self) -> u64 {
@@ -258,16 +258,16 @@ impl MinerWebState {
     }
 
     fn mining_balance(&self) -> Decimal {
-        self.node.token_ledger.read().unwrap().balance(&self.validator_wallet)
+        self.node.token_ledger.read().unwrap_or_else(|e| e.into_inner()).balance(&self.validator_wallet)
     }
 
     fn payout_balance(&self) -> Decimal {
-        let config = self.config.read().unwrap();
-        self.node.token_ledger.read().unwrap().balance(&config.payout_wallet)
+        let config = self.config.read().unwrap_or_else(|e| e.into_inner());
+        self.node.token_ledger.read().unwrap_or_else(|e| e.into_inner()).balance(&config.payout_wallet)
     }
 
     fn current_reward(&self) -> Decimal {
-        let pool = self.node.token_ledger.read().unwrap().balance("pool:storage_rewards");
+        let pool = self.node.token_ledger.read().unwrap_or_else(|e| e.into_inner()).balance("pool:storage_rewards");
         MasterNodeState::calculate_block_reward(self.block_height(), pool)
     }
 
@@ -285,7 +285,7 @@ impl MinerWebState {
     }
 
     fn next_payout_str(&self) -> String {
-        let hour = self.config.read().unwrap().payout_hour;
+        let hour = self.config.read().unwrap_or_else(|e| e.into_inner()).payout_hour;
         let now = Local::now();
         let today = now.date_naive().and_hms_opt(hour as u32, 0, 0).unwrap();
         let next = if now.naive_local() > today {
@@ -310,18 +310,18 @@ async fn handle_dashboard() -> impl IntoResponse {
 
 /// GET /api/miner/stats — All miner stats as JSON
 async fn handle_miner_stats(State(state): State<MinerWebState>) -> impl IntoResponse {
-    let config = state.config.read().unwrap().clone();
-    let storage = state.storage_metrics.read().unwrap().clone();
-    let system = state.system_metrics.read().unwrap().clone();
-    let pow = state.pow_metrics.read().unwrap().clone();
-    let logs = state.logs.read().unwrap().clone();
+    let config = state.config.read().unwrap_or_else(|e| e.into_inner()).clone();
+    let storage = state.storage_metrics.read().unwrap_or_else(|e| e.into_inner()).clone();
+    let system = state.system_metrics.read().unwrap_or_else(|e| e.into_inner()).clone();
+    let pow = state.pow_metrics.read().unwrap_or_else(|e| e.into_inner()).clone();
+    let logs = state.logs.read().unwrap_or_else(|e| e.into_inner()).clone();
     let (peers_healthy, peers_total) = {
         let peers = state.node.get_peers();
         let h = peers.iter().filter(|p| p.is_healthy()).count();
         (h, peers.len())
     };
     let chain_valid = {
-        let chain = state.node.chain.lock().unwrap();
+        let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
         // Lightweight check: just verify last block links correctly (not entire chain)
         if chain.blocks.len() <= 1 {
             true
@@ -404,16 +404,16 @@ async fn handle_set_throttle(
 
 /// POST /api/miner/payout — Force payout
 async fn handle_force_payout(State(state): State<MinerWebState>) -> impl IntoResponse {
-    let mut config = state.config.write().unwrap().clone();
+    let mut config = state.config.write().unwrap_or_else(|e| e.into_inner()).clone();
     let msg = force_payout(&state.node, &mut config, &state.validator_wallet);
-    *state.config.write().unwrap() = config;
+    *state.config.write().unwrap_or_else(|e| e.into_inner()) = config;
     state.add_log(msg.clone());
     Json(serde_json::json!({"message": msg}))
 }
 
 /// GET /api/miner/logs — Recent logs as JSON
 async fn handle_miner_logs(State(state): State<MinerWebState>) -> impl IntoResponse {
-    let logs = state.logs.read().unwrap().clone();
+    let logs = state.logs.read().unwrap_or_else(|e| e.into_inner()).clone();
     Json(logs)
 }
 
@@ -429,7 +429,7 @@ async fn handle_save_config(
     State(state): State<MinerWebState>,
     Json(payload): Json<ConfigPayload>,
 ) -> impl IntoResponse {
-    let mut config = state.config.write().unwrap();
+    let mut config = state.config.write().unwrap_or_else(|e| e.into_inner());
 
     if let Some(wallet) = payload.payout_wallet {
         let wallet = wallet.trim().to_string();
@@ -485,7 +485,7 @@ fn try_daily_payout(
 
     // Balance und Nonce atomar lesen (inkl. Pending-TXs im Mempool)
     let (balance, nonce) = {
-        let ledger = node.token_ledger.read().unwrap();
+        let ledger = node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
         let base_nonce = ledger.nonce(validator_wallet);
         let pending = node.mempool.sender_pending_count(validator_wallet);
         (ledger.balance(validator_wallet), base_nonce + pending)
@@ -508,7 +508,7 @@ fn try_daily_payout(
         format!("Daily Miner Payout {}", now.format("%Y-%m-%d")),
     ) {
         Ok(tx) => {
-            let ledger = node.token_ledger.read().unwrap();
+            let ledger = node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
             match node.mempool.add_tx(tx, Some(&ledger)) {
                 Ok(()) => {
                     config.last_payout = Utc::now().to_rfc3339();
@@ -536,7 +536,7 @@ fn force_payout(
 
     // Balance und Nonce atomar lesen (inkl. Pending-TXs im Mempool)
     let (balance, nonce) = {
-        let ledger = node.token_ledger.read().unwrap();
+        let ledger = node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
         let base_nonce = ledger.nonce(validator_wallet);
         let pending = node.mempool.sender_pending_count(validator_wallet);
         (ledger.balance(validator_wallet), base_nonce + pending)
@@ -559,7 +559,7 @@ fn force_payout(
         format!("Manual Miner Payout {}", Local::now().format("%Y-%m-%d %H:%M")),
     ) {
         Ok(tx) => {
-            let ledger = node.token_ledger.read().unwrap();
+            let ledger = node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
             match node.mempool.add_tx(tx, Some(&ledger)) {
                 Ok(()) => {
                     config.last_payout = Utc::now().to_rfc3339();
@@ -602,11 +602,11 @@ async fn handle_p2p_event(
                 let syncing = !node.metrics.initial_sync_done.load(std::sync::atomic::Ordering::Relaxed);
                 if syncing { None }
                 else {
-                    let vs = node.validator_set.read().unwrap();
+                    let vs = node.validator_set.read().unwrap_or_else(|e| e.into_inner());
                     if vs.validators.is_empty() || vs.active_count() <= 1 { None }
                     else {
                         let (prev_hash, last_block_ts) = {
-                            let chain = node.chain.lock().unwrap();
+                            let chain = node.chain.lock().unwrap_or_else(|e| e.into_inner());
                             let ph = chain.blocks.last().map(|b| b.hash.clone()).unwrap_or("genesis".into());
                             let ts = chain.blocks.last().map(|b| b.timestamp);
                             (ph, ts)
@@ -628,7 +628,7 @@ async fn handle_p2p_event(
             enum BlockResult { Accepted(u64), NeedsResync, Rejected, AlreadyKnown, Stale, Fork }
 
             let result = {
-                let mut chain = node.chain.lock().unwrap();
+                let mut chain = node.chain.lock().unwrap_or_else(|e| e.into_inner());
                 if chain.blocks.iter().any(|b| b.hash == block.hash) {
                     BlockResult::AlreadyKnown
                 } else {
@@ -640,7 +640,7 @@ async fn handle_p2p_event(
 
                     // Equivocation-Check vor Block-Akzeptanz
                     {
-                        let mut tracker = node.equivocation_tracker.lock().unwrap();
+                        let mut tracker = node.equivocation_tracker.lock().unwrap_or_else(|e| e.into_inner());
                         if let Some(evidence) = tracker.check_and_record(
                             block.index,
                             &block.validator_pub_key,
@@ -668,7 +668,7 @@ async fn handle_p2p_event(
                                 // accept_peer_block hat truncate_to intern gerufen,
                                 // danach den neuen Block angefügt → Ledger muss konsistent sein
                                 let rebuilt = stone::token::TokenLedger::rebuild_from_chain(&chain.blocks);
-                                let mut ledger = node.token_ledger.write().unwrap();
+                                let mut ledger = node.token_ledger.write().unwrap_or_else(|e| e.into_inner());
                                 *ledger = rebuilt;
                                 eprintln!(
                                     "[sync] Token-Ledger nach Single-Block-Reorg neu aufgebaut: {} Accounts, Supply: {}",
@@ -677,9 +677,9 @@ async fn handle_p2p_event(
                                 );
                                 // StakingPool nach Reorg auch neu aufbauen
                                 let rebuilt_pool = stone::token::StakingPool::rebuild_from_chain(&chain.blocks);
-                                *node.staking_pool.write().unwrap() = rebuilt_pool;
+                                *node.staking_pool.write().unwrap_or_else(|e| e.into_inner()) = rebuilt_pool;
                             } else if !txs.is_empty() {
-                                let mut ledger = node.token_ledger.write().unwrap();
+                                let mut ledger = node.token_ledger.write().unwrap_or_else(|e| e.into_inner());
                                 // Peer-Blöcke wurden bereits vom Netzwerk validiert →
                                 // replay_mode aktivieren um Nonce-Checks zu überspringen
                                 // (bei Initial-Sync hat der Ledger noch nicht alle Nonces)
@@ -712,11 +712,11 @@ async fn handle_p2p_event(
                                 && !block_validator_pk.is_empty()
                                 && block_signer != node.node_id
                             {
-                                let mut vs = node.validator_set.write().unwrap();
+                                let mut vs = node.validator_set.write().unwrap_or_else(|e| e.into_inner());
                                 if vs.get(&block_signer).is_none() {
                                     // Stake-Check: Signer muss mindestens VALIDATOR_MIN_STAKE haben
                                     let has_stake = {
-                                        let pool = node.staking_pool.read().unwrap();
+                                        let pool = node.staking_pool.read().unwrap_or_else(|e| e.into_inner());
                                         let min_stake: rust_decimal::Decimal = stone::token::staking::VALIDATOR_MIN_STAKE.parse().unwrap();
                                         pool.stakers.values().any(|entry| entry.staked_amount >= min_stake)
                                             || pool.total_staked >= min_stake
@@ -799,7 +799,7 @@ async fn handle_p2p_event(
             sorted.sort_by_key(|b| b.index);
 
             let reorg_result: Option<(u64, u64)> = {
-                let mut chain = node.chain.lock().unwrap();
+                let mut chain = node.chain.lock().unwrap_or_else(|e| e.into_inner());
                 let local_len = chain.blocks.len();
 
                 let mut fork_at = 0usize;
@@ -837,7 +837,7 @@ async fn handle_p2p_event(
                     // damit Balancen/Nonces konsistent sind (BUG-11 Fix)
                     {
                         let rebuilt = stone::token::TokenLedger::rebuild_from_chain(&chain.blocks);
-                        let mut ledger = node.token_ledger.write().unwrap();
+                        let mut ledger = node.token_ledger.write().unwrap_or_else(|e| e.into_inner());
                         *ledger = rebuilt;
                         eprintln!(
                             "[sync] Token-Ledger nach Reorg neu aufgebaut: {} Accounts, Supply: {}",
@@ -848,7 +848,7 @@ async fn handle_p2p_event(
                     // StakingPool nach fork-Reorg auch neu aufbauen
                     {
                         let rebuilt_pool = stone::token::StakingPool::rebuild_from_chain(&chain.blocks);
-                        *node.staking_pool.write().unwrap() = rebuilt_pool;
+                        *node.staking_pool.write().unwrap_or_else(|e| e.into_inner()) = rebuilt_pool;
                     }
 
                     let mut applied = 0u64;
@@ -860,7 +860,7 @@ async fn handle_p2p_event(
 
                         // Equivocation-Check
                         {
-                            let mut tracker = node.equivocation_tracker.lock().unwrap();
+                            let mut tracker = node.equivocation_tracker.lock().unwrap_or_else(|e| e.into_inner());
                             let _ = tracker.check_and_record(
                                 block.index,
                                 &block.validator_pub_key,
@@ -884,7 +884,7 @@ async fn handle_p2p_event(
                                 continue;
                             }
                             // SECURITY: Prüfe ob der Signer im ValidatorSet bekannt ist
-                            let vs = node.validator_set.read().unwrap();
+                            let vs = node.validator_set.read().unwrap_or_else(|e| e.into_inner());
                             let is_known_validator = vs.validators.iter().any(|v| {
                                 v.public_key_hex == block.validator_pub_key
                             });
@@ -915,7 +915,7 @@ async fn handle_p2p_event(
                             Ok(_) => {
                                 applied += 1;
                                 if !txs.is_empty() {
-                                    let mut ledger = node.token_ledger.write().unwrap();
+                                    let mut ledger = node.token_ledger.write().unwrap_or_else(|e| e.into_inner());
                                     ledger.replay_mode = true;
                                     let _ = ledger.apply_block_txs(&txs, idx);
                                     ledger.replay_mode = false;
@@ -1018,7 +1018,7 @@ async fn handle_p2p_event(
         }
 
         NetworkEvent::PeerConnected { peer_id, addr: _ } => {
-            let local_height = node.chain.lock().unwrap().blocks.len() as u64;
+            let local_height = node.chain.lock().unwrap_or_else(|e| e.into_inner()).blocks.len() as u64;
             // Handshake: eigene Version + Chain-Höhe via Gossip ankündigen
             let handshake = serde_json::json!({
                 "type": "handshake",
@@ -1137,7 +1137,7 @@ fn spawn_storage_audit_worker(
 
             // Also incorporate block storage proofs from chain
             let _block_proof_stats = {
-                let chain = node.chain.lock().unwrap();
+                let chain = node.chain.lock().unwrap_or_else(|e| e.into_inner());
                 let recent_blocks: Vec<_> = chain.blocks.iter().rev().take(100).collect();
                 let mut bp_total = 0u64;
                 let mut bp_proven = 0u64;
@@ -1150,7 +1150,7 @@ fn spawn_storage_audit_worker(
 
             // Update metrics
             {
-                let mut m = storage_metrics.write().unwrap();
+                let mut m = storage_metrics.write().unwrap_or_else(|e| e.into_inner());
                 m.chunks_stored = chunk_count;
                 m.storage_used_bytes = total_size;
                 m.challenges_total += passed + failed;
@@ -1206,7 +1206,7 @@ fn spawn_challenge_response_worker(
         loop {
             interval.tick().await;
 
-            let chain = node.chain.lock().unwrap();
+            let chain = node.chain.lock().unwrap_or_else(|e| e.into_inner());
             let current_height = chain.blocks.len() as u64;
 
             if current_height <= last_checked_block {
@@ -1265,7 +1265,7 @@ fn spawn_challenge_response_worker(
                 ) {
                     Some(response) => {
                         // Submit to node's pending responses
-                        node.pending_challenge_responses.lock().unwrap().push(response);
+                        node.pending_challenge_responses.lock().unwrap_or_else(|e| e.into_inner()).push(response);
                         responded += 1;
                         let _ = log_tx.send(format!(
                             "✅ Challenge {}… beantwortet (Chunk {}… Offset {})",
@@ -1287,7 +1287,7 @@ fn spawn_challenge_response_worker(
 
             // Update metrics
             {
-                let mut m = storage_metrics.write().unwrap();
+                let mut m = storage_metrics.write().unwrap_or_else(|e| e.into_inner());
                 m.chain_challenges_received += our_challenges.len() as u64;
                 m.chain_challenges_responded += responded;
                 m.chain_challenges_missed += failed;
@@ -1338,7 +1338,7 @@ fn spawn_shard_repair_worker(
 
             // Collect EC chunks from chain
             let ec_chunks: Vec<(String, u8, u8)> = {
-                let chain = node.chain.lock().unwrap();
+                let chain = node.chain.lock().unwrap_or_else(|e| e.into_inner());
                 let mut chunks = Vec::new();
                 for block in &chain.blocks {
                     for doc in &block.documents {
@@ -1437,7 +1437,7 @@ fn spawn_shard_repair_worker(
                                 Utc::now().timestamp()
                             ).as_bytes()
                         ));
-                        node.pending_repair_rewards.lock().unwrap().push(
+                        node.pending_repair_rewards.lock().unwrap_or_else(|e| e.into_inner()).push(
                             stone::storage_proof::RepairReward {
                                 repair_id,
                                 repairer_wallet: validator_wallet.clone(),
@@ -1459,7 +1459,7 @@ fn spawn_shard_repair_worker(
 
             // Update metrics
             {
-                let mut m = storage_metrics.write().unwrap();
+                let mut m = storage_metrics.write().unwrap_or_else(|e| e.into_inner());
                 m.repairs_completed += repaired;
                 m.repairs_failed += failed;
                 m.repairs_skipped += skipped;
@@ -1529,7 +1529,7 @@ fn spawn_pow_solver(
                 let throttle = node.metrics.mining_throttle_pct.load(Ordering::Relaxed);
                 if throttle == 0 {
                     {
-                        let mut m = pow_metrics.write().unwrap();
+                        let mut m = pow_metrics.write().unwrap_or_else(|e| e.into_inner());
                         m.solving = false;
                         m.hashrate = 0.0;
                     }
@@ -1539,9 +1539,9 @@ fn spawn_pow_solver(
 
                 // Template holen (oder erstellen)
                 let template = {
-                    let tmpl = node.current_mining_template.read().unwrap();
+                    let tmpl = node.current_mining_template.read().unwrap_or_else(|e| e.into_inner());
                     if let Some((t, _)) = tmpl.as_ref() {
-                        let chain = node.chain.lock().unwrap();
+                        let chain = node.chain.lock().unwrap_or_else(|e| e.into_inner());
                         let current_height = chain.blocks.len() as u64;
                         if t.block_index == current_height {
                             Some(t.clone())
@@ -1580,7 +1580,7 @@ fn spawn_pow_solver(
                 let template_id = template.template_id.clone();
 
                 {
-                    let mut m = pow_metrics.write().unwrap();
+                    let mut m = pow_metrics.write().unwrap_or_else(|e| e.into_inner());
                     m.solving = true;
                     m.current_difficulty = eff_difficulty;
                     m.current_block_index = block_index;
@@ -1656,7 +1656,7 @@ fn spawn_pow_solver(
                                 // Alle 5 Hashes pro Thread: Staleness-Check
                                 if (nonce / stride) % 5 == 0 {
                                     let stale = {
-                                        let tmpl = node_c.current_mining_template.read().unwrap();
+                                        let tmpl = node_c.current_mining_template.read().unwrap_or_else(|e| e.into_inner());
                                         match tmpl.as_ref() {
                                             Some((t, _)) => t.template_id != tmpl_id,
                                             None => true,
@@ -1699,7 +1699,7 @@ fn spawn_pow_solver(
                             let elapsed = start.elapsed();
                             let hashrate = hashes as f64 / elapsed.as_secs_f64().max(0.001);
                             {
-                                let mut m = pow_metrics_c.write().unwrap();
+                                let mut m = pow_metrics_c.write().unwrap_or_else(|e| e.into_inner());
                                 m.current_nonce = hashes;
                                 m.hashrate = hashrate;
                             }
@@ -1744,14 +1744,14 @@ fn spawn_pow_solver(
                             MasterNodeState::run_post_block_hooks(&node, &block);
 
                             {
-                                let tx = node.block_broadcast_tx.lock().unwrap();
+                                let tx = node.block_broadcast_tx.lock().unwrap_or_else(|e| e.into_inner());
                                 if let Some(ref sender) = *tx {
                                     let _ = sender.send(block.clone());
                                 }
                             }
 
                             {
-                                let mut m = pow_metrics.write().unwrap();
+                                let mut m = pow_metrics.write().unwrap_or_else(|e| e.into_inner());
                                 m.blocks_solved += 1;
                                 m.last_solved_block = block.index;
                                 m.last_solve_elapsed_secs = elapsed.as_secs_f64();
@@ -1770,7 +1770,7 @@ fn spawn_pow_solver(
                 } else {
                     // Kein Ergebnis → Template stale oder Mining gestoppt
                     {
-                        let mut m = pow_metrics.write().unwrap();
+                        let mut m = pow_metrics.write().unwrap_or_else(|e| e.into_inner());
                         m.solving = false;
                     }
                     std::thread::sleep(Duration::from_millis(100));
@@ -1820,7 +1820,7 @@ fn spawn_system_metrics_worker(
             // stone_data directory size
             let data_size = dir_size_bytes(&data_dir());
 
-            let mut m = system_metrics.write().unwrap();
+            let mut m = system_metrics.write().unwrap_or_else(|e| e.into_inner());
             m.cpu_usage_pct = cpu;
             m.memory_used_mb = mem_used;
             m.memory_total_mb = mem_total;
@@ -2040,7 +2040,7 @@ fn spawn_status_relay_push(
             interval.tick().await;
 
             // Metriken sammeln
-            let pm = pow_metrics.read().unwrap().clone();
+            let pm = pow_metrics.read().unwrap_or_else(|e| e.into_inner()).clone();
             let block_height = miner_state.block_height();
             let blocks_mined = miner_state.blocks_mined();
             let total_rewards = miner_state.total_rewards().to_string();
@@ -2252,9 +2252,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let users = load_users();
     {
-        let ledger = node.token_ledger.read().unwrap();
+        let ledger = node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
         if ledger.registered_account_count() > 0 {
-            let mut local = users.lock().unwrap();
+            let mut local = users.lock().unwrap_or_else(|e| e.into_inner());
             let merged = stone::auth::rebuild_users_from_ledger(&ledger, &local);
             *local = merged;
             stone::auth::save_users(&local);
@@ -2302,7 +2302,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             p2p_config.listen_addr = format!("/ip4/0.0.0.0/tcp/{miner_p2p_port}");
             match start_network(Some(p2p_config)).await {
                 Ok(handle) => {
-                    let count = node.chain.lock().unwrap().blocks.len() as u64;
+                    let count = node.chain.lock().unwrap_or_else(|e| e.into_inner()).blocks.len() as u64;
                     handle.set_chain_count(count).await;
                     handle.set_chain_ref(node.chain.clone()).await;
                     {
@@ -2321,7 +2321,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     {
                         let (broadcast_tx, mut broadcast_rx) =
                             tokio::sync::mpsc::unbounded_channel::<stone::blockchain::Block>();
-                        *node.block_broadcast_tx.lock().unwrap() = Some(broadcast_tx);
+                        *node.block_broadcast_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(broadcast_tx);
                         let net_bc = handle.clone();
                         tokio::spawn(async move {
                             while let Some(block) = broadcast_rx.recv().await {
@@ -2427,7 +2427,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         orgs: Arc::new(std::sync::Mutex::new(stone::organization::load_orgs())),
         chat_index: {
             let mut idx = stone::chat::load_chat_index();
-            let chain = node.chain.lock().unwrap();
+            let chain = node.chain.lock().unwrap_or_else(|e| e.into_inner());
             if chain.blocks.len() as u64 > idx.last_indexed_block {
                 let new_blocks: Vec<_> = chain.blocks.iter()
                     .skip(idx.last_indexed_block as usize)
@@ -2550,14 +2550,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Stats alle 30 Sekunden
             if last_stats.elapsed() >= Duration::from_secs(30) {
                 last_stats = Instant::now();
-                let height = node.chain.lock().unwrap().blocks.len() as u64;
+                let height = node.chain.lock().unwrap_or_else(|e| e.into_inner()).blocks.len() as u64;
                 let mined = node.metrics.blocks_mined.load(std::sync::atomic::Ordering::Relaxed);
-                let balance = node.token_ledger.read().unwrap().balance(&validator_wallet);
+                let balance = node.token_ledger.read().unwrap_or_else(|e| e.into_inner()).balance(&validator_wallet);
                 let (h, t) = {
                     let peers = node.get_peers();
                     (peers.iter().filter(|p| p.is_healthy()).count(), peers.len())
                 };
-                let sm = storage_metrics.read().unwrap();
+                let sm = storage_metrics.read().unwrap_or_else(|e| e.into_inner());
                 println!(
                     "[miner] Height: {} | Mined: {} | Balance: {} STONE | Peers: {}/{} | Chunks: {} ({:.1} MB)",
                     height, mined, balance, h, t, sm.chunks_stored, sm.storage_used_bytes as f64 / 1_048_576.0
@@ -2583,10 +2583,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut iv = tokio::time::interval(Duration::from_secs(60));
             loop {
                 iv.tick().await;
-                let mut cfg = payout_config.write().unwrap().clone();
+                let mut cfg = payout_config.write().unwrap_or_else(|e| e.into_inner()).clone();
                 if let Some(msg) = try_daily_payout(&payout_node, &mut cfg, &payout_wallet) {
                     payout_state.add_log(msg);
-                    *payout_config.write().unwrap() = cfg;
+                    *payout_config.write().unwrap_or_else(|e| e.into_inner()) = cfg;
                 }
             }
         });

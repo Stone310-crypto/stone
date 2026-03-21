@@ -107,7 +107,7 @@ impl MinerStatusStore {
     /// Speichert einen Status-Report für eine Wallet
     pub fn insert(&self, report: MinerStatusReport) {
         let wallet = report.wallet.clone();
-        let mut map = self.inner.lock().unwrap();
+        let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         map.insert(wallet, (report, Instant::now()));
         // Cleanup: Alte Einträge entfernen
         map.retain(|_, (_, ts)| ts.elapsed().as_secs() < MINER_STATUS_TTL_SECS * 5);
@@ -115,7 +115,7 @@ impl MinerStatusStore {
 
     /// Holt den letzten Status für eine Wallet (falls noch nicht abgelaufen)
     pub fn get(&self, wallet: &str) -> Option<MinerStatusReport> {
-        let map = self.inner.lock().unwrap();
+        let map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some((report, ts)) = map.get(wallet) {
             if ts.elapsed().as_secs() < MINER_STATUS_TTL_SECS {
                 return Some(report.clone());

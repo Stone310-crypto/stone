@@ -268,7 +268,7 @@ impl MessagePool {
         // Sequenzstand laden
         if let Ok(data) = fs::read_to_string(seq_state_file()) {
             if let Ok(state) = serde_json::from_str::<SequenceState>(&data) {
-                let mut inner = pool.inner.write().unwrap();
+                let mut inner = pool.inner.write().unwrap_or_else(|e| e.into_inner());
                 inner.seq_state = state;
             }
         }
@@ -276,7 +276,7 @@ impl MessagePool {
         // Pending Messages laden
         if let Ok(data) = fs::read_to_string(pending_file()) {
             if let Ok(messages) = serde_json::from_str::<Vec<PooledMessage>>(&data) {
-                let mut inner = pool.inner.write().unwrap();
+                let mut inner = pool.inner.write().unwrap_or_else(|e| e.into_inner());
                 for msg in messages {
                     inner.known_ids.insert(msg.msg_id.clone());
                     inner.by_id.insert(msg.msg_id.clone(), msg.clone());
@@ -361,7 +361,7 @@ impl MessagePool {
         }
 
         // 6 + 7: Lock nehmen für Duplikat + Kapazität
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
 
         if inner.known_ids.contains(&msg.msg_id) {
             return Err(PoolError::Duplicate(msg.msg_id));
@@ -411,7 +411,7 @@ impl MessagePool {
     /// - Mindestens `BATCH_MIN_MESSAGES` pending sind, ODER
     /// - Mindestens 1 pending Message UND `BATCH_MAX_WAIT_SECS` seit letztem Batch vergangen
     pub fn batch_ready(&self) -> bool {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
         let pending = inner.queue.len();
         if pending == 0 {
             return false;
@@ -428,7 +428,7 @@ impl MessagePool {
     /// Aktualisiert den `last_batch_time` Timer und persistiert den Zustand.
     /// Gibt einen leeren Vec zurück wenn keine Nachrichten pending sind.
     pub fn drain_for_batch(&self) -> Vec<PooledMessage> {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
 
         if inner.queue.is_empty() {
             return Vec::new();
@@ -456,7 +456,7 @@ impl MessagePool {
 
     /// Markiert Nachrichten als gebatcht (Merkle-Batch erstellt, wartet auf Block).
     pub fn mark_batched(&self, msg_ids: &[String], batch_id: &str) {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
         for id in msg_ids {
             if let Some(msg) = inner.by_id.get_mut(id) {
                 msg.status = MessageStatus::Batched {
@@ -468,7 +468,7 @@ impl MessagePool {
 
     /// Gibt alle Nachrichten-IDs zurück die zu einem bestimmten Batch gehören.
     pub fn msg_ids_for_batch(&self, batch_id: &str) -> Vec<String> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
         inner.by_id.iter()
             .filter(|(_, msg)| matches!(
                 &msg.status,
@@ -480,7 +480,7 @@ impl MessagePool {
 
     /// Setzt gebatchte Nachrichten zurück auf Pending (Rollback bei Block-Commit-Fehler).
     pub fn unbatch(&self, batch_id: &str) {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
         let to_restore: Vec<PooledMessage> = inner.by_id.values()
             .filter(|msg| matches!(&msg.status, MessageStatus::Batched { batch_id: bid } if bid == batch_id))
             .cloned()
@@ -496,7 +496,7 @@ impl MessagePool {
 
     /// Markiert Nachrichten als bestätigt (Block mit Merkle-Root gemined).
     pub fn mark_confirmed(&self, msg_ids: &[String], block_index: u64) {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
         for id in msg_ids {
             if let Some(msg) = inner.by_id.get_mut(id) {
                 msg.status = MessageStatus::Confirmed { block_index };
@@ -524,7 +524,7 @@ impl MessagePool {
     /// Alle Nachrichten für eine Konversation (wallet_a ↔ wallet_b) aus dem Pool.
     /// Enthält Pending + Batched Nachrichten (noch nicht bestätigt).
     pub fn messages_for_conversation(&self, wallet_a: &str, wallet_b: &str) -> Vec<PooledMessage> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
         inner
             .by_id
             .values()
@@ -538,13 +538,13 @@ impl MessagePool {
 
     /// Nachricht nach msg_id abrufen.
     pub fn get_message(&self, msg_id: &str) -> Option<PooledMessage> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
         inner.by_id.get(msg_id).cloned()
     }
 
     /// Alle Nachrichten ab einer bestimmten Sequenznummer (für P2P-Sync).
     pub fn messages_since(&self, since_seq: u64) -> Vec<PooledMessage> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
         inner
             .by_id
             .values()
@@ -555,13 +555,13 @@ impl MessagePool {
 
     /// Anzahl der pending Nachrichten im Pool.
     pub fn pending_count(&self) -> usize {
-        self.inner.read().unwrap().queue.len()
+        self.inner.read().unwrap_or_else(|e| e.into_inner()).queue.len()
     }
 
     /// Alle Nachrichten (pending + batched) für eine Wallet-Adresse.
     /// Enthält sowohl gesendete als auch empfangene Nachrichten.
     pub fn pending_for_wallet(&self, wallet: &str) -> Vec<PooledMessage> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
         inner.by_id.values()
             .filter(|m| {
                 (m.from_wallet == wallet || m.to_wallet == wallet)
@@ -573,12 +573,12 @@ impl MessagePool {
 
     /// Gesamtzahl bekannter Nachrichten (pending + batched + confirmed im Cache).
     pub fn total_count(&self) -> usize {
-        self.inner.read().unwrap().by_id.len()
+        self.inner.read().unwrap_or_else(|e| e.into_inner()).by_id.len()
     }
 
     /// Aktueller Sequenzstand.
     pub fn sequence_state(&self) -> SequenceState {
-        self.inner.read().unwrap().seq_state.clone()
+        self.inner.read().unwrap_or_else(|e| e.into_inner()).seq_state.clone()
     }
 
     // ─── Eviction ────────────────────────────────────────────────────────
@@ -590,7 +590,7 @@ impl MessagePool {
         let now = Utc::now().timestamp();
         let cutoff = now - MESSAGE_TTL_SECS;
 
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
         let before = inner.by_id.len();
 
         // Queue: nur noch nicht-abgelaufene behalten
@@ -660,7 +660,7 @@ impl MessagePool {
 
     /// Alle Nachrichten in einem Sequenzbereich (inkl. start und end).
     pub fn messages_in_seq_range(&self, seq_start: u64, seq_end: u64) -> Vec<PooledMessage> {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
         let mut msgs: Vec<PooledMessage> = inner.by_id.values()
             .filter(|m| m.sequence >= seq_start && m.sequence <= seq_end)
             .cloned()
@@ -673,7 +673,7 @@ impl MessagePool {
 
     /// Speichert den aktuellen Zustand auf Disk.
     fn persist(&self) {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
         let dir = pool_dir();
         let _ = fs::create_dir_all(&dir);
 

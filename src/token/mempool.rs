@@ -161,7 +161,7 @@ impl Mempool {
             });
         }
 
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
 
         // 2. Duplikat-Check
         if inner.known_ids.contains(&tx.tx_id) {
@@ -246,7 +246,7 @@ impl Mempool {
     /// Standard-TXs werden hier **nicht** entnommen — sie warten auf Dokument-Uploads.
     /// Gibt maximal `MAX_TXS_PER_BLOCK` TXs zurück.
     pub fn drain_for_block(&self) -> Vec<TokenTx> {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
 
         // Partitioniere: Express + Priority sofort, Standard bleibt
         let mut to_drain: Vec<TokenTx> = Vec::new();
@@ -292,7 +292,7 @@ impl Mempool {
     /// Wird aufgerufen wenn ein Dokument hochgeladen wird — Standard-TXs
     /// „reiten" kostenlos mit auf dem Block.
     pub fn drain_standard_txs(&self) -> Vec<TokenTx> {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
         let mut standard: Vec<TokenTx> = Vec::new();
         let mut rest: VecDeque<TokenTx> = VecDeque::new();
 
@@ -322,7 +322,7 @@ impl Mempool {
     /// wegen Gap-Nonce — TX könnte gültig werden wenn vorherige TXs eintreffen).
     /// Gibt `true` zurück wenn requeued, `false` wenn Limit erreicht.
     pub fn requeue_tx(&self, tx: TokenTx) -> bool {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
         if inner.queue.len() >= MAX_MEMPOOL_SIZE {
             return false;
         }
@@ -341,7 +341,7 @@ impl Mempool {
     /// Alle pending TXs entnehmen (Express + Priority + Standard).
     /// Für den Mining-Loop: wird alle 30s aufgerufen, entnimmt alles.
     pub fn drain_all_for_block(&self) -> Vec<TokenTx> {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
         let mut txs: Vec<TokenTx> = inner.queue.drain(..).collect();
         txs.sort_by_key(|tx| tx.fee_tier.priority_order());
         let count = txs.len().min(MAX_TXS_PER_BLOCK);
@@ -365,20 +365,20 @@ impl Mempool {
 
     /// TX aus dem Mempool entfernen (z.B. nach Block-Commit durch Peer).
     pub fn remove_tx(&self, tx_id: &str) {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
         inner.queue.retain(|tx| tx.tx_id != tx_id);
         // known_ids behalten für Duplikat-Schutz
     }
 
     /// Alle TXs eines bestimmten Senders entfernen (z.B. nach Nonce-Reset).
     pub fn remove_sender_txs(&self, sender: &str) {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
         inner.queue.retain(|tx| tx.from != sender);
     }
 
     /// Anzahl der pending TXs.
     pub fn pending_count(&self) -> usize {
-        self.inner.read().unwrap().queue.len()
+        self.inner.read().unwrap_or_else(|e| e.into_inner()).queue.len()
     }
 
     /// Anzahl der pending TXs eines bestimmten Senders.
@@ -397,17 +397,17 @@ impl Mempool {
 
     /// Alle pending TXs als Snapshot (für API).
     pub fn pending_txs(&self) -> Vec<TokenTx> {
-        self.inner.read().unwrap().queue.iter().cloned().collect()
+        self.inner.read().unwrap_or_else(|e| e.into_inner()).queue.iter().cloned().collect()
     }
 
     /// Bekannte TX-ID prüfen (Duplikat-Check von außen).
     pub fn is_known(&self, tx_id: &str) -> bool {
-        self.inner.read().unwrap().known_ids.contains(tx_id)
+        self.inner.read().unwrap_or_else(|e| e.into_inner()).known_ids.contains(tx_id)
     }
 
     /// TX-ID als bekannt markieren (z.B. wenn sie aus einem Peer-Block kommt).
     pub fn mark_known(&self, tx_id: &str) {
-        self.inner.write().unwrap().known_ids.insert(tx_id.to_string());
+        self.inner.write().unwrap_or_else(|e| e.into_inner()).known_ids.insert(tx_id.to_string());
     }
 
     /// User-TXs aus verwaisten Blöcken (Reorg) zurück in den Mempool führen.
@@ -423,7 +423,7 @@ impl Mempool {
                 {
                     continue;
                 }
-                let mut inner = self.inner.write().unwrap();
+                let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
                 if inner.known_ids.contains(&tx.tx_id) {
                     // Bereits bekannt (evtl. schon im neuen Fork bestätigt)
                     continue;
@@ -454,7 +454,7 @@ impl Mempool {
         let now = chrono::Utc::now().timestamp();
         let cutoff = now - TX_TTL_SECS;
 
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
         let before = inner.queue.len();
         let evicted_ids: Vec<String> = inner.queue.iter()
             .filter(|tx| tx.timestamp < cutoff)
@@ -478,7 +478,7 @@ impl Mempool {
     /// Behält nur TX-IDs die noch in der Queue sind + die neuesten Einträge.
     /// Sollte periodisch aufgerufen werden (z.B. alle 5 Minuten).
     pub fn gc_known_ids(&self) -> usize {
-        let mut inner = self.inner.write().unwrap();
+        let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
         if inner.known_ids.len() <= MAX_KNOWN_IDS {
             return 0;
         }
@@ -499,7 +499,7 @@ impl Mempool {
 
     /// Statistiken für Monitoring/API.
     pub fn stats(&self) -> MempoolStats {
-        let inner = self.inner.read().unwrap();
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
         let now = chrono::Utc::now().timestamp();
 
         let oldest_age = inner.queue.front().map(|tx| now - tx.timestamp).unwrap_or(0);

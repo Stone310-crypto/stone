@@ -14,12 +14,6 @@ type HmacSha256 = Hmac<Sha256>;
 /// alternative Chain anbietet um bestätigte Transaktionen rückgängig zu machen.
 pub const MAX_REORG_DEPTH: u64 = 10;
 
-// ─── bincode-kompatibles serde_json::Value Wrapper ───────────────────────────
-//
-// bincode v2 unterstützt kein serde_json::Value direkt (AnyNotSupported-Fehler).
-// Lösung: Value wird als JSON-String in RocksDB gespeichert und beim Lesen
-// wieder deserialisiert. Für alle anderen Formate (JSON API) ist es transparent.
-
 #[derive(Debug, Clone, Default)]
 pub struct JsonValue(pub serde_json::Value);
 
@@ -1194,11 +1188,11 @@ impl StoneChain {
                         .unwrap_or(0);
                     let mut cd = anchor_cd;
                     for fb in &fork_chain {
-                        cd += block_work(fb.pow_difficulty);
+                        cd = cd.saturating_add(block_work(fb.pow_difficulty));
                     }
                     cd
                 };
-                last_cd + block_work(new_block.pow_difficulty)
+                last_cd.saturating_add(block_work(new_block.pow_difficulty))
             };
 
             let our_tip_cd = self.blocks.last()

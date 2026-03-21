@@ -295,12 +295,21 @@ fn compute_state_root_from_path(db_path: &Path) -> String {
     balances.sort_by(|a, b| a.0.cmp(&b.0));
     let mut hasher = Sha256::new();
     for (addr, bal, nonce) in &balances {
-        hasher.update(addr.as_bytes());
-        hasher.update(bal.to_string().as_bytes());
+        // SECURITY: Length-Prefix vor jedem Feld (identisch zu TokenLedger::state_root)
+        let addr_bytes = addr.as_bytes();
+        hasher.update((addr_bytes.len() as u32).to_le_bytes());
+        hasher.update(addr_bytes);
+        let bal_str = bal.to_string();
+        hasher.update((bal_str.len() as u32).to_le_bytes());
+        hasher.update(bal_str.as_bytes());
         hasher.update(nonce.to_le_bytes());
     }
-    hasher.update(total_supply.to_string().as_bytes());
-    hasher.update(total_fees_burned.to_string().as_bytes());
+    let supply_str = total_supply.to_string();
+    hasher.update((supply_str.len() as u32).to_le_bytes());
+    hasher.update(supply_str.as_bytes());
+    let fees_str = total_fees_burned.to_string();
+    hasher.update((fees_str.len() as u32).to_le_bytes());
+    hasher.update(fees_str.as_bytes());
     hex::encode(hasher.finalize())
 }
 
