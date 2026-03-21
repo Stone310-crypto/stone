@@ -152,7 +152,9 @@ impl ValidatorSet {
     pub fn save(&self) {
         let path = Self::path();
         if let Ok(s) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(&path, s);
+            if let Err(e) = std::fs::write(&path, &s) {
+                eprintln!("[consensus] ❌ ValidatorSet::save({}) failed: {}", path, e);
+            }
         }
     }
 
@@ -476,6 +478,24 @@ impl ValidatorSet {
             return None; // Kein Backup möglich
         }
 
+        // Anti-Sybil: Gleicher Filter wie select_validator_weighted
+        let validator_min: rust_decimal::Decimal = crate::token::staking::VALIDATOR_MIN_STAKE.parse().unwrap();
+        let eligible: Vec<&ValidatorInfo> = active.iter()
+            .filter(|v| {
+                let wallet = wallet_map.get(&v.node_id);
+                let stake = wallet
+                    .and_then(|w| stakes.get(w))
+                    .copied()
+                    .unwrap_or(rust_decimal::Decimal::ZERO);
+                stake >= validator_min
+            })
+            .copied()
+            .collect();
+        let candidates = if eligible.is_empty() { &active } else { &eligible };
+        if candidates.len() <= 1 {
+            return None;
+        }
+
         // Gleicher SHA256-Seed wie select_validator_weighted
         let mut hasher = Sha256::new();
         hasher.update(prev_hash.as_bytes());
@@ -484,7 +504,7 @@ impl ValidatorSet {
         let seed = u64::from_le_bytes(hash[24..32].try_into().unwrap());
 
         let base_weight = rust_decimal::Decimal::ONE;
-        let weights: Vec<u64> = active.iter().map(|v| {
+        let weights: Vec<u64> = candidates.iter().map(|v| {
             let wallet = wallet_map.get(&v.node_id);
             let stake = wallet
                 .and_then(|w| stakes.get(w))
@@ -500,10 +520,10 @@ impl ValidatorSet {
         let total_weight: u64 = weights.iter().sum();
         if total_weight == 0 {
             // Fallback: einfache Index-Rotation
-            let primary_idx = (seed % active.len() as u64) as usize;
-            for rank in 1..active.len() {
-                let idx = (primary_idx + rank) % active.len();
-                if active[idx].node_id == node_id {
+            let primary_idx = (seed % candidates.len() as u64) as usize;
+            for rank in 1..candidates.len() {
+                let idx = (primary_idx + rank) % candidates.len();
+                if candidates[idx].node_id == node_id {
                     return Some(rank);
                 }
             }
@@ -515,7 +535,7 @@ impl ValidatorSet {
         // Backup-Reihenfolge = nächste Validatoren in der kumulativen Liste (wraparound).
         let position = seed % total_weight;
         let mut cumulative: u64 = 0;
-        let mut primary_idx = active.len() - 1;
+        let mut primary_idx = candidates.len() - 1;
         for (i, &w) in weights.iter().enumerate() {
             cumulative += w;
             if position < cumulative {
@@ -525,9 +545,9 @@ impl ValidatorSet {
         }
 
         // Backup-Rang bestimmen: nächste Validatoren nach dem Primary
-        for rank in 1..active.len() {
-            let idx = (primary_idx + rank) % active.len();
-            if active[idx].node_id == node_id {
+        for rank in 1..candidates.len() {
+            let idx = (primary_idx + rank) % candidates.len();
+            if candidates[idx].node_id == node_id {
                 return Some(rank);
             }
         }
@@ -1655,7 +1675,9 @@ impl CheckpointStore {
 
     pub fn save(&self) {
         if let Ok(s) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(Self::path(), s);
+            if let Err(e) = std::fs::write(Self::path(), &s) {
+                eprintln!("[consensus] ❌ CheckpointStore::save failed: {}", e);
+            }
         }
     }
 
@@ -1847,7 +1869,9 @@ impl SlashingStore {
 
     pub fn save(&self) {
         if let Ok(s) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(Self::path(), s);
+            if let Err(e) = std::fs::write(Self::path(), &s) {
+                eprintln!("[consensus] ❌ SlashingStore::save failed: {}", e);
+            }
         }
     }
 
@@ -2239,7 +2263,20 @@ pub fn detect_forks(blocks: &[Block]) -> Vec<Vec<ForkCandidate>> {
                 block_hash: b.hash.clone(),
                 signer_id: b.signer.clone(),
                 validator_signature: b.validator_signature.clone(),
-                chain_length_after: blocks.iter().filter(|x| x.index > b.index).count() as u64,
+                chain_length_after: {
+                    // Folge der Kette via previous_hash statt alle höheren Blöcke zu zählen
+                    let mut count = 0u64;
+                    let mut current_hash = b.hash.as_str();
+                    for _ in 0..blocks.len() {
+                        if let Some(next) = blocks.iter().find(|x| x.previous_hash == current_hash) {
+                            count += 1;
+                            current_hash = next.hash.as_str();
+                        } else {
+                            break;
+                        }
+                    }
+                    count
+                },
                 timestamp: b.timestamp,
                 signature_valid: false, // caller fills this in with ValidatorSet
                 signer_stake_weight: 0, // caller fills this with StakingPool data
