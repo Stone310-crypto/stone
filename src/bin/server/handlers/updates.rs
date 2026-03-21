@@ -72,7 +72,7 @@ pub async fn handle_update_chunk(
         Some(data) => (
             StatusCode::OK,
             [("content-type", "application/octet-stream")],
-            data.clone(),
+            data,
         )
             .into_response(),
         None => (

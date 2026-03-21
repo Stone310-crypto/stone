@@ -39,7 +39,7 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey, SigningKey, Signer};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashMap,
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
 };
@@ -61,8 +61,18 @@ const MAX_BINARY_SIZE: u64 = 500 * 1024 * 1024;
 /// Trusted-Keys-Datei (hex-kodierte Ed25519 public keys, eine pro Zeile)
 const TRUSTED_KEYS_FILE: &str = "trusted_update_keys.txt";
 
+/// Rollback-Marker-Datei nach OTA-Install
+const ROLLBACK_MARKER: &str = "rollback_pending.json";
+
 /// Aktuell laufende Stone-Version (aus Cargo.toml)
 pub const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Prüft ob ein Manifest-Target zur aktuellen Plattform passt
+fn platform_matches(manifest_target: &str) -> bool {
+    let arch = std::env::consts::ARCH;
+    let os = std::env::consts::OS;
+    manifest_target.starts_with(arch) && manifest_target.contains(os)
+}
 
 // ─── Datenstrukturen ──────────────────────────────────────────────────────────
 
@@ -153,6 +163,16 @@ impl Default for UpdateConfig {
 
 // ─── UpdateManager ────────────────────────────────────────────────────────────
 
+/// Rollback-Marker für Post-Update-Überwachung
+#[derive(Debug, Serialize, Deserialize)]
+struct RollbackMarker {
+    backup_path: String,
+    exe_path: String,
+    version: String,
+    attempt: u32,
+    created_at: DateTime<Utc>,
+}
+
 /// Verwaltet den gesamten Update-Lifecycle:
 /// Manifest-Empfang → Verifizierung → Download → Installation
 pub struct UpdateManager {
@@ -160,8 +180,8 @@ pub struct UpdateManager {
     pub state: UpdateState,
     /// Aktives Manifest (falls vorhanden)
     pub manifest: Option<UpdateManifest>,
-    /// Heruntergeladene Chunks: chunk_index → Daten
-    pub chunks: HashMap<usize, Vec<u8>>,
+    /// Indices der auf Disk gespeicherten Chunks (kein RAM-Verbrauch)
+    chunks_on_disk: HashSet<usize>,
     /// Konfiguration
     pub config: UpdateConfig,
     /// Daten-Verzeichnis (z.B. "stone_data")
@@ -175,7 +195,7 @@ impl UpdateManager {
         Self {
             state: UpdateState::Idle,
             manifest: None,
-            chunks: HashMap::new(),
+            chunks_on_disk: HashSet::new(),
             config,
             data_dir: data_dir.to_string(),
         }
@@ -184,7 +204,7 @@ impl UpdateManager {
     /// Gibt den aktuellen Fortschritt zurück.
     pub fn progress(&self) -> UpdateProgress {
         let total = self.manifest.as_ref().map(|m| m.chunk_hashes.len()).unwrap_or(0);
-        let downloaded = self.chunks.len();
+        let downloaded = self.chunks_on_disk.len();
         let pct = if total > 0 {
             ((downloaded as f64 / total as f64) * 100.0) as u8
         } else {
@@ -207,6 +227,11 @@ impl UpdateManager {
         // 1. Version prüfen – nur neuere Versionen akzeptieren
         if !is_newer_version(&manifest.version, CURRENT_VERSION) {
             return Ok(false); // Nicht neuer, ignorieren
+        }
+
+        // 1b. Plattform prüfen – nur Updates für diese Architektur akzeptieren
+        if !platform_matches(&manifest.target) {
+            return Ok(false);
         }
 
         // 2. Signatur prüfen
@@ -236,7 +261,7 @@ impl UpdateManager {
         }
 
         // 5. Vorherige Chunks verwerfen
-        self.chunks.clear();
+        self.chunks_on_disk.clear();
 
         // 6. Manifest speichern
         self.manifest = Some(manifest);
@@ -288,7 +313,7 @@ impl UpdateManager {
 
     // ─── Chunk-Download ───────────────────────────────────────────────────
 
-    /// Speichert einen heruntergeladenen Chunk (nach Hash-Verifikation).
+    /// Speichert einen heruntergeladenen Chunk (nach Hash-Verifikation) auf Disk.
     pub fn store_chunk(&mut self, index: usize, data: Vec<u8>) -> Result<(), String> {
         let manifest = self.manifest.as_ref().ok_or("Kein aktives Manifest")?;
 
@@ -307,15 +332,23 @@ impl UpdateManager {
             ));
         }
 
-        self.chunks.insert(index, data);
+        // Chunk auf Disk speichern (kein RAM-Verbrauch)
+        let update_dir = self.update_dir(&manifest.version);
+        fs::create_dir_all(&update_dir)
+            .map_err(|e| format!("Update-Verzeichnis erstellen: {e}"))?;
+        let chunk_path = update_dir.join(format!("chunk_{index:04}.bin"));
+        fs::write(&chunk_path, &data)
+            .map_err(|e| format!("Chunk {index} auf Disk speichern: {e}"))?;
+
+        self.chunks_on_disk.insert(index);
 
         if self.state == UpdateState::Available {
             self.state = UpdateState::Downloading;
         }
 
         // Alle Chunks da?
-        if self.chunks.len() == manifest.chunk_hashes.len() {
-            println!("[updater] ✓ Alle {} Chunks heruntergeladen", self.chunks.len());
+        if self.chunks_on_disk.len() == manifest.chunk_hashes.len() {
+            println!("[updater] ✓ Alle {} Chunks heruntergeladen", self.chunks_on_disk.len());
             self.state = UpdateState::Verifying;
         }
 
@@ -328,7 +361,7 @@ impl UpdateManager {
             return Vec::new();
         };
         (0..manifest.chunk_hashes.len())
-            .filter(|i| !self.chunks.contains_key(i))
+            .filter(|i| !self.chunks_on_disk.contains(i))
             .collect()
     }
 
@@ -338,19 +371,22 @@ impl UpdateManager {
     pub fn assemble_binary(&self) -> Result<Vec<u8>, String> {
         let manifest = self.manifest.as_ref().ok_or("Kein aktives Manifest")?;
 
-        if self.chunks.len() != manifest.chunk_hashes.len() {
+        if self.chunks_on_disk.len() != manifest.chunk_hashes.len() {
             return Err(format!(
                 "Unvollständig: {}/{} Chunks",
-                self.chunks.len(),
+                self.chunks_on_disk.len(),
                 manifest.chunk_hashes.len()
             ));
         }
 
-        // Chunks in Reihenfolge zusammensetzen
+        // Chunks von Disk lesen und in Reihenfolge zusammensetzen
+        let update_dir = self.update_dir(&manifest.version);
         let mut binary = Vec::with_capacity(manifest.binary_size as usize);
         for i in 0..manifest.chunk_hashes.len() {
-            let chunk = self.chunks.get(&i).ok_or(format!("Chunk {i} fehlt"))?;
-            binary.extend_from_slice(chunk);
+            let chunk_path = update_dir.join(format!("chunk_{i:04}.bin"));
+            let chunk = fs::read(&chunk_path)
+                .map_err(|e| format!("Chunk {i} von Disk lesen: {e}"))?;
+            binary.extend_from_slice(&chunk);
         }
 
         // Gesamt-Hash prüfen
@@ -468,7 +504,7 @@ impl UpdateManager {
 
             self.state = UpdateState::Idle;
             self.manifest = None;
-            self.chunks.clear();
+            self.chunks_on_disk.clear();
             let _ = fs::remove_dir_all(self.update_dir(&version));
 
             return Ok(target_path);
@@ -512,9 +548,22 @@ impl UpdateManager {
             current_exe.display()
         );
 
+        // Rollback-Marker schreiben (für Auto-Rollback bei Crash)
+        let marker = RollbackMarker {
+            backup_path: backup_path.to_string_lossy().to_string(),
+            exe_path: current_exe.to_string_lossy().to_string(),
+            version: version.clone(),
+            attempt: 0,
+            created_at: Utc::now(),
+        };
+        let marker_path = PathBuf::from(&self.data_dir).join(ROLLBACK_MARKER);
+        if let Ok(json) = serde_json::to_string_pretty(&marker) {
+            let _ = fs::write(&marker_path, json);
+        }
+
         self.state = UpdateState::Idle;
         self.manifest = None;
-        self.chunks.clear();
+        self.chunks_on_disk.clear();
 
         // Aufräumen: Staged Files löschen
         let _ = fs::remove_dir_all(self.update_dir(&version));
@@ -595,17 +644,19 @@ impl UpdateManager {
 
         // In eigenen State übernehmen (für andere Peers zum Download)
         self.manifest = Some(manifest.clone());
-        for (idx, data) in chunk_data {
-            self.chunks.insert(idx, data);
+        for (idx, _data) in chunk_data {
+            self.chunks_on_disk.insert(idx);
         }
         self.state = UpdateState::Idle; // Für den Publisher bleibt es Idle
 
         Ok(())
     }
 
-    /// Gibt die Chunk-Daten für einen bestimmten Index zurück (für Peer-Download).
-    pub fn get_chunk(&self, index: usize) -> Option<&Vec<u8>> {
-        self.chunks.get(&index)
+    /// Gibt die Chunk-Daten für einen bestimmten Index zurück (von Disk, für Peer-Download).
+    pub fn get_chunk(&self, index: usize) -> Option<Vec<u8>> {
+        let manifest = self.manifest.as_ref()?;
+        let chunk_path = self.update_dir(&manifest.version).join(format!("chunk_{index:04}.bin"));
+        fs::read(&chunk_path).ok()
     }
 
     // ─── Hilfsfunktionen ──────────────────────────────────────────────────
@@ -672,6 +723,7 @@ impl UpdateManager {
     }
 
     /// Versucht ein gespeichertes Update von Disk zu laden (nach Neustart).
+    /// Chunks bleiben auf Disk – nur Indices werden in den Speicher geladen.
     pub fn load_persisted_update(&mut self) {
         let updates_dir = PathBuf::from(&self.data_dir).join(UPDATES_DIR);
         if !updates_dir.exists() {
@@ -701,16 +753,16 @@ impl UpdateManager {
                             manifest.version
                         );
 
-                        // Chunks laden + Hash verifizieren
+                        // Chunks auf Disk prüfen (Hash-Verifikation, kein RAM-Load)
                         let update_dir = updates_dir.join(latest);
-                        let mut chunks = HashMap::new();
+                        let mut valid_chunks = HashSet::new();
                         let mut corrupted = 0usize;
                         for (idx, expected_hash) in manifest.chunk_hashes.iter().enumerate() {
                             let chunk_path = update_dir.join(format!("chunk_{idx:04}.bin"));
                             if let Ok(data) = fs::read(&chunk_path) {
                                 let actual_hash = sha256_hex(&data);
                                 if actual_hash == *expected_hash {
-                                    chunks.insert(idx, data);
+                                    valid_chunks.insert(idx);
                                 } else {
                                     eprintln!(
                                         "[updater] ⚠ Chunk {idx} korrupt (erwartet {}…, erhalten {}…) – wird erneut geladen",
@@ -725,18 +777,19 @@ impl UpdateManager {
                             eprintln!("[updater] ⚠ {corrupted} korrupte Chunk(s) entfernt");
                         }
 
-                        if chunks.len() == manifest.chunk_hashes.len() {
+                        let present = valid_chunks.len();
+                        let total = manifest.chunk_hashes.len();
+                        if present == total {
                             self.manifest = Some(manifest);
-                            self.chunks = chunks;
+                            self.chunks_on_disk = valid_chunks;
                             self.state = UpdateState::Verifying;
                             println!("[updater] ✓ Alle Chunks vorhanden → Verifizierung nötig");
                         } else {
                             self.manifest = Some(manifest);
+                            self.chunks_on_disk = valid_chunks;
                             self.state = UpdateState::Available;
                             println!(
-                                "[updater] ⚠ {}/{} Chunks vorhanden → Download fortsetzen",
-                                chunks.len(),
-                                self.manifest.as_ref().unwrap().chunk_hashes.len()
+                                "[updater] ⚠ {present}/{total} Chunks vorhanden → Download fortsetzen"
                             );
                         }
                     }
@@ -829,6 +882,91 @@ pub fn chunk_binary(data: &[u8]) -> Vec<(Vec<u8>, String)> {
             (chunk.to_vec(), hash)
         })
         .collect()
+}
+
+// ─── Auto-Rollback ────────────────────────────────────────────────────────────
+
+/// Prüft ob ein Post-Update-Rollback nötig ist (nach wiederholtem Crash).
+/// Gibt `true` zurück wenn ein Rollback durchgeführt wurde.
+/// Sollte früh beim Start aufgerufen werden.
+pub fn check_post_update_rollback(data_dir: &str) -> bool {
+    let marker_path = PathBuf::from(data_dir).join(ROLLBACK_MARKER);
+    if !marker_path.exists() {
+        return false;
+    }
+
+    let data = match fs::read_to_string(&marker_path) {
+        Ok(d) => d,
+        Err(_) => {
+            let _ = fs::remove_file(&marker_path);
+            return false;
+        }
+    };
+    let mut marker: RollbackMarker = match serde_json::from_str(&data) {
+        Ok(m) => m,
+        Err(_) => {
+            let _ = fs::remove_file(&marker_path);
+            return false;
+        }
+    };
+
+    marker.attempt += 1;
+
+    if marker.attempt >= 3 {
+        eprintln!(
+            "[updater] ⚠ Update v{} fehlgeschlagen nach {} Versuchen – Rollback!",
+            marker.version, marker.attempt
+        );
+        let backup = PathBuf::from(&marker.backup_path);
+        let exe = PathBuf::from(&marker.exe_path);
+        if backup.exists() {
+            if let Err(e) = fs::copy(&backup, &exe) {
+                eprintln!("[updater] ❌ Rollback fehlgeschlagen: {e}");
+            } else {
+                eprintln!("[updater] ✓ Rollback auf vorherige Version durchgeführt");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let _ = fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755));
+                }
+                let _ = fs::remove_file(&backup);
+            }
+        }
+        let _ = fs::remove_file(&marker_path);
+        return true;
+    }
+
+    // Attempt-Zähler hochschreiben
+    if let Ok(json) = serde_json::to_string_pretty(&marker) {
+        let _ = fs::write(&marker_path, json);
+    }
+    println!(
+        "[updater] 📋 Post-Update-Check: v{} (Versuch {})",
+        marker.version, marker.attempt
+    );
+    false
+}
+
+/// Bestätigt ein erfolgreiches Update (Marker + Backup löschen).
+/// Sollte aufgerufen werden nachdem der Node erfolgreich gestartet ist
+/// (z.B. nach 60 Sekunden gesundem Betrieb).
+pub fn confirm_update_success(data_dir: &str) {
+    let marker_path = PathBuf::from(data_dir).join(ROLLBACK_MARKER);
+    if marker_path.exists() {
+        if let Ok(data) = fs::read_to_string(&marker_path) {
+            if let Ok(marker) = serde_json::from_str::<RollbackMarker>(&data) {
+                let backup = PathBuf::from(&marker.backup_path);
+                if backup.exists() {
+                    let _ = fs::remove_file(&backup);
+                }
+                println!(
+                    "[updater] ✓ Update v{} bestätigt – Rollback-Marker entfernt",
+                    marker.version
+                );
+            }
+        }
+        let _ = fs::remove_file(&marker_path);
+    }
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -930,8 +1068,9 @@ mod tests {
         assert!(manager.store_chunk(0, data.to_vec()).is_ok());
         assert_eq!(manager.state, UpdateState::Verifying);
 
-        // Falscher Chunk
-        manager.chunks.clear();
+        // Reset: Disk-Chunks und Index leeren
+        manager.chunks_on_disk.clear();
+        let _ = fs::remove_dir_all("/tmp/stone_test_chunks/updates");
         manager.state = UpdateState::Available;
         let result = manager.store_chunk(0, b"wrong data".to_vec());
         assert!(result.is_err());

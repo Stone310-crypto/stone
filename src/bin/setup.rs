@@ -262,6 +262,20 @@ async fn start_full_node(state: SetupState) {
     println!("[node] Full-Node wird gestartet...");
 
     std::fs::create_dir_all(data_dir()).ok();
+
+    // Post-Update Rollback prüfen (bei Crash-Loop → altes Binary wiederherstellen)
+    if stone::updater::check_post_update_rollback(&data_dir()) {
+        eprintln!("[node] ⚠ Rollback durchgeführt – Neustart mit altem Binary...");
+        let exe = std::env::current_exe().expect("current_exe");
+        let args: Vec<String> = std::env::args().collect();
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            let _ = std::process::Command::new(&exe).args(&args[1..]).exec();
+        }
+        std::process::exit(1);
+    }
+
     if let Err(e) = ChunkStore::new() {
         eprintln!("[node] ChunkStore-Fehler: {e}");
     }
@@ -375,6 +389,15 @@ async fn start_full_node(state: SetupState) {
         um.load_persisted_update();
         um
     }));
+
+    // Post-Update Erfolg bestätigen (nach 120s gesundem Betrieb → Rollback-Marker löschen)
+    {
+        let dd = data_dir();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+            stone::updater::confirm_update_success(&dd);
+        });
+    }
 
     // P2P starten
     let network_handle: Option<NetworkHandle> =

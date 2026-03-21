@@ -2176,6 +2176,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── Konfiguration laden oder erstellen ──────────────────────────────
     std::fs::create_dir_all(data_dir()).ok();
+
+    // Post-Update Rollback prüfen
+    if stone::updater::check_post_update_rollback(&data_dir()) {
+        eprintln!("[miner] ⚠ Rollback durchgeführt – Neustart mit altem Binary...");
+        let exe = std::env::current_exe().expect("current_exe");
+        let args_exec: Vec<String> = std::env::args().collect();
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            let _ = std::process::Command::new(&exe).args(&args_exec[1..]).exec();
+        }
+        std::process::exit(1);
+    }
+
     let mut config = MinerConfig::load().unwrap_or_else(|| {
         let seed_peers = load_peers_from_disk()
             .into_iter()
@@ -2446,6 +2460,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         call_signals: Arc::new(stone::chat::CallSignalStore::default()),
         audio_rooms: server::handlers::audio_relay::new_audio_rooms(),
     };
+
+    // Post-Update Erfolg bestätigen (nach 120s gesundem Betrieb)
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(120)).await;
+        stone::updater::confirm_update_success(&data_dir());
+    });
 
     // Audio-Room GC: Idle-Rooms alle 60s aufräumen (Rooms ohne Aktivität > 5 Min)
     {

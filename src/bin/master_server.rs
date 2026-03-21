@@ -58,6 +58,20 @@ async fn main() {
     }
 
     std::fs::create_dir_all(data_dir()).expect("DATA_DIR anlegen");
+
+    // Post-Update Rollback prüfen
+    if stone::updater::check_post_update_rollback(&data_dir()) {
+        eprintln!("[master] ⚠ Rollback durchgeführt – Neustart mit altem Binary...");
+        let exe = std::env::current_exe().expect("current_exe");
+        let args: Vec<String> = std::env::args().collect();
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            let _ = std::process::Command::new(&exe).args(&args[1..]).exec();
+        }
+        std::process::exit(1);
+    }
+
     ChunkStore::new().expect("ChunkStore anlegen");
 
     let api_key = Arc::new(load_api_key());
@@ -996,6 +1010,12 @@ async fn main() {
     };
 
     let router = build_router(state.clone());
+
+    // Post-Update Erfolg bestätigen (nach 120s gesundem Betrieb)
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+        stone::updater::confirm_update_success(&stone::blockchain::data_dir());
+    });
 
     // Audio-Room GC: Idle-Rooms alle 60s aufräumen (Rooms ohne Aktivität > 5 Min)
     {
