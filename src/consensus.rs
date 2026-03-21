@@ -1082,12 +1082,19 @@ pub fn calculate_next_difficulty(
     let upper = target + target / 3; // ~40s
     let lower = target.saturating_sub(target / 3); // ~20s
 
+    // Proportionale Anpassung: Ratio actual/target bestimmt Richtung und Stärke.
+    // Begrenzung auf ±4 Bits pro Adjustment um Oszillation zu vermeiden.
+    const MAX_STEP: u32 = 4;
     let new_difficulty = if avg_block_time > upper {
-        // Blöcke zu langsam → Difficulty runter
-        current_difficulty.saturating_sub(1)
+        // Blöcke zu langsam → Difficulty runter (proportional)
+        let ratio = avg_block_time / target; // z.B. 4× zu langsam → step=4
+        let step = (ratio as u32).clamp(1, MAX_STEP);
+        current_difficulty.saturating_sub(step)
     } else if avg_block_time < lower {
-        // Blöcke zu schnell → Difficulty hoch
-        current_difficulty + 1
+        // Blöcke zu schnell → Difficulty hoch (proportional)
+        let ratio = if avg_block_time == 0 { MAX_STEP as u64 } else { target / avg_block_time };
+        let step = (ratio as u32).clamp(1, MAX_STEP);
+        current_difficulty + step
     } else {
         // Im Zielbereich → Difficulty beibehalten
         current_difficulty
@@ -1434,25 +1441,6 @@ impl VotingRound {
         }
     }
 
-    /// Responsive Tally: Quorum basiert nur auf Validators die tatsächlich
-    /// geantwortet haben (accept oder reject), nicht auf allen aktiven.
-    /// Wird verwendet wenn Peers voting nicht unterstützen (alter Code).
-    pub fn tally_pre_votes_responsive(&self) -> VoteTally {
-        let accepts = self.pre_votes.values().filter(|v| v.accept).count();
-        let rejects = self.pre_votes.values().filter(|v| !v.accept).count();
-        let responded = accepts + rejects;
-        // Mindestens 1 Stimme nötig, Supermajority der Antwortenden
-        let threshold = if responded == 0 { 1 } else { (responded * 2 / 3) + 1 };
-        VoteTally {
-            accepts,
-            rejects,
-            abstentions: 0,
-            total_validators: responded,
-            threshold,
-            quorum_reached: accepts >= threshold,
-        }
-    }
-
     /// Pre-Commit Auswertung: Supermajorität bei Pre-Commits erreicht?
     pub fn tally_pre_commits(&self, validator_set: &ValidatorSet) -> VoteTally {
         let accepts = self.pre_commits.values().filter(|v| v.accept).count();
@@ -1464,22 +1452,6 @@ impl VotingRound {
             rejects,
             abstentions: total_active.saturating_sub(self.pre_commits.len()),
             total_validators: total_active,
-            threshold,
-            quorum_reached: accepts >= threshold,
-        }
-    }
-
-    /// Responsive Pre-Commit Tally: nur antwortende Validators zählen.
-    pub fn tally_pre_commits_responsive(&self) -> VoteTally {
-        let accepts = self.pre_commits.values().filter(|v| v.accept).count();
-        let rejects = self.pre_commits.values().filter(|v| !v.accept).count();
-        let responded = accepts + rejects;
-        let threshold = if responded == 0 { 1 } else { (responded * 2 / 3) + 1 };
-        VoteTally {
-            accepts,
-            rejects,
-            abstentions: 0,
-            total_validators: responded,
             threshold,
             quorum_reached: accepts >= threshold,
         }
@@ -1511,25 +1483,6 @@ impl VotingRound {
         tally
     }
 
-    /// Finalisiert mit Responsive-Fallback.
-    pub fn finalize_responsive(&mut self, validator_set: &ValidatorSet) -> (VoteTally, bool) {
-        let tally = self.tally_pre_commits(validator_set);
-        if tally.quorum_reached {
-            self.finalized = true;
-            self.accepted = true;
-            return (tally, false);
-        }
-        let responsive = self.tally_pre_commits_responsive();
-        let responded = responsive.accepts + responsive.rejects;
-        if responded < tally.total_validators && responsive.quorum_reached {
-            self.finalized = true;
-            self.accepted = true;
-            return (responsive, true);
-        }
-        self.finalized = true;
-        self.accepted = false;
-        (tally, false)
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
