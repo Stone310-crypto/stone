@@ -28,6 +28,11 @@ fn chat_index_file() -> String {
 // ─── Chat-Nachricht (Index-Eintrag) ──────────────────────────────────────────
 
 /// Ein Chat-Nachrichten-Eintrag (aus der Blockchain extrahiert).
+///
+/// DSGVO-Architektur: Der verschluesselte Inhalt (`encrypted_content`, `nonce`)
+/// wird NUR off-chain im ChatIndex gespeichert. On-chain landet nur der
+/// `content_hash` (SHA-256 des Ciphertexts). Bei Account-Loeschung wird der
+/// off-chain Content geloescht und der Key vernichtet — funktionale Loeschung.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ChatEntry {
     /// Eindeutige Nachrichten-ID
@@ -40,10 +45,13 @@ pub struct ChatEntry {
     pub from_user_id: String,
     /// Sender Display-Name
     pub from_name: String,
-    /// AES-256-GCM verschlüsselter Inhalt (base64)
+    /// AES-256-GCM verschlüsselter Inhalt (base64) — nur off-chain, NICHT on-chain
     pub encrypted_content: String,
-    /// AES-256-GCM Nonce (base64, 12 Bytes)
+    /// AES-256-GCM Nonce (base64, 12 Bytes) — nur off-chain
     pub nonce: String,
+    /// SHA-256 Hash des verschlüsselten Inhalts (on-chain Beweis, DSGVO-konform)
+    #[serde(default)]
+    pub content_hash: String,
     /// Unix-Timestamp
     pub timestamp: i64,
     /// Block-Index in dem die Nachricht geminet wurde (0 = pending)
@@ -186,14 +194,28 @@ impl ChatIndex {
                 }
 
                 if let Ok(data) = serde_json::from_str::<serde_json::Value>(&tx.memo) {
+                    // Backward-compat: Altes Format hat "encrypted"+"nonce" in memo,
+                    // neues DSGVO-Format hat nur "content_hash" — Content kommt off-chain.
+                    let (enc, nc, ch) = if let Some(e) = data["encrypted"].as_str() {
+                        // Altes Format: Content war on-chain
+                        let n = data["nonce"].as_str().unwrap_or("").to_string();
+                        let hash = compute_content_hash(e, &n);
+                        (e.to_string(), n, hash)
+                    } else {
+                        // Neues DSGVO-Format: Nur content_hash on-chain
+                        let hash = data["content_hash"].as_str().unwrap_or("").to_string();
+                        (String::new(), String::new(), hash)
+                    };
+
                     let entry = ChatEntry {
                         msg_id: data["msg_id"].as_str().unwrap_or("").to_string(),
                         from_wallet: tx.from.clone(),
                         to_wallet: tx.to.clone(),
                         from_user_id: data["from_user_id"].as_str().unwrap_or("").to_string(),
                         from_name: data["from_name"].as_str().unwrap_or("").to_string(),
-                        encrypted_content: data["encrypted"].as_str().unwrap_or("").to_string(),
-                        nonce: data["nonce"].as_str().unwrap_or("").to_string(),
+                        encrypted_content: enc,
+                        nonce: nc,
+                        content_hash: ch,
                         timestamp: tx.timestamp,
                         block_index: block.index,
                         tx_id: tx.tx_id.clone(),
@@ -242,6 +264,7 @@ impl ChatIndex {
                         from_name: m.from_name.clone(),
                         encrypted_content: m.encrypted_content.clone(),
                         nonce: m.nonce.clone(),
+                        content_hash: compute_content_hash(&m.encrypted_content, &m.nonce),
                         timestamp: m.timestamp,
                         block_index: block.index,
                         tx_id: String::new(),
@@ -288,14 +311,72 @@ impl ChatIndex {
             for tx in &chat_txs {
                 match serde_json::from_str::<serde_json::Value>(&tx.memo) {
                     Ok(data) => {
+                        // Backward-compat: Altes Format hat "encrypted"+"nonce",
+                        // neues DSGVO-Format hat nur "content_hash".
+                        let (enc, nc, ch) = if let Some(e) = data["encrypted"].as_str() {
+                            let n = data["nonce"].as_str().unwrap_or("").to_string();
+                            let hash = compute_content_hash(e, &n);
+                            (e.to_string(), n, hash)
+                        } else {
+                            let hash = data["content_hash"].as_str().unwrap_or("").to_string();
+                            // DSGVO-Format: Content muss bereits im ChatIndex sein
+                            // (wurde beim Senden sofort off-chain gespeichert).
+                            // Falls ein anderer Node den Block empfaengt, hat er den Content
+                            // via P2P MessagePool erhalten; hier nur Hash setzen.
+                            (String::new(), String::new(), hash)
+                        };
+
+                        // DSGVO-Format: Pruefen ob Content bereits im ChatIndex liegt
+                        // (z.B. von handle_chat_send sofort gespeichert)
+                        let key = Self::conv_key(&tx.from, &tx.to);
+                        let mid = data["msg_id"].as_str().unwrap_or("");
+                        let existing = self.conversations.get(&key)
+                            .and_then(|entries| entries.iter().find(|e| e.msg_id == mid));
+
+                        let (final_enc, final_nc) = if enc.is_empty() {
+                            if let Some(ex) = existing {
+                                // Content aus vorherigem off-chain Eintrag uebernehmen
+                                (ex.encrypted_content.clone(), ex.nonce.clone())
+                            } else {
+                                (enc, nc)
+                            }
+                        } else {
+                            (enc, nc)
+                        };
+
+                        // Wenn msg_id schon existiert: block_index aktualisieren
+                        if let Some(entries) = self.conversations.get_mut(&key) {
+                            if let Some(ex) = entries.iter_mut().find(|e| e.msg_id == mid) {
+                                ex.block_index = block.index;
+                                ex.tx_id = tx.tx_id.clone();
+                                if !final_enc.is_empty() && ex.encrypted_content.is_empty() {
+                                    ex.encrypted_content = final_enc.clone();
+                                    ex.nonce = final_nc.clone();
+                                }
+                                if ex.content_hash.is_empty() {
+                                    ex.content_hash = ch.clone();
+                                }
+                                chat_count += 1;
+                                println!(
+                                    "[chat-index] ✅ ChatMessage aktualisiert: {} → {} (msg_id: {}, block: #{})",
+                                    &tx.from[..12.min(tx.from.len())],
+                                    &tx.to[..12.min(tx.to.len())],
+                                    &mid[..8.min(mid.len())],
+                                    block.index,
+                                );
+                                continue;
+                            }
+                        }
+
                         let entry = ChatEntry {
-                            msg_id: data["msg_id"].as_str().unwrap_or("").to_string(),
+                            msg_id: mid.to_string(),
                             from_wallet: tx.from.clone(),
                             to_wallet: tx.to.clone(),
                             from_user_id: data["from_user_id"].as_str().unwrap_or("").to_string(),
                             from_name: data["from_name"].as_str().unwrap_or("").to_string(),
-                            encrypted_content: data["encrypted"].as_str().unwrap_or("").to_string(),
-                            nonce: data["nonce"].as_str().unwrap_or("").to_string(),
+                            encrypted_content: final_enc,
+                            nonce: final_nc,
+                            content_hash: ch,
                             timestamp: tx.timestamp,
                             block_index: block.index,
                             tx_id: tx.tx_id.clone(),
@@ -363,6 +444,7 @@ impl ChatIndex {
                         from_name: m.from_name.clone(),
                         encrypted_content: m.encrypted_content.clone(),
                         nonce: m.nonce.clone(),
+                        content_hash: compute_content_hash(&m.encrypted_content, &m.nonce),
                         timestamp: m.timestamp,
                         block_index: block.index,
                         tx_id: String::new(),
@@ -763,6 +845,87 @@ pub fn save_chat_groups(store: &ChatGroupStore) {
         let _ = fs::create_dir_all(data_dir());
         let _ = fs::write(chat_groups_file(), json);
     }
+}
+
+// ─── DSGVO / Content-Hash ────────────────────────────────────────────────────
+
+/// Berechnet den SHA-256 Content-Hash eines verschluesselten Inhalts.
+/// Dieser Hash ist das einzige was on-chain gespeichert wird.
+pub fn compute_content_hash(encrypted_content: &str, nonce: &str) -> String {
+    let input = format!("{}:{}", encrypted_content, nonce);
+    crate::updater::sha256_hex(input.as_bytes())
+}
+
+/// DSGVO Art. 17 — Recht auf Loeschung: Alle Chat-Inhalte einer Wallet purgen.
+///
+/// Ersetzt `encrypted_content` und `nonce` aller Nachrichten, die von oder an
+/// die angegebene Wallet gerichtet sind, durch einen REDACTED-Platzhalter.
+/// Der `content_hash` und die Metadaten (msg_id, timestamp, block_index) bleiben
+/// als kryptografischer Beweis erhalten — aber der Inhalt ist faktisch geloescht.
+///
+/// Gibt die Anzahl gepurgter Nachrichten zurueck.
+pub fn gdpr_purge_wallet(index: &mut ChatIndex, wallet: &str) -> u32 {
+    let mut purged = 0u32;
+    for (conv_key, messages) in index.conversations.iter_mut() {
+        // Nur Konversationen in denen die Wallet beteiligt ist
+        let parts: Vec<&str> = conv_key.splitn(2, ':').collect();
+        if parts.len() != 2 { continue; }
+        if parts[0] != wallet && parts[1] != wallet { continue; }
+
+        for msg in messages.iter_mut() {
+            if msg.encrypted_content != crate::chat_policy::REDACTED_CONTENT {
+                msg.encrypted_content = crate::chat_policy::REDACTED_CONTENT.to_string();
+                msg.nonce = String::new();
+                msg.from_user_id = String::new();
+                msg.from_name = String::new();
+                purged += 1;
+            }
+        }
+    }
+
+    if purged > 0 {
+        println!(
+            "[gdpr] Art.17: {} Nachrichten fuer Wallet {} geloescht (funktionale Loeschung)",
+            purged,
+            &wallet[..12.min(wallet.len())],
+        );
+    }
+    purged
+}
+
+/// DSGVO: Gruppen-Nachrichten einer Wallet purgen.
+pub fn gdpr_purge_wallet_groups(groups: &mut ChatGroupStore, wallet: &str) -> u32 {
+    let mut purged = 0u32;
+    for group in &mut groups.groups {
+        for msg in &mut group.messages {
+            if msg.from_wallet == wallet && msg.encrypted_content != crate::chat_policy::REDACTED_CONTENT {
+                msg.encrypted_content = crate::chat_policy::REDACTED_CONTENT.to_string();
+                msg.nonce = String::new();
+                msg.from_user_id = String::new();
+                msg.from_name = String::new();
+                purged += 1;
+            }
+        }
+        // Wallet aus der Mitgliederliste entfernen
+        group.members.retain(|m| m.wallet != wallet);
+    }
+    purged
+}
+
+/// DSGVO: Kontakte und Kontaktanfragen einer Wallet komplett entfernen.
+pub fn gdpr_purge_wallet_contacts(
+    contacts: &mut ContactList,
+    requests: &mut ContactRequestStore,
+    wallet: &str,
+) {
+    // Eigene Kontaktliste loeschen
+    contacts.contacts.remove(wallet);
+    // Sich selbst aus allen Kontaktlisten anderer entfernen
+    for list in contacts.contacts.values_mut() {
+        list.retain(|c| c.wallet != wallet);
+    }
+    // Alle Kontaktanfragen von/an diese Wallet loeschen
+    requests.requests.retain(|r| r.from_wallet != wallet && r.to_wallet != wallet);
 }
 
 // ─── Call-Signaling ──────────────────────────────────────────────────────────

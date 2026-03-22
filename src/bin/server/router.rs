@@ -127,7 +127,7 @@ use super::handlers::{
         handle_snapshot_meta, handle_snapshot_download, handle_snapshot_create,
         handle_snapshot_state_root,
     },
-    users::{handle_delete_user, handle_list_users, handle_list_users_public},
+    users::{handle_delete_user, handle_delete_own_account, handle_list_users, handle_list_users_public},
     ws::handle_websocket,
 };
 
@@ -209,6 +209,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/users", get(handle_list_users))
         .route("/api/v1/users/public", get(handle_list_users_public))
         .route("/api/v1/users/{user_id}", delete(handle_delete_user))
+        // Self-Service Account-Loeschung (DSGVO Art. 17)
+        .route("/api/v1/account", delete(handle_delete_own_account))
         // Alias: Frontend ruft /api/v1/users/{id}/documents statt /api/v1/documents/user/{id}
         .route("/api/v1/users/{user_id}/documents", get(handle_list_user_documents))
         // Auth

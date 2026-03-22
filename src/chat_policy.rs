@@ -51,6 +51,29 @@ pub const REPORT_VOTING_TIMEOUT_SECS: i64 = 24 * 3600;
 /// Platzhalter für gelöschten Content
 pub const REDACTED_CONTENT: &str = "[REDACTED — self-destruct or reported]";
 
+/// Platzhalter fuer DSGVO-geloeschten Content (Art. 17)
+pub const GDPR_REDACTED: &str = "[GDPR-DELETED — account removed]";
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DSGVO Art. 17 — Loeschprotokoll
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Eintrag im DSGVO-Loeschprotokoll.
+/// Wird bei Account-Loeschung erstellt und dauerhaft im ChatPolicyStore archiviert.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GdprDeletionRecord {
+    /// Wallet-Adresse des geloeschten Accounts
+    pub wallet: String,
+    /// Unix-Timestamp der Loeschung
+    pub deleted_at: i64,
+    /// Anzahl gepurgter Chat-Nachrichten
+    pub messages_purged: u32,
+    /// Anzahl gepurgter Gruppen-Nachrichten
+    pub group_messages_purged: u32,
+    /// Kontakte entfernt
+    pub contacts_removed: bool,
+}
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // Self-Destruct TTL
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -233,6 +256,9 @@ pub struct ChatPolicyStore {
     pub reports: HashMap<String, MessageReport>,
     /// Erledigte Reports (Archiv, begrenzt): report_id → MessageReport
     pub report_archive: Vec<MessageReport>,
+    /// DSGVO Art. 17: Loeschprotokoll (Audit-Trail)
+    #[serde(default)]
+    pub gdpr_deletions: Vec<GdprDeletionRecord>,
     /// Statistik
     pub total_messages_tracked: u64,
     pub total_content_purged: u64,
@@ -247,6 +273,7 @@ impl ChatPolicyStore {
             ttl_entries: HashMap::new(),
             reports: HashMap::new(),
             report_archive: Vec::new(),
+            gdpr_deletions: Vec::new(),
             total_messages_tracked: 0,
             total_content_purged: 0,
             total_reports_filed: 0,
@@ -694,6 +721,28 @@ impl ChatPolicyStore {
             }
             _ => ChatPolicyStore::new(),
         }
+    }
+
+    /// DSGVO Art. 17: Loeschung protokollieren und alle TTL-Eintraege der Wallet entfernen.
+    pub fn record_gdpr_deletion(&mut self, record: GdprDeletionRecord) {
+        // TTL-Eintraege der Wallet als gepurged markieren
+        for entry in self.ttl_entries.values_mut() {
+            if entry.from_wallet == record.wallet || entry.to_wallet == record.wallet {
+                if !entry.content_purged {
+                    entry.content_purged = true;
+                    entry.purge_reason = Some("gdpr_art17".to_string());
+                    self.total_content_purged += 1;
+                }
+            }
+        }
+
+        println!(
+            "[chat-policy] DSGVO Art.17: Loeschung protokolliert fuer Wallet {} — {} DM + {} Gruppen-Nachrichten geloescht",
+            &record.wallet[..12.min(record.wallet.len())],
+            record.messages_purged,
+            record.group_messages_purged,
+        );
+        self.gdpr_deletions.push(record);
     }
 }
 

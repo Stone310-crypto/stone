@@ -1582,9 +1582,9 @@ impl TokenLedger {
         Ok(())
     }
 
-    /// Interne Fee-Split-Logik: 40% Miner, 30% Staker-Pool, 20% burn, 10% Node-Operator-Pool.
+    /// Interne Fee-Split-Logik: 37% Miner, 28% Staker-Pool, 20% burn, 10% Node-Ops, 5% Governance.
     fn apply_fee_split(&mut self, fee: Decimal) {
-        let (burn, miner_share, staker_share, pool_share) = super::reputation::split_fee(fee);
+        let (burn, miner_share, staker_share, pool_share, gov_share) = super::reputation::split_fee(fee);
 
         // 20% verbrennen (Deflation)
         if burn > Decimal::ZERO {
@@ -1592,7 +1592,7 @@ impl TokenLedger {
             self.total_fees_burned += burn;
         }
 
-        // 40% → Block-Miner (aktueller Validator)
+        // 37% → Block-Miner (aktueller Validator)
         if miner_share > Decimal::ZERO {
             if let Some(ref vw) = self.current_block_validator {
                 *self.balances.entry(vw.clone()).or_insert(Decimal::ZERO) += miner_share;
@@ -1603,7 +1603,7 @@ impl TokenLedger {
             }
         }
 
-        // 30% → Staker-Fee-Pool (wird proportional nach Stake verteilt)
+        // 28% → Staker-Fee-Pool (wird proportional nach Stake verteilt)
         if staker_share > Decimal::ZERO {
             *self.balances.entry(super::reputation::STAKER_FEE_POOL.to_string())
                 .or_insert(Decimal::ZERO) += staker_share;
@@ -1613,6 +1613,12 @@ impl TokenLedger {
         if pool_share > Decimal::ZERO {
             *self.balances.entry(super::reputation::NODE_OPERATOR_POOL.to_string())
                 .or_insert(Decimal::ZERO) += pool_share;
+        }
+
+        // 5% → Governance-Pool (Nachfüllung aus Netzwerkaktivität)
+        if gov_share > Decimal::ZERO {
+            *self.balances.entry(super::governance::GOVERNANCE_POOL.to_string())
+                .or_insert(Decimal::ZERO) += gov_share;
         }
     }
 }

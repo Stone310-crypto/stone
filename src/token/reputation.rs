@@ -36,11 +36,12 @@ pub const STAKER_FEE_POOL: &str = "pool:staker_fees";
 pub const DISTRIBUTION_INTERVAL: u64 = 720;
 
 /// Fee-Split Anteile (Summe = 100)
-/// 20% burn, 40% miner, 30% staker-pool, 10% node-operator-pool
+/// 20% burn, 37% miner, 28% staker-pool, 10% node-operator-pool, 5% governance
 pub const FEE_BURN_PCT: u64 = 20;
-pub const FEE_VALIDATOR_PCT: u64 = 40;
-pub const FEE_STAKER_PCT: u64 = 30;
+pub const FEE_VALIDATOR_PCT: u64 = 37;
+pub const FEE_STAKER_PCT: u64 = 28;
 pub const FEE_NODE_POOL_PCT: u64 = 10;
+pub const FEE_GOVERNANCE_PCT: u64 = 5;
 
 /// Maximaler Reputation-Score
 pub const MAX_REPUTATION_SCORE: u64 = 100;
@@ -432,25 +433,27 @@ pub struct NodeReputationInfo {
 ///
 /// Rückgabe: `(burn_amount, validator_amount, staker_amount, pool_amount)`
 ///
-/// | Anteil | Prozent | Empfänger                               |
-/// |--------|---------|-------------------------------------------|
-/// | Burn   |  20%    | Deflation (Supply-Reduktion)              |
-/// | Miner  |  40%    | Block-Produzent (aktueller Validator)     |
-/// | Staker |  30%    | pool:staker_fees (proportional nach Stake)|
-/// | Pool   |  10%    | pool:node_operators (Reputation-gewichtet)|
-pub fn split_fee(fee: Decimal) -> (Decimal, Decimal, Decimal, Decimal) {
+/// | Anteil     | Prozent | Empfänger                                 |
+/// |------------|---------|---------------------------------------------|
+/// | Burn       |  20%    | Deflation (Supply-Reduktion)                |
+/// | Miner      |  37%    | Block-Produzent (aktueller Validator)        |
+/// | Staker     |  28%    | pool:staker_fees (proportional nach Stake)   |
+/// | Node-Ops   |  10%    | pool:node_operators (Reputation-gewichtet)   |
+/// | Governance |   5%    | pool:governance (Refill aus Netzaktivität)   |
+pub fn split_fee(fee: Decimal) -> (Decimal, Decimal, Decimal, Decimal, Decimal) {
     if fee <= Decimal::ZERO {
-        return (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO, Decimal::ZERO);
+        return (Decimal::ZERO, Decimal::ZERO, Decimal::ZERO, Decimal::ZERO, Decimal::ZERO);
     }
 
     let hundred = Decimal::from(100u64);
     let burn = (fee * Decimal::from(FEE_BURN_PCT) / hundred).round_dp(8);
     let validator = (fee * Decimal::from(FEE_VALIDATOR_PCT) / hundred).round_dp(8);
     let staker = (fee * Decimal::from(FEE_STAKER_PCT) / hundred).round_dp(8);
-    // Pool bekommt den Rest (vermeidet Rundungsfehler)
-    let pool = fee - burn - validator - staker;
+    let governance = (fee * Decimal::from(FEE_GOVERNANCE_PCT) / hundred).round_dp(8);
+    // Node-Ops bekommt den Rest (vermeidet Rundungsfehler)
+    let pool = fee - burn - validator - staker - governance;
 
-    (burn, validator, staker, pool)
+    (burn, validator, staker, pool, governance)
 }
 
 #[cfg(test)]
@@ -460,12 +463,13 @@ mod tests {
     #[test]
     fn test_fee_split() {
         let fee = Decimal::new(1, 2); // 0.01 STONE
-        let (burn, validator, staker, pool) = split_fee(fee);
-        assert_eq!(burn + validator + staker + pool, fee, "Fee-Split muss sich zu 100% aufaddieren");
+        let (burn, validator, staker, pool, governance) = split_fee(fee);
+        assert_eq!(burn + validator + staker + pool + governance, fee, "Fee-Split muss sich zu 100% aufaddieren");
         assert!(burn > Decimal::ZERO);
         assert!(validator > Decimal::ZERO);
         assert!(staker > Decimal::ZERO);
         assert!(pool > Decimal::ZERO);
+        assert!(governance > Decimal::ZERO);
     }
 
     #[test]

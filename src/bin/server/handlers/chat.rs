@@ -156,12 +156,13 @@ pub async fn handle_chat_send(
         req.ttl.as_deref().unwrap_or("30")
     );
 
-    // Memo-JSON bauen (mit TTL)
+    // DSGVO: Nur content_hash landet on-chain, NICHT der verschluesselte Inhalt.
+    // Der encrypted_content bleibt off-chain (ChatIndex + MessagePool P2P).
     let msg_id = uuid::Uuid::new_v4().to_string();
+    let content_hash = stone::chat::compute_content_hash(&req.encrypted_content, &req.nonce);
     let memo = json!({
         "msg_id": msg_id,
-        "encrypted": req.encrypted_content,
-        "nonce": req.nonce,
+        "content_hash": content_hash,
         "from_user_id": user.id,
         "from_name": user.name,
         "ttl": ttl.to_string(),
@@ -203,6 +204,26 @@ pub async fn handle_chat_send(
 
     match result {
         Ok(()) => {
+            // DSGVO: Encrypted content off-chain in ChatIndex speichern (sofort)
+            {
+                let entry = stone::chat::ChatEntry {
+                    msg_id: msg_id.clone(),
+                    from_wallet: wallet.address(),
+                    to_wallet: to_wallet.clone(),
+                    from_user_id: user.id.clone(),
+                    from_name: user.name.clone(),
+                    encrypted_content: req.encrypted_content.clone(),
+                    nonce: req.nonce.clone(),
+                    content_hash: content_hash.clone(),
+                    timestamp: tx.timestamp,
+                    block_index: 0, // pending — wird beim Block-Index aktualisiert
+                    tx_id: tx.tx_id.clone(),
+                };
+                let mut idx = state.chat_index.lock().unwrap_or_else(|e| e.into_inner());
+                idx.add_message(entry);
+                stone::chat::save_chat_index(&idx);
+            }
+
             // P2P broadcast
             if let Some(ref net) = state.network {
                 let net = net.clone();
@@ -382,17 +403,28 @@ pub async fn handle_chat_messages(
             })
         })
         .filter(|(msg_id, _, _)| !msg_id.is_empty() && !confirmed_msg_ids.contains(msg_id))
-        .map(|(msg_id, tx, data)| stone::chat::ChatEntry {
-            msg_id,
-            from_wallet: tx.from,
-            to_wallet: tx.to,
-            from_user_id: data["from_user_id"].as_str().unwrap_or("").to_string(),
-            from_name: data["from_name"].as_str().unwrap_or("").to_string(),
-            encrypted_content: data["encrypted"].as_str().unwrap_or("").to_string(),
-            nonce: data["nonce"].as_str().unwrap_or("").to_string(),
-            timestamp: tx.timestamp,
-            block_index: 0,
-            tx_id: tx.tx_id,
+        .map(|(msg_id, tx, data)| {
+            // Backward-compat: Altes Format hat "encrypted", neues nur "content_hash"
+            let enc = data["encrypted"].as_str().unwrap_or("").to_string();
+            let nc = data["nonce"].as_str().unwrap_or("").to_string();
+            let ch = if !enc.is_empty() {
+                stone::chat::compute_content_hash(&enc, &nc)
+            } else {
+                data["content_hash"].as_str().unwrap_or("").to_string()
+            };
+            stone::chat::ChatEntry {
+                msg_id,
+                from_wallet: tx.from,
+                to_wallet: tx.to,
+                from_user_id: data["from_user_id"].as_str().unwrap_or("").to_string(),
+                from_name: data["from_name"].as_str().unwrap_or("").to_string(),
+                encrypted_content: enc,
+                nonce: nc,
+                content_hash: ch,
+                timestamp: tx.timestamp,
+                block_index: 0,
+                tx_id: tx.tx_id,
+            }
         })
         .collect();
 
