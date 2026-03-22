@@ -242,13 +242,13 @@ impl Mempool {
 
     /// Alle pending TXs für den nächsten Block abrufen und aus dem Mempool entfernen.
     ///
-    /// Sortiert nach Fee-Tier: Express → Priority → Standard.
+    /// Sortiert nach Fee-Tier (Priority vor Standard).
     /// Standard-TXs werden hier **nicht** entnommen — sie warten auf Dokument-Uploads.
     /// Gibt maximal `MAX_TXS_PER_BLOCK` TXs zurück.
     pub fn drain_for_block(&self) -> Vec<TokenTx> {
         let mut inner = self.inner.write().unwrap_or_else(|e| e.into_inner());
 
-        // Partitioniere: Express + Priority sofort, Standard bleibt
+        // Partitioniere: Priority sofort, Standard bleibt
         let mut to_drain: Vec<TokenTx> = Vec::new();
         let mut keep: VecDeque<TokenTx> = VecDeque::new();
 
@@ -260,7 +260,7 @@ impl Mempool {
             }
         }
 
-        // Sortiere Express vor Priority
+        // Sortiere nach Priorität
         to_drain.sort_by_key(|tx| tx.fee_tier.priority_order());
 
         // Kapazitätslimit
@@ -280,7 +280,7 @@ impl Mempool {
         }
 
         if !to_drain.is_empty() {
-            println!("[mempool] 📦 {} TXs für Block entnommen (Express/Priority), {} verbleibend (davon {} Standard)",
+            println!("[mempool] 📦 {} TXs für Block entnommen (Priority), {} verbleibend (davon {} Standard)",
                 to_drain.len(), inner.queue.len(),
                 inner.queue.iter().filter(|t| t.fee_tier == FeeTier::Standard).count());
         }

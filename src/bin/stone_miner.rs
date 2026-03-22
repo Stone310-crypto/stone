@@ -267,7 +267,7 @@ impl MinerWebState {
     }
 
     fn current_reward(&self) -> Decimal {
-        let pool = self.node.token_ledger.read().unwrap_or_else(|e| e.into_inner()).balance("pool:storage_rewards");
+        let pool = self.node.token_ledger.read().unwrap_or_else(|e| e.into_inner()).balance("pool:mining_rewards");
         MasterNodeState::calculate_block_reward(self.block_height(), pool)
     }
 
@@ -506,6 +506,7 @@ fn try_daily_payout(
         validator_wallet.to_string(), config.payout_wallet.clone(),
         payout_amount, fee, nonce,
         format!("Daily Miner Payout {}", now.format("%Y-%m-%d")),
+        stone::token::FeeTier::Standard,
     ) {
         Ok(tx) => {
             let ledger = node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
@@ -557,6 +558,7 @@ fn force_payout(
         validator_wallet.to_string(), config.payout_wallet.clone(),
         payout_amount, fee, nonce,
         format!("Manual Miner Payout {}", Local::now().format("%Y-%m-%d %H:%M")),
+        stone::token::FeeTier::Standard,
     ) {
         Ok(tx) => {
             let ledger = node.token_ledger.read().unwrap_or_else(|e| e.into_inner());

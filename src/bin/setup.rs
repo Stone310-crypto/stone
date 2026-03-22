@@ -2309,7 +2309,7 @@ async fn api_dashboard(State(state): State<SetupState>) -> Json<DashboardData> {
         // Current reward
         let reward_pool = {
             let ledger = ns.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
-            ledger.balance("pool:storage_rewards")
+            ledger.balance("pool:mining_rewards")
         };
         let current_reward = MasterNodeState::calculate_block_reward(bc, reward_pool);
 
@@ -2350,7 +2350,7 @@ async fn api_dashboard(State(state): State<SetupState>) -> Json<DashboardData> {
     let token_economy = if let Some(ref ns) = *ns {
         let ledger = ns.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
         let supply = SupplyInfo::from_ledger(&ledger);
-        let reward_pool = ledger.balance("pool:storage_rewards");
+        let reward_pool = ledger.balance("pool:mining_rewards");
         let fee_pool = ledger.balance(stone::token::reputation::STAKER_FEE_POOL);
         let node_op_pool = ledger.balance(stone::token::reputation::NODE_OPERATOR_POOL);
         let staking = ns.node.staking_pool.read().unwrap_or_else(|e| e.into_inner());
@@ -2396,7 +2396,7 @@ async fn api_dashboard(State(state): State<SetupState>) -> Json<DashboardData> {
         }
     } else {
         TokenEconomyInfo {
-            total_supply: 0.0, max_supply: 50_000_000.0, circulating: 0.0, burned: 0.0,
+            total_supply: 0.0, max_supply: 55_000_000.0, circulating: 0.0, burned: 0.0,
             fees_burned: 0.0, accounts: 0, total_staked: 0.0, staker_count: 0,
             estimated_apy: 0.0, reward_pool_balance: 0.0,
             fee_pool_balance: 0.0, node_operator_pool_balance: 0.0,
@@ -2694,6 +2694,8 @@ fn generate_wallet_12() -> (String, String) {
     let signing_key = SigningKey::from_bytes(&key_bytes);
     let public_key = signing_key.verifying_key();
     let wallet_address = hex::encode(public_key.to_bytes());
+    // Display-Adresse loggen für den Nutzer
+    eprintln!("Wallet generiert: {}", stone::token::display_address(&wallet_address));
     (phrase, wallet_address)
 }
 

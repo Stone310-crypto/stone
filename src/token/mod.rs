@@ -10,6 +10,7 @@
 //! - `mempool`     – Thread-safe TX-Queue für Block-Integration
 //! - `wallet`      – Ed25519 Wallet: Keypair-Gen, Mnemonic-Recovery, TX-Signierung
 
+pub mod address;
 pub mod game_economy;
 pub mod genesis;
 pub mod governance;
@@ -23,13 +24,14 @@ pub mod wallet;
 // Re-exports für bequemen Zugriff
 pub use genesis::{apply_genesis, GenesisConfig, NetworkMode, SupplyInfo};
 pub use game_economy::{GameEconomyStore, GameEconomyError, GameItem, GameWallet, MarketListing, SdkSession, GamePermission, RegisteredGame, ConsentRequest, AuditLogEntry};
-pub use governance::{GovernanceStore, GovernanceInfo, GovernanceError, Proposal, ProposalCategory, ProposalStatus, TrustedNode, TrustedNodeStatus};
+pub use governance::{GovernanceStore, GovernanceInfo, GovernanceError, Proposal, ProposalCategory, ProposalStatus, TrustedNode, TrustedNodeStatus, ModerationReward, VOTING_REWARD, MODERATION_REPORT_REWARD, MODERATION_VOTE_REWARD, UPGRADE_BONUS, MAX_GRANT_AMOUNT, GOVERNANCE_POOL};
 pub use ledger::{AccountInfo, LedgerError, TokenLedger, TxReceipt, VestingSchedule};
 pub use mempool::{Mempool, MempoolError, MempoolStats};
 pub use reputation::{ReputationRegistry, ReputationSummary, NodeReputationInfo};
 pub use staking::{StakingPool, StakingPoolInfo, StakerInfo, StakingError, StakeLevel, SnapshotAttestation, SnapshotTrust};
 pub use transaction::{FeeTier, TokenTx, TxError, TxType, compute_tx_id, create_signed_tx, default_chain_id, validate_tx, verify_tx_signature};
 pub use wallet::{Wallet, WalletError, WalletInfo};
+pub use address::{encode as encode_address, decode as decode_address, normalize_to_hex as normalize_address, to_display as display_address, hex_to_bech32, is_valid as is_valid_address};
 
 // ─── Shared Token-DB Helper ──────────────────────────────────────────────────
 

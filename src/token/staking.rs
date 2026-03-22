@@ -1,7 +1,7 @@
 //! StoneCoin Staking-Pool
 //!
 //! Proof-of-Stake Light: Nutzer können STONE in den Pool einzahlen
-//! und erhalten proportionale Rewards aus dem Storage-Rewards-Pool.
+//! und erhalten proportionale Rewards aus TX-Gebühren (Umverteilung).
 //!
 //! ## Konzept
 //!
@@ -9,15 +9,13 @@
 //! |---------------------|-----------------------------|
 //! | Min. Stake          | 100 STONE                   |
 //! | Lock-Periode        | 7 Tage (Unstake-Wartezeit)  |
-//! | Reward-Quelle       | pool:storage_rewards (60%)  |
+//! | Reward-Quelle       | TX-Gebühren (30% an Staker) |
 //! | Epoch-Länge         | 720 Blöcke (~6h bei 30s)    |
-//! | Staking-APY         | 2%-9% (dynamisch, Pool-abhängig) |
-//! | Rewards pro Epoch   | total_staked × dynamic_APY / epochs_per_year |
 //!
 //! ## Flow
 //!
 //! 1. **Stake**: Nutzer sendet TX (Stake, amount) → Balance wird in StakingPool verbucht
-//! 2. **Epoch-Tick**: Alle 720 Blöcke werden 9% APY anteilig verteilt
+//! 2. **Fee-Verteilung**: Alle 720 Blöcke werden TX-Gebühren an Staker verteilt
 //! 3. **Unstake**: Nutzer sendet TX (Unstake, amount) → 7-Tage-Lock startet
 //! 4. **Withdraw**: Nach Lock-Periode wird der Betrag in die Wallet zurückgebucht
 
@@ -460,86 +458,27 @@ impl StakingPool {
 
     // ── Epoch-Verarbeitung ────────────────────────────────────────────────
 
-    /// Prüft ob eine neue Epoch fällig ist und verteilt ggf. Rewards.
+    /// Epoch-Tick: Aktualisiert den Epoch-Zähler.
     ///
-    /// Wird vom Mining-Loop aufgerufen. Gibt die Menge der verteilten
-    /// Rewards zurück (0 wenn keine Epoch fällig).
+    /// Staking erzeugt keine neuen Coins mehr — Rewards kommen ausschließlich
+    /// aus TX-Gebühren (pool:staker_fees), verteilt in `distribute_fee_income()`.
     ///
-    /// `reward_pool_balance` = Balance von pool:storage_rewards im Ledger.
+    /// `_reward_pool_balance` wird nur aus Kompatibilitätsgründen akzeptiert.
     pub fn process_epoch(
         &mut self,
         current_block: u64,
-        reward_pool_balance: Decimal,
+        _reward_pool_balance: Decimal,
     ) -> Decimal {
         // Prüfen ob eine neue Epoch fällig ist
         if current_block < self.last_epoch_block + EPOCH_LENGTH {
             return Decimal::ZERO;
         }
-        if self.total_staked == Decimal::ZERO || self.stakers.is_empty() {
-            self.last_epoch_block = current_block;
-            self.current_epoch += 1;
-            return Decimal::ZERO;
-        }
 
-        // Dynamische APY basierend auf Reward-Pool-Füllstand
-        let apy = dynamic_apy(reward_pool_balance);
-        let epochs_year = Decimal::new(EPOCHS_PER_YEAR as i64, 0);
-        let epoch_reward = (self.total_staked * apy / epochs_year).round_dp(8);
-
-        if epoch_reward <= Decimal::ZERO {
-            self.last_epoch_block = current_block;
-            self.current_epoch += 1;
-            return Decimal::ZERO;
-        }
-
-        // Sicherstellen dass nicht mehr verteilt wird als im Reward-Pool vorhanden.
-        // Staking darf pro Epoch maximal 20% des verbleibenden Pools nutzen,
-        // damit der Mining-Reward (Halving-Schema) nicht ausgehungert wird.
-        let max_staking_draw = (reward_pool_balance * Decimal::new(20, 2)).round_dp(8); // 20%
-        let capped_reward = epoch_reward
-            .min(reward_pool_balance)
-            .min(max_staking_draw);
-
-        if capped_reward <= Decimal::ZERO {
-            self.last_epoch_block = current_block;
-            self.current_epoch += 1;
-            println!("[staking] ⚠️  Epoch #{}: Reward-Pool erschöpft", self.current_epoch);
-            return Decimal::ZERO;
-        }
-
-        // Rewards proportional verteilen
-        let mut total_distributed = Decimal::ZERO;
-        let stakers: Vec<String> = self.stakers.keys().cloned().collect();
-
-        for addr in &stakers {
-            if let Some(entry) = self.stakers.get_mut(addr) {
-                // Anteil = staked_amount / total_staked
-                let share = entry.staked_amount / self.total_staked;
-                let reward = (capped_reward * share).round_dp(8);
-
-                if reward > Decimal::ZERO {
-                    entry.pending_rewards += reward;
-                    entry.total_rewards += reward;
-                    entry.last_reward_epoch = self.current_epoch + 1;
-                    total_distributed += reward;
-                }
-            }
-        }
-
-        // Delegation-Rewards: Split zwischen Delegator und Validator
-        self.distribute_delegation_rewards(capped_reward);
-
-        self.total_rewards_distributed += total_distributed;
         self.current_epoch += 1;
         self.last_epoch_block = current_block;
 
-        let current_apy_pct = (dynamic_apy(reward_pool_balance) * Decimal::new(100, 0)).round_dp(2);
-        println!(
-            "[staking] 💰 Epoch #{}: {} STONE Rewards an {} Staker + {} Delegatoren ({}% APY, Pool: {})",
-            self.current_epoch, total_distributed, stakers.len(), self.delegations.len(), current_apy_pct, reward_pool_balance,
-        );
-
-        total_distributed
+        // Keine Pool-basierte Emission mehr — nur Epoch-Counter vorrücken
+        Decimal::ZERO
     }
 
     // ── Gebühren-Verteilung (Fee Revenue Sharing) ─────────────────────────
@@ -651,8 +590,8 @@ impl StakingPool {
 
     /// Pool-Info für die API.
     pub fn pool_info(&self, reward_pool_balance: Decimal) -> StakingPoolInfo {
-        // Dynamische APY basierend auf Pool-Füllstand
-        let apy = dynamic_apy(reward_pool_balance) * Decimal::new(100, 0);
+        // Staking-Rewards kommen nur aus TX-Gebühren (keine Pool-APY mehr)
+        let apy = Decimal::ZERO;
 
         let validator_eligible = self.stakers.values()
             .filter(|s| StakeLevel::from_stake(s.staked_amount).can_validate())

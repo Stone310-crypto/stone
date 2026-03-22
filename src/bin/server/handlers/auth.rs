@@ -89,7 +89,7 @@ pub async fn handle_signup(
                 "api_key_hash": api_key_hash,
             }).to_string();
 
-            if let Ok(mut tx) = stone::token::create_signed_tx(
+            if let Ok(tx) = stone::token::create_signed_tx(
                 &signing_key,
                 stone::token::TxType::AccountRegister,
                 wallet.clone(),
@@ -98,9 +98,8 @@ pub async fn handle_signup(
                 rust_decimal::Decimal::ZERO,
                 nonce,
                 memo,
+                stone::token::transaction::FeeTier::Priority,
             ) {
-                // Priority damit der TX sofort in den nächsten Block kommt
-                tx.fee_tier = stone::token::transaction::FeeTier::Priority;
                 // Direkt in den nächsten Block aufnehmen (via Mempool)
                 if let Err(e) = node.mempool.add_tx(tx.clone(), None) {
                     eprintln!("[auth] AccountRegister TX → Mempool fehlgeschlagen: {e}");
@@ -286,7 +285,7 @@ pub async fn handle_login(
                             "name": user_name,
                             "api_key_hash": api_key_hash,
                         }).to_string();
-                        if let Ok(mut tx) = stone::token::create_signed_tx(
+                        if let Ok(tx) = stone::token::create_signed_tx(
                             &signing_key,
                             stone::token::TxType::AccountRegister,
                             w.clone(),
@@ -295,8 +294,8 @@ pub async fn handle_login(
                             rust_decimal::Decimal::ZERO,
                             nonce,
                             memo,
+                            stone::token::transaction::FeeTier::Priority,
                         ) {
-                            tx.fee_tier = stone::token::transaction::FeeTier::Priority;
                             if let Err(e) = node.mempool.add_tx(tx.clone(), None) {
                                 eprintln!("[auth] Auto-Register TX fehlgeschlagen für {user_name}: {e}");
                             } else {
@@ -386,7 +385,7 @@ pub async fn handle_login(
                         "name": user_name,
                         "api_key_hash": api_key_hash,
                     }).to_string();
-                    if let Ok(mut tx) = stone::token::create_signed_tx(
+                    if let Ok(tx) = stone::token::create_signed_tx(
                         &signing_key,
                         stone::token::TxType::AccountRegister,
                         w.clone(),
@@ -395,8 +394,8 @@ pub async fn handle_login(
                         rust_decimal::Decimal::ZERO,
                         nonce,
                         memo,
+                        stone::token::transaction::FeeTier::Priority,
                     ) {
-                        tx.fee_tier = stone::token::transaction::FeeTier::Priority;
                         let _ = node.mempool.add_tx(tx, None);
                     }
                 }

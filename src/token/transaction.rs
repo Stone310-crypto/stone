@@ -16,8 +16,9 @@
 //! ## Signatur-Schema
 //!
 //! ```text
-//! sign_input = tx_type || from || to || amount || fee || nonce || timestamp
-//! signature  = Ed25519.sign(signing_key, SHA-256(sign_input))
+//! tx_id_input = tx_type || from || to || amount || fee || nonce || timestamp || chain_id
+//! sign_input  = tx_id_input || memo || fee_tier
+//! signature   = Ed25519.sign(signing_key, SHA-256(sign_input))
 //! ```
 
 use chrono::Utc;
@@ -85,15 +86,15 @@ pub enum TxType {
 
 /// Gebührenstufe einer Transaktion.
 ///
-/// | Tier     | Fee (STONE) | Verarbeitung                                       |
-/// |----------|-------------|-----------------------------------------------------|
-/// | Express  | 0.01        | Sofort im nächsten Block                            |
-/// | Priority | 0.001       | Innerhalb von ~5 Minuten (nächste Validator-Runde)  |
-/// | Standard | 0.0         | Wartet bis zum nächsten Dokument-Upload (kostenlos) |
+/// | Tier     | Fee (STONE) | Verarbeitung                         |
+/// |----------|-------------|--------------------------------------|
+/// | Priority | 0.001       | Bevorzugt im nächsten Block          |
+/// | Standard | 0.0001      | Basis-Fee (wird geburnt)             |
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum FeeTier {
-    Express,
+    /// Bevorzugte Verarbeitung im nächsten Block.
+    #[serde(alias = "express")]
     Priority,
     Standard,
 }
@@ -107,7 +108,6 @@ impl Default for FeeTier {
 impl std::fmt::Display for FeeTier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            FeeTier::Express  => write!(f, "express"),
             FeeTier::Priority => write!(f, "priority"),
             FeeTier::Standard => write!(f, "standard"),
         }
@@ -118,7 +118,6 @@ impl FeeTier {
     /// Die automatische Fee für diese Stufe.
     pub fn fee(&self) -> Decimal {
         match self {
-            FeeTier::Express  => Decimal::new(1, 2),   // 0.01 STONE
             FeeTier::Priority => Decimal::new(1, 3),   // 0.001 STONE
             FeeTier::Standard => Decimal::new(1, 4),   // 0.0001 STONE (Basis-Fee, wird geburnt)
         }
@@ -127,9 +126,8 @@ impl FeeTier {
     /// Sortier-Priorität (kleiner = höhere Priorität).
     pub fn priority_order(&self) -> u8 {
         match self {
-            FeeTier::Express  => 0,
-            FeeTier::Priority => 1,
-            FeeTier::Standard => 2,
+            FeeTier::Priority => 0,
+            FeeTier::Standard => 1,
         }
     }
 }
@@ -188,7 +186,7 @@ pub struct TokenTx {
     /// Verhindert Cross-Chain Replay-Angriffe.
     #[serde(default = "default_chain_id")]
     pub chain_id: String,
-    /// Gebührenstufe: Express (sofort, 0.01), Priority (~5min, 0.001), Standard (kostenlos, wartet auf Dokument-Upload)
+    /// Gebührenstufe: Priority (0.001, bevorzugt), Standard (0.0001, Basis-Fee)
     #[serde(default)]
     pub fee_tier: FeeTier,
 }
@@ -248,7 +246,8 @@ impl std::fmt::Display for TxError {
 ///   "|"
 ///   timestamp.to_le_bytes()   8 Byte
 /// ```
-fn sign_input(tx: &TokenTx) -> Vec<u8> {
+/// Stabiler Input für TX-ID-Berechnung – ändert sich nicht zwischen Versionen.
+fn tx_id_input(tx: &TokenTx) -> Vec<u8> {
     let mut buf = Vec::with_capacity(256);
     buf.extend_from_slice(tx.tx_type.to_string().as_bytes());
     buf.push(b'|');
@@ -268,9 +267,19 @@ fn sign_input(tx: &TokenTx) -> Vec<u8> {
     buf
 }
 
-/// Berechnet die TX-ID: SHA-256 über den Signatur-Input.
+/// Signatur-Payload inkl. `memo` und `fee_tier` (verhindert Manipulation dieser Felder).
+fn sign_input(tx: &TokenTx) -> Vec<u8> {
+    let mut buf = tx_id_input(tx);
+    buf.push(b'|');
+    buf.extend_from_slice(tx.memo.as_bytes());
+    buf.push(b'|');
+    buf.extend_from_slice(tx.fee_tier.to_string().as_bytes());
+    buf
+}
+
+/// Berechnet die TX-ID: SHA-256 über den stabilen TX-Input.
 pub fn compute_tx_id(tx: &TokenTx) -> String {
-    let input = sign_input(tx);
+    let input = tx_id_input(tx);
     format!("{:x}", Sha256::digest(&input))
 }
 
@@ -296,6 +305,7 @@ pub fn create_signed_tx(
     fee: Decimal,
     nonce: u64,
     memo: String,
+    fee_tier: FeeTier,
 ) -> Result<TokenTx, TxError> {
     // Validierung
     if tx_type == TxType::RotateKey || tx_type == TxType::AccountRegister
@@ -341,7 +351,7 @@ pub fn create_signed_tx(
         signature: String::new(),
         memo,
         chain_id: default_chain_id(),
-        fee_tier: FeeTier::Standard,
+        fee_tier,
     };
 
     // TX-ID berechnen
@@ -366,7 +376,7 @@ pub fn create_signed_tx(
 pub fn verify_tx_signature(tx: &TokenTx) -> Result<(), TxError> {
     // System-/Pool-Transaktionen: Signatur wird nicht gegen einen Public-Key geprüft
     if tx.tx_type == TxType::Mint || tx.tx_type == TxType::Reward {
-        // Reward kommt aus pool:storage_rewards, Mint aus system – beides System-TXs
+        // Reward kommt aus pool:mining_rewards, Mint aus system – beides System-TXs
         return Ok(());
     }
 
@@ -392,31 +402,21 @@ pub fn verify_tx_signature(tx: &TokenTx) -> Result<(), TxError> {
     if tx.tx_type == TxType::Stake || tx.tx_type == TxType::Unstake
         || tx.tx_type == TxType::Delegate || tx.tx_type == TxType::Undelegate
     {
-        // Validator-PubKey aus Memo extrahieren
-        let validator_pubkey = if let Ok(memo) = serde_json::from_str::<serde_json::Value>(&tx.memo) {
-            memo.get("validator").and_then(|v| v.as_str()).map(|s| s.to_string())
-        } else {
-            None
-        };
+        // Validator-PubKey aus Memo extrahieren; Fallback auf `from` (Staker-Wallet).
+        // KEIN Überspringen der Signaturprüfung — das war eine Sicherheitslücke.
+        let pubkey_hex = serde_json::from_str::<serde_json::Value>(&tx.memo)
+            .ok()
+            .and_then(|m| m.get("validator").and_then(|v| v.as_str()).map(String::from))
+            .unwrap_or_else(|| tx.from.clone());
 
-        let pubkey_hex = match validator_pubkey {
-            Some(pk) => pk,
-            None => {
-                // Legacy-TXs ohne Validator-PubKey in Memo: Signatur überspringen
-                // (Rückwärtskompatibilität für bereits in der Chain befindliche TXs)
-                return Ok(());
-            }
-        };
-
-        // Ed25519-Verifikation gegen den Validator-Key
         let pub_bytes = hex::decode(&pubkey_hex)
-            .map_err(|e| TxError::InvalidKey(format!("Validator-Key Hex ungültig: {e}")))?;
+            .map_err(|e| TxError::InvalidKey(format!("Validator/Staker-Key Hex ungültig: {e}")))?;
         if pub_bytes.len() != 32 {
-            return Err(TxError::InvalidKey("Validator-Key muss 32 Byte sein".into()));
+            return Err(TxError::InvalidKey("Key muss 32 Byte sein".into()));
         }
         let verifying_key = VerifyingKey::from_bytes(
             pub_bytes.as_slice().try_into().unwrap()
-        ).map_err(|e| TxError::InvalidKey(format!("Ungültiger Validator-Key: {e}")))?;
+        ).map_err(|e| TxError::InvalidKey(format!("Ungültiger Key: {e}")))?;
 
         let sig_bytes = hex::decode(&tx.signature)
             .map_err(|e| TxError::InvalidSignature(format!("Signatur Hex ungültig: {e}")))?;
@@ -425,10 +425,8 @@ pub fn verify_tx_signature(tx: &TokenTx) -> Result<(), TxError> {
         }
         let signature = Signature::from_bytes(sig_bytes.as_slice().try_into().unwrap());
 
-        let input = sign_input(tx);
-        let hash = Sha256::digest(&input);
-        return verifying_key.verify(&hash, &signature)
-            .map_err(|_| TxError::InvalidSignature("Stake/Unstake: Validator-Signatur ungültig".into()));
+        return verify_with_fallback(&verifying_key, &signature, tx,
+            "Stake/Unstake: Signatur ungültig");
     }
 
     // Public-Key aus Hex dekodieren
@@ -456,11 +454,29 @@ pub fn verify_tx_signature(tx: &TokenTx) -> Result<(), TxError> {
     }
     let signature = Signature::from_bytes(sig_bytes.as_slice().try_into().unwrap());
 
-    // Verifizieren
+    verify_with_fallback(&verifying_key, &signature, tx,
+        "Ed25519-Verifikation fehlgeschlagen")
+}
+
+/// Verifiziert Ed25519-Signatur: erst neues Format (inkl. memo + fee_tier),
+/// bei Fehlschlag Fallback auf Legacy-Format (bestehende Chain-Daten).
+fn verify_with_fallback(
+    verifying_key: &VerifyingKey,
+    signature: &Signature,
+    tx: &TokenTx,
+    error_msg: &str,
+) -> Result<(), TxError> {
+    // Neues Format (inkl. memo + fee_tier)
     let input = sign_input(tx);
     let hash = Sha256::digest(&input);
-    verifying_key.verify(&hash, &signature)
-        .map_err(|_| TxError::InvalidSignature("Ed25519-Verifikation fehlgeschlagen".into()))
+    if verifying_key.verify(&hash, signature).is_ok() {
+        return Ok(());
+    }
+    // Legacy-Fallback: alte TXs signiert ohne memo + fee_tier
+    let legacy = tx_id_input(tx);
+    let legacy_hash = Sha256::digest(&legacy);
+    verifying_key.verify(&legacy_hash, signature)
+        .map_err(|_| TxError::InvalidSignature(error_msg.to_string()))
 }
 
 /// Validiert eine Transaktion strukturell (ohne Ledger-Zustand).

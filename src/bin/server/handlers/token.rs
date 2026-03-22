@@ -59,12 +59,18 @@ pub async fn handle_wallet_balance(
     State(state): State<AppState>,
     Path(address): Path<String>,
 ) -> impl IntoResponse {
+    // Akzeptiere sowohl stone1... als auch Hex-Adressen
+    let hex_addr = match stone::token::normalize_address(&address) {
+        Some(h) => h,
+        None => return Json(serde_json::json!({ "ok": false, "error": "Ungültige Adresse" })),
+    };
     let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
-    let balance = ledger.balance(&address);
-    let nonce = ledger.nonce(&address);
+    let balance = ledger.balance(&hex_addr);
+    let nonce = ledger.nonce(&hex_addr);
     Json(serde_json::json!({
         "ok": true,
-        "address": address,
+        "address": hex_addr,
+        "display_address": stone::token::display_address(&hex_addr),
         "balance": balance.to_string(),
         "nonce": nonce,
     }))
@@ -75,15 +81,20 @@ pub async fn handle_wallet_info(
     State(state): State<AppState>,
     Path(address): Path<String>,
 ) -> impl IntoResponse {
+    let hex_addr = match stone::token::normalize_address(&address) {
+        Some(h) => h,
+        None => return Json(serde_json::json!({ "ok": false, "error": "Ungültige Adresse" })),
+    };
     let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
     let info = AccountInfo {
-        address: address.clone(),
-        balance: ledger.balance(&address),
-        nonce: ledger.nonce(&address),
+        address: hex_addr.clone(),
+        balance: ledger.balance(&hex_addr),
+        nonce: ledger.nonce(&hex_addr),
     };
     Json(serde_json::json!({
         "ok": true,
         "account": info,
+        "display_address": stone::token::display_address(&hex_addr),
     }))
 }
 
@@ -323,23 +334,21 @@ pub async fn handle_token_faucet(
         );
     }
 
-    // Adress-Validierung: genau 64 Hex-Zeichen, kein Pool-Prefix
-    if req.address.len() != 64
-        || !req.address.chars().all(|c| c.is_ascii_hexdigit())
-        || req.address.starts_with("pool:")
-    {
-        return (
+    // Adress-Validierung: stone1... oder 64 Hex-Zeichen, kein Pool-Prefix
+    let faucet_addr = match stone::token::normalize_address(&req.address) {
+        Some(h) if h.len() == 64 && !h.starts_with("pool:") => h,
+        _ => return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "ok": false,
-                "error": "Ungültige Adresse: muss 64 Hex-Zeichen sein (Ed25519 Public Key)",
+                "error": "Ungültige Adresse: stone1... oder 64 Hex-Zeichen erwartet",
             })),
-        );
-    }
+        ),
+    };
 
     // Rate Limiting: per Empfänger-Adresse
-    if !state.rate_limits.faucet.check(&req.address) {
-        let retry = state.rate_limits.faucet.retry_after_secs(&req.address);
+    if !state.rate_limits.faucet.check(&faucet_addr) {
+        let retry = state.rate_limits.faucet.retry_after_secs(&faucet_addr);
         return (
             StatusCode::TOO_MANY_REQUESTS,
             Json(serde_json::json!({
@@ -357,7 +366,7 @@ pub async fn handle_token_faucet(
     // Max-per-Address Schutz: prüfen ob Adresse schon zu viel bekommen hat
     {
         let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
-        let current_balance = ledger.balance(&req.address);
+        let current_balance = ledger.balance(&faucet_addr);
         if current_balance + amount > max_per_addr {
             return (
                 StatusCode::BAD_REQUEST,
@@ -403,7 +412,7 @@ pub async fn handle_token_faucet(
         tx_id: String::new(),
         tx_type: TxType::Transfer,
         from: pool.to_string(),
-        to: req.address.clone(),
+        to: faucet_addr.clone(),
         amount,
         fee: rust_decimal::Decimal::ZERO,
         nonce,
@@ -543,13 +552,18 @@ pub async fn handle_token_history(
     State(state): State<AppState>,
     Path(address): Path<String>,
 ) -> impl IntoResponse {
+    // Akzeptiere stone1... und Hex
+    let hex_addr = match stone::token::normalize_address(&address) {
+        Some(h) => h,
+        None => return Json(serde_json::json!({ "ok": false, "error": "Ungültige Adresse" })),
+    };
     let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
     let chain_height = chain.blocks.len() as u64;
 
     let mut txs: Vec<serde_json::Value> = Vec::new();
     for block in &chain.blocks {
         for tx in &block.transactions {
-            if tx.from == address || tx.to == address {
+            if tx.from == hex_addr || tx.to == hex_addr {
                 let confirmations = chain_height.saturating_sub(block.index);
                 txs.push(serde_json::json!({
                     "tx_id": tx.tx_id,
@@ -571,7 +585,8 @@ pub async fn handle_token_history(
 
     Json(serde_json::json!({
         "ok": true,
-        "address": address,
+        "address": hex_addr,
+        "display_address": stone::token::display_address(&hex_addr),
         "count": txs.len(),
         "chain_height": chain_height,
         "transactions": txs,
@@ -724,16 +739,17 @@ pub async fn handle_token_send(
         );
     }
 
-    // Empfänger-Adresse validieren
-    if req.to.is_empty() || req.to.len() != 64 || !req.to.chars().all(|c| c.is_ascii_hexdigit()) {
-        return (
+    // Empfänger-Adresse validieren (stone1... oder Hex)
+    let to_hex = match stone::token::normalize_address(&req.to) {
+        Some(h) if h.len() == 64 => h,
+        _ => return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "ok": false,
-                "error": "Ungültige Empfänger-Adresse: muss 64 Hex-Zeichen sein",
+                "error": "Ungültige Empfänger-Adresse: stone1... oder 64 Hex-Zeichen erwartet",
             })),
-        );
-    }
+        ),
+    };
 
     // Betrag parsen
     let amount: rust_decimal::Decimal = match req.amount.parse() {
@@ -769,15 +785,18 @@ pub async fn handle_token_send(
         ),
     };
 
-    // Optional: from-Adresse gegen Wallet-Adresse prüfen
-    if !req.from.is_empty() && req.from != wallet.address() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": "Absender-Adresse stimmt nicht mit dem Mnemonic überein. Falscher Mnemonic?",
-            })),
-        );
+    // Optional: from-Adresse gegen Wallet-Adresse prüfen (akzeptiert stone1... und Hex)
+    if !req.from.is_empty() {
+        let from_hex = stone::token::normalize_address(&req.from).unwrap_or_default();
+        if from_hex != wallet.address() {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "Absender-Adresse stimmt nicht mit dem Mnemonic überein. Falscher Mnemonic?",
+                })),
+            );
+        }
     }
 
     // Rate Limiting per Sender
@@ -802,14 +821,13 @@ pub async fn handle_token_send(
 
     // Fee-Tier parsen
     let tier = match req.fee_tier.as_deref() {
-        Some("express")  => stone::token::FeeTier::Express,
-        Some("priority") => stone::token::FeeTier::Priority,
+        Some("express") | Some("priority") => stone::token::FeeTier::Priority,
         Some("standard") | None => stone::token::FeeTier::Standard,
         Some(other) => return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "ok": false,
-                "error": format!("Unbekannter fee_tier: '{}'. Erlaubt: express, priority, standard", other),
+                "error": format!("Unbekannter fee_tier: '{}'. Erlaubt: priority, standard", other),
             })),
         ),
     };
@@ -817,7 +835,7 @@ pub async fn handle_token_send(
     // TX signieren mit Fee-Tier
     let tx = match wallet.sign_tx_with_tier(
         TxType::Transfer,
-        req.to.clone(),
+        to_hex.clone(),
         amount,
         nonce,
         String::new(),
@@ -862,9 +880,8 @@ pub async fn handle_token_send(
                     "fee": tx.fee.to_string(),
                     "fee_tier": tx.fee_tier.to_string(),
                     "message": match tx.fee_tier {
-                        stone::token::FeeTier::Express  => "Express-TX im Mempool – wird im nächsten Block verarbeitet",
-                        stone::token::FeeTier::Priority => "Priority-TX im Mempool – wird innerhalb von ~5 Minuten verarbeitet",
-                        stone::token::FeeTier::Standard => "Standard-TX im Mempool – wird beim nächsten Dokument-Upload verarbeitet (kostenlos)",
+                        stone::token::FeeTier::Priority => "Priority-TX im Mempool – wird im nächsten Block verarbeitet",
+                        stone::token::FeeTier::Standard => "Standard-TX im Mempool – wird beim nächsten Dokument-Upload verarbeitet",
                     },
                 })),
             )
@@ -908,7 +925,7 @@ fn default_fee_tier() -> String { "standard".to_string() }
 /// dem Mnemonic abgeleitet. Designed für den Flask-Proxy der den Mnemonic
 /// aus der Server-Session injiziert — der Browser schickt ihn nie.
 ///
-/// Body: { "to": "...", "amount": "10", "fee_tier": "express", "mnemonic": "..." }
+/// Body: { "to": "...", "amount": "10", "fee_tier": "priority", "mnemonic": "..." }
 pub async fn handle_token_send_authenticated(
     State(state): State<AppState>,
     Json(req): Json<SendAuthenticatedRequest>,
@@ -927,16 +944,17 @@ pub async fn handle_token_send_authenticated(
         );
     }
 
-    // Empfänger validieren
-    if req.to.is_empty() || req.to.len() != 64 || !req.to.chars().all(|c| c.is_ascii_hexdigit()) {
-        return (
+    // Empfänger validieren (stone1... oder Hex)
+    let to_hex = match stone::token::normalize_address(&req.to) {
+        Some(h) if h.len() == 64 => h,
+        _ => return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "ok": false,
-                "error": "Ungültige Empfänger-Adresse: muss 64 Hex-Zeichen sein",
+                "error": "Ungültige Empfänger-Adresse: stone1... oder 64 Hex-Zeichen erwartet",
             })),
-        );
-    }
+        ),
+    };
 
     // Betrag parsen
     let amount: rust_decimal::Decimal = match req.amount.parse() {
@@ -955,14 +973,13 @@ pub async fn handle_token_send_authenticated(
 
     // Fee-Tier
     let tier = match req.fee_tier.as_str() {
-        "express"  => stone::token::FeeTier::Express,
-        "priority" => stone::token::FeeTier::Priority,
+        "express" | "priority" => stone::token::FeeTier::Priority,
         "standard" => stone::token::FeeTier::Standard,
         other => return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "ok": false,
-                "error": format!("Unbekannter fee_tier: '{}'. Erlaubt: express, priority, standard", other),
+                "error": format!("Unbekannter fee_tier: '{}'. Erlaubt: priority, standard", other),
             })),
         ),
     };
@@ -999,7 +1016,7 @@ pub async fn handle_token_send_authenticated(
     // TX signieren
     let tx = match wallet.sign_tx_with_tier(
         TxType::Transfer,
-        req.to.clone(),
+        to_hex.clone(),
         amount,
         nonce,
         String::new(),
@@ -1037,9 +1054,8 @@ pub async fn handle_token_send_authenticated(
                     "fee": tx.fee.to_string(),
                     "fee_tier": tx.fee_tier.to_string(),
                     "message": match tx.fee_tier {
-                        stone::token::FeeTier::Express  => "Express-TX – wird im nächsten Block verarbeitet",
-                        stone::token::FeeTier::Priority => "Priority-TX – wird innerhalb von ~5 Minuten verarbeitet",
-                        stone::token::FeeTier::Standard => "Standard-TX – wird beim nächsten Dokument-Upload verarbeitet (kostenlos)",
+                        stone::token::FeeTier::Priority => "Priority-TX – wird im nächsten Block verarbeitet",
+                        stone::token::FeeTier::Standard => "Standard-TX – wird beim nächsten Dokument-Upload verarbeitet",
                     },
                 })),
             )
@@ -1067,7 +1083,7 @@ pub async fn handle_staking_info(
     let pool = state.node.staking_pool.read().unwrap_or_else(|e| e.into_inner());
     let reward_pool_balance = {
         let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
-        ledger.balance("pool:storage_rewards")
+        ledger.balance("pool:mining_rewards")
     };
 
     let info = pool.pool_info(reward_pool_balance);
@@ -1083,7 +1099,7 @@ pub async fn handle_staking_pool(
     let pool = state.node.staking_pool.read().unwrap_or_else(|e| e.into_inner());
     let reward_pool_balance = {
         let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
-        ledger.balance("pool:storage_rewards")
+        ledger.balance("pool:mining_rewards")
     };
 
     let info = pool.pool_info(reward_pool_balance);
@@ -1103,14 +1119,17 @@ pub async fn handle_staker_info(
     State(state): State<AppState>,
     Path(address): Path<String>,
 ) -> impl IntoResponse {
+    // Akzeptiere stone1... und Hex
+    let hex_addr = stone::token::normalize_address(&address).unwrap_or(address.clone());
     let pool = state.node.staking_pool.read().unwrap_or_else(|e| e.into_inner());
 
-    match pool.staker_info(&address) {
+    match pool.staker_info(&hex_addr) {
         Some(info) => (
             StatusCode::OK,
             Json(serde_json::json!({
                 "ok": true,
                 "staker": info,
+                "display_address": stone::token::display_address(&hex_addr),
             })),
         ),
         None => (
@@ -1118,7 +1137,8 @@ pub async fn handle_staker_info(
             Json(serde_json::json!({
                 "ok": true,
                 "staker": {
-                    "address": address,
+                    "address": hex_addr,
+                    "display_address": stone::token::display_address(&hex_addr),
                     "staked_amount": "0",
                     "pending_rewards": "0",
                     "total_rewards": "0",
@@ -1224,16 +1244,17 @@ pub async fn handle_admin_airdrop(
         return e.into_response();
     }
 
-    // Adress-Validierung
-    if req.to.len() != 64 || !req.to.chars().all(|c| c.is_ascii_hexdigit()) {
-        return (
+    // Adress-Validierung (stone1... oder Hex)
+    let to_hex = match stone::token::normalize_address(&req.to) {
+        Some(h) if h.len() == 64 => h,
+        _ => return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "ok": false,
-                "error": "Ungültige Empfänger-Adresse: muss 64 Hex-Zeichen sein",
+                "error": "Ungültige Empfänger-Adresse: stone1... oder 64 Hex-Zeichen erwartet",
             })),
-        ).into_response();
-    }
+        ).into_response(),
+    };
 
     // Pool-Validierung: nur bekannte Pools erlauben
     let allowed_pools = [
@@ -1299,7 +1320,7 @@ pub async fn handle_admin_airdrop(
         tx_id: String::new(),
         tx_type: TxType::Transfer,
         from: req.from_pool.clone(),
-        to: req.to.clone(),
+        to: to_hex.clone(),
         amount,
         fee: rust_decimal::Decimal::ZERO,
         nonce,

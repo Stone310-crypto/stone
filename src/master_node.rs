@@ -13,7 +13,7 @@
 //! - Optional: Dokumente (werden weiterhin über Upload-Handler hinzugefügt)
 //!
 //! Der Block-Reward folgt einem **Halving-Schema**: alle `HALVING_INTERVAL`
-//! Blöcke halbiert sich der Reward. Mining stoppt wenn `pool:storage_rewards` leer ist.
+//! Blöcke halbiert sich der Reward. Mining stoppt wenn `pool:mining_rewards` leer ist.
 
 use crate::blockchain::{Block, Document, DocumentTombstone, NodeRole, StoneChain};
 use crate::consensus::{
@@ -44,14 +44,14 @@ pub const TARGET_BLOCK_TIME_SECS: u64 = crate::consensus::TARGET_BLOCK_TIME_SECS
 pub const MINING_INTERVAL_SECS: u64 = TARGET_BLOCK_TIME_SECS;
 
 /// Initialer Block-Reward in STONE (vor erstem Halving)
-pub const INITIAL_BLOCK_REWARD: &str = "10.0";
+pub const INITIAL_BLOCK_REWARD: &str = "7.0";
 
 /// Alle N Blöcke halbiert sich der Reward
-/// 210.000 Blöcke × 30s = ~73 Tage pro Halving-Epoche
-pub const HALVING_INTERVAL: u64 = 210_000;
+/// 2.102.400 Blöcke × 30s = ~2 Jahre pro Halving-Epoche
+pub const HALVING_INTERVAL: u64 = 2_102_400;
 
 /// Maximale Supply (aus Genesis-Config, hier als Fallback)
-pub const MAX_SUPPLY: &str = "50000000";
+pub const MAX_SUPPLY: &str = "55000000";
 
 /// Minimaler Block-Reward (unter diesem Wert wird nicht mehr gemined)
 pub const MIN_BLOCK_REWARD: &str = "0.00000001";
@@ -1229,7 +1229,7 @@ impl MasterNodeState {
     /// Schema: `INITIAL_BLOCK_REWARD / 2^(block_index / HALVING_INTERVAL)`
     /// Gibt `Decimal::ZERO` zurück wenn Reward < MIN oder Reward-Pool leer.
     ///
-    /// `pool_balance` = Balance von pool:storage_rewards (woraus Rewards kommen).
+    /// `pool_balance` = Balance von pool:mining_rewards (woraus Rewards kommen).
     pub fn calculate_block_reward(block_index: u64, pool_balance: Decimal) -> Decimal {
         let min_reward: Decimal = MIN_BLOCK_REWARD.parse().unwrap_or_else(|_| Decimal::new(1, 8));
 
@@ -1273,7 +1273,7 @@ impl MasterNodeState {
         let mut tx = TokenTx {
             tx_id: String::new(),
             tx_type: TxType::Reward,
-            from: "pool:storage_rewards".to_string(),
+            from: "pool:mining_rewards".to_string(),
             to: validator_wallet.to_string(),
             amount,
             fee: Decimal::ZERO,
@@ -1282,7 +1282,7 @@ impl MasterNodeState {
             signature: String::new(), // System-TXs brauchen keine Signatur
             memo: format!("Block #{block_index} Mining Reward"),
             chain_id,
-            fee_tier: crate::token::FeeTier::Express, // System-TXs immer Express
+            fee_tier: crate::token::FeeTier::Priority,
         };
         tx.tx_id = compute_tx_id(&tx);
         tx
@@ -1439,7 +1439,7 @@ impl MasterNodeState {
                 .map(|b| b.hash.clone())
                 .unwrap_or_else(|| "genesis".into());
             let ledger = self.token_ledger.read().unwrap_or_else(|e| e.into_inner());
-            let pool_balance = ledger.balance("pool:storage_rewards");
+            let pool_balance = ledger.balance("pool:mining_rewards");
             (Self::calculate_block_reward(next_idx, pool_balance), next_idx, prev)
         };
 
@@ -1574,38 +1574,9 @@ impl MasterNodeState {
                 );
                 block.storage_challenges = challenges;
 
-                // Challenge-Responses aufnehmen
+                // Challenge-Responses aufnehmen (keine Rewards mehr, nur Tracking)
                 let responses = self.collect_pending_challenge_responses(&chain);
                 if !responses.is_empty() {
-                    let challenge_reward: Decimal = crate::storage_proof::CHALLENGE_REWARD
-                        .parse().unwrap_or(Decimal::new(5, 1));
-                    let pool_balance = {
-                        let ledger = self.token_ledger.read().unwrap_or_else(|e| e.into_inner());
-                        ledger.balance("pool:storage_rewards")
-                    };
-                    let mut total = Decimal::ZERO;
-                    for resp in &responses {
-                        if total + challenge_reward > pool_balance { break; }
-                        let chain_id = std::env::var("STONE_NETWORK")
-                            .map(|n| if n == "mainnet" || n == "main" { "stone-mainnet".to_string() } else { "stone-testnet".to_string() })
-                            .unwrap_or_else(|_| "stone-testnet".to_string());
-                        let mut reward_tx = TokenTx {
-                            tx_id: String::new(), tx_type: TxType::Reward,
-                            from: "pool:storage_rewards".to_string(), to: resp.responder_wallet.clone(),
-                            amount: challenge_reward, fee: Decimal::ZERO, nonce: 0,
-                            timestamp: Utc::now().timestamp(), signature: String::new(),
-                            memo: format!("Storage Challenge Reward ({})", &resp.challenge_id[..12.min(resp.challenge_id.len())]),
-                            chain_id, fee_tier: crate::token::FeeTier::Express,
-                        };
-                        reward_tx.tx_id = compute_tx_id(&reward_tx);
-                        block.transactions.push(reward_tx);
-                        total += challenge_reward;
-                    }
-                    if total > Decimal::ZERO {
-                        block.merkle_root = crate::blockchain::compute_merkle_root(
-                            &block.documents, &block.tombstones, &block.transactions,
-                        );
-                    }
                     block.challenge_responses = responses;
                 }
 
@@ -1925,7 +1896,7 @@ impl MasterNodeState {
             let chain = self.chain.lock().unwrap_or_else(|e| e.into_inner());
             let next_idx = chain.blocks.len() as u64;
             let ledger = self.token_ledger.read().unwrap_or_else(|e| e.into_inner());
-            let pool_balance = ledger.balance("pool:storage_rewards");
+            let pool_balance = ledger.balance("pool:mining_rewards");
             (Self::calculate_block_reward(next_idx, pool_balance), next_idx)
         };
 
@@ -2112,117 +2083,25 @@ impl MasterNodeState {
                 // Challenges hinzufügen und Block-Hash neu berechnen
                 block.storage_challenges = challenges;
 
-                // Pending ChallengeResponses aus dem Mempool holen
-                // (diese wurden von herausgeforderten Nodes eingereicht)
+                // Pending ChallengeResponses aufnehmen (keine Rewards mehr, nur Tracking)
                 let responses = self.collect_pending_challenge_responses(&chain);
-                let mut challenge_rewards_total = Decimal::ZERO;
                 if !responses.is_empty() {
                     println!(
                         "[storage-challenge] ✅ {} Challenge-Responses in Block #{} aufgenommen",
                         responses.len(), block.index
                     );
-
-                    // Challenge-Reward-TXs: Jede gültige Response bekommt CHALLENGE_REWARD STONE
-                    let challenge_reward: Decimal = crate::storage_proof::CHALLENGE_REWARD
-                        .parse().unwrap_or(Decimal::new(5, 1)); // 0.5 STONE Fallback
-                    let pool_balance = {
-                        let ledger = self.token_ledger.read().unwrap_or_else(|e| e.into_inner());
-                        ledger.balance("pool:storage_rewards")
-                    };
-                    for resp in &responses {
-                        if challenge_rewards_total + challenge_reward > pool_balance {
-                            println!(
-                                "[storage-challenge] ⚠ Reward-Pool reicht nicht für weitere Challenge-Rewards"
-                            );
-                            break;
-                        }
-                        let chain_id = std::env::var("STONE_NETWORK")
-                            .map(|n| if n == "mainnet" || n == "main" { "stone-mainnet".to_string() } else { "stone-testnet".to_string() })
-                            .unwrap_or_else(|_| "stone-testnet".to_string());
-                        let mut reward_tx = TokenTx {
-                            tx_id: String::new(),
-                            tx_type: TxType::Reward,
-                            from: "pool:storage_rewards".to_string(),
-                            to: resp.responder_wallet.clone(),
-                            amount: challenge_reward,
-                            fee: Decimal::ZERO,
-                            nonce: 0,
-                            timestamp: Utc::now().timestamp(),
-                            signature: String::new(),
-                            memo: format!("Storage Challenge Reward ({})", &resp.challenge_id[..12.min(resp.challenge_id.len())]),
-                            chain_id,
-                            fee_tier: crate::token::FeeTier::Express,
-                        };
-                        reward_tx.tx_id = compute_tx_id(&reward_tx);
-                        block.transactions.push(reward_tx);
-                        challenge_rewards_total += challenge_reward;
-                    }
-                    if challenge_rewards_total > Decimal::ZERO {
-                        // Merkle-Root muss wegen neuer TXs neu berechnet werden
-                        block.merkle_root = crate::blockchain::compute_merkle_root(
-                            &block.documents, &block.tombstones, &block.transactions,
-                        );
-                        println!(
-                            "[storage-challenge] 💰 {} STONE Challenge-Rewards in Block #{}",
-                            challenge_rewards_total, block.index
-                        );
-                    }
                 }
                 block.challenge_responses = responses;
 
-                // ── Shard-Repair-Rewards: Miner die degradierte Shards repariert haben ──
-                let pending_repairs: Vec<crate::storage_proof::RepairReward> = {
+                // Pending Shard-Repairs aufnehmen (keine Rewards mehr, nur Tracking)
+                {
                     let mut repairs = self.pending_repair_rewards.lock().unwrap_or_else(|e| e.into_inner());
-                    std::mem::take(&mut *repairs)
-                };
-                if !pending_repairs.is_empty() {
-                    let repair_reward: Decimal = crate::storage_proof::REPAIR_REWARD
-                        .parse().unwrap_or(Decimal::new(25, 2)); // 0.25 STONE Fallback
-                    let pool_balance_now = {
-                        let ledger = self.token_ledger.read().unwrap_or_else(|e| e.into_inner());
-                        ledger.balance("pool:storage_rewards")
-                    };
-                    let mut repair_rewards_total = Decimal::ZERO;
-                    for repair in &pending_repairs {
-                        if repair_rewards_total + repair_reward > pool_balance_now - challenge_rewards_total {
-                            println!(
-                                "[shard-repair] ⚠ Reward-Pool reicht nicht für weitere Repair-Rewards"
-                            );
-                            break;
-                        }
-                        let chain_id = std::env::var("STONE_NETWORK")
-                            .map(|n| if n == "mainnet" || n == "main" { "stone-mainnet".to_string() } else { "stone-testnet".to_string() })
-                            .unwrap_or_else(|_| "stone-testnet".to_string());
-                        let mut reward_tx = TokenTx {
-                            tx_id: String::new(),
-                            tx_type: TxType::Reward,
-                            from: "pool:storage_rewards".to_string(),
-                            to: repair.repairer_wallet.clone(),
-                            amount: repair_reward,
-                            fee: Decimal::ZERO,
-                            nonce: 0,
-                            timestamp: Utc::now().timestamp(),
-                            signature: String::new(),
-                            memo: format!(
-                                "Shard Repair Reward ({}[{}])",
-                                &repair.chunk_hash[..12.min(repair.chunk_hash.len())],
-                                repair.shard_index
-                            ),
-                            chain_id,
-                            fee_tier: crate::token::FeeTier::Express,
-                        };
-                        reward_tx.tx_id = compute_tx_id(&reward_tx);
-                        block.transactions.push(reward_tx);
-                        repair_rewards_total += repair_reward;
-                    }
-                    if repair_rewards_total > Decimal::ZERO {
-                        block.merkle_root = crate::blockchain::compute_merkle_root(
-                            &block.documents, &block.tombstones, &block.transactions,
-                        );
+                    if !repairs.is_empty() {
                         println!(
-                            "[shard-repair] 🔧 {} STONE Repair-Rewards in Block #{} ({} Shards repariert)",
-                            repair_rewards_total, block.index, pending_repairs.len()
+                            "[shard-repair] 🔧 {} Shard-Repairs in Block #{} aufgenommen",
+                            repairs.len(), block.index
                         );
+                        repairs.clear();
                     }
                 }
 
@@ -2594,38 +2473,19 @@ impl MasterNodeState {
         Self::post_block_slashing(state, block);
         Self::post_block_reputation(state, block);
         Self::post_block_chat_policy(state, block, None);
+        Self::post_block_governance(state);
     }
 
     /// Staking Epoch-Verarbeitung nach einem committed Block.
     fn post_block_staking(state: &Arc<Self>, block: &Block) {
         let mut pool = state.staking_pool.write().unwrap_or_else(|e| e.into_inner());
 
-        // 1. Epoch-Rewards verteilen (APY aus pool:storage_rewards)
+        // 1. Epoch-Tick (rückt nur den Counter vor, keine Pool-basierte Emission mehr)
         let reward_pool_balance = {
             let ledger = state.token_ledger.read().unwrap_or_else(|e| e.into_inner());
-            ledger.balance("pool:storage_rewards")
+            ledger.balance("pool:mining_rewards")
         };
-        let distributed = pool.process_epoch(block.index, reward_pool_balance);
-        if distributed > rust_decimal::Decimal::ZERO {
-            let mut ledger = state.token_ledger.write().unwrap_or_else(|e| e.into_inner());
-            let mut credited: Vec<String> = Vec::new();
-            for (addr, entry) in &pool.stakers {
-                if entry.pending_rewards > rust_decimal::Decimal::ZERO {
-                    if let Err(e) = ledger.credit_staking_reward(addr, entry.pending_rewards) {
-                        eprintln!("[staking] Reward-Gutschrift fehlgeschlagen für {}: {e}", &addr[..12.min(addr.len())]);
-                    } else {
-                        credited.push(addr.clone());
-                    }
-                }
-            }
-            drop(ledger);
-            // Nur erfolgreich gutgeschriebene Rewards nullen
-            for addr in &credited {
-                if let Some(entry) = pool.stakers.get_mut(addr) {
-                    entry.pending_rewards = rust_decimal::Decimal::ZERO;
-                }
-            }
-        }
+        let _epoch_tick = pool.process_epoch(block.index, reward_pool_balance);
 
         // 2. Gebühren-Verteilung aus pool:staker_fees (alle Staker, Node-Ops mit Bonus)
         let fee_pool_balance = {
@@ -2663,7 +2523,7 @@ impl MasterNodeState {
 
         // 4. StakingPool persistieren
         let fee_distributed = fee_pool_balance > rust_decimal::Decimal::ZERO;
-        if distributed > rust_decimal::Decimal::ZERO || fee_distributed || !matured.is_empty() {
+        if fee_distributed || !matured.is_empty() {
             if let Err(e) = pool.persist() {
                 eprintln!("[staking] Pool-Persist: {e}");
             }
@@ -2898,6 +2758,57 @@ impl MasterNodeState {
         }
     }
 
+    /// Governance-Hook: Proposals auswerten, Timelocks pruefen, Rewards auszahlen.
+    fn post_block_governance(state: &Arc<Self>) {
+        let mut gov = state.governance.write().unwrap_or_else(|e| e.into_inner());
+
+        // 1. Abgelaufene Proposals aufraeumen
+        gov.expire_old_proposals();
+
+        // 2. Timelock-Pruefung: Accepted -> Ready
+        let ready_ids = gov.check_timelocks();
+
+        // 3. Ready-Proposals ausfuehren (inkl. Grant-Payouts)
+        for pid in &ready_ids {
+            match gov.mark_executed(pid) {
+                Ok(Some((recipient, amount, memo))) => {
+                    drop(gov);
+                    {
+                        let mut ledger = state.token_ledger.write().unwrap_or_else(|e| e.into_inner());
+                        if let Err(e) = ledger.credit_governance_payout(&recipient, amount, &memo) {
+                            eprintln!("[governance] Payout fehlgeschlagen: {e}");
+                        }
+                    }
+                    gov = state.governance.write().unwrap_or_else(|e| e.into_inner());
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    eprintln!("[governance] mark_executed Fehler: {e}");
+                }
+            }
+        }
+
+        // 4. Voting-Rewards + Moderation-Rewards auszahlen
+        let voting_payouts = gov.drain_voting_rewards();
+        let moderation_payouts = gov.drain_moderation_rewards();
+        drop(gov);
+
+        if !voting_payouts.is_empty() || !moderation_payouts.is_empty() {
+            let mut ledger = state.token_ledger.write().unwrap_or_else(|e| e.into_inner());
+            for (wallet, amount, memo) in voting_payouts.iter().chain(moderation_payouts.iter()) {
+                if let Err(e) = ledger.credit_governance_payout(wallet, *amount, memo) {
+                    eprintln!("[governance] Reward fehlgeschlagen: {e}");
+                }
+            }
+            if !voting_payouts.is_empty() {
+                println!("[governance] {} Voting-Rewards ausgezahlt", voting_payouts.len());
+            }
+            if !moderation_payouts.is_empty() {
+                println!("[governance] {} Moderation-Rewards ausgezahlt", moderation_payouts.len());
+            }
+        }
+    }
+
     /// Chat-Policy nach einem committed Block: TTL-Tracking + GC + Report-Finalisierung.
     ///
     /// 1. Neue ChatMessage-TXs im Block → TTL-Eintrag erstellen
@@ -2957,6 +2868,24 @@ impl MasterNodeState {
                     let mut chat_idx = chat_idx_arc.lock().unwrap_or_else(|e| e.into_inner());
                     crate::chat_policy::purge_message_content(&mut chat_idx, msg_id);
                     crate::chat::save_chat_index(&chat_idx);
+                }
+
+                // Reporter- und Voter-Wallets für Moderation-Rewards einsammeln
+                if let Some(archived) = policy.report_archive.iter().rev().find(|r| r.report_id == *report_id) {
+                    let reporter_wallet_reward = archived.reporter_wallet.clone();
+                    // Vote-Keys in der MessageReport sind Node-IDs → lookup Wallets aus GovernanceStore
+                    let voter_wallets: Vec<String> = {
+                        let gov = state.governance.read().unwrap_or_else(|e| e.into_inner());
+                        archived.votes.keys()
+                            .filter_map(|node_id| {
+                                gov.trusted_nodes.get(node_id).map(|tn| tn.wallet.clone())
+                            })
+                            .collect()
+                    };
+                    if !reporter_wallet_reward.is_empty() {
+                        let mut gov = state.governance.write().unwrap_or_else(|e| e.into_inner());
+                        gov.queue_moderation_reward(reporter_wallet_reward, voter_wallets);
+                    }
                 }
 
                 // Slash

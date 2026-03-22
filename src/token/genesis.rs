@@ -2,15 +2,16 @@
 //!
 //! Definiert die initiale Token-Verteilung beim Start der Chain.
 //!
-//! ## Supply-Verteilung (50.000.000 STONE)
+//! ## Supply-Verteilung (55.000.000 STONE)
 //!
-//! | Pool             | Anteil | STONE      | Vesting         |
-//! |------------------|--------|------------|-------------------|
-//! | Storage Rewards  | 60%    | 30.000.000 | ~10 Jahre Emission |
-//! | Treasury / Dev   | 15%    |  7.500.000 | 3 Jahre linear    |
-//! | Onboarding       | 10%    |  5.000.000 | Sofort (gesperrt)  |
-//! | Founders         | 10%    |  5.000.000 | 4 Jahre linear    |
-//! | Liquidity        |  5%    |  2.500.000 | Sofort            |
+//! | Pool             | Anteil  | STONE      | Vesting            |
+//! |------------------|---------|------------|--------------------|
+//! | Mining Rewards   | 54,55%  | 30.000.000 | Halving-Emission   |
+//! | Governance       |  9,09%  |  5.000.000 | Grants/Voting      |
+//! | Treasury / Dev   | 13,64%  |  7.500.000 | 3 Jahre linear     |
+//! | Onboarding       |  9,09%  |  5.000.000 | Sofort (gesperrt)  |
+//! | Founders         |  9,09%  |  5.000.000 | 4 Jahre linear     |
+//! | Liquidity        |  4,55%  |  2.500.000 | Sofort             |
 //!
 //! ## Netzwerk-Modus
 //!
@@ -31,7 +32,7 @@ use super::ledger::TokenLedger;
 const TESTNET_FAUCET_AMOUNT: &str = "1000000";
 
 /// Maximales Supply (auch in ledger.rs definiert, hier zur Dokumentation)
-const TOTAL_SUPPLY: &str = "50000000";
+const TOTAL_SUPPLY: &str = "55000000";
 
 // ─── Netzwerk-Modus ──────────────────────────────────────────────────────────
 
@@ -117,35 +118,42 @@ impl GenesisConfig {
     }
 
     /// Testnet-Allokation: alles auf System-Pools + Faucet
-    fn testnet_allocations(total: Decimal) -> Vec<GenesisAllocation> {
+    fn testnet_allocations(_total: Decimal) -> Vec<GenesisAllocation> {
+        // Feste Beträge statt Prozente (55M lässt sich nicht sauber per % aufteilen)
         vec![
             GenesisAllocation {
-                address: "pool:storage_rewards".into(),
-                amount: total * Decimal::new(60, 2), // 60%
-                label: "Storage Rewards Pool".into(),
+                address: "pool:mining_rewards".into(),
+                amount: Decimal::new(30_000_000, 0),
+                label: "Mining Rewards Pool".into(),
+                vesting_months: 0,
+            },
+            GenesisAllocation {
+                address: "pool:governance".into(),
+                amount: Decimal::new(5_000_000, 0),
+                label: "Governance (Voting, Grants, Bounties)".into(),
                 vesting_months: 0,
             },
             GenesisAllocation {
                 address: "pool:treasury".into(),
-                amount: total * Decimal::new(15, 2), // 15%
+                amount: Decimal::new(7_500_000, 0),
                 label: "Treasury / Development".into(),
                 vesting_months: 0, // Testnet: kein Vesting
             },
             GenesisAllocation {
                 address: "pool:onboarding".into(),
-                amount: total * Decimal::new(10, 2), // 10% = 5.000.000 STONE
+                amount: Decimal::new(5_000_000, 0),
                 label: "Onboarding Pool (0.5 STONE/User, gesperrt)".into(),
                 vesting_months: 0,
             },
             GenesisAllocation {
                 address: "pool:founders".into(),
-                amount: total * Decimal::new(10, 2), // 10%
+                amount: Decimal::new(5_000_000, 0),
                 label: "Founders".into(),
                 vesting_months: 0,
             },
             GenesisAllocation {
                 address: "pool:liquidity".into(),
-                amount: total * Decimal::new(5, 2), // 5%
+                amount: Decimal::new(2_500_000, 0),
                 label: "Liquidity Reserve".into(),
                 vesting_months: 0,
             },
@@ -153,37 +161,44 @@ impl GenesisConfig {
     }
 
     /// Mainnet-Allokation: echte Adressen mit Vesting
-    fn mainnet_allocations(total: Decimal) -> Vec<GenesisAllocation> {
+    fn mainnet_allocations(_total: Decimal) -> Vec<GenesisAllocation> {
         // Mainnet-Adressen werden später über Config-Datei oder ENV gesetzt.
         // Hier die gleiche Pool-Struktur mit Vesting-Schedules.
+        // Feste Beträge statt Prozente (55M lässt sich nicht sauber per % aufteilen)
         vec![
             GenesisAllocation {
-                address: "pool:storage_rewards".into(),
-                amount: total * Decimal::new(60, 2),
-                label: "Storage Rewards Pool".into(),
-                vesting_months: 0, // Emission über Epochs, nicht Vesting
+                address: "pool:mining_rewards".into(),
+                amount: Decimal::new(30_000_000, 0),
+                label: "Mining Rewards Pool".into(),
+                vesting_months: 0, // Emission über Halving-Schema
+            },
+            GenesisAllocation {
+                address: "pool:governance".into(),
+                amount: Decimal::new(5_000_000, 0),
+                label: "Governance (Voting, Grants, Bounties)".into(),
+                vesting_months: 0,
             },
             GenesisAllocation {
                 address: "pool:treasury".into(),
-                amount: total * Decimal::new(15, 2),
+                amount: Decimal::new(7_500_000, 0),
                 label: "Treasury / Development".into(),
                 vesting_months: 36, // 3 Jahre
             },
             GenesisAllocation {
                 address: "pool:onboarding".into(),
-                amount: total * Decimal::new(10, 2),
+                amount: Decimal::new(5_000_000, 0),
                 label: "Onboarding Pool (0.5 STONE/User, gesperrt)".into(),
                 vesting_months: 0,
             },
             GenesisAllocation {
                 address: "pool:founders".into(),
-                amount: total * Decimal::new(10, 2),
+                amount: Decimal::new(5_000_000, 0),
                 label: "Founders".into(),
                 vesting_months: 48, // 4 Jahre
             },
             GenesisAllocation {
                 address: "pool:liquidity".into(),
-                amount: total * Decimal::new(5, 2),
+                amount: Decimal::new(2_500_000, 0),
                 label: "Liquidity Reserve".into(),
                 vesting_months: 0,
             },
@@ -258,7 +273,7 @@ pub fn apply_genesis(ledger: &mut TokenLedger) -> Result<Vec<super::transaction:
             signature: String::new(), // System-TXs brauchen keine Signatur
             memo: alloc.label.clone(),
             chain_id: format!("stone-{}", config.network),
-            fee_tier: super::transaction::FeeTier::Express,
+            fee_tier: super::transaction::FeeTier::Priority,
         };
         let tx_id = super::transaction::compute_tx_id(&tx);
         let tx = super::transaction::TokenTx { tx_id, ..tx };
@@ -328,7 +343,8 @@ pub struct SupplyInfo {
 impl SupplyInfo {
     pub fn from_ledger(ledger: &TokenLedger) -> Self {
         let config = GenesisConfig::from_env();
-        let locked_pools: Decimal = ledger.balance("pool:storage_rewards")
+        let locked_pools: Decimal = ledger.balance("pool:mining_rewards")
+            + ledger.balance("pool:governance")
             + ledger.balance("pool:treasury")
             + ledger.balance("pool:founders");
 

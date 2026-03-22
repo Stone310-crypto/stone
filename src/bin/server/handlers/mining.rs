@@ -88,7 +88,7 @@ pub async fn handle_mining_status(
         let vw = local_validator_pubkey_hex(&signing_key);
         let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
         let ts = ledger.total_supply();
-        let pool_bal = ledger.balance("pool:storage_rewards");
+        let pool_bal = ledger.balance("pool:mining_rewards");
         let circ = ts - total_staked_dec - pool_bal;
         (
             ts.to_string(),
@@ -344,8 +344,9 @@ pub async fn handle_mining_withdraw(
         withdrawal_fee,
         nonce,
         memo,
+        FeeTier::Priority,
     ) {
-        Ok(mut tx) => { tx.fee_tier = FeeTier::Priority; tx }
+        Ok(tx) => tx,
         Err(e) => return (
             StatusCode::INTERNAL_SERVER_ERROR,
             axum::Json(json!({
@@ -469,8 +470,9 @@ pub async fn handle_mining_stake(
         rust_decimal::Decimal::ZERO,
         nonce,
         stake_memo,
+        FeeTier::Priority,
     ) {
-        Ok(mut tx) => { tx.fee_tier = FeeTier::Priority; tx }
+        Ok(tx) => tx,
         Err(e) => return (
             StatusCode::INTERNAL_SERVER_ERROR,
             axum::Json(json!({ "ok": false, "error": format!("TX-Erstellung: {e}") })),
@@ -594,8 +596,9 @@ pub async fn handle_mining_unstake(
         rust_decimal::Decimal::ZERO,
         nonce,
         unstake_memo,
+        FeeTier::Priority,
     ) {
-        Ok(mut tx) => { tx.fee_tier = FeeTier::Priority; tx }
+        Ok(tx) => tx,
         Err(e) => return (
             StatusCode::INTERNAL_SERVER_ERROR,
             axum::Json(json!({ "ok": false, "error": format!("TX-Erstellung: {e}") })),

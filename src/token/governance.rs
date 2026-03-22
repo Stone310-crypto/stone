@@ -54,6 +54,26 @@ pub const MULTISIG_GROUP_SIZE: usize = 5;
 /// Maximale Laufzeit eines Proposals: 7 Tage
 pub const PROPOSAL_LIFETIME_SECS: i64 = 7 * 24 * 3600;
 
+// ─── Governance-Reward-Konstanten ────────────────────────────────────────────
+
+/// Belohnung pro Abstimmung (Node-Vote oder Stake-Vote): 5 STONE
+pub const VOTING_REWARD: &str = "5.0";
+
+/// Belohnung für erfolgreichen Chat-Report (Reporter): 2 STONE
+pub const MODERATION_REPORT_REWARD: &str = "2.0";
+
+/// Belohnung für Validator-Teilnahme an Report-Votes: 0.5 STONE
+pub const MODERATION_VOTE_REWARD: &str = "0.5";
+
+/// Bonus für schnelles Upgrade (innerhalb 48h): 10 STONE
+pub const UPGRADE_BONUS: &str = "10.0";
+
+/// Maximaler Grant-Betrag pro einzelnem Proposal: 50.000 STONE
+pub const MAX_GRANT_AMOUNT: &str = "50000";
+
+/// Governance-Pool-Adresse
+pub const GOVERNANCE_POOL: &str = "pool:governance";
+
 // ─── Trusted Node Registry ──────────────────────────────────────────────────
 
 /// Status einer Node in der Trusted-Registry.
@@ -94,6 +114,12 @@ pub enum ProposalCategory {
     /// Kritisch: Zusätzlich 3-of-5 Multisig erforderlich
     /// (Supply-Änderungen, Pool-Größen, Slashing-Parameter, Bootstrap-Keys)
     Critical,
+    /// Grant/Bounty: Auszahlung aus pool:governance an einen Empfänger
+    Grant,
+    /// Slashing-Dispute: Rückerstattung eines zu Unrecht geslashten Validators
+    SlashingDispute,
+    /// Upgrade-Incentive: Bonus für schnelle Netzwerk-Upgrades
+    UpgradeIncentive,
 }
 
 /// Status eines Proposals im Lifecycle.
@@ -154,6 +180,14 @@ pub struct Proposal {
     // ── Multisig (nur bei Critical) ──
     /// Bootstrap-Signaturen (node_id → signiert?)
     pub multisig_approvals: HashMap<String, bool>,
+
+    // ── Payout (nur bei Grant / SlashingDispute / UpgradeIncentive) ──
+    /// Auszahlungsbetrag in STONE (0 bei Standard/Critical)
+    #[serde(default)]
+    pub payout_amount: Decimal,
+    /// Empfänger-Wallet (leer bei Standard/Critical)
+    #[serde(default)]
+    pub payout_recipient: String,
 }
 
 // ─── Governance Store ────────────────────────────────────────────────────────
@@ -169,6 +203,22 @@ pub struct GovernanceStore {
     pub bootstrap_signers: Vec<String>,
     /// Letzte Aktualisierung
     pub last_updated: i64,
+    /// Wallets die für einen Proposal abgestimmt haben und Voting-Reward bekommen
+    /// Key: proposal_id, Value: Vec<wallet_address> die noch ausstehen
+    #[serde(default)]
+    pub pending_voting_rewards: HashMap<String, Vec<String>>,
+    /// Moderation-Rewards: (reporter_wallet, Vec<voter_wallet>)
+    #[serde(default)]
+    pub pending_moderation_rewards: Vec<ModerationReward>,
+}
+
+/// Ausstehende Moderations-Belohnung nach einem akzeptierten Report.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModerationReward {
+    /// Reporter-Wallet bekommt MODERATION_REPORT_REWARD
+    pub reporter_wallet: String,
+    /// Validator-Wallets bekommen je MODERATION_VOTE_REWARD
+    pub voter_wallets: Vec<String>,
 }
 
 impl GovernanceStore {
@@ -178,6 +228,8 @@ impl GovernanceStore {
             proposals: Vec::new(),
             bootstrap_signers: Vec::new(),
             last_updated: Utc::now().timestamp(),
+            pending_voting_rewards: HashMap::new(),
+            pending_moderation_rewards: Vec::new(),
         }
     }
 
@@ -318,10 +370,34 @@ impl GovernanceStore {
         description: &str,
         category: ProposalCategory,
     ) -> Result<String, GovernanceError> {
+        self.create_proposal_with_payout(proposer, title, description, category, Decimal::ZERO, String::new())
+    }
+
+    /// Erstellt ein Proposal mit optionaler Auszahlung (für Grant / SlashingDispute / UpgradeIncentive).
+    pub fn create_proposal_with_payout(
+        &mut self,
+        proposer: &str,
+        title: &str,
+        description: &str,
+        category: ProposalCategory,
+        payout_amount: Decimal,
+        payout_recipient: String,
+    ) -> Result<String, GovernanceError> {
         // Proposer muss Trusted sein
         if !self.is_eligible_voter(proposer) {
             return Err(GovernanceError::NotEligible {
                 node_id: proposer.to_string(),
+            });
+        }
+
+        // Bei Grant/SlashingDispute: Betrag prüfen
+        let max_grant: Decimal = MAX_GRANT_AMOUNT.parse().unwrap();
+        if matches!(category, ProposalCategory::Grant | ProposalCategory::SlashingDispute)
+            && payout_amount > max_grant
+        {
+            return Err(GovernanceError::GrantExceedsLimit {
+                amount: payout_amount,
+                max: max_grant,
             });
         }
 
@@ -349,6 +425,8 @@ impl GovernanceStore {
             node_votes: Vec::new(),
             stake_votes: Vec::new(),
             multisig_approvals,
+            payout_amount,
+            payout_recipient,
         };
 
         println!(
@@ -399,6 +477,14 @@ impl GovernanceStore {
             stake_weight: Decimal::ZERO,
         });
 
+        // Voting-Reward tracken (Wallet des Voters)
+        if let Some(node) = self.trusted_nodes.get(node_id) {
+            self.pending_voting_rewards
+                .entry(proposal_id.to_string())
+                .or_default()
+                .push(node.wallet.clone());
+        }
+
         Ok(())
     }
 
@@ -439,6 +525,12 @@ impl GovernanceStore {
             timestamp: Utc::now().timestamp(),
             stake_weight: stake_amount,
         });
+
+        // Voting-Reward tracken
+        self.pending_voting_rewards
+            .entry(proposal_id.to_string())
+            .or_default()
+            .push(wallet.to_string());
 
         Ok(())
     }
@@ -636,8 +728,12 @@ impl GovernanceStore {
         ready
     }
 
-    /// Markiert ein Proposal als ausgeführt.
-    pub fn mark_executed(&mut self, proposal_id: &str) -> Result<(), GovernanceError> {
+    /// Markiert ein Proposal als ausgeführt und gibt eventuelle Payout-Daten zurück.
+    /// Rückgabe: Ok(Some((recipient, amount, memo))) wenn Auszahlung nötig, sonst Ok(None).
+    pub fn mark_executed(
+        &mut self,
+        proposal_id: &str,
+    ) -> Result<Option<(String, Decimal, String)>, GovernanceError> {
         let proposal = self.find_proposal_mut(proposal_id)?;
         if proposal.status != ProposalStatus::Ready {
             return Err(GovernanceError::ProposalNotReady {
@@ -647,12 +743,76 @@ impl GovernanceStore {
         proposal.status = ProposalStatus::Executed {
             executed_at: Utc::now().timestamp(),
         };
+
+        let payout = if proposal.payout_amount > Decimal::ZERO && !proposal.payout_recipient.is_empty() {
+            let memo = format!(
+                "Governance-Payout: {} ({})",
+                proposal.title, proposal.id
+            );
+            println!(
+                "[governance] 💰 Payout {:.4} STONE → {} für Proposal [{}]",
+                proposal.payout_amount,
+                &proposal.payout_recipient[..12.min(proposal.payout_recipient.len())],
+                &proposal.id[..8],
+            );
+            Some((proposal.payout_recipient.clone(), proposal.payout_amount, memo))
+        } else {
+            None
+        };
+
         println!(
             "[governance] ⚡ Proposal [{}] \"{}\" ausgeführt",
             &proposal.id[..8],
             proposal.title,
         );
-        Ok(())
+        Ok(payout)
+    }
+
+    /// Holt und leert alle ausstehenden Voting-Rewards.
+    /// Rückgabe: Vec<(wallet, amount, memo)>
+    pub fn drain_voting_rewards(&mut self) -> Vec<(String, Decimal, String)> {
+        let reward: Decimal = VOTING_REWARD.parse().unwrap();
+        let pending = std::mem::take(&mut self.pending_voting_rewards);
+        let mut payouts = Vec::new();
+        for (proposal_id, wallets) in pending {
+            for wallet in wallets {
+                let memo = format!("Voting-Reward für Proposal {}", proposal_id);
+                payouts.push((wallet, reward, memo));
+            }
+        }
+        payouts
+    }
+
+    /// Holt und leert alle ausstehenden Moderation-Rewards.
+    /// Rückgabe: Vec<(wallet, amount, memo)>
+    pub fn drain_moderation_rewards(&mut self) -> Vec<(String, Decimal, String)> {
+        let report_reward: Decimal = MODERATION_REPORT_REWARD.parse().unwrap();
+        let vote_reward: Decimal = MODERATION_VOTE_REWARD.parse().unwrap();
+        let pending = std::mem::take(&mut self.pending_moderation_rewards);
+        let mut payouts = Vec::new();
+        for mr in pending {
+            payouts.push((
+                mr.reporter_wallet.clone(),
+                report_reward,
+                "Moderation-Report-Reward".to_string(),
+            ));
+            for w in &mr.voter_wallets {
+                payouts.push((
+                    w.clone(),
+                    vote_reward,
+                    "Moderation-Vote-Reward".to_string(),
+                ));
+            }
+        }
+        payouts
+    }
+
+    /// Fügt einen ausstehenden Moderation-Reward hinzu (wird nach Report-Finalisierung aufgerufen).
+    pub fn queue_moderation_reward(&mut self, reporter_wallet: String, voter_wallets: Vec<String>) {
+        self.pending_moderation_rewards.push(ModerationReward {
+            reporter_wallet,
+            voter_wallets,
+        });
     }
 
     /// Räumt abgelaufene Proposals auf (Status → Expired).
@@ -770,6 +930,7 @@ pub enum GovernanceError {
     NotBootstrapSigner { node_id: String },
     MultisigNotRequired { id: String },
     InvalidMultisigGroup { expected: usize, got: usize },
+    GrantExceedsLimit { amount: Decimal, max: Decimal },
 }
 
 impl std::fmt::Display for GovernanceError {
@@ -784,6 +945,7 @@ impl std::fmt::Display for GovernanceError {
             Self::NotBootstrapSigner { node_id } => write!(f, "{node_id} ist kein Bootstrap-Signer"),
             Self::MultisigNotRequired { id } => write!(f, "Proposal {id} ist Standard (kein Multisig nötig)"),
             Self::InvalidMultisigGroup { expected, got } => write!(f, "Multisig-Gruppe: {got} statt {expected} Signer"),
+            Self::GrantExceedsLimit { amount, max } => write!(f, "Grant {amount} STONE übersteigt Maximum {max} STONE"),
         }
     }
 }

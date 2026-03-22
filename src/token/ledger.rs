@@ -29,8 +29,8 @@ use super::transaction::{TokenTx, TxError, TxType, validate_tx};
 
 // ─── Konstanten ──────────────────────────────────────────────────────────────
 
-/// Maximales Token-Supply: 50.000.000 STONE
-pub const MAX_SUPPLY: &str = "50000000";
+/// Maximales Token-Supply: 55.000.000 STONE
+pub const MAX_SUPPLY: &str = "55000000";
 
 /// Minimale Transaktionsgebühr (0.0001 STONE — Basis-Fee, wird geburnt)
 pub const MIN_FEE: &str = "0.0001";
@@ -765,8 +765,8 @@ impl TokenLedger {
                 self.mint(&tx.to, tx.amount)?;
             }
             TxType::Reward => {
-                // Block-Rewards werden aus pool:storage_rewards transferiert (nicht neu geminted)
-                let pool_addr = "pool:storage_rewards";
+                // Block-Rewards werden aus pool:mining_rewards transferiert (nicht neu geminted)
+                let pool_addr = "pool:mining_rewards";
                 let pool_balance = self.balance(pool_addr);
                 if pool_balance < tx.amount {
                     return Err(LedgerError::InsufficientBalance {
@@ -779,7 +779,7 @@ impl TokenLedger {
                 *self.balances.entry(tx.to.clone()).or_insert(Decimal::ZERO) += tx.amount;
                 // total_supply bleibt gleich – es werden keine neuen Token erzeugt
                 println!(
-                    "[token] ⛏️  Reward: {} STONE pool:storage_rewards → {}",
+                    "[token] ⛏️  Reward: {} STONE pool:mining_rewards → {}",
                     tx.amount, &tx.to[..16.min(tx.to.len())]
                 );
             }
@@ -1501,20 +1501,42 @@ impl TokenLedger {
         }
     }
 
-    /// Gutschreibung von Staking-Rewards aus pool:storage_rewards.
+    /// Gutschreibung von Staking-Rewards aus pool:mining_rewards.
     ///
-    /// Transferiert `amount` von pool:storage_rewards auf die Ziel-Wallet.
+    /// Transferiert `amount` von pool:mining_rewards auf die Ziel-Wallet.
     pub fn credit_staking_reward(&mut self, address: &str, amount: Decimal) -> Result<(), LedgerError> {
-        let pool_balance = self.balance("pool:storage_rewards");
+        let pool_balance = self.balance("pool:mining_rewards");
         if pool_balance < amount {
             return Err(LedgerError::InsufficientBalance {
-                account: "pool:storage_rewards".to_string(),
+                account: "pool:mining_rewards".to_string(),
                 available: pool_balance,
                 required: amount,
             });
         }
-        *self.balances.entry("pool:storage_rewards".to_string()).or_insert(Decimal::ZERO) -= amount;
+        *self.balances.entry("pool:mining_rewards".to_string()).or_insert(Decimal::ZERO) -= amount;
         *self.balances.entry(address.to_string()).or_insert(Decimal::ZERO) += amount;
+        Ok(())
+    }
+
+    /// Auszahlung aus pool:governance (Voting-Rewards, Grants, Moderation-Rewards).
+    ///
+    /// Transferiert `amount` von pool:governance auf die Ziel-Wallet.
+    pub fn credit_governance_payout(&mut self, address: &str, amount: Decimal, memo: &str) -> Result<(), LedgerError> {
+        let pool = "pool:governance";
+        let pool_balance = self.balance(pool);
+        if pool_balance < amount {
+            return Err(LedgerError::InsufficientBalance {
+                account: pool.to_string(),
+                available: pool_balance,
+                required: amount,
+            });
+        }
+        *self.balances.entry(pool.to_string()).or_insert(Decimal::ZERO) -= amount;
+        *self.balances.entry(address.to_string()).or_insert(Decimal::ZERO) += amount;
+        println!(
+            "[governance] 💰 {} STONE → {} ({})",
+            amount, &address[..12.min(address.len())], memo
+        );
         Ok(())
     }
 

@@ -20,7 +20,7 @@ AMOUNT="${2:?Fehler: Betrag fehlt}"
 POOL="${3:-pool:founders}"
 MEMO="${4:-Beta Airdrop}"
 
-SERVER="${STONE_SERVER:-http://100.90.28.68:8080}"
+SERVER="${STONE_SERVER:-http://100.90.28.68:3080}"
 API_KEY="${STONE_ADMIN_KEY:?Fehler: STONE_ADMIN_KEY nicht gesetzt}"
 
 echo "╔═══════════════════════════════════════╗"

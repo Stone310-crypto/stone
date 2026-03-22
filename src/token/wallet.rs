@@ -5,7 +5,7 @@
 //! - **Generierung** aus kryptographisch sicherer Entropy (16 oder 32 Byte → 12- oder 24-Wort BIP39-Mnemonic)
 //! - **Recovery** aus einem BIP39-Mnemonic (12 oder 24 Wörter)
 //! - **TX-Signierung** über `sign_tx()` (erzeugt vollständig signierte `TokenTx`)
-//! - **Adresse** = Public-Key als 64-Zeichen Hex-String
+//! - **Adresse** = intern Hex (64 Zeichen), extern Bech32m (`stone1...`)
 //!
 //! ## Key-Derivation
 //!
@@ -90,8 +90,10 @@ impl From<TxError> for WalletError {
 /// Enthält **keinen** Private Key – nur die Adresse und den Mnemonic-Hinweis.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct WalletInfo {
-    /// Public-Key-Hex (= Adresse)
+    /// Public-Key-Hex (interne Adresse)
     pub address: String,
+    /// Bech32m-Adresse (`stone1...`) für Anzeige
+    pub display_address: String,
     /// BIP39-Mnemonic (12 oder 24 Wörter) – nur bei Erstgenerierung zurückgeben!
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mnemonic: Option<String>,
@@ -218,9 +220,23 @@ impl Wallet {
 
     // ── Getter ────────────────────────────────────────────────────────────
 
-    /// Gibt die Wallet-Adresse zurück (Public-Key als 64-Zeichen Hex-String).
+    /// Gibt die Wallet-Adresse als Hex-String zurück (intern, 64 Zeichen).
+    ///
+    /// Für die user-facing `stone1...` Darstellung: [`display_address()`].
     pub fn address(&self) -> String {
         hex::encode(self.verifying_key.as_bytes())
+    }
+
+    /// Gibt die Wallet-Adresse im `stone1...` Bech32m-Format zurück (Display/API).
+    pub fn display_address(&self) -> String {
+        super::address::encode(self.verifying_key.as_bytes())
+    }
+
+    /// Gibt die Wallet-Adresse als 64-Zeichen Hex-String zurück.
+    ///
+    /// Alias für [`address()`] – explizit für Stellen die Hex erwarten.
+    pub fn address_hex(&self) -> String {
+        self.address()
     }
 
     /// Gibt den BIP39-Mnemonic zurück (12 oder 24 Wörter).
@@ -250,6 +266,7 @@ impl Wallet {
         let wc = self.mnemonic_phrase.split_whitespace().count() as u16;
         WalletInfo {
             address: self.address(),
+            display_address: self.display_address(),
             mnemonic: if include_mnemonic && !self.mnemonic_phrase.is_empty() {
                 Some(self.mnemonic_phrase.clone())
             } else {
@@ -286,6 +303,7 @@ impl Wallet {
             fee,
             nonce,
             memo,
+            super::transaction::FeeTier::Standard,
         )?;
         Ok(tx)
     }
@@ -303,7 +321,7 @@ impl Wallet {
         tier: super::transaction::FeeTier,
     ) -> Result<TokenTx, WalletError> {
         let fee = tier.fee();
-        let mut tx = create_signed_tx(
+        let tx = create_signed_tx(
             &self.signing_key,
             tx_type,
             self.address(),
@@ -312,8 +330,8 @@ impl Wallet {
             fee,
             nonce,
             memo,
+            tier,
         )?;
-        tx.fee_tier = tier;
         Ok(tx)
     }
 
@@ -349,6 +367,7 @@ impl Wallet {
             fee,
             nonce,
             "Key-Rotation".to_string(),
+            super::transaction::FeeTier::Priority,
         )?;
 
         Ok((new_wallet, tx))
@@ -381,6 +400,18 @@ mod tests {
         // Adresse = 64 Hex-Zeichen (32 Byte Ed25519 Public Key)
         assert_eq!(addr.len(), 64);
         assert!(addr.chars().all(|c| c.is_ascii_hexdigit()));
+
+        // Display-Adresse = stone1... Bech32m-Format
+        let display = wallet.display_address();
+        assert!(display.starts_with("stone1"), "Display-Adresse muss mit stone1 beginnen: {display}");
+
+        // Display-Adresse = stone1... Bech32m-Format
+        let display = wallet.display_address();
+        assert!(display.starts_with("stone1"), "Display-Adresse muss mit stone1 beginnen: {display}");
+
+        // Roundtrip: display → hex
+        let normalized = crate::token::address::normalize_to_hex(&display).unwrap();
+        assert_eq!(normalized, addr);
 
         // Mnemonic = 24 Wörter (Default)
         let words: Vec<&str> = wallet.mnemonic().split_whitespace().collect();
