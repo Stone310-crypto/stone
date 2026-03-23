@@ -7,6 +7,7 @@ use axum::{
     routing::{delete, get, post},
 };
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::compression::CompressionLayer;
 
 use super::state::{AppState, MAX_UPLOAD_BYTES};
 use super::handlers::{
@@ -66,7 +67,7 @@ use super::handlers::{
         handle_resolve_fork, handle_set_validator_active, handle_slashing_info,
         handle_slashing_validator, handle_validator_self,
     },
-    status::{handle_health, handle_info, handle_metrics, handle_network_stats, handle_node_list, handle_shard_health, handle_status, handle_verify},
+    status::{handle_dashboard, handle_health, handle_info, handle_metrics, handle_network_stats, handle_node_list, handle_shard_health, handle_status, handle_verify},
     token::{
         handle_token_accounts, handle_token_faucet, handle_token_history,
         handle_token_pending, handle_token_send, handle_token_send_authenticated,
@@ -135,6 +136,8 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         // Health (kein Auth)
         .route("/api/v1/health", get(handle_health))
+        // Kombinierter Dashboard-Endpoint (1 Request statt 6)
+        .route("/api/v1/dashboard", get(handle_dashboard))
         // Öffentliche Node-Info (kein Auth, für Peer-Discovery)
         .route("/api/v1/info", get(handle_info))
         // Node-Liste für Client-Discovery (kein Auth)
@@ -431,6 +434,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/sdk/shop/item", post(handle_sdk_shop_create_item))
         .route("/api/v1/sdk/shop/buy", post(handle_sdk_shop_buy))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
+        .layer(CompressionLayer::new().gzip(true))
         .layer(build_cors())
         .with_state(state)
 }

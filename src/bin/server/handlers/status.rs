@@ -152,6 +152,127 @@ pub fn format_uptime(secs: u64) -> String {
     }
 }
 
+/// GET /api/v1/dashboard — Kombinierter Endpoint: health + status + network + peers + blocks
+/// in einer einzigen Response. Spart 5 separate HTTP-Roundtrips für das macOS-Dashboard.
+pub async fn handle_dashboard(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let summary = state.node.chain_summary();
+    let network_mode = stone::token::NetworkMode::from_env();
+    let metrics = state.node.snapshot_metrics();
+    let peers = state.node.get_peers();
+    let uptime_secs = (chrono::Utc::now().timestamp() - state.node.started_at) as u64;
+
+    // Gecachte Server-Ressourcen
+    let memory_rss_kb = state.node.cached_memory_rss_kb.load(std::sync::atomic::Ordering::Relaxed);
+    let cpu_time_ms = state.node.cached_cpu_time_ms.load(std::sync::atomic::Ordering::Relaxed);
+    let data_dir_bytes = state.node.cached_data_dir_bytes.load(std::sync::atomic::Ordering::Relaxed);
+
+    // P2P-Status
+    let net = if let Some(h) = &state.network {
+        h.get_status().await
+    } else {
+        None
+    };
+    let (local_peer_id, connected_peers, total_known, mesh_size, p2p_peers) =
+        if let Some(ref s) = net {
+            (
+                s.local_peer_id.clone(),
+                s.connected_peers,
+                s.total_known_peers,
+                s.gossipsub_mesh_size,
+                s.peers.iter().map(|p| json!({
+                    "peer_id":        p.peer_id,
+                    "addresses":      p.addresses,
+                    "connected":      p.connected,
+                    "agent":          p.agent_version,
+                    "last_seen_secs": p.last_seen_ago_secs,
+                    "blocks_received": p.blocks_received,
+                    "in_mesh":        p.in_gossipsub_mesh,
+                })).collect::<Vec<_>>(),
+            )
+        } else {
+            (String::from("–"), 0, 0, 0, vec![])
+        };
+
+    // Blöcke (slim, letzte 20)
+    let blocks: Vec<serde_json::Value> = {
+        let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
+        chain.blocks.iter().rev()
+            .take(20)
+            .map(|b| json!({
+                "index": b.index,
+                "timestamp": b.timestamp,
+                "previous_hash": b.previous_hash,
+                "hash": b.hash,
+                "documents": b.documents.len(),
+                "transactions": b.transactions.len(),
+                "signer": b.signer,
+            }))
+            .collect()
+    };
+
+    let resp = state.node.snapshot_metrics();
+    let block_count = summary.block_height;
+
+    (StatusCode::OK, axum::Json(json!({
+        "health": {
+            "status": "ok",
+            "node_id": state.node.node_id,
+            "role": format!("{:?}", state.node.role),
+            "block_height": summary.block_height,
+            "latest_hash": &summary.latest_hash[..12.min(summary.latest_hash.len())],
+            "network": network_mode.to_string(),
+        },
+        "status": {
+            "node_id": state.node.node_id,
+            "role": format!("{:?}", state.node.role),
+            "chain": summary,
+            "metrics": metrics,
+            "peers": peers,
+            "started_at": state.node.started_at,
+            "trust": state.node.trust_summary(),
+        },
+        "network": {
+            "p2p": {
+                "enabled":          state.network.is_some(),
+                "local_peer_id":    local_peer_id,
+                "connected_peers":  connected_peers,
+                "total_known":      total_known,
+                "gossipsub_mesh":   mesh_size,
+                "peers":            p2p_peers,
+            },
+            "server": {
+                "uptime_secs":      uptime_secs,
+                "uptime_human":     format_uptime(uptime_secs),
+                "memory_rss_kb":    memory_rss_kb,
+                "cpu_time_ms":      cpu_time_ms,
+                "data_dir_bytes":   data_dir_bytes,
+            },
+            "chain": {
+                "blocks":           block_count,
+                "requests_total":   resp.requests_total,
+                "sync_runs":        resp.sync_runs,
+                "sync_success":     resp.sync_success,
+                "sync_failure":     resp.sync_failure,
+                "docs_uploaded":    resp.documents_uploaded,
+                "ws_connections":   resp.ws_connections,
+            },
+        },
+        "peers": peers,
+        "blocks": {
+            "ok": true,
+            "total": block_count,
+            "blocks": blocks,
+        },
+        "info": {
+            "node_id": state.node.node_id,
+            "role": format!("{:?}", state.node.role),
+            "block_height": summary.block_height,
+        },
+    })))
+}
+
 /// GET /api/v1/chain/verify (öffentlich)
 pub async fn handle_verify(
     State(state): State<AppState>,
