@@ -1004,7 +1004,7 @@ async fn handle_p2p_event(
 
                 if !ip_already_known {
                     // Kandidaten-Ports in Prioritätsreihenfolge
-                    let candidate_ports = [8081u16, 8080, 3030];
+                    let candidate_ports = [8081u16, 3080, 3030];
                     for port in candidate_ports {
                         let url = format!("http://{}:{}", ip, port);
                         if !known_peers.iter().any(|p| p.url.trim_end_matches('/') == url.trim_end_matches('/')) {
@@ -2477,6 +2477,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             loop {
                 interval.tick().await;
                 server::handlers::audio_relay::gc_idle_rooms(&audio_rooms);
+            }
+        });
+    }
+
+    // ── Hintergrund-Task: System-Ressourcen-Cache ────────────────────────
+    {
+        let node_res = node.clone();
+        node_res.update_resource_cache();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(10));
+            loop {
+                interval.tick().await;
+                let n = node_res.clone();
+                tokio::task::spawn_blocking(move || n.update_resource_cache()).await.ok();
             }
         });
     }

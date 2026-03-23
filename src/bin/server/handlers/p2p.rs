@@ -135,6 +135,7 @@ pub async fn handle_p2p_status(State(state): State<AppState>) -> impl IntoRespon
                 "last_seen_ago_s": p.last_seen_ago_secs,
                 "blocks_received": p.blocks_received,
                 "in_mesh":         p.in_gossipsub_mesh,
+                "avg_latency_ms":  p.avg_latency_ms,
             })).collect::<Vec<_>>(),
         }))
         .into_response(),

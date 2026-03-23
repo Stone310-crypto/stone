@@ -1029,6 +1029,20 @@ async fn main() {
         });
     }
 
+    // ── Hintergrund-Task: System-Ressourcen-Cache ────────────────────────
+    {
+        let node_res = node.clone();
+        node_res.update_resource_cache();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+            loop {
+                interval.tick().await;
+                let n = node_res.clone();
+                tokio::task::spawn_blocking(move || n.update_resource_cache()).await.ok();
+            }
+        });
+    }
+
     let preferred_port: u16 = std::env::var("STONE_HTTP_PORT")
         .or_else(|_| std::env::var("STONE_PORT"))
         .ok()

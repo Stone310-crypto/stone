@@ -520,6 +520,16 @@ pub struct MasterNodeState {
     pub governance: RwLock<crate::token::GovernanceStore>,
     /// Gaming-Economy: Game-Wallets, NFT-Items, Marktplatz, Sessions
     pub game_economy: RwLock<crate::token::GameEconomyStore>,
+
+    // ─── Caches (Performance: vermeidet teure Berechnungen bei jedem API-Request) ───
+    /// Gecachte Chain-Zusammenfassung (wird bei jedem neuen Block aktualisiert)
+    pub cached_summary: RwLock<Option<ChainSummary>>,
+    /// Gecachte Dateiordner-Größe in Bytes (wird periodisch aktualisiert, nicht per Request)
+    pub cached_data_dir_bytes: AtomicU64,
+    /// Gecachte Memory-RSS in KB (wird periodisch aktualisiert)
+    pub cached_memory_rss_kb: AtomicU64,
+    /// Gecachte CPU-Time in ms (wird periodisch aktualisiert)
+    pub cached_cpu_time_ms: AtomicU64,
 }
 
 #[derive(Default)]
@@ -700,6 +710,10 @@ impl MasterNodeState {
             current_mining_template: RwLock::new(None),
             governance: RwLock::new(crate::token::GovernanceStore::load()),
             game_economy: RwLock::new(crate::token::GameEconomyStore::load()),
+            cached_summary: RwLock::new(None),
+            cached_data_dir_bytes: AtomicU64::new(0),
+            cached_memory_rss_kb: AtomicU64::new(0),
+            cached_cpu_time_ms: AtomicU64::new(0),
         });
 
         // Nach Restart: Prüfen ob die lokale Chain aktuell genug ist.
@@ -1155,15 +1169,25 @@ impl MasterNodeState {
 
     /// Chain-Zusammenfassung für API-Antworten.
     ///
-    /// HINWEIS: `is_valid` prüft nur den letzten Block (O(1)) statt die gesamte
-    /// Chain (O(n)). Volle Chain-Verifikation via `chain.verify()` sollte nur
-    /// bei Admin-Requests oder Startup verwendet werden.
+    /// Verwendet einen Cache der nur invalidiert wird wenn sich die Block-Höhe ändert.
+    /// Vorher: O(n×m) list_all_documents() + calculate_hash() bei JEDEM Request.
+    /// Jetzt: O(1) Cache-Hit, O(n×m) nur bei neuem Block (~alle 30s).
     pub fn chain_summary(&self) -> ChainSummary {
+        // Schneller Cache-Hit ohne Chain-Lock
+        {
+            let cached = self.cached_summary.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(ref s) = *cached {
+                let chain = self.chain.lock().unwrap_or_else(|e| e.into_inner());
+                if s.block_height == chain.blocks.len() as u64 {
+                    return s.clone();
+                }
+            }
+        }
+        // Cache-Miss: Berechne neu
         let chain = self.chain.lock().unwrap_or_else(|e| e.into_inner());
         let total_docs: usize = chain
             .list_all_documents()
             .len();
-        // Schnell-Check: letzter Block konsistent? (O(1) statt O(n))
         let is_valid = if chain.blocks.len() >= 2 {
             let last = &chain.blocks[chain.blocks.len() - 1];
             let prev = &chain.blocks[chain.blocks.len() - 2];
@@ -1172,12 +1196,94 @@ impl MasterNodeState {
         } else {
             true
         };
-        ChainSummary {
+        let summary = ChainSummary {
             block_height: chain.blocks.len() as u64,
             latest_hash: chain.latest_hash.clone(),
             total_documents: total_docs as u64,
             is_valid,
+        };
+        drop(chain);
+        // Cache aktualisieren
+        if let Ok(mut w) = self.cached_summary.write() {
+            *w = Some(summary.clone());
         }
+        summary
+    }
+
+    /// Invalidiert den Chain-Summary-Cache.
+    /// Muss nach jedem neuen Block aufgerufen werden.
+    pub fn invalidate_summary_cache(&self) {
+        if let Ok(mut w) = self.cached_summary.write() {
+            *w = None;
+        }
+    }
+
+    /// Aktualisiert die gecachten System-Ressourcen (RAM, CPU, Disk).
+    /// Wird periodisch im Hintergrund aufgerufen (alle 10s) statt bei jedem Request.
+    pub fn update_resource_cache(&self) {
+        // Memory RSS
+        let rss: u64 = {
+            #[cfg(target_os = "linux")]
+            {
+                std::fs::read_to_string("/proc/self/status")
+                    .unwrap_or_default()
+                    .lines()
+                    .find(|l| l.starts_with("VmRSS:"))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|v| v.parse().ok())
+                    .unwrap_or(0)
+            }
+            #[cfg(target_os = "macos")]
+            {
+                std::process::Command::new("ps")
+                    .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+                    .output()
+                    .ok()
+                    .and_then(|o| String::from_utf8(o.stdout).ok())
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .unwrap_or(0)
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            { 0 }
+        };
+        self.cached_memory_rss_kb.store(rss, Ordering::Relaxed);
+
+        // CPU Time
+        let cpu: u64 = {
+            #[cfg(target_os = "linux")]
+            {
+                std::fs::read_to_string("/proc/self/stat")
+                    .unwrap_or_default()
+                    .split_whitespace()
+                    .enumerate()
+                    .filter(|(i, _)| *i == 13 || *i == 14)
+                    .map(|(_, v)| v.parse::<u64>().unwrap_or(0))
+                    .sum::<u64>() * 10
+            }
+            #[cfg(not(target_os = "linux"))]
+            { 0 }
+        };
+        self.cached_cpu_time_ms.store(cpu, Ordering::Relaxed);
+
+        // Data dir size (rekursiv — teuer, aber nur alle 10s)
+        fn dir_size(path: &std::path::Path) -> u64 {
+            std::fs::read_dir(path)
+                .map(|e| {
+                    e.filter_map(|e| e.ok())
+                        .map(|e| {
+                            let meta = e.metadata().ok();
+                            if meta.as_ref().map(|m| m.is_dir()).unwrap_or(false) {
+                                dir_size(&e.path())
+                            } else {
+                                meta.map(|m| m.len()).unwrap_or(0)
+                            }
+                        })
+                        .sum()
+                })
+                .unwrap_or(0)
+        }
+        let bytes = dir_size(std::path::Path::new(&crate::blockchain::data_dir()));
+        self.cached_data_dir_bytes.store(bytes, Ordering::Relaxed);
     }
 
     /// Metriken für API

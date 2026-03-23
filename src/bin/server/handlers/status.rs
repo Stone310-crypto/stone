@@ -97,65 +97,10 @@ pub async fn handle_network_stats(
 
     let uptime_secs = (chrono::Utc::now().timestamp() - state.node.started_at) as u64;
 
-    let memory_rss_kb: u64 = {
-        #[cfg(target_os = "linux")]
-        {
-            std::fs::read_to_string("/proc/self/status")
-                .unwrap_or_default()
-                .lines()
-                .find(|l| l.starts_with("VmRSS:"))
-                .and_then(|l| l.split_whitespace().nth(1))
-                .and_then(|v| v.parse().ok())
-                .unwrap_or(0)
-        }
-        #[cfg(target_os = "macos")]
-        {
-            std::process::Command::new("ps")
-                .args(["-o", "rss=", "-p", &std::process::id().to_string()])
-                .output()
-                .ok()
-                .and_then(|o| String::from_utf8(o.stdout).ok())
-                .and_then(|s| s.trim().parse::<u64>().ok())
-                .unwrap_or(0)
-        }
-        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-        { 0 }
-    };
-
-    let cpu_time_ms: u64 = {
-        #[cfg(target_os = "linux")]
-        {
-            std::fs::read_to_string("/proc/self/stat")
-                .unwrap_or_default()
-                .split_whitespace()
-                .enumerate()
-                .filter(|(i, _)| *i == 13 || *i == 14)
-                .map(|(_, v)| v.parse::<u64>().unwrap_or(0))
-                .sum::<u64>() * 10
-        }
-        #[cfg(not(any(target_os = "linux")))]
-        { 0 }
-    };
-
-    let data_dir_bytes: u64 = {
-        fn dir_size(path: &std::path::Path) -> u64 {
-            std::fs::read_dir(path)
-                .map(|e| {
-                    e.filter_map(|e| e.ok())
-                        .map(|e| {
-                            let meta = e.metadata().ok();
-                            if meta.as_ref().map(|m| m.is_dir()).unwrap_or(false) {
-                                dir_size(&e.path())
-                            } else {
-                                meta.map(|m| m.len()).unwrap_or(0)
-                            }
-                        })
-                        .sum()
-                })
-                .unwrap_or(0)
-        }
-        dir_size(std::path::Path::new(&stone::blockchain::data_dir()))
-    };
+    // Gecachte Werte verwenden (werden periodisch im Hintergrund aktualisiert)
+    let memory_rss_kb = state.node.cached_memory_rss_kb.load(std::sync::atomic::Ordering::Relaxed);
+    let cpu_time_ms = state.node.cached_cpu_time_ms.load(std::sync::atomic::Ordering::Relaxed);
+    let data_dir_bytes = state.node.cached_data_dir_bytes.load(std::sync::atomic::Ordering::Relaxed);
 
     let m = state.node.snapshot_metrics();
     let block_count = {

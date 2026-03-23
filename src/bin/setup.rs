@@ -683,6 +683,23 @@ async fn start_full_node(state: SetupState) {
         });
     }
 
+    // ── Hintergrund-Task: System-Ressourcen-Cache aktualisieren ─────────
+    // RAM, CPU, Disk werden alle 10s gecacht statt bei jedem /network-Request
+    // berechnet (~100-200ms gespart pro Request).
+    {
+        let node_res = node.clone();
+        // Initiale Berechnung sofort ausführen
+        node_res.update_resource_cache();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+            loop {
+                interval.tick().await;
+                let n = node_res.clone();
+                tokio::task::spawn_blocking(move || n.update_resource_cache()).await.ok();
+            }
+        });
+    }
+
     // ── Public API Port (nur /api/v1/* — kein Dashboard) ────────────────
     // Für externen Zugriff via Cloudflare Tunnel (chain.unrooted.dev).
     // Dashboard bleibt nur auf dem Haupt-Port (8080) erreichbar.

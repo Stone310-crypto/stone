@@ -582,6 +582,9 @@ pub struct PeerStatus {
     pub last_seen_ago_secs: i64,
     pub blocks_received: u64,
     pub in_gossipsub_mesh: bool,
+    /// Durchschnittliche Latenz in ms (aus Keepalive-Pings, None wenn noch kein Ping)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub avg_latency_ms: Option<u64>,
 }
 
 /// Vereinfachte Peer-Info für die API
@@ -1083,6 +1086,15 @@ struct SwarmTask {
     /// PeerId → (frühester nächster Versuch, aktueller Backoff-Intervall)
     /// Verhindert Connect-Disconnect-Storms wenn beide Seiten gleichzeitig dialen.
     reconnect_backoff: HashMap<PeerId, (Instant, Duration)>,
+
+    // ─── Keepalive / Warm Peer Table ─────────────────────────────────────
+
+    /// Laufende Keepalive-Pings: request_id → (PeerId, Sende-Zeitpunkt)
+    /// Fire-and-forget: kein oneshot-Channel, nur Latenz-Recording.
+    keepalive_pings: HashMap<request_response::OutboundRequestId, (PeerId, Instant)>,
+
+    /// Rolling-Window Latenz-Historie pro Peer (letzte 10 Messungen, in ms)
+    peer_latencies: HashMap<PeerId, VecDeque<u64>>,
 }
 
 /// Tracking für Fehlverhalten eines Peers
@@ -1369,6 +1381,10 @@ impl SwarmTask {
         let mut cleanup_ticker = tokio::time::interval(Duration::from_secs(300));
         cleanup_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        // Keepalive-Ticker: alle 45s Pings an verbundene Peers senden um NAT-Mappings warm zu halten
+        let mut keepalive_ticker = tokio::time::interval(Duration::from_secs(45));
+        keepalive_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
             tokio::select! {
                 event = self.swarm.next() => {
@@ -1396,6 +1412,9 @@ impl SwarmTask {
                 }
                 _ = cleanup_ticker.tick() => {
                     self.periodic_cleanup();
+                }
+                _ = keepalive_ticker.tick() => {
+                    self.keepalive_ping_peers();
                 }
             }
         }
@@ -2045,8 +2064,12 @@ impl SwarmTask {
                     }
                 }
                 request_response::Message::Response { request_id, response, .. } => {
-                    // Ping-Antwort?
-                    if let Some((peer_id_str, start, reply)) = self.pending_pings.remove(&request_id) {
+                    // Keepalive-Ping-Antwort? (Fire-and-forget, nur Latenz aufzeichnen)
+                    if self.handle_keepalive_response(&request_id) {
+                        // Keepalive verarbeitet – fertig
+                    }
+                    // Manueller Ping-Antwort?
+                    else if let Some((peer_id_str, start, reply)) = self.pending_pings.remove(&request_id) {
                         let ms = start.elapsed().as_millis() as u64;
                         println!("[p2p] 🏓 Pong von {peer_id_str} – {ms}ms");
                         let _ = reply.send(PingResult {
@@ -2579,6 +2602,63 @@ impl SwarmTask {
         }
     }
 
+    // ── Keepalive: Warm Peer Table ──────────────────────────────────────────
+
+    /// Maximale Latenz-Samples pro Peer (Rolling Window)
+    const LATENCY_WINDOW: usize = 10;
+
+    /// Sendet Keepalive-Pings an alle verbundenen Peers um NAT-Mappings warm
+    /// zu halten und Latenz-Statistiken zu sammeln.
+    fn keepalive_ping_peers(&mut self) {
+        let connected: Vec<PeerId> = self.swarm.connected_peers().cloned().collect();
+        if connected.is_empty() {
+            return;
+        }
+        let mut sent = 0u32;
+        for peer_id in &connected {
+            let req_id = self.swarm.behaviour_mut().block_exchange.send_request(
+                peer_id,
+                BlockRequest { block_index: BLOCK_REQUEST_PING, block_index_end: None },
+            );
+            self.keepalive_pings.insert(req_id, (*peer_id, Instant::now()));
+            sent += 1;
+        }
+        if sent > 0 {
+            println!("[p2p] 💓 Keepalive: {sent} Ping(s) gesendet");
+        }
+    }
+
+    /// Verarbeitet eine Keepalive-Ping-Antwort: zeichnet die Latenz auf und
+    /// aktualisiert `last_seen`. Gibt `true` zurück wenn es ein Keepalive-Ping war.
+    fn handle_keepalive_response(&mut self, request_id: &request_response::OutboundRequestId) -> bool {
+        if let Some((peer_id, start)) = self.keepalive_pings.remove(request_id) {
+            let ms = start.elapsed().as_millis() as u64;
+            // Latenz in Rolling-Window aufnehmen
+            let window = self.peer_latencies.entry(peer_id).or_insert_with(VecDeque::new);
+            if window.len() >= Self::LATENCY_WINDOW {
+                window.pop_front();
+            }
+            window.push_back(ms);
+            // last_seen aktualisieren
+            if let Some(entry) = self.peers.get_mut(&peer_id) {
+                entry.last_seen = chrono::Utc::now().timestamp();
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Durchschnittliche Latenz eines Peers (aus Rolling-Window), oder None.
+    fn avg_latency_ms(&self, peer_id: &PeerId) -> Option<u64> {
+        let window = self.peer_latencies.get(peer_id)?;
+        if window.is_empty() {
+            return None;
+        }
+        let sum: u64 = window.iter().sum();
+        Some(sum / window.len() as u64)
+    }
+
     // ── Periodisches Aufräumen ────────────────────────────────────────────────
 
     /// Räumt verwaiste Einträge in Rate-Limitern, Penalty-Map und Storage-Announcements auf.
@@ -2675,10 +2755,17 @@ impl SwarmTask {
             if !stale_peers.is_empty() {
                 for pid in &stale_peers {
                     self.peers.remove(pid);
+                    self.peer_latencies.remove(pid);
                 }
                 println!("[p2p] 🧹 {} inaktive Peers entfernt (>1h nicht gesehen)", stale_peers.len());
             }
         }
+
+        // 8. Keepalive-Pings: verwaiste Pings > 30s aufräumen (Fire-and-forget)
+        self.keepalive_pings.retain(|_, (_, start)| start.elapsed() < Duration::from_secs(30));
+
+        // 9. Latenz-Daten: Einträge für nicht mehr bekannte Peers entfernen
+        self.peer_latencies.retain(|pid, _| self.peers.contains_key(pid));
     }
 
     // ── Peer-Scoring & Banning ────────────────────────────────────────────────
@@ -3479,7 +3566,7 @@ impl SwarmTask {
                     }
                 }
 
-                let peers: Vec<PeerStatus> = self.peers.values().map(|p| PeerStatus {
+                let peers: Vec<PeerStatus> = self.peers.iter().map(|(pid, p)| PeerStatus {
                     peer_id: p.peer_id.clone(),
                     addresses: p.addresses.clone(),
                     agent_version: p.agent_version.clone(),
@@ -3488,6 +3575,7 @@ impl SwarmTask {
                     last_seen_ago_secs: now - p.last_seen,
                     blocks_received: p.blocks_received,
                     in_gossipsub_mesh: mesh_peers.contains(&p.peer_id),
+                    avg_latency_ms: self.avg_latency_ms(pid),
                 }).collect();
 
                 let connected = swarm_connected.len(); // direkt aus Swarm
@@ -3879,6 +3967,8 @@ pub async fn start_network(
         sync_expected_next: 0,
         local_stake_level: 0,
         reconnect_backoff: HashMap::new(),
+        keepalive_pings: HashMap::new(),
+        peer_latencies: HashMap::new(),
     };
 
     tokio::spawn(task.run());

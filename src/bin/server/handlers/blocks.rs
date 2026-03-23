@@ -16,6 +16,10 @@ pub struct PaginationQuery {
     pub page: Option<u64>,
     #[serde(default)]
     pub per_page: Option<u64>,
+    /// Wenn true, werden volle Block-Daten (Transaktionen, Dokumente) zurückgegeben.
+    /// Default: false (nur Counts für Dashboard-Performance).
+    #[serde(default)]
+    pub detail: Option<bool>,
 }
 
 /// GET /api/v1/blocks  — öffentlich (Chain-Daten sind nicht vertraulich)
@@ -26,17 +30,36 @@ pub async fn handle_list_blocks(
     let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
     let per_page = q.per_page.unwrap_or(50).min(500) as usize;
     let page = q.page.unwrap_or(0) as usize;
+    let detail = q.detail.unwrap_or(false);
     let total = chain.blocks.len();
-    let blocks: Vec<_> = chain
-        .blocks
-        .iter()
-        .rev()
-        .skip(page * per_page)
-        .take(per_page)
-        .collect();
+    let blocks: Vec<serde_json::Value> = if detail {
+        // Volle Block-Daten (für StoneScan / Block-Explorer)
+        chain.blocks.iter().rev()
+            .skip(page * per_page)
+            .take(per_page)
+            .map(|b| serde_json::to_value(b).unwrap_or_default())
+            .collect()
+    } else {
+        // Slim (nur Counts — für Dashboard-Performance)
+        chain.blocks.iter().rev()
+            .skip(page * per_page)
+            .take(per_page)
+            .map(|b| json!({
+                "index": b.index,
+                "timestamp": b.timestamp,
+                "previous_hash": b.previous_hash,
+                "hash": b.hash,
+                "documents": b.documents.len(),
+                "transactions": b.transactions.len(),
+                "signer": b.signer,
+            }))
+            .collect()
+    };
+    drop(chain);
     (
         StatusCode::OK,
         axum::Json(json!({
+            "ok": true,
             "total": total,
             "page": page,
             "per_page": per_page,
