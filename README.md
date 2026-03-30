@@ -1,67 +1,103 @@
-# Stone — Dezentrales Blockchain-Dokumentensystem
+# Stone — Dezentrale Blockchain-Plattform
 
-Stone ist ein Proof-of-Authority (PoA) Blockchain-Node für die sichere, unveränderliche Speicherung von Dokumenten. Er stellt eine REST + WebSocket API bereit und lässt sich direkt mit dem **Eigenen* Web-Frontend verbinden.
+Stone ist eine eigenständige Blockchain mit integrierter Token-Ökonomie, P2P-Netzwerk, verschlüsseltem Chat, Staking, Governance und Game-SDK. Ein einziger Node bringt alles mit — von Mining über Wallet-Management bis zu atomaren Swaps.
+
+**Mainnet** und **Testnet** laufen parallel auf getrennten Ports und Datenverzeichnissen.
 
 ---
 
 ## Inhaltsverzeichnis
 
 1. [Architektur](#architektur)
-2. [Komponenten](#komponenten)
-3. [Schnellstart (Entwicklung)](#schnellstart)
-4. [Konfiguration (Umgebungsvariablen)](#konfiguration)
-5. [API-Referenz](#api-referenz)
-6. [Authentifizierung](#authentifizierung)
-7. [PoA-Konsensus](#poa-konsensus)
-8. [Deployment (Produktion)](#deployment)
-9. [Projektstruktur](#projektstruktur)
+2. [Features](#features)
+3. [Schnellstart](#schnellstart)
+4. [Netzwerk-Konfiguration (Mainnet / Testnet)](#netzwerk-konfiguration)
+5. [Umgebungsvariablen](#umgebungsvariablen)
+6. [Binaries & Tools](#binaries--tools)
+7. [API-Übersicht (150+ Endpunkte)](#api-übersicht)
+8. [Authentifizierung](#authentifizierung)
+9. [Docker Deployment](#docker-deployment)
+10. [Projektstruktur](#projektstruktur)
+11. [Technologie-Stack](#technologie-stack)
 
 ---
 
 ## Architektur
 
 ```
-Internet
-   │
-   ▼
-Nginx (443 HTTPS)
-   │
-   ├─► forge-Nomad Flask App  (Port 5002)
-   │       │  Session-Auth, UI, Proxying
-   │       │
-   │       └─► stone-master  (Port 8080, nur intern)
-   │               │  REST + WebSocket API
-   │               │  x-api-key Auth
-   │               │
-   │               ├── RocksDB  (Chain + Dokument-Index)
-   │               ├── Chunks/  (Binär-Daten, Content-Addressed)
-   │               └── P2P      (libp2p, optional)
-   │
-   └─► stone-auth  (Port 8443, optional)
-           TLS-Zertifikats-Ausstelldienst für Cluster-Nodes
+                        ┌──────────────────────────────────────────────┐
+                        │              Stone Node                      │
+                        │                                              │
+  iOS / Android App ───►│  Axum REST API + WebSocket                   │
+  StoneScan Explorer ──►│    ├── Token Ledger (RocksDB)                │
+  Miner Clients ───────►│    ├── Blockchain (RocksDB)                  │
+                        │    ├── Chat (E2E verschlüsselt)              │
+                        │    ├── Staking Pool                          │
+                        │    ├── HTLC (Atomic Swaps)                   │
+                        │    ├── Bridge (Wrapped Tokens)               │
+                        │    ├── Game SDK (NFTs, Marketplace)          │
+                        │    └── Governance (Dual-Vote)                │
+                        │                                              │
+                        │  libp2p P2P (TCP + QUIC)                     │
+                        │    ├── Gossipsub (Blocks, Mempool, Chat)     │
+                        │    ├── Kademlia DHT                          │
+                        │    ├── Relay + DCUtR (NAT-Traversal)         │
+                        │    └── OTA Updates (signiert, via Gossip)    │
+                        │                                              │
+                        │  Datenspeicher                               │
+                        │    ├── chain_db/   (RocksDB – Blöcke)        │
+                        │    ├── token_db/   (RocksDB – Konten)        │
+                        │    ├── chunks/     (Content-Addressed Files)  │
+                        │    └── snapshots/  (Zstd-komprimiert)        │
+                        └──────────────────────────────────────────────┘
 ```
-
-**Schlüsselprinzip:** Port `8080` (stone-master) ist nie direkt aus dem Internet erreichbar. Alle Anfragen laufen über Flask, das den Admin-API-Key server-seitig hinzufügt.
 
 ---
 
-## Komponenten
+## Features
 
-| Binär | Datei | Funktion |
-|---|---|---|
-| `stone-master` | `src/bin/master_server.rs` | Haupt-Node: Chain, Dokumente, PoA, P2P, WebSocket |
-| `stone-auth` | `src/bin/auth_server.rs` | Auth-Server: TLS-Zertifikate für Cluster-Nodes ausstellen |
+### Token-Ökonomie
 
-| Modul | Datei | Funktion |
-|---|---|---|
-| `auth` | `src/auth.rs` | User-Verwaltung, BIP-39 Phrasen, TLS-Cert-Fetch |
-| `blockchain` | `src/blockchain.rs` | Block/Document Structs, Chain-Logik, RocksDB-Storage |
-| `consensus` | `src/consensus.rs` | PoA Validator-Set, Voting, Fork-Erkennung |
-| `crypto` | `src/crypto.rs` | Ed25519 Signaturen, X25519 ECDH, AES-256-GCM Verschlüsselung |
-| `master_node` | `src/master_node.rs` | MasterNodeState, Dokument-Upload-Logik, Events |
-| `network` | `src/network.rs` | libp2p P2P-Netzwerk, Gossipsub, Kademlia |
-| `storage` | `src/storage.rs` | Chunk-Store (Content-Addressed Binary Storage) |
-| `tls` | `src/tls.rs` | rustls Server-Config-Helpers |
+- **StoneCoin (STONE)** — 50M Genesis-Supply, 8 Dezimalstellen, Bech32m-Adressen (`stone1...`)
+- **Mining** — Intervall-basiert (30s Block-Target), Halving-Schema für Block-Rewards
+- **Staking** — PoS-Pool (min. 100 STONE, 7-Tage Unstake-Lock, 720-Block Epochs, 30% Fee-Redistribution)
+- **Mempool** — Thread-sichere TX-Queue mit Nonce-Prüfung, TTL, Rate-Limiting
+- **Fee-Tiers** — Priority (0.001), Standard (0.0001), Low (0.00001)
+
+### Governance & Konsensus
+
+- **Proof-of-Authority (PoA)** — Validator-Whitelist mit Ed25519-Signaturen, Supermajority (⌊2/3⌋+1)
+- **Dual-Vote Governance** — 50% Node-Voting + 50% Stake-Voting (verhindert Zentralisierung)
+- **Multisig Bootstrap** — Kritische Parameter benötigen 3-of-5 Signaturen + Governance-Vote
+- **Web-of-Trust** — Peer-Reputation, Join-Requests, 30-Tage Uptime, Slashing
+
+### Kommunikation
+
+- **E2E-Chat** — AES-256-GCM via ECDH, Merkle-Batch Anchoring auf der Chain
+- **Organisationen** — Rollen (Owner/Admin/Member/Viewer), Channels, Dokumentenfreigabe
+- **Push-Notifications** — FCM v1 für Android
+- **Selbstzerstörende Nachrichten** — TTL (30/90 Tage), Stake-Gate
+
+### DeFi & Trading
+
+- **HTLC Atomic Swaps** — SHA-256 Hash-Lock, 24h Time-Lock, Trustless Trading
+- **Token Bridge** — Wrapped Tokens (wUSDT, wBTC, wETH, wUSDC, wTRX)
+- **Market Simulator** — Testnet Preis-Simulation (1 STONE = 0.10 TC$)
+
+### Infrastruktur
+
+- **P2P-Netzwerk** — libp2p mit QUIC, TCP, Noise, Gossipsub, Kademlia, mDNS, Relay, UPnP
+- **Proof-of-Storage** — Netzwerk-getriebene Challenges, Reputation-Rewards
+- **Erasure-Coded Sharding** — Reed-Solomon (k+m) für redundante Chunk-Verteilung
+- **Snapshots** — Tar+Zstd komprimiert, automatische Erstellung alle N Blöcke
+- **OTA Updates** — Ed25519-signierte Binaries, P2P-Distribution via Gossip
+
+### Game SDK
+
+- **NFT-Marketplace** — Listings, Buy/Sell, Angebote, Preishistorie
+- **Game-Wallets** — Separate In-Game Wallets, Spending-Limits, Consent-System
+- **Turniere** — Prize-Pools, Leaderboards, Belohnungen
+- **Audit-Log** — Vollständige Action-History für Compliance
 
 ---
 
@@ -69,248 +105,285 @@ Nginx (443 HTTPS)
 
 ### Voraussetzungen
 
-- Rust (stable) ≥ 1.75
-- `cargo` im PATH
+- Rust ≥ 1.75, `cargo` im PATH
+- RocksDB-Abhängigkeiten (`libclang`, `llvm` auf macOS: `brew install llvm`)
 
 ### Build & Start
 
 ```bash
-# Projekt bauen
-cargo build
+# Release-Build (empfohlen)
+cargo build --release
 
-# Node mit persistentem API-Key starten (empfohlen)
-# .env enthält: STONE_CLUSTER_API_KEY=sk_...
+# Testnet starten (Standard)
 ./start.sh
 
-# Alternativ direkt:
-STONE_CLUSTER_API_KEY=sk_meinkey STONE_DATA_DIR=/var/lib/stone ./target/debug/stone-master
+# Oder direkt:
+./target/release/stone-setup
 ```
 
-### forge-Nomad verbinden
+Der Setup-Wizard fragt interaktiv nach Node-Name, Passwort und Speicher. Danach startet der Full-Node automatisch.
 
-In `/Webfrontend/path/.env`:
-```env
-BLOCKCHAIN_URL=http://localhost:8080
-BLOCKCHAIN_API_KEY=sk_<gleicher key wie STONE_CLUSTER_API_KEY>
-```
-
-### Token synchronisieren (nach manuellem Reset)
+### Miner starten
 
 ```bash
-./sync_token.sh
+# Miner verbindet sich mit lokaler Node
+./target/release/stone-miner
 ```
+
+Dashboard auf `http://localhost:8080` im Browser.
 
 ---
 
-## Konfiguration
+## Netzwerk-Konfiguration
 
-Alle Einstellungen per Umgebungsvariable (oder `.env` Datei im Projektroot):
+Stone unterstützt parallelen Betrieb von **Mainnet** und **Testnet** auf demselben Server.
+
+### Port-Schema
+
+| | Testnet (Standard) | Mainnet |
+|--|---|---|
+| **HTTP API** | 3080 | 3180 |
+| **P2P (TCP + QUIC)** | 4001 | 5001 |
+| **Sync (Node-zu-Node)** | 4002 | 5002 |
+| **Datenverzeichnis** | `stone_data/` | `stone_data_mainnet/` |
+| **Chain-ID** | `stone-testnet` | `stone-mainnet` |
+
+### Beide Netzwerke starten
+
+```bash
+# Terminal 1: Testnet (Default)
+STONE_NETWORK=testnet ./target/release/stone-master
+
+# Terminal 2: Mainnet
+STONE_NETWORK=mainnet ./target/release/stone-master
+```
+
+Die Seed-Nodes, Ports und Datenverzeichnisse werden automatisch nach Netzwerk getrennt. Kein manuelles Port-Mapping nötig.
+
+### Netzwerk-Isolation
+
+- **Getrennte Seed-Nodes** — Testnet-Peers auf Port 4001, Mainnet-Peers auf Port 5001
+- **Getrennte Daten** — Separate RocksDB-Instanzen, kein Datenmix
+- **Chain-ID Replay-Schutz** — Transaktionen enthalten `chain_id`, Cross-Chain-Replay unmöglich
+- **Alle Ports per ENV überschreibbar** — Für individuelle Setups
+
+### Seed-Nodes
+
+| VPS | Testnet | Mainnet |
+|-----|---------|---------|
+| VPS1 (212.227.54.241) | TCP/UDP 4001 | TCP/UDP 5001 |
+| VPS2 (69.48.200.255) | TCP/UDP 4001 | TCP/UDP 5001 |
+
+Seed-Nodes können per `STONE_NO_SEED=1` deaktiviert werden (für private Netzwerke).
+
+---
+
+## Umgebungsvariablen
+
+### Netzwerk
 
 | Variable | Standard | Beschreibung |
 |---|---|---|
-| `STONE_CLUSTER_API_KEY` | — | **Primär:** Fixer Admin-API-Key (Priorität 1) |
-| `STONE_API_KEY` | — | Fallback Admin-API-Key (Priorität 2) |
-| `STONE_DATA_DIR` | `stone_data` | Verzeichnis für Chain-DB, Chunks, Keys |
-| `STONE_PORT` | `8080` | HTTP-API Port |
-| `STONE_NODE_ID` | Hostname | Node-Identifikator |
-| `STONE_P2P_PORT` | `9000` | libp2p Port |
-| `STONE_P2P_DISABLED` | `0` | P2P deaktivieren (`1` = aus) |
-| `STONE_TLS_CERT` | — | Pfad zum TLS-Zertifikat (aktiviert HTTPS) |
-| `STONE_TLS_KEY` | — | Pfad zum TLS-Key |
-| `STONE_CORS_ORIGINS` | `*` | CORS-Whitelist (kommagetrennt) |
-| `STONE_INSECURE_SSL` | `0` | TLS-Verifikation deaktivieren (nur Dev) |
+| `STONE_NETWORK` | `testnet` | Netzwerk: `testnet` oder `mainnet` |
+| `STONE_NO_SEED` | `0` | `1` = keine eingebauten Seed-Nodes (isoliertes Netz) |
 
-**Token-Priorität:** `STONE_CLUSTER_API_KEY` → `STONE_API_KEY` → `token.bin` → neu generieren
+### Ports
+
+| Variable | Testnet | Mainnet | Beschreibung |
+|---|---|---|---|
+| `STONE_HTTP_PORT` / `STONE_PORT` | 3080 | 3180 | HTTP/REST API Port |
+| `STONE_P2P_PORT` | 4001 | 5001 | libp2p Port (TCP + QUIC) |
+| `STONE_SYNC_PORT` | 4002 | 5002 | Sync-API (kein Auth, Node-zu-Node) |
+| `STONE_P2P_LISTEN` | — | — | Volle Multiaddr, überschreibt Port |
+
+### Daten & Identität
+
+| Variable | Standard | Beschreibung |
+|---|---|---|
+| `STONE_DATA_DIR` | `stone_data` / `stone_data_mainnet` | Datenverzeichnis (auto nach Netzwerk) |
+| `STONE_NODE_ID` / `STONE_NODE_NAME` | Hostname | Node-Identifikator |
+| `STONE_CLUSTER_API_KEY` | — | Admin-API-Key (Priorität 1) |
+| `STONE_API_KEY` | — | Fallback Admin-API-Key (Priorität 2) |
+| `STONE_PASSWORD` | — | Admin-Passwort (Docker/Setup) |
+
+### P2P Bootstrap
+
+| Variable | Beschreibung |
+|---|---|
+| `STONE_BOOTSTRAP_NODES` | HTTP-Bootstrap-Nodes (kommagetrennt) |
+| `STONE_SEED_PEERS` | libp2p-Multiaddrs (kommagetrennt) |
+| `STONE_RELAY_NODES` | Relay-Server für NAT-Traversal |
+| `STONE_RELAY_SERVER` | `1` = dieser Node als Relay aktivieren |
+
+### Docker
+
+| Variable | Beschreibung |
+|---|---|
+| `STONE_DOCKER` | `1` = Docker-Modus (automatisch via Entrypoint) |
+| `STONE_STORAGE_GB` | Angebotener Speicher in GB (default: 50) |
 
 ---
 
-## API-Referenz
+## Binaries & Tools
 
-Alle Endpunkte sind unter `http://localhost:8080` erreichbar.  
-Admin-Endpunkte erfordern den Header: `x-api-key: <ADMIN_KEY>`
+| Binary | Beschreibung |
+|---|---|
+| `stone-setup` | Interaktiver Setup-Wizard → startet danach als Full-Node |
+| `stone-master` | Haupt-Node: REST API, WebSocket, PoA, P2P, Mining |
+| `stone-miner` | Standalone-Miner mit TUI-Dashboard (CPU/RAM/Disk) |
+| `stone-keygen` | Ed25519 Schlüsselpaar-Generator für Validators |
+| `stone-publish-update` | OTA-Update veröffentlichen (Ed25519-signiert) |
+| `stone-auth` | TLS-Zertifikat-Ausstelldienst für Cluster |
+| `db-dump` | RocksDB-Datenbank Inspektion |
 
-### System
+---
+
+## API-Übersicht
+
+Alle Endpunkte unter `http://localhost:3080` (Testnet) bzw. `:3180` (Mainnet).
+
+### System & Status
 
 | Methode | Pfad | Auth | Beschreibung |
 |---|---|---|---|
-| `GET` | `/api/v1/health` | Nein | Einfacher Liveness-Check |
-| `GET` | `/api/v1/status` | Admin | Node-Status, Chain-Höhe, Peers |
+| `GET` | `/api/v1/health` | Nein | Liveness + Netzwerk + Chain-ID |
+| `GET` | `/api/v1/status` | Nein | Vollständiger Node-Status |
+| `GET` | `/api/v1/info` | Nein | Node-Info für Peer-Discovery |
 | `GET` | `/api/v1/metrics` | Admin | Upload/Download-Zähler, Uptime |
-| `GET` | `/api/v1/chain/verify` | Admin | Chain-Integrität vollständig prüfen |
+| `GET` | `/api/v1/dashboard` | Admin | Dashboard-Daten |
+| `WS` | `/ws` | Nein | Real-Time Events (Blocks, TXs, Peers) |
 
-### Dokumente
-
-| Methode | Pfad | Auth | Beschreibung |
-|---|---|---|---|
-| `GET` | `/api/v1/documents` | Admin | Alle aktiven Dokumente (paginiert) |
-| `GET` | `/api/v1/documents?q=&page=&per_page=` | Admin | Suche + Pagination |
-| `GET` | `/api/v1/documents/search?q=` | User | Volltextsuche |
-| `GET` | `/api/v1/documents/user/:user_id` | User¹ | Dokumente eines Nutzers |
-| `GET` | `/api/v1/documents/:doc_id` | User¹ | Dokument-Metadaten |
-| `GET` | `/api/v1/documents/:doc_id/history` | User¹ | Versionshistorie |
-| `GET` | `/api/v1/documents/:doc_id/data` | User¹ | Roh-Bytes (rekonstruiert aus Chunks) |
-| `POST` | `/api/v1/documents` | User | Dokument hochladen (Multipart) |
-| `PATCH` | `/api/v1/documents/:doc_id` | User¹ | Metadaten aktualisieren |
-| `DELETE` | `/api/v1/documents/:doc_id` | User¹ | Soft-Delete (Tombstone) |
-
-¹ User kann nur eigene Dokumente sehen/bearbeiten; Admin sieht alle.
-
-**Upload-Felder (Multipart):**
-```
-file     — Binärdaten (erforderlich)
-title    — Anzeigename (optional)
-tags     — Kommagetrennte Tags (optional)
-owner    — User-ID des Besitzers (optional, Standard: aufrufender User)
-encrypt  — "true" für AES-256-GCM Verschlüsselung (optional)
-```
-
-### Blöcke
+### Token & Wallet
 
 | Methode | Pfad | Auth | Beschreibung |
 |---|---|---|---|
-| `GET` | `/api/v1/blocks` | Admin | Alle Blöcke (paginiert) |
-| `GET` | `/api/v1/blocks/:index` | Admin | Block nach Index |
+| `POST` | `/api/v1/token/transfer` | User | Signierte Token-Transaktion |
+| `POST` | `/api/v1/token/send` | User | Mnemonic-basierter Transfer |
+| `GET` | `/api/v1/token/supply` | Nein | Aktuelles Token-Supply |
+| `GET` | `/api/v1/token/pending` | Nein | Pending Mempool Transaktionen |
+| `GET` | `/api/v1/token/history/:addr` | Nein | TX-Historie einer Adresse |
+| `GET` | `/api/v1/wallet/:addr/balance` | Nein | Wallet-Balance + Nonce |
+| `POST` | `/api/v1/wallet/create` | User | Neues Wallet erstellen |
 
-### Nutzer
-
-| Methode | Pfad | Auth | Beschreibung |
-|---|---|---|---|
-| `POST` | `/api/v1/auth/signup` | Nein | Neuen Nutzer anlegen |
-| `POST` | `/api/v1/auth/login` | Nein | BIP-39 Phrase → API-Key |
-| `GET` | `/api/v1/users` | Admin | Alle Nutzer mit Quota-Info |
-| `DELETE` | `/api/v1/users/:user_id` | Admin | Nutzer löschen |
-
-**Signup-Request:**
-```json
-{ "name": "Max Mustermann" }
-```
-**Signup-Response:**
-```json
-{
-  "id": "user-3",
-  "api_key": "abc123...",
-  "phrase": "word1 word2 ... word12"
-}
-```
-⚠️ Die Phrase wird nur einmal zurückgegeben und ist der einzige Wiederherstellungsweg.
-
-### Peers & Sync
+### Staking
 
 | Methode | Pfad | Auth | Beschreibung |
 |---|---|---|---|
-| `GET` | `/api/v1/peers` | Admin | Peer-Liste mit Status |
-| `POST` | `/api/v1/peers` | Admin | Peer hinzufügen |
-| `DELETE` | `/api/v1/peers/:idx` | Admin | Peer entfernen |
-| `POST` | `/api/v1/sync` | Admin | Manuelle Synchronisation |
+| `GET` | `/api/v1/staking/pool` | Nein | Pool-Info (APY, Total Staked) |
+| `GET` | `/api/v1/staking/staker/:addr` | Nein | Staker-Details |
 
-### PoA Konsensus
+### Mining
 
 | Methode | Pfad | Auth | Beschreibung |
 |---|---|---|---|
+| `GET` | `/api/v1/mining/status` | Admin | Mining-Status |
+| `POST` | `/api/v1/mining/template` | Admin | Block-Template anfordern |
+| `POST` | `/api/v1/mining/submit` | Admin | Geminten Block einreichen |
+
+### Chat & Organisationen
+
+| Methode | Pfad | Auth | Beschreibung |
+|---|---|---|---|
+| `POST` | `/api/v1/chat/send` | User | Nachricht senden (E2E-verschlüsselt) |
+| `GET` | `/api/v1/chat/conversations` | User | Alle Konversationen |
+| `POST` | `/api/v1/chat/send-coins` | User | Coins im Chat senden |
+| `POST` | `/api/v1/orgs` | User | Organisation erstellen |
+| `GET` | `/api/v1/orgs` | User | Eigene Organisationen |
+
+### HTLC & Bridge
+
+| Methode | Pfad | Auth | Beschreibung |
+|---|---|---|---|
+| `POST` | `/api/v1/htlc/create` | User | Atomic Swap erstellen |
+| `POST` | `/api/v1/htlc/claim` | User | Swap einlösen (Preimage) |
+| `POST` | `/api/v1/bridge/deposit` | User | Wrapped Token einzahlen |
+| `POST` | `/api/v1/bridge/withdraw` | User | Wrapped Token auszahlen |
+
+### Governance & Konsensus
+
+| Methode | Pfad | Auth | Beschreibung |
+|---|---|---|---|
+| `POST` | `/api/v1/governance/vote` | User | Governance-Vote abgeben |
 | `GET` | `/api/v1/validators` | Admin | Validator-Whitelist |
-| `POST` | `/api/v1/validators` | Admin | Validator hinzufügen |
-| `DELETE` | `/api/v1/validators/:node_id` | Admin | Validator entfernen |
-| `PATCH` | `/api/v1/validators/:node_id/active` | Admin | Validator aktivieren/deaktivieren |
-| `GET` | `/api/v1/validators/self` | Admin | Eigener Validator-Status + Public Key |
-| `GET` | `/api/v1/consensus/status` | Admin | Konsensus-Status, aktive Runde |
-| `POST` | `/api/v1/consensus/vote` | Admin | Vote abgeben |
-| `GET` | `/api/v1/consensus/forks` | Admin | Fork-Kandidaten erkennen |
-| `POST` | `/api/v1/consensus/resolve` | Admin | Fork auflösen |
+| `GET` | `/api/v1/consensus/status` | Admin | Konsensus-Runde |
 
-### P2P
+### Game SDK (40+ Endpunkte)
 
 | Methode | Pfad | Auth | Beschreibung |
 |---|---|---|---|
-| `GET` | `/api/v1/p2p/peers` | Admin | Verbundene P2P-Peers |
-| `POST` | `/api/v1/p2p/dial` | Admin | Peer per Multiaddr verbinden |
-| `GET` | `/api/v1/p2p/info` | Admin | Lokale P2P-Identität |
-| `GET` | `/api/v1/p2p/config` | Admin | P2P-Konfiguration |
-| `GET` | `/api/v1/p2p/status` | Admin | P2P-Netzwerk-Status |
-| `POST` | `/api/v1/p2p/ping/:peer_id` | Admin | Peer anpingen |
+| `POST` | `/api/v1/sdk/register` | User | Spiel registrieren |
+| `POST` | `/api/v1/sdk/marketplace/list` | User | NFT listen |
+| `POST` | `/api/v1/sdk/marketplace/buy` | User | NFT kaufen |
+| `POST` | `/api/v1/sdk/tournament/create` | User | Turnier erstellen |
 
-### WebSocket
-
-```
-ws://localhost:8080/ws
-```
-Sendet JSON-Events für alle Node-Aktivitäten (Uploads, Blocks, Peer-Änderungen).
-
-**Event-Format:**
-```json
-{ "type": "document_uploaded", "payload": { "doc_id": "...", "owner": "user-1" } }
-```
+*Vollständige API-Dokumentation: alle Routen in `src/bin/server/router.rs`*
 
 ---
 
 ## Authentifizierung
 
-### Admin-Key
+### Admin-Key (x-api-key)
 
-Für alle Admin-Endpunkte:
 ```http
 x-api-key: sk_38e597...
 ```
 
-### User-Keys
+Gesetzt via `STONE_CLUSTER_API_KEY` oder `STONE_API_KEY`.
 
-Nutzer authentifizieren sich mit ihrem persönlichen API-Key (erhalten beim Signup):
+### Session-Token (Bearer)
+
 ```http
-x-api-key: d3af03c706...
+Authorization: Bearer <session_token>
 ```
+
+Ablauf:
+1. `POST /api/v1/auth/challenge` → Server sendet Challenge
+2. Client signiert Challenge mit Ed25519 Private Key
+3. `POST /api/v1/auth/verify` → Server gibt Session-Token (24h TTL, HMAC-SHA256)
+
+### QR-Code Login (Cross-Device)
+
+1. `POST /api/v1/auth/qr/create` → `{ login_token, expires_in }`
+2. App scannt QR, bestätigt via `POST /api/v1/auth/qr/confirm`
+3. Browser pollt `GET /api/v1/auth/qr/status/:token` → Session-Token
 
 ### BIP-39 Wiederherstellung
 
-Der API-Key wird aus der 12-Wort-Mnemonic-Phrase abgeleitet (SHA-256 Hash). Bei Verlust des Keys kann er via `/api/v1/auth/login` mit der Phrase wiederhergestellt werden.
+12- oder 24-Wort Mnemonic-Phrase → Ed25519-Keypair → Wallet-Adresse. Die Phrase wird beim Signup einmalig ausgegeben.
 
 ---
 
-## PoA-Konsensus
+## Docker Deployment
 
-Stone nutzt **Proof of Authority**: Nur explizit zugelassene Nodes (Validatoren) dürfen Blöcke schreiben.
-
-### Wie es funktioniert
-
-1. **Validator-Whitelist** — Jede Node hat eine Ed25519-Identität. Der Admin trägt `node_id` + `public_key_hex` in die Whitelist ein.
-2. **Upload** — Beim Dokument-Upload prüft der Node ob seine eigene `node_id` ein aktiver Validator ist.
-3. **Signatur** — Der Node signiert den Block mit seinem privaten Validator-Key.
-4. **Verifikation** — Andere Nodes prüfen Signatur gegen die Whitelist beim Sync.
-
-### Validator hinzufügen
+### Beide Netzwerke starten
 
 ```bash
-# Eigenen Public Key abrufen
-curl -H "x-api-key: $ADMIN_KEY" http://localhost:8080/api/v1/validators/self
-
-# Validator registrieren
-curl -X POST -H "x-api-key: $ADMIN_KEY" \
-  -H "Content-Type: application/json" \
-  -d '{"node_id":"mein-node","public_key_hex":"abc123...","name":"Mein Node"}' \
-  http://localhost:8080/api/v1/validators
+docker-compose -f docker/docker-compose.yml up --build
 ```
 
----
-
-## Deployment
-
-### Produktions-Setup (Ubuntu/Debian)
+### Nur ein Netzwerk
 
 ```bash
-# Einmaliges Server-Setup (Domain erforderlich)
-sudo bash deploy/setup.sh meine-domain.de
+# Nur Testnet
+docker-compose -f docker/docker-compose.yml up --build node-testnet
+
+# Nur Mainnet
+docker-compose -f docker/docker-compose.yml up --build node-mainnet
 ```
 
-Siehe `deploy/` für:
-- `nginx.conf` — Reverse-Proxy + TLS-Terminierung
-- `stone-master.service` — Systemd Unit
-- `forge-nomad.service` — Systemd Unit  
-- `setup.sh` — Automatisches Server-Setup
+### Port-Mapping (Docker)
 
-### Wichtige Sicherheitshinweise
+| Service | HTTP | P2P | Volume |
+|---|---|---|---|
+| `node-testnet` | 8080 | 4001 | `testnet_data` |
+| `node-mainnet` | 8180 | 5001 | `mainnet_data` |
 
-- Port `8080` muss durch Firewall geblockt sein (`ufw deny 8080`)
-- `.env` enthält den Admin-Key — **nie committen** (steht in `.gitignore`)
-- `stone_data/keys/` enthält private Schlüssel — **nie committen**
-- In Produktion: `STONE_CLUSTER_API_KEY` als Systemd-EnvironmentFile setzen
+### Systemd (direkt auf VPS)
+
+```bash
+sudo cp configs/stone-node.service /etc/systemd/system/
+sudo systemctl enable --now stone-node
+```
 
 ---
 
@@ -319,64 +392,112 @@ Siehe `deploy/` für:
 ```
 stone/
 ├── src/
-│   ├── lib.rs               # Modul-Baum
-│   ├── auth.rs              # User-Verwaltung, BIP-39, TLS-Cert-Fetch
-│   ├── blockchain.rs        # Block/Document Structs, Chain, RocksDB
-│   ├── consensus.rs         # PoA: Validators, Voting, Fork-Erkennung
-│   ├── crypto.rs            # Ed25519, X25519 ECDH, AES-256-GCM
-│   ├── master_node.rs       # MasterNodeState, Upload-Logik, Events
-│   ├── network.rs           # libp2p P2P (Kademlia, Gossipsub)
-│   ├── storage.rs           # Chunk-Store
-│   ├── tls.rs               # rustls Server-Config-Helpers
+│   ├── lib.rs                  # Modul-Baum
+│   ├── blockchain.rs           # Block-Structs, Chain-Logik, RocksDB
+│   ├── consensus.rs            # PoA: Validators, Voting, Fork-Erkennung
+│   ├── crypto.rs               # Ed25519, X25519, AES-256-GCM, Argon2id
+│   ├── master_node.rs          # MasterNodeState, Upload-Logik, Events
+│   ├── network/                # libp2p P2P (Gossipsub, Kademlia, Relay)
+│   ├── storage.rs              # Chunk-Store (Content-Addressed)
+│   ├── storage_proof.rs        # Proof-of-Storage Challenges
+│   ├── chat.rs                 # E2E-verschlüsselter Chat
+│   ├── chat_policy.rs          # Self-Destruct, Reporting, Stake-Gate
+│   ├── message_pool.rs         # Off-Chain Messages + Merkle-Batch
+│   ├── merkle_batch.rs         # Merkle-Tree für Chat-Anchoring
+│   ├── organization.rs         # Org-Management (Rollen, Channels)
+│   ├── shard.rs                # Erasure-Coding (Reed-Solomon)
+│   ├── snapshot.rs             # Zstd-Snapshots für Fast-Sync
+│   ├── updater.rs              # OTA-Update (Ed25519-signiert)
+│   ├── auth.rs                 # User-Auth, BIP39, QR-Login
+│   ├── token/
+│   │   ├── mod.rs              # Token-Modul Einstieg
+│   │   ├── ledger.rs           # Account-Ledger (RocksDB)
+│   │   ├── transaction.rs      # TokenTx, Signatur, Chain-ID
+│   │   ├── genesis.rs          # 50M Genesis-Allocation
+│   │   ├── wallet.rs           # Ed25519 Wallet, BIP39
+│   │   ├── address.rs          # Bech32m (stone1...) Adressen
+│   │   ├── mempool.rs          # TX-Queue mit Validierung
+│   │   ├── staking.rs          # PoS-Pool, Epochs, Rewards
+│   │   ├── governance.rs       # Dual-Vote, Multisig, Timelock
+│   │   ├── reputation.rs       # Node-Reputation (0-100)
+│   │   ├── bridge.rs           # Wrapped Token Bridge
+│   │   ├── htlc.rs             # Hash Time-Locked Contracts
+│   │   ├── market_sim.rs       # Testnet Markt-Simulator
+│   │   └── game_economy.rs     # Game SDK (NFTs, Marketplace)
 │   └── bin/
-│       ├── master_server.rs # Haupt-Binary: REST API + WebSocket
-│       └── auth_server.rs   # Auth-Binary: TLS-Zertifikate ausstellen
-├── web/
-│   ├── blockhain.html       # Management-Panel (Admin)
-│   ├── stonechain.html      # Public-Panel (Nutzer)
-│   └── blockchain.css       # Gemeinsame Styles
-├── deploy/
-│   ├── nginx.conf           # Nginx Reverse-Proxy Konfiguration
-│   ├── stone-master.service # Systemd Unit für stone-master
-│   ├── forge-nomad.service  # Systemd Unit für forge-Nomad
-│   └── setup.sh             # Automatisches Server-Setup (Ubuntu/Debian)
-├── stone_data/              # Laufzeit-Daten (gitignored)
-│   ├── chain_db/            # RocksDB (Chain-Daten)
-│   ├── chunks/              # Binäre Dokument-Chunks
-│   ├── keys/                # Ed25519 Schlüsselpaare
-│   └── users.json           # Nutzer-Datenbank
-├── .env                     # Lokale Konfiguration (gitignored)
-├── start.sh                 # Node starten (lädt .env)
-├── sync_token.sh            # API-Key zwischen .env-Dateien synchronisieren
-└── Cargo.toml
+│       ├── master_server.rs    # Haupt-Binary: REST + WS + P2P
+│       ├── stone_miner.rs      # Standalone-Miner mit TUI
+│       ├── setup.rs            # Setup-Wizard + Full-Node
+│       ├── auth_server.rs      # TLS-Zertifikat-Authority
+│       ├── stone_keygen.rs     # Ed25519 Key-Generator
+│       ├── stone_publish_update.rs  # OTA-Publish Tool
+│       ├── db_dump.rs          # DB-Inspektion
+│       └── server/             # Axum Router + Handler (150+ Endpunkte)
+├── docker/
+│   ├── docker-compose.yml      # Testnet + Mainnet Services
+│   ├── Dockerfile              # Multi-Stage Build
+│   └── entrypoint.sh           # Auto-Setup + OTA
+├── configs/
+│   └── stone-node.service      # Systemd Unit
+├── scripts/                    # Deploy, Release, Airdrop Tools
+├── stone_data/                 # Testnet-Daten (gitignored)
+├── stone_data_mainnet/         # Mainnet-Daten (gitignored)
+├── start.sh                    # Quick-Start Script
+└── Cargo.toml                  # 7 Binaries, 50+ Dependencies
 ```
+
+---
+
+## Technologie-Stack
+
+| Komponente | Technologie |
+|---|---|
+| **Runtime** | Tokio (async, multi-threaded) |
+| **HTTP** | Axum 0.8 (REST + WebSocket + Multipart) |
+| **P2P** | libp2p 0.55 (QUIC, TCP, Gossipsub, Kademlia, mDNS, Relay, UPnP) |
+| **Persistenz** | RocksDB 0.22 (Snappy, Column Families) |
+| **Kryptographie** | Ed25519-dalek, X25519-dalek, AES-256-GCM, SHA-256, Argon2id |
+| **Adressen** | Bech32m (`stone1...`), intern 64-Hex |
+| **Serialisierung** | serde_json + bincode |
+| **Präzision** | rust_decimal (8 Dezimalstellen) |
+| **Erasure Coding** | Reed-Solomon 6.0 |
+| **Kompression** | tar + zstd |
+| **TUI** | Ratatui (Miner Dashboard) |
+| **Setup UI** | Dialoguer + Indicatif |
 
 ---
 
 ## Curl-Beispiele
 
 ```bash
-export ADMIN_KEY="sk_38e597..."
-export BASE="http://localhost:8080"
+export KEY="sk_38e597..."
+export BASE="http://localhost:3080"    # Testnet
+# export BASE="http://localhost:3180"  # Mainnet
 
-# Status
-curl -H "x-api-key: $ADMIN_KEY" "$BASE/api/v1/status"
+# Health-Check (zeigt Netzwerk + Chain-ID)
+curl "$BASE/api/v1/health"
 
-# Dokument hochladen
-curl -X POST -H "x-api-key: $ADMIN_KEY" \
-  -F "file=@/pfad/zur/datei.pdf" \
-  -F "title=Mein Dokument" \
-  -F "tags=intern,v1" \
-  "$BASE/api/v1/documents"
+# Token-Supply
+curl "$BASE/api/v1/token/supply"
 
-# Alle Nutzer
-curl -H "x-api-key: $ADMIN_KEY" "$BASE/api/v1/users"
+# Wallet-Balance
+curl "$BASE/api/v1/wallet/stone1abc.../balance"
 
-# Neuen Nutzer anlegen
-curl -X POST -H "Content-Type: application/json" \
-  -d '{"name":"Max Mustermann"}' \
-  "$BASE/api/v1/auth/signup"
+# Token-Transfer (mit Mnemonic)
+curl -X POST -H "x-api-key: $KEY" \
+  -H "Content-Type: application/json" \
+  -d '{"mnemonic":"word1 word2 ...","to":"stone1xyz...","amount":"10.0"}' \
+  "$BASE/api/v1/token/send"
 
-# Validators anzeigen
-curl -H "x-api-key: $ADMIN_KEY" "$BASE/api/v1/validators"
+# Staking-Pool Info
+curl "$BASE/api/v1/staking/pool"
+
+# Chat-Nachricht senden
+curl -X POST -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"to":"user-id","content":"Hallo!"}' \
+  "$BASE/api/v1/chat/send"
+
+# Alle Validators
+curl -H "x-api-key: $KEY" "$BASE/api/v1/validators"
 ```

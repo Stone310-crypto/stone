@@ -1,42 +1,69 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Stone Network – Docker Compose
 #
-# Standard:  1 Node  →  docker-compose -f docker/docker-compose.yml up --build
-# Cluster:   3 Nodes →  docker-compose -f docker/docker-compose.yml --profile cluster up --build
+# Testnet:   docker-compose -f docker/docker-compose.yml up --build node-testnet
+# Mainnet:   docker-compose -f docker/docker-compose.yml up --build node-mainnet
+# Beide:     docker-compose -f docker/docker-compose.yml up --build
 #
-# Dashboard: http://localhost:8080
+# Testnet Dashboard: http://localhost:8080
+# Mainnet Dashboard: http://localhost:8180
 # ─────────────────────────────────────────────────────────────────────────────
 
 services:
 
-  # ── Haupt-Node (startet immer) ─────────────────────────────────────────────
-  node:
+  # ── Testnet Node ────────────────────────────────────────────────────────────
+  node-testnet:
     build:
       context: ..
       dockerfile: docker/Dockerfile
-    container_name: stone-node
-    hostname: stone-node
+    container_name: stone-testnet
+    hostname: stone-testnet
     ports:
       - "8080:8080"
-      - "4001:4001"      # P2P TCP
-      - "4001:4001/udp"  # P2P QUIC (UDP)
+      - "4001:4001"      # P2P TCP (Testnet)
+      - "4001:4001/udp"  # P2P QUIC (Testnet)
     environment:
-      STONE_NODE_NAME: "stone-node"
+      STONE_NETWORK: "testnet"
+      STONE_NODE_NAME: "stone-testnet"
       STONE_PASSWORD: "TestPasswort1!"
       STONE_STORAGE_GB: "50"
       STONE_HTTP_PORT: "8080"
       STONE_P2P_PORT: "4001"
-      # Bootstrap zuerst zum VPS (öffentliche IPv4), dann IPv6-Server
-      STONE_SEED_PEERS: "/ip4/212.227.54.241/tcp/4001/p2p/12D3KooWAq975k49YZiCdaf3V96iJtU9fxqmoGRZW3e3Ceupv17k,/ip4/212.227.54.241/udp/4001/quic-v1/p2p/12D3KooWAq975k49YZiCdaf3V96iJtU9fxqmoGRZW3e3Ceupv17k"
-      # STONE_ADMIN_KEY: "" # Optional: separater Admin-Key
+      STONE_SEED_PEERS: "/ip4/212.227.54.241/tcp/4001/p2p/12D3KooWNz9GTNsFks567mHaQLKR4Ai6MCiw5WUDWAgvny1ow4tJ,/ip4/212.227.54.241/udp/4001/quic-v1/p2p/12D3KooWNz9GTNsFks567mHaQLKR4Ai6MCiw5WUDWAgvny1ow4tJ"
     volumes:
-      - node_data:/opt/stone-node/stone_data
+      - testnet_data:/opt/stone-node/stone_data
+    networks:
+      - stonenet
+    restart: unless-stopped
+
+  # ── Mainnet Node ────────────────────────────────────────────────────────────
+  node-mainnet:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: stone-mainnet
+    hostname: stone-mainnet
+    ports:
+      - "8180:8180"
+      - "5001:5001"      # P2P TCP (Mainnet)
+      - "5001:5001/udp"  # P2P QUIC (Mainnet)
+    environment:
+      STONE_NETWORK: "mainnet"
+      STONE_NODE_NAME: "stone-mainnet"
+      STONE_PASSWORD: "TestPasswort1!"
+      STONE_STORAGE_GB: "50"
+      STONE_HTTP_PORT: "8180"
+      STONE_P2P_PORT: "5001"
+      STONE_SEED_PEERS: "/ip4/212.227.54.241/tcp/5001/p2p/12D3KooWNz9GTNsFks567mHaQLKR4Ai6MCiw5WUDWAgvny1ow4tJ,/ip4/212.227.54.241/udp/5001/quic-v1/p2p/12D3KooWNz9GTNsFks567mHaQLKR4Ai6MCiw5WUDWAgvny1ow4tJ"
+    volumes:
+      - mainnet_data:/opt/stone-node/stone_data_mainnet
     networks:
       - stonenet
     restart: unless-stopped
 
 volumes:
-  node_data:
+  testnet_data:
+  mainnet_data:
 
 networks:
   stonenet:

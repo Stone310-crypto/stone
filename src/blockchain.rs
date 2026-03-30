@@ -48,8 +48,18 @@ impl<'de> Deserialize<'de> for JsonValue {
 
 /// Datenverzeichnis – überschreibbar per `STONE_DATA_DIR` env var.
 /// Verwendet von: token, RocksDB, chunks, users, peers.
+/// Mainnet: `stone_data_mainnet/`, Testnet: `stone_data/` (backward-kompatibel).
 pub fn data_dir() -> String {
-    std::env::var("STONE_DATA_DIR").unwrap_or_else(|_| "stone_data".to_string())
+    std::env::var("STONE_DATA_DIR").unwrap_or_else(|_| {
+        let mode = std::env::var("STONE_NETWORK")
+            .unwrap_or_default()
+            .to_lowercase();
+        if mode == "mainnet" || mode == "main" {
+            "stone_data_mainnet".to_string()
+        } else {
+            "stone_data".to_string()
+        }
+    })
 }
 
 pub const MAX_BLOCK_SIZE: u64 = 5 * 1024 * 1024 * 1024; // 5 GiB

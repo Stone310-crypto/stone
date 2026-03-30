@@ -6,12 +6,13 @@
 # Danach startet stone-setup direkt im Full-Node-Modus.
 #
 # Umgebungsvariablen:
+#   STONE_NETWORK        – Netzwerk: "testnet" (default) oder "mainnet"
 #   STONE_NODE_NAME      – Name der Node (Pflicht)
 #   STONE_PASSWORD       – Admin-Passwort, min 8 Zeichen (Pflicht)
 #   STONE_STORAGE_GB     – Angebotener Speicher in GB (default: 50)
 #   STONE_SEED_PEERS     – Komma-separierte Seed-Peer Multiaddrs
 #   STONE_HTTP_PORT      – HTTP-Port (default: 8080)
-#   STONE_P2P_PORT       – P2P-Port (default: 4001)
+#   STONE_P2P_PORT       – P2P-Port (default: 4001 testnet, 5001 mainnet)
 #   STONE_ADMIN_KEY      – Separater Admin-Key (optional, empfohlen)
 #   STONE_VALIDATOR_PASSPHRASE – Passphrase für Validator-Key-Verschlüsselung
 # ─────────────────────────────────────────────────────────────────────────────
@@ -23,11 +24,22 @@ export STONE_DOCKER=1
 NODE_NAME="${STONE_NODE_NAME:-}"
 PASSWORD="${STONE_PASSWORD:-}"
 STORAGE_GB="${STONE_STORAGE_GB:-50}"
-# VPS Bootstrap-Node als Default (öffentliche IPv4, weltweit erreichbar)
-DEFAULT_SEEDS="/ip4/212.227.54.241/tcp/4001/p2p/12D3KooWAq975k49YZiCdaf3V96iJtU9fxqmoGRZW3e3Ceupv17k,/ip4/212.227.54.241/udp/4001/quic-v1/p2p/12D3KooWAq975k49YZiCdaf3V96iJtU9fxqmoGRZW3e3Ceupv17k"
+NETWORK="${STONE_NETWORK:-testnet}"
+
+# Netzwerk-abhängige Defaults
+if [ "$NETWORK" = "mainnet" ] || [ "$NETWORK" = "main" ]; then
+    DEFAULT_HTTP_PORT="8180"
+    DEFAULT_P2P_PORT="5001"
+    DEFAULT_SEEDS="/ip4/212.227.54.241/tcp/5001/p2p/12D3KooWNz9GTNsFks567mHaQLKR4Ai6MCiw5WUDWAgvny1ow4tJ,/ip4/212.227.54.241/udp/5001/quic-v1/p2p/12D3KooWNz9GTNsFks567mHaQLKR4Ai6MCiw5WUDWAgvny1ow4tJ"
+else
+    DEFAULT_HTTP_PORT="8080"
+    DEFAULT_P2P_PORT="4001"
+    DEFAULT_SEEDS="/ip4/212.227.54.241/tcp/4001/p2p/12D3KooWNz9GTNsFks567mHaQLKR4Ai6MCiw5WUDWAgvny1ow4tJ,/ip4/212.227.54.241/udp/4001/quic-v1/p2p/12D3KooWNz9GTNsFks567mHaQLKR4Ai6MCiw5WUDWAgvny1ow4tJ"
+fi
+
 SEED_PEERS="${STONE_SEED_PEERS:-$DEFAULT_SEEDS}"
-HTTP_PORT="${STONE_HTTP_PORT:-8080}"
-P2P_PORT="${STONE_P2P_PORT:-4001}"
+HTTP_PORT="${STONE_HTTP_PORT:-$DEFAULT_HTTP_PORT}"
+P2P_PORT="${STONE_P2P_PORT:-$DEFAULT_P2P_PORT}"
 
 DATA_DIR="/opt/stone-node/stone_data"
 BINARY="/opt/stone-node/target/release/stone-setup"
@@ -77,7 +89,8 @@ fi
 if [ -f "$CONFIG_FILE" ]; then
     SETUP_DONE=$(grep -o '"setup_complete":true' "$CONFIG_FILE" 2>/dev/null || echo "")
     if [ -n "$SETUP_DONE" ]; then
-        echo "✅ Node bereits konfiguriert → starte Full-Node..."
+        echo "✅ Node bereits konfiguriert ($NETWORK) → starte Full-Node..."
+        export STONE_NETWORK="$NETWORK"
         export STONE_PORT="$HTTP_PORT"
         export STONE_P2P_PORT="$P2P_PORT"
         export STONE_P2P_LISTEN="/ip4/0.0.0.0/tcp/$P2P_PORT"
@@ -92,6 +105,7 @@ fi
 echo "🔧 Erster Start – konfiguriere Node '$NODE_NAME' automatisch..."
 
 # stone-setup im Hintergrund starten (wartet auf Setup via API)
+export STONE_NETWORK="$NETWORK"
 export STONE_PORT="$HTTP_PORT"
 export STONE_P2P_PORT="$P2P_PORT"
 export STONE_P2P_LISTEN="/ip4/0.0.0.0/tcp/$P2P_PORT"

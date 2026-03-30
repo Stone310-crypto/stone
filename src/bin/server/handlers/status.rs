@@ -14,6 +14,7 @@ use super::super::state::AppState;
 pub async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
     let summary = state.node.chain_summary();
     let network = stone::token::NetworkMode::from_env();
+    let chain_id = stone::token::transaction::default_chain_id();
     (
         StatusCode::OK,
         axum::Json(json!({
@@ -23,6 +24,7 @@ pub async fn handle_health(State(state): State<AppState>) -> impl IntoResponse {
             "block_height": summary.block_height,
             "latest_hash": &summary.latest_hash[..12.min(summary.latest_hash.len())],
             "network": network.to_string(),
+            "chain_id": chain_id,
         })),
     )
 }

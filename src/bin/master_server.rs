@@ -1167,17 +1167,23 @@ async fn main() {
         });
     }
 
+    // ── Netzwerk-abhängige Default-Ports ─────────────────────────────────────
+    // Mainnet: HTTP 3180, Sync 5002 | Testnet: HTTP 3080, Sync 4002
+    let mainnet = stone::network::is_mainnet();
+    let default_http = if mainnet { 3180 } else { 3080 };
+    let default_sync = if mainnet { 5002 } else { 4002 };
+
     let preferred_port: u16 = std::env::var("STONE_HTTP_PORT")
         .or_else(|_| std::env::var("STONE_PORT"))
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(3080);
+        .unwrap_or(default_http);
 
     // ── Public Sync Port (kein Auth, für Node-zu-Node Kommunikation) ─────
     let sync_port: u16 = std::env::var("STONE_SYNC_PORT")
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(4002);
+        .unwrap_or(default_sync);
 
     let sync_router = build_sync_router(state);
     let sync_listener = bind_with_fallback(sync_port).await;
@@ -1190,9 +1196,13 @@ async fn main() {
 
     let listener = bind_with_fallback(preferred_port).await;
     let bound_port = listener.local_addr().unwrap().port();
+    let net_label = if mainnet { "MAINNET" } else { "TESTNET" };
+    println!("[master] ═══════════════════════════════════════");
+    println!("[master] 🌐 Netzwerk: {net_label}");
     println!("[master] HTTP auf 0.0.0.0:{bound_port} (Admin-API)");
     println!("[master] Stone Master Node läuft auf http://0.0.0.0:{bound_port}");
     println!("[master] Web-UI kann sich via ws://0.0.0.0:{bound_port}/ws verbinden");
+    println!("[master] ═══════════════════════════════════════");
     axum::serve(listener, router).await.expect("HTTP-Server Fehler");
 }
 

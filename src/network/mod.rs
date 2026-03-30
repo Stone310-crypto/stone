@@ -92,6 +92,7 @@ const SEEN_CACHE_SIZE: usize = 2048;
 // ─── Konstanten ───────────────────────────────────────────────────────────────
 
 const DEFAULT_DATA_DIR: &str = "stone_data";
+const DEFAULT_DATA_DIR_MAINNET: &str = "stone_data_mainnet";
 const P2P_KEY_FILENAME: &str = "p2p.key";
 const P2P_CONFIG_FILENAME: &str = "p2p_config.json";
 
@@ -113,41 +114,71 @@ const BANNED_PEERS_FILENAME: &str = "banned_peers.json";
 /// Standard-libp2p-Port des Stone-Netzwerks
 pub const DEFAULT_P2P_PORT: u16 = 7654;
 
+// ─── Netzwerk-Erkennung ────────────────────────────────────────────────────────
+
+/// Prüft ob wir im Mainnet laufen (STONE_NETWORK=mainnet|main).
+pub fn is_mainnet() -> bool {
+    let mode = std::env::var("STONE_NETWORK")
+        .unwrap_or_default()
+        .to_lowercase();
+    mode == "mainnet" || mode == "main"
+}
+
 // ─── Built-in Seed-Nodes ──────────────────────────────────────────────────────
 //
-// Mindestens ein Seed-Node ist nötig damit neue Nodes das Netzwerk finden können.
-// Die Seed-Nodes werden als Bootstrap UND als Relay genutzt.
-// Weitere Nodes können per ENV (STONE_BOOTSTRAP_NODES) hinzugefügt werden.
+// Mainnet und Testnet haben **getrennte** Seed-Nodes und Ports.
+// Dadurch können sie auf denselben VPS laufen ohne sich gegenseitig zu stören.
 //
 // Format: "/ip4/<IP>/tcp/<PORT>/p2p/<PeerId>"
 //
 // HINWEIS: Diese Liste kann per `STONE_NO_SEED=1` deaktiviert werden.
 //          Das ist nützlich für komplett private / isolierte Netzwerke.
 
-/// Eingebaute Seed-Nodes – der erste Einstiegspunkt ins Stone-Netzwerk.
-/// Jeder dieser Nodes ist gleichzeitig Relay-Server und Bootstrap-Node.
-/// TCP und QUIC (UDP) Adressen – QUIC wird für NAT-Traversal bevorzugt.
-///
-/// WICHTIG: Die Reihenfolge bestimmt die Verbindungs-Priorität.
-/// VPS1 (212.227.54.241) ist der primäre Bootstrap und muss immer zuerst stehen.
-/// VPS2 (69.48.200.255) ist der sekundäre Bootstrap (Redundanz).
-const SEED_NODES: &[&str] = &[
-    // ── VPS1 (212.227.54.241 / 2a02:2479:a0:fa00::1) – primärer Bootstrap + Relay ───
+/// Testnet Seed-Nodes (Port 4001) – Standard-Netzwerk für Entwicklung.
+const SEED_NODES_TESTNET: &[&str] = &[
+    // ── VPS1 (212.227.54.241) – primärer Testnet-Bootstrap + Relay ───
     "/ip4/212.227.54.241/tcp/4001/p2p/12D3KooWNz9GTNsFks567mHaQLKR4Ai6MCiw5WUDWAgvny1ow4tJ",
     "/ip4/212.227.54.241/udp/4001/quic-v1/p2p/12D3KooWNz9GTNsFks567mHaQLKR4Ai6MCiw5WUDWAgvny1ow4tJ",
     "/ip6/2a02:2479:a0:fa00::1/tcp/4001/p2p/12D3KooWNz9GTNsFks567mHaQLKR4Ai6MCiw5WUDWAgvny1ow4tJ",
     "/ip6/2a02:2479:a0:fa00::1/udp/4001/quic-v1/p2p/12D3KooWNz9GTNsFks567mHaQLKR4Ai6MCiw5WUDWAgvny1ow4tJ",
-    // ── VPS2 (69.48.200.255 / 2607:f1c0:f074:4300::1) – sekundärer Bootstrap + Relay ───
+    // ── VPS2 (69.48.200.255) – sekundärer Testnet-Bootstrap + Relay ───
     "/ip4/69.48.200.255/tcp/4001/p2p/12D3KooWQ4yo42uYwihPAJx1qXm85rTVVXEbH5oWu4GHrrNMs564",
     "/ip4/69.48.200.255/udp/4001/quic-v1/p2p/12D3KooWQ4yo42uYwihPAJx1qXm85rTVVXEbH5oWu4GHrrNMs564",
     "/ip6/2607:f1c0:f074:4300::1/tcp/4001/p2p/12D3KooWQ4yo42uYwihPAJx1qXm85rTVVXEbH5oWu4GHrrNMs564",
     "/ip6/2607:f1c0:f074:4300::1/udp/4001/quic-v1/p2p/12D3KooWQ4yo42uYwihPAJx1qXm85rTVVXEbH5oWu4GHrrNMs564",
 ];
 
+/// Mainnet Seed-Nodes (Port 5001) – Produktionsnetzwerk.
+/// Dieselben VPS, aber auf separaten Ports → komplette Netzwerk-Isolation.
+const SEED_NODES_MAINNET: &[&str] = &[
+    // ── VPS1 (212.227.54.241) – primärer Mainnet-Bootstrap + Relay ───
+    "/ip4/212.227.54.241/tcp/5001/p2p/12D3KooWNz9GTNsFks567mHaQLKR4Ai6MCiw5WUDWAgvny1ow4tJ",
+    "/ip4/212.227.54.241/udp/5001/quic-v1/p2p/12D3KooWNz9GTNsFks567mHaQLKR4Ai6MCiw5WUDWAgvny1ow4tJ",
+    "/ip6/2a02:2479:a0:fa00::1/tcp/5001/p2p/12D3KooWNz9GTNsFks567mHaQLKR4Ai6MCiw5WUDWAgvny1ow4tJ",
+    "/ip6/2a02:2479:a0:fa00::1/udp/5001/quic-v1/p2p/12D3KooWNz9GTNsFks567mHaQLKR4Ai6MCiw5WUDWAgvny1ow4tJ",
+    // ── VPS2 (69.48.200.255) – sekundärer Mainnet-Bootstrap + Relay ───
+    "/ip4/69.48.200.255/tcp/5001/p2p/12D3KooWQ4yo42uYwihPAJx1qXm85rTVVXEbH5oWu4GHrrNMs564",
+    "/ip4/69.48.200.255/udp/5001/quic-v1/p2p/12D3KooWQ4yo42uYwihPAJx1qXm85rTVVXEbH5oWu4GHrrNMs564",
+    "/ip6/2607:f1c0:f074:4300::1/tcp/5001/p2p/12D3KooWQ4yo42uYwihPAJx1qXm85rTVVXEbH5oWu4GHrrNMs564",
+    "/ip6/2607:f1c0:f074:4300::1/udp/5001/quic-v1/p2p/12D3KooWQ4yo42uYwihPAJx1qXm85rTVVXEbH5oWu4GHrrNMs564",
+];
+
+/// Gibt die Seed-Nodes für das aktive Netzwerk zurück.
+fn active_seed_nodes() -> &'static [&'static str] {
+    if is_mainnet() { SEED_NODES_MAINNET } else { SEED_NODES_TESTNET }
+}
+
 /// Gibt das aktive Daten-Verzeichnis zurück.
 /// Kann per `STONE_DATA_DIR` überschrieben werden.
+/// Mainnet: `stone_data_mainnet/`, Testnet: `stone_data/`.
 fn data_dir() -> String {
-    std::env::var("STONE_DATA_DIR").unwrap_or_else(|_| DEFAULT_DATA_DIR.to_string())
+    std::env::var("STONE_DATA_DIR").unwrap_or_else(|_| {
+        if is_mainnet() {
+            DEFAULT_DATA_DIR_MAINNET.to_string()
+        } else {
+            DEFAULT_DATA_DIR.to_string()
+        }
+    })
 }
 
 fn p2p_key_file() -> String {
@@ -273,11 +304,12 @@ impl P2pConfig {
 
     /// Bootstrap-Nodes aus ENV `STONE_BOOTSTRAP_NODES` / `STONE_SEED_NODES` (kommagetrennt)
     /// laden und eingebaute Seed-Nodes hinzufügen.
+    /// Wählt automatisch die Seeds für Mainnet oder Testnet (STONE_NETWORK).
     pub fn merge_env(&mut self) {
         // ── Seed-Nodes automatisch hinzufügen ─────────────────────────────────
         // Kann per STONE_NO_SEED=1 deaktiviert werden (für isolierte Netze)
         if std::env::var("STONE_NO_SEED").as_deref() != Ok("1") {
-            for seed in SEED_NODES {
+            for seed in active_seed_nodes() {
                 let seed_str = seed.to_string();
                 // Als Bootstrap-Node
                 if !self.bootstrap_nodes.contains(&seed_str) {
