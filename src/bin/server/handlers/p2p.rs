@@ -289,7 +289,7 @@ pub async fn handle_p2p_proposal(
                 .map(|b| (chrono::Utc::now().timestamp() - b.timestamp) as u64)
                 .unwrap_or(u64::MAX)
         };
-        let fallback_threshold = stone::master_node::MINING_INTERVAL_SECS * 2;
+        let fallback_threshold = stone::master::MINING_INTERVAL_SECS * 2;
 
         if !pow_valid || last_block_age < fallback_threshold {
             let signing_key = load_or_create_validator_key();

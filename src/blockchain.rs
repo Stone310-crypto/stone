@@ -361,7 +361,7 @@ impl StoneChain {
                 let bc = store.block_count().unwrap_or(0);
                 eprintln!("[chain] DB geöffnet: block_count={bc}");
                 match store.read_all_blocks() {
-                    Ok(blocks) if !blocks.is_empty() => {
+                    Ok(mut blocks) if !blocks.is_empty() => {
                         let stored_genesis_hash = blocks[0].hash.clone();
 
                         // Genesis-Hash Validierung: stimmt die DB mit dem aktuellen
@@ -384,6 +384,35 @@ impl StoneChain {
                                 eprintln!("[chain] DB-Reset fehlgeschlagen: {e}");
                             }
                         } else {
+                            // ── Integritäts-Check: blocks[i].index == i ──
+                            // Erkennt Index-Lücken die durch fehlerhafte Reorgs entstehen können.
+                            let mut truncate_at: Option<usize> = None;
+                            for (pos, blk) in blocks.iter().enumerate() {
+                                if blk.index != pos as u64 {
+                                    eprintln!(
+                                        "[chain] ⚠️  Index-Lücke erkannt: blocks[{pos}].index = {} (erwartet {pos}). \
+                                         Kette wird bei Position {pos} abgeschnitten.",
+                                        blk.index,
+                                    );
+                                    truncate_at = Some(pos);
+                                    break;
+                                }
+                            }
+                            if let Some(cut) = truncate_at {
+                                blocks.truncate(cut);
+                                // DB-Metadaten korrigieren (store ist noch offen)
+                                let new_count = blocks.len() as u64;
+                                let new_latest = blocks.last().map(|b| b.hash.as_str()).unwrap_or("genesis");
+                                if let Err(e) = store.repair_meta(new_count, new_latest) {
+                                    eprintln!("[chain] DB-Reparatur fehlgeschlagen: {e}");
+                                } else {
+                                    eprintln!(
+                                        "[chain] ✅ Chain auf {} Blöcke repariert (block_count in DB korrigiert)",
+                                        blocks.len()
+                                    );
+                                }
+                            }
+
                             let latest_hash = blocks.last().map(|b| b.hash.clone()).unwrap_or_default();
                             println!(
                                 "[chain] RocksDB geladen: {} Blöcke, Latest: {}...",
@@ -421,7 +450,7 @@ impl StoneChain {
                     eprintln!("[chain] RocksDB konnte nicht geöffnet werden: {e}");
                 }
             }
-            _ => {}
+
         }
 
         // Leere oder neue Datenbank → Genesis-Block erstellen

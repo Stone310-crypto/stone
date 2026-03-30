@@ -849,24 +849,31 @@ impl GovernanceStore {
 
     pub fn persist(&self) -> Result<(), String> {
         let db = super::open_token_db()?;
+        let cf = db.cf_handle(super::TOKEN_CF_GOVERNANCE)
+            .ok_or("CF governance nicht gefunden")?;
         let json = serde_json::to_vec(self).map_err(|e| format!("serialize: {e}"))?;
-        db.put(Self::DB_KEY, &json).map_err(|e| format!("db put: {e}"))?;
+        db.put_cf(cf, Self::DB_KEY, &json).map_err(|e| format!("db put: {e}"))?;
         Ok(())
     }
 
     pub fn load() -> Self {
-        match super::open_token_db() {
-            Ok(db) => match db.get(Self::DB_KEY) {
-                Ok(Some(bytes)) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-                    eprintln!("[governance] ⚠️  Deserialize fehlgeschlagen: {e}");
-                    Self::new()
-                }),
-                _ => Self::new(),
-            },
+        let db = match super::open_token_db() {
+            Ok(db) => db,
             Err(e) => {
                 eprintln!("[governance] ⚠️  DB nicht verfügbar: {e}");
-                Self::new()
+                return Self::new();
             }
+        };
+        // Erst neue CF, dann Fallback auf default
+        let bytes = db.cf_handle(super::TOKEN_CF_GOVERNANCE)
+            .and_then(|cf| db.get_cf(cf, Self::DB_KEY).ok().flatten())
+            .or_else(|| db.get(Self::DB_KEY).ok().flatten());
+        match bytes {
+            Some(bytes) => serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+                eprintln!("[governance] ⚠️  Deserialize fehlgeschlagen: {e}");
+                Self::new()
+            }),
+            None => Self::new(),
         }
     }
 

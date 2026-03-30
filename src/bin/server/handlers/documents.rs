@@ -196,7 +196,7 @@ pub async fn handle_list_documents(
     let per_page = q.per_page.unwrap_or(50).min(500) as usize;
     let page = q.page.unwrap_or(0) as usize;
 
-    let mut docs: Vec<stone::master_node::DocumentResponse> = chain
+    let mut docs: Vec<stone::master::DocumentResponse> = chain
         .list_all_documents()
         .into_iter()
         .filter(|(d, _)| {
@@ -212,7 +212,7 @@ pub async fn handle_list_documents(
             }
             true
         })
-        .map(|(d, _)| stone::master_node::DocumentResponse::from(d))
+        .map(|(d, _)| stone::master::DocumentResponse::from(d))
         .collect();
 
     docs.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
@@ -250,10 +250,10 @@ pub async fn handle_list_user_documents(
     let per_page = q.per_page.unwrap_or(50).min(500) as usize;
     let page = q.page.unwrap_or(0) as usize;
 
-    let mut docs: Vec<stone::master_node::DocumentResponse> = chain
+    let mut docs: Vec<stone::master::DocumentResponse> = chain
         .list_documents_for_user(&user_id)
         .into_iter()
-        .map(|(d, _)| stone::master_node::DocumentResponse::from(d))
+        .map(|(d, _)| stone::master::DocumentResponse::from(d))
         .collect();
 
     docs.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
@@ -285,7 +285,7 @@ pub async fn handle_get_document(
             .into_response()
     })?;
 
-    let resp = stone::master_node::DocumentResponse::from(doc);
+    let resp = stone::master::DocumentResponse::from(doc);
     Ok((
         StatusCode::OK,
         axum::Json(json!({
@@ -1301,7 +1301,7 @@ pub async fn handle_search_documents(
 
     let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
 
-    let mut docs: Vec<stone::master_node::DocumentResponse> = chain
+    let mut docs: Vec<stone::master::DocumentResponse> = chain
         .list_all_documents()
         .into_iter()
         .filter(|(d, _)| {
@@ -1338,7 +1338,7 @@ pub async fn handle_search_documents(
             }
             true
         })
-        .map(|(d, _)| stone::master_node::DocumentResponse::from(d))
+        .map(|(d, _)| stone::master::DocumentResponse::from(d))
         .collect();
 
     docs.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));

@@ -1,6 +1,7 @@
 //! Server module – sub-modules for the stone-master binary.
 
 pub mod auth_middleware;
+pub mod bridge_monitor;
 pub mod handlers;
 pub mod rate_limiter;
 pub mod router;

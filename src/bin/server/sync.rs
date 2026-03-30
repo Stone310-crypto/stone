@@ -8,7 +8,7 @@ use std::{
 use stone::{
     auth::{save_users, User},
     consensus::verify_block_signature_standalone,
-    master_node::{MasterNodeState, NodeEvent, PeerStatus},
+    master::{MasterNodeState, NodeEvent, PeerStatus},
     storage::ChunkStore,
 };
 
@@ -148,7 +148,7 @@ pub async fn pull_from_peer(node: &Arc<MasterNodeState>, peer_url: &str, api_key
     let total_pages = (peer_height + per_page - 1) / per_page;
     'page_loop: for page in 0..total_pages {
         let blocks_url = format!(
-            "{}/api/v1/blocks?per_page={}&page={}",
+            "{}/api/v1/blocks?per_page={}&page={}&detail=true",
             peer_url.trim_end_matches('/'),
             per_page,
             page
@@ -244,8 +244,12 @@ pub async fn pull_from_peer(node: &Arc<MasterNodeState>, peer_url: &str, api_key
             let local_stake = stone::consensus::cumulative_stake_weight(
                 &chain.blocks, fork_idx, &stakes, &wallet_map,
             );
+            // peer blocks batch starts at an offset – find position of fork_idx within the slice
+            let peer_offset = blocks.iter()
+                .position(|b| b.index as usize >= fork_idx)
+                .unwrap_or(blocks.len());
             let peer_stake = stone::consensus::cumulative_stake_weight(
-                &blocks, fork_idx, &stakes, &wallet_map,
+                &blocks, peer_offset, &stakes, &wallet_map,
             );
 
             // Hash am Fork-Punkt für deterministischen Tiebreak
@@ -422,6 +426,8 @@ pub async fn pull_from_peer(node: &Arc<MasterNodeState>, peer_url: &str, api_key
                             node.mempool.remove_tx(&tx.tx_id);
                         }
                     }
+                    // HTLC-TXs verarbeiten (HTTP-Sync-Pfad)
+                    stone::master::MasterNodeState::process_htlc_txs(&node, &block_txs, idx);
                     // Chat-Batch-Records speichern (für Chat-Index)
                     for batch in &chat_batches {
                         if !batch.messages.is_empty() {

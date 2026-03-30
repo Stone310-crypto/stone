@@ -295,7 +295,7 @@ pub async fn handle_group_send(
     }
 
     // WebSocket-Push
-    state.node.events.publish(stone::master_node::NodeEvent::ChatMessageReceived {
+    state.node.events.publish(stone::master::NodeEvent::ChatMessageReceived {
         msg_id: msg_id.clone(),
         from_wallet: user.wallet_address.clone(),
         to_wallet: String::new(),

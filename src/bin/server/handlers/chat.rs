@@ -224,7 +224,7 @@ pub async fn handle_chat_send(
                 stone::chat::save_chat_index(&idx);
             }
 
-            // P2P broadcast
+            // P2P broadcast (TX)
             if let Some(ref net) = state.network {
                 let net = net.clone();
                 let tx_clone = tx.clone();
@@ -232,6 +232,45 @@ pub async fn handle_chat_send(
                     net.broadcast_tx(tx_clone).await;
                 });
             }
+
+            // P2P gossip: off-chain encrypted content an andere Nodes senden
+            if let Some(ref net) = state.network {
+                let sync = stone::chat::ChatContentSync {
+                    msg_id: msg_id.clone(),
+                    from_wallet: wallet.address(),
+                    to_wallet: to_wallet.clone(),
+                    encrypted_content: req.encrypted_content.clone(),
+                    nonce: req.nonce.clone(),
+                    content_hash: content_hash.clone(),
+                };
+                if let Ok(data) = serde_json::to_vec(&sync) {
+                    let net = net.clone();
+                    tokio::spawn(async move {
+                        net.publish_gossip(stone::network::TOPIC_CHAT_CONTENT, data).await;
+                    });
+                }
+            }
+
+            // Push-Benachrichtigung an Empfänger senden (Fire & Forget)
+            {
+                let push_store = state.push_tokens.lock().unwrap().clone();
+                let fcm = state.fcm_client.clone();
+                let sender_name = user.name.clone();
+                let recipient = to_wallet.clone();
+                tokio::spawn(async move {
+                    let body = format!("Nachricht von {}", sender_name);
+                    let sent = fcm.notify_wallet_with_body(
+                        &push_store,
+                        &recipient,
+                        &stone::push::PushType::NewMessage,
+                        &body,
+                    ).await;
+                    if sent {
+                        println!("[push] 📬 Chat-Push an {} gesendet", recipient);
+                    }
+                });
+            }
+
             (
                 StatusCode::ACCEPTED,
                 axum::Json(json!({
@@ -745,17 +784,40 @@ fn index_new_blocks_if_needed(state: &AppState) {
 
     let chain_len = chain.blocks.len() as u64;
     let last_idx = idx.last_indexed_block;
+    let last_chain_block_idx = chain.blocks.last().map(|b| b.index).unwrap_or(0);
 
     // ── Chain-Reset erkennen ──────────────────────────────────────────────
     // Wenn der Index weiter ist als die aktuelle Chain, wurde die Chain neu
     // aufgebaut (z.B. nach Node-Reset). Index muss komplett neu gebaut werden.
-    if last_idx > 0 && chain_len > 0 && last_idx >= chain_len {
+    if last_idx > 0 && chain_len > 0 && last_idx > last_chain_block_idx {
         println!(
-            "[chat-index] ⚠️ Chain-Reset erkannt! last_indexed_block={} aber chain hat nur {} Blöcke. Rebuild...",
-            last_idx, chain_len
+            "[chat-index] ⚠️ Chain-Reset erkannt! last_indexed_block={} aber letzter Block ist #{}. Rebuild...",
+            last_idx, last_chain_block_idx
         );
+        // Bestehenden encrypted_content sichern (DSGVO off-chain)
+        let old_content: std::collections::HashMap<String, (String, String)> = idx.conversations.values()
+            .flat_map(|entries| entries.iter())
+            .filter(|e| !e.encrypted_content.is_empty())
+            .map(|e| (e.msg_id.clone(), (e.encrypted_content.clone(), e.nonce.clone())))
+            .collect();
+
         let all_blocks: Vec<_> = chain.blocks.iter().collect();
         *idx = stone::chat::ChatIndex::rebuild_from_chain(&all_blocks, Some(&state.node.message_pool));
+
+        // Off-chain Content zurückmergen
+        if !old_content.is_empty() {
+            for entries in idx.conversations.values_mut() {
+                for entry in entries.iter_mut() {
+                    if entry.encrypted_content.is_empty() {
+                        if let Some((enc, nc)) = old_content.get(&entry.msg_id) {
+                            entry.encrypted_content = enc.clone();
+                            entry.nonce = nc.clone();
+                        }
+                    }
+                }
+            }
+        }
+
         let _ = stone::chat::save_chat_index(&idx);
         println!(
             "[chat-index] ✅ Rebuild fertig: {} Konversationen, last_indexed_block={}",
@@ -766,21 +828,19 @@ fn index_new_blocks_if_needed(state: &AppState) {
     }
 
     // ── Inkrementelles Indexieren ─────────────────────────────────────────
-    // chain hat Blöcke [0..chain_len-1], last_indexed_block ist der letzte verarbeitete
-    if chain_len > 0 && (chain_len - 1) > last_idx {
-        let skip_count = (last_idx + 1) as usize;
+    // last_indexed_block ist der letzte verarbeitete Block-INDEX
+    if chain_len > 0 && last_chain_block_idx > last_idx {
         let new_blocks: Vec<_> = chain
             .blocks
             .iter()
-            .skip(skip_count)
+            .filter(|b| b.index > last_idx)
             .collect();
 
         if !new_blocks.is_empty() {
             println!(
-                "[chat-index] 📋 {} neue Blöcke indexieren (Block #{} → #{})",
+                "[chat-index] 📋 {} neue Blöcke indexieren (ab Block #{})",
                 new_blocks.len(),
-                skip_count,
-                chain_len - 1,
+                last_idx + 1,
             );
             idx.index_new_blocks(&new_blocks, Some(&state.node.message_pool));
             let _ = stone::chat::save_chat_index(&idx);
@@ -1224,6 +1284,27 @@ pub async fn handle_chat_send_coins(
         });
     }
 
+    // Push-Benachrichtigung an Empfänger (Fire & Forget)
+    {
+        let push_store = state.push_tokens.lock().unwrap().clone();
+        let fcm = state.fcm_client.clone();
+        let sender_name = user.name.clone();
+        let recipient = to_wallet.clone();
+        let amt = amount.to_string();
+        tokio::spawn(async move {
+            let body = format!("{} hat dir {} STONE gesendet", sender_name, amt);
+            let sent = fcm.notify_wallet_with_body(
+                &push_store,
+                &recipient,
+                &stone::push::PushType::PaymentConfirmed,
+                &body,
+            ).await;
+            if sent {
+                println!("[push] 📬 Coin-Transfer-Push an {} gesendet", recipient);
+            }
+        });
+    }
+
     (
         StatusCode::ACCEPTED,
         axum::Json(json!({
@@ -1352,6 +1433,28 @@ pub async fn handle_chat_request_coins(
                     net.broadcast_tx(tx_clone).await;
                 });
             }
+
+            // Push-Benachrichtigung an den Empfänger der Anforderung (Fire & Forget)
+            {
+                let push_store = state.push_tokens.lock().unwrap().clone();
+                let fcm = state.fcm_client.clone();
+                let sender_name = user.name.clone();
+                let recipient = from_wallet.clone();
+                let amt = amount.to_string();
+                tokio::spawn(async move {
+                    let body = format!("{} fordert {} STONE an", sender_name, amt);
+                    let sent = fcm.notify_wallet_with_body(
+                        &push_store,
+                        &recipient,
+                        &stone::push::PushType::PaymentRequest,
+                        &body,
+                    ).await;
+                    if sent {
+                        println!("[push] 📬 Coin-Request-Push an {} gesendet", recipient);
+                    }
+                });
+            }
+
             (
                 StatusCode::ACCEPTED,
                 axum::Json(json!({

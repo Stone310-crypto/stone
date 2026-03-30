@@ -79,7 +79,7 @@ pub async fn handle_send_signal(
     state.call_signals.add_signal(signal);
 
     // WebSocket-Push ans Ziel
-    state.node.events.publish(stone::master_node::NodeEvent::CallSignalReceived {
+    state.node.events.publish(stone::master::NodeEvent::CallSignalReceived {
         call_id: req.call_id.clone(),
         signal_type: format!("{:?}", signal_type).to_lowercase(),
         from_wallet: user.wallet_address.clone(),

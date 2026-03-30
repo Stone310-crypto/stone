@@ -18,7 +18,7 @@
 
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
@@ -26,7 +26,8 @@ use serde::Deserialize;
 
 use stone::token::{
     AccountInfo, SupplyInfo, TokenTx, TxType, compute_tx_id, default_chain_id,
-    TokenLedger,
+    TokenLedger, BuyStatus,
+    HtlcStore, HtlcStatus, HtlcCreateParams, HtlcClaimParams, HtlcRefundParams,
 };
 
 use super::super::auth_middleware::{require_admin, require_user};
@@ -1372,5 +1373,1592 @@ pub async fn handle_admin_airdrop(
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({ "ok": false, "error": format!("{e}") })),
         ).into_response(),
+    }
+}
+
+// ─── Testnet-Markt-Simulation ────────────────────────────────────────────────
+// Entfernen: Diesen Block + Routen in router.rs löschen.
+
+/// GET /api/v1/token/market
+pub async fn handle_market_info(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let market = state.node.testnet_market.read().unwrap_or_else(|e| e.into_inner());
+    if !market.config.enabled {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "error": "Market simulation disabled" })),
+        ).into_response();
+    }
+    let info = market.market_info();
+    (StatusCode::OK, Json(serde_json::json!({ "ok": true, "market": info }))).into_response()
+}
+
+/// GET /api/v1/token/market/history?count=100
+pub async fn handle_market_history(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let market = state.node.testnet_market.read().unwrap_or_else(|e| e.into_inner());
+    if !market.config.enabled {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "ok": false, "error": "Market simulation disabled" })),
+        ).into_response();
+    }
+    let count: usize = params.get("count")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(100)
+        .min(1000);
+    let history: Vec<_> = market.history.iter().rev().take(count).collect();
+    (StatusCode::OK, Json(serde_json::json!({
+        "ok": true,
+        "count": history.len(),
+        "points": history,
+    }))).into_response()
+}
+
+// ─── Markt: Echte Trades (Kauf/Verkauf mit realen STONE-TXs) ────────────────
+
+#[derive(Deserialize)]
+pub struct MarketBuyRequest {
+    /// Wallet-Adresse des Käufers (hex)
+    pub address: String,
+    /// STONE-Menge die gekauft werden soll
+    pub amount: String,
+}
+
+#[derive(Deserialize)]
+pub struct MarketSellRequest {
+    /// Wallet-Adresse des Verkäufers (hex)
+    pub address: String,
+    /// STONE-Menge die verkauft werden soll
+    pub amount: String,
+}
+
+/// POST /api/v1/token/market/buy
+///
+/// Kauft STONE mit TC$ (Testnet-Dollar). Erstellt eine echte Blockchain-TX
+/// von pool:market_reserve → Käufer-Adresse.
+pub async fn handle_market_buy(
+    State(state): State<AppState>,
+    Json(req): Json<MarketBuyRequest>,
+) -> impl IntoResponse {
+    // Nur im Testnet
+    let network = stone::token::NetworkMode::from_env();
+    if !network.is_testnet() {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({
+            "ok": false, "error": "Markt-Trading nur im Testnet verfügbar"
+        }))).into_response();
+    }
+
+    // Adresse normalisieren
+    let buyer_addr = match stone::token::normalize_address(&req.address) {
+        Some(h) if h.len() == 64 && !h.starts_with("pool:") => h,
+        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": "Ungültige Wallet-Adresse"
+        }))).into_response(),
+    };
+
+    // Betrag parsen
+    let stone_amount: f64 = match req.amount.parse() {
+        Ok(a) if a > 0.0 => a,
+        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": "Ungültiger Betrag"
+        }))).into_response(),
+    };
+
+    let decimal_amount: rust_decimal::Decimal = match req.amount.parse() {
+        Ok(a) => a,
+        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": "Ungültiger Betrag"
+        }))).into_response(),
+    };
+
+    // TC$-Balance prüfen & Preis ermitteln
+    let (price, _total_tc, _fee) = {
+        let mut market = state.node.testnet_market.write().unwrap_or_else(|e| e.into_inner());
+        match market.prepare_buy(&buyer_addr, stone_amount) {
+            Ok(result) => result,
+            Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "ok": false, "error": e
+            }))).into_response(),
+        }
+    };
+
+    // Pool-Balance prüfen
+    let pool_addr = stone::token::MARKET_RESERVE_POOL;
+    {
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
+        let available = ledger.balance(pool_addr);
+        if available < decimal_amount {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "ok": false,
+                "error": format!("Market-Reserve hat nicht genug STONE ({} verfügbar)", available),
+            }))).into_response();
+        }
+    }
+
+    // Nonce für pool:market_reserve
+    let nonce = {
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
+        ledger.nonce(pool_addr) + state.node.mempool.sender_pending_count(pool_addr)
+    };
+
+    // Echte STONE-TX erstellen: pool:market_reserve → buyer
+    let mut tx = TokenTx {
+        tx_id: String::new(),
+        tx_type: TxType::Transfer,
+        from: pool_addr.to_string(),
+        to: buyer_addr.clone(),
+        amount: decimal_amount,
+        fee: rust_decimal::Decimal::ZERO,
+        nonce,
+        timestamp: chrono::Utc::now().timestamp(),
+        signature: "market-buy".to_string(),
+        memo: format!("Market Buy: {} STONE @ {:.6} TC$", stone_amount, price),
+        chain_id: default_chain_id(),
+        fee_tier: stone::token::FeeTier::Standard,
+    };
+    tx.tx_id = compute_tx_id(&tx);
+    let tx_id = tx.tx_id.clone();
+
+    // In Mempool
+    let result = {
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
+        state.node.mempool.add_tx(tx.clone(), Some(&ledger))
+    };
+
+    match result {
+        Ok(()) => {
+            // P2P Broadcast
+            if let Some(ref net) = state.network {
+                let net = net.clone();
+                let tx_clone = tx;
+                tokio::spawn(async move { net.broadcast_tx(tx_clone).await; });
+            }
+
+            // TC$ abbuchen + Trade speichern
+            let trade_result = {
+                let mut market = state.node.testnet_market.write().unwrap_or_else(|e| e.into_inner());
+                let result = market.confirm_buy(&buyer_addr, stone_amount, price, &tx_id);
+                let _ = market.save();
+                result
+            };
+
+            (StatusCode::OK, Json(serde_json::json!({
+                "ok": true,
+                "trade": trade_result,
+                "message": "Kauf ausgeführt – STONE werden beim nächsten Block gutgeschrieben",
+            }))).into_response()
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": format!("Mempool: {e}")
+        }))).into_response(),
+    }
+}
+
+/// POST /api/v1/token/market/sell
+///
+/// Verkauft STONE für TC$ (Testnet-Dollar). Erstellt eine echte Blockchain-TX
+/// vom User → pool:market_reserve. Erfordert Signatur des Verkäufers.
+pub async fn handle_market_sell(
+    State(state): State<AppState>,
+    Json(req): Json<MarketSellRequest>,
+) -> impl IntoResponse {
+    let network = stone::token::NetworkMode::from_env();
+    if !network.is_testnet() {
+        return (StatusCode::FORBIDDEN, Json(serde_json::json!({
+            "ok": false, "error": "Markt-Trading nur im Testnet verfügbar"
+        }))).into_response();
+    }
+
+    let seller_addr = match stone::token::normalize_address(&req.address) {
+        Some(h) if h.len() == 64 && !h.starts_with("pool:") => h,
+        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": "Ungültige Wallet-Adresse"
+        }))).into_response(),
+    };
+
+    let stone_amount: f64 = match req.amount.parse() {
+        Ok(a) if a > 0.0 => a,
+        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": "Ungültiger Betrag"
+        }))).into_response(),
+    };
+
+    let decimal_amount: rust_decimal::Decimal = match req.amount.parse() {
+        Ok(a) => a,
+        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": "Ungültiger Betrag"
+        }))).into_response(),
+    };
+
+    // STONE-Balance prüfen
+    {
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
+        let available = ledger.balance(&seller_addr);
+        if available < decimal_amount {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "ok": false,
+                "error": format!("Nicht genug STONE: {} verfügbar", available),
+            }))).into_response();
+        }
+    }
+
+    // Preis ermitteln
+    let (price, _total_tc, _fee) = {
+        let market = state.node.testnet_market.read().unwrap_or_else(|e| e.into_inner());
+        match market.prepare_sell(&seller_addr, stone_amount) {
+            Ok(result) => result,
+            Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "ok": false, "error": e
+            }))).into_response(),
+        }
+    };
+
+    // Nonce für den Verkäufer
+    let nonce = {
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
+        ledger.nonce(&seller_addr) + state.node.mempool.sender_pending_count(&seller_addr)
+    };
+
+    // Echte TX: seller → pool:market_reserve
+    let pool_addr = stone::token::MARKET_RESERVE_POOL;
+    let mut tx = TokenTx {
+        tx_id: String::new(),
+        tx_type: TxType::Transfer,
+        from: seller_addr.clone(),
+        to: pool_addr.to_string(),
+        amount: decimal_amount,
+        fee: rust_decimal::Decimal::ZERO,
+        nonce,
+        timestamp: chrono::Utc::now().timestamp(),
+        signature: "market-sell".to_string(),
+        memo: format!("Market Sell: {} STONE @ {:.6} TC$", stone_amount, price),
+        chain_id: default_chain_id(),
+        fee_tier: stone::token::FeeTier::Standard,
+    };
+    tx.tx_id = compute_tx_id(&tx);
+    let tx_id = tx.tx_id.clone();
+
+    // In Mempool (Signatur wird hier validiert)
+    let result = {
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
+        state.node.mempool.add_tx(tx.clone(), Some(&ledger))
+    };
+
+    match result {
+        Ok(()) => {
+            if let Some(ref net) = state.network {
+                let net = net.clone();
+                let tx_clone = tx;
+                tokio::spawn(async move { net.broadcast_tx(tx_clone).await; });
+            }
+
+            // TC$ gutschreiben + Trade speichern
+            let trade_result = {
+                let mut market = state.node.testnet_market.write().unwrap_or_else(|e| e.into_inner());
+                let result = market.confirm_sell(&seller_addr, stone_amount, price, &tx_id);
+                let _ = market.save();
+                result
+            };
+
+            (StatusCode::OK, Json(serde_json::json!({
+                "ok": true,
+                "trade": trade_result,
+                "message": "Verkauf ausgeführt – TC$ wurden gutgeschrieben",
+            }))).into_response()
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": format!("Mempool: {e}")
+        }))).into_response(),
+    }
+}
+
+/// GET /api/v1/token/market/balance?address=...
+///
+/// Gibt TC$-Guthaben, Trade-Historie und Portfolio-Übersicht zurück.
+pub async fn handle_market_balance(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let address = match params.get("address") {
+        Some(a) => match stone::token::normalize_address(a) {
+            Some(h) if h.len() == 64 => h,
+            _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "ok": false, "error": "Ungültige Adresse"
+            }))).into_response(),
+        },
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": "address Parameter fehlt"
+        }))).into_response(),
+    };
+
+    let market = state.node.testnet_market.read().unwrap_or_else(|e| e.into_inner());
+    let balance = market.market_balance(&address);
+
+    // Echte STONE-Balance aus dem Ledger
+    let stone_balance = {
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
+        ledger.balance(&address).to_string()
+    };
+
+    (StatusCode::OK, Json(serde_json::json!({
+        "ok": true,
+        "balance": balance,
+        "stone_balance": stone_balance,
+    }))).into_response()
+}
+
+// ─── HTLC (Hash Time-Locked Contracts) ──────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct HtlcCreateRequest {
+    /// Sender Wallet-Adresse (hex)
+    pub from: String,
+    /// Empfänger Wallet-Adresse (hex) — leer für offenen Trade
+    #[serde(default)]
+    pub to: String,
+    /// Betrag in STONE
+    pub amount: String,
+    /// SHA-256 Hash-Lock (64 hex chars)
+    pub hash_lock: String,
+    /// Time-Lock als Unix-Timestamp (absolute Ablaufzeit)
+    pub time_lock: i64,
+    /// Ed25519-Signatur des Senders (hex)
+    pub signature: String,
+    /// Nonce des Senders
+    pub nonce: u64,
+    /// Timestamp der TX (Client-Zeitstempel, muss zur Signatur passen)
+    pub timestamp: i64,
+    /// Preimage für Auto-Buy (optional, wird server-seitig gespeichert)
+    #[serde(default)]
+    pub preimage: String,
+    /// Preis in externer Währung (optional, für P2P-Käufe)
+    #[serde(default)]
+    pub price_amount: Option<String>,
+    /// Asset-Name (z.B. "USDT", "USDC", "ETH")
+    #[serde(default)]
+    pub price_asset: Option<String>,
+    /// Blockchain-Netzwerk für Zahlung (z.B. "polygon", "ethereum")
+    #[serde(default)]
+    pub price_chain: Option<String>,
+}
+
+#[derive(Deserialize)]
+pub struct HtlcClaimRequest {
+    /// HTLC Contract-ID
+    pub htlc_id: String,
+    /// Preimage (hex) das zum Hash-Lock passt
+    pub preimage: String,
+    /// Ziel-Wallet für offene Trades (wenn kein Empfänger im HTLC)
+    #[serde(default)]
+    pub claim_wallet: String,
+}
+
+#[derive(Deserialize)]
+pub struct HtlcRefundRequest {
+    /// HTLC Contract-ID
+    pub htlc_id: String,
+}
+
+/// POST /api/v1/htlc/create
+///
+/// Erstellt einen neuen HTLC-Contract. Sender schickt STONE an pool:htlc_escrow
+/// mit Hash-Lock und Time-Lock. Erfordert Signatur des Senders.
+pub async fn handle_htlc_create(
+    State(state): State<AppState>,
+    Json(req): Json<HtlcCreateRequest>,
+) -> impl IntoResponse {
+    use stone::token::htlc::HTLC_ESCROW_POOL;
+
+    // Adresse normalisieren
+    let sender = match stone::token::normalize_address(&req.from) {
+        Some(h) if h.len() == 64 && !h.starts_with("pool:") => h,
+        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": "Ungültige Sender-Adresse"
+        }))).into_response(),
+    };
+    // Empfänger: leer = offener Trade (jeder kann claimen)
+    let receiver = if req.to.is_empty() {
+        String::new()
+    } else {
+        match stone::token::normalize_address(&req.to) {
+            Some(h) if h.len() == 64 && !h.starts_with("pool:") => h,
+            _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "ok": false, "error": "Ungültige Empfänger-Adresse"
+            }))).into_response(),
+        }
+    };
+
+    // Betrag parsen
+    let amount: rust_decimal::Decimal = match req.amount.parse() {
+        Ok(a) if a > rust_decimal::Decimal::ZERO => a,
+        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": "Ungültiger Betrag"
+        }))).into_response(),
+    };
+
+    // Hash-Lock validieren
+    if req.hash_lock.len() != 64 || !req.hash_lock.chars().all(|c| c.is_ascii_hexdigit()) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": "hash_lock muss 64 Hex-Zeichen sein (SHA-256)"
+        }))).into_response();
+    }
+
+    // Time-Lock validieren
+    let now = chrono::Utc::now().timestamp();
+    if req.time_lock <= now {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": "time_lock muss in der Zukunft liegen"
+        }))).into_response();
+    }
+
+    // Preis-Info bauen (optional)
+    let trade_price = match (&req.price_amount, &req.price_asset, &req.price_chain) {
+        (Some(amt), Some(asset), Some(chain)) if !amt.is_empty() && !asset.is_empty() && !chain.is_empty() => {
+            // Asset und Chain validieren
+            let asset_upper = asset.to_uppercase();
+            let chain_lower = chain.to_lowercase();
+            if !stone::token::htlc::SUPPORTED_ASSETS.contains(&asset_upper.as_str()) {
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                    "ok": false, "error": format!("Nicht unterstütztes Asset: {asset}. Erlaubt: {:?}", stone::token::htlc::SUPPORTED_ASSETS)
+                }))).into_response();
+            }
+            if !stone::token::htlc::SUPPORTED_CHAINS.contains(&chain_lower.as_str()) {
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                    "ok": false, "error": format!("Nicht unterstützte Chain: {chain}. Erlaubt: {:?}", stone::token::htlc::SUPPORTED_CHAINS)
+                }))).into_response();
+            }
+            // Betrag validieren
+            if amt.parse::<rust_decimal::Decimal>().is_err() {
+                return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                    "ok": false, "error": "Ungültiger Preisbetrag"
+                }))).into_response();
+            }
+            Some(stone::token::TradePrice {
+                amount: amt.clone(),
+                asset: asset_upper,
+                chain: chain_lower,
+            })
+        }
+        _ => None,
+    };
+
+    // Memo bauen
+    let memo = serde_json::to_string(&HtlcCreateParams {
+        hash_lock: req.hash_lock.clone(),
+        time_lock: req.time_lock,
+        receiver: receiver.clone(),
+        price: trade_price,
+    }).unwrap_or_default();
+
+    // Timestamp validieren: nicht älter als 5 Min, nicht mehr als 5 Min in der Zukunft
+    if (now - req.timestamp).abs() > 300 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": "Timestamp zu weit vom Server-Zeitpunkt entfernt"
+        }))).into_response();
+    }
+
+    // TX erstellen
+    let mut tx = TokenTx {
+        tx_id: String::new(),
+        tx_type: TxType::HtlcCreate,
+        from: sender.clone(),
+        to: HTLC_ESCROW_POOL.to_string(),
+        amount,
+        fee: rust_decimal::Decimal::ZERO,
+        nonce: req.nonce,
+        timestamp: req.timestamp,
+        signature: req.signature.clone(),
+        memo,
+        chain_id: default_chain_id(),
+        fee_tier: stone::token::FeeTier::Standard,
+    };
+    tx.tx_id = compute_tx_id(&tx);
+    let tx_id = tx.tx_id.clone();
+
+    // In Mempool
+    let result = {
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
+        state.node.mempool.add_tx(tx.clone(), Some(&ledger))
+    };
+
+    match result {
+        Ok(()) => {
+            // P2P Broadcast
+            if let Some(ref net) = state.network {
+                let net = net.clone();
+                let tx_clone = tx;
+                tokio::spawn(async move { net.broadcast_tx(tx_clone).await; });
+            }
+
+            // Preimage für Auto-Buy speichern (bei offenen Trades)
+            let htlc_id = format!("htlc-{}", &tx_id[..16]);
+            if !req.preimage.is_empty() {
+                if HtlcStore::verify_preimage(&req.hash_lock, &req.preimage) {
+                    let mut store = state.node.htlc_store.write().unwrap_or_else(|e| e.into_inner());
+                    store.store_preimage(&htlc_id, req.preimage.clone());
+                    if let Err(e) = store.persist() {
+                        eprintln!("[htlc] ⚠️  Preimage persist fehlgeschlagen: {e}");
+                    }
+                }
+            }
+
+            (StatusCode::OK, Json(serde_json::json!({
+                "ok": true,
+                "tx_id": tx_id,
+                "htlc_id": htlc_id,
+                "message": "HTLC erstellt – wird im nächsten Block aktiviert",
+            }))).into_response()
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": format!("Mempool: {e}")
+        }))).into_response(),
+    }
+}
+
+/// POST /api/v1/htlc/claim
+///
+/// Claimed einen HTLC-Contract mit dem korrekten Preimage.
+/// Erstellt eine System-TX: pool:htlc_escrow → Empfänger.
+pub async fn handle_htlc_claim(
+    State(state): State<AppState>,
+    Json(req): Json<HtlcClaimRequest>,
+) -> impl IntoResponse {
+    use stone::token::htlc::HTLC_ESCROW_POOL;
+
+    // HTLC im Store prüfen
+    let contract = {
+        let store = state.node.htlc_store.read().unwrap_or_else(|e| e.into_inner());
+        store.get(&req.htlc_id).cloned()
+    };
+
+    let contract = match contract {
+        Some(c) => c,
+        None => return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "ok": false, "error": "HTLC nicht gefunden"
+        }))).into_response(),
+    };
+
+    if contract.status != HtlcStatus::Locked {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": format!("HTLC Status ist {:?}, erwartet Locked", contract.status)
+        }))).into_response();
+    }
+
+    // Preimage vorab prüfen
+    if !stone::token::htlc::HtlcStore::verify_preimage(&contract.hash_lock, &req.preimage) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": "Ungültiges Preimage – Hash stimmt nicht überein"
+        }))).into_response();
+    }
+
+    // Time-Lock prüfen
+    let now = chrono::Utc::now().timestamp();
+    if now >= contract.time_lock {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": "HTLC ist abgelaufen – nur noch Refund möglich"
+        }))).into_response();
+    }
+
+    // Memo bauen
+    let memo = serde_json::to_string(&HtlcClaimParams {
+        htlc_id: req.htlc_id.clone(),
+        preimage: req.preimage.clone(),
+    }).unwrap_or_default();
+
+    // Empfänger bestimmen: bei offenem Trade → claim_wallet verwenden
+    let claim_to = if contract.receiver.is_empty() {
+        match stone::token::normalize_address(&req.claim_wallet) {
+            Some(h) if h.len() == 64 && !h.starts_with("pool:") => h,
+            _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "ok": false, "error": "claim_wallet fehlt oder ungültig – bei offenem Trade erforderlich"
+            }))).into_response(),
+        }
+    } else {
+        contract.receiver.clone()
+    };
+
+    // System-TX erstellen
+    let mut tx = TokenTx {
+        tx_id: String::new(),
+        tx_type: TxType::HtlcClaim,
+        from: HTLC_ESCROW_POOL.to_string(),
+        to: claim_to,
+        amount: contract.amount,
+        fee: rust_decimal::Decimal::ZERO,
+        nonce: 0,
+        timestamp: now,
+        signature: "system".to_string(),
+        memo,
+        chain_id: default_chain_id(),
+        fee_tier: stone::token::FeeTier::Standard,
+    };
+    tx.tx_id = compute_tx_id(&tx);
+    let tx_id = tx.tx_id.clone();
+
+    let result = {
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
+        state.node.mempool.add_tx(tx.clone(), Some(&ledger))
+    };
+
+    match result {
+        Ok(()) => {
+            if let Some(ref net) = state.network {
+                let net = net.clone();
+                let tx_clone = tx;
+                tokio::spawn(async move { net.broadcast_tx(tx_clone).await; });
+            }
+
+            (StatusCode::OK, Json(serde_json::json!({
+                "ok": true,
+                "tx_id": tx_id,
+                "htlc_id": req.htlc_id,
+                "message": "HTLC claimed – STONE werden im nächsten Block übertragen",
+            }))).into_response()
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": format!("Mempool: {e}")
+        }))).into_response(),
+    }
+}
+
+/// POST /api/v1/htlc/refund
+///
+/// Refunded einen abgelaufenen HTLC-Contract.
+/// Erstellt eine System-TX: pool:htlc_escrow → Original-Sender.
+pub async fn handle_htlc_refund(
+    State(state): State<AppState>,
+    Json(req): Json<HtlcRefundRequest>,
+) -> impl IntoResponse {
+    use stone::token::htlc::HTLC_ESCROW_POOL;
+
+    let contract = {
+        let store = state.node.htlc_store.read().unwrap_or_else(|e| e.into_inner());
+        store.get(&req.htlc_id).cloned()
+    };
+
+    let contract = match contract {
+        Some(c) => c,
+        None => return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "ok": false, "error": "HTLC nicht gefunden"
+        }))).into_response(),
+    };
+
+    if contract.status != HtlcStatus::Locked {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": format!("HTLC Status ist {:?}, erwartet Locked", contract.status)
+        }))).into_response();
+    }
+
+    let now = chrono::Utc::now().timestamp();
+    if now < contract.time_lock {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false,
+            "error": "HTLC ist noch nicht abgelaufen",
+            "expires_at": contract.time_lock,
+            "seconds_remaining": contract.time_lock - now,
+        }))).into_response();
+    }
+
+    let memo = serde_json::to_string(&HtlcRefundParams {
+        htlc_id: req.htlc_id.clone(),
+    }).unwrap_or_default();
+
+    let mut tx = TokenTx {
+        tx_id: String::new(),
+        tx_type: TxType::HtlcRefund,
+        from: HTLC_ESCROW_POOL.to_string(),
+        to: contract.sender.clone(),
+        amount: contract.amount,
+        fee: rust_decimal::Decimal::ZERO,
+        nonce: 0,
+        timestamp: now,
+        signature: "system".to_string(),
+        memo,
+        chain_id: default_chain_id(),
+        fee_tier: stone::token::FeeTier::Standard,
+    };
+    tx.tx_id = compute_tx_id(&tx);
+    let tx_id = tx.tx_id.clone();
+
+    let result = {
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
+        state.node.mempool.add_tx(tx.clone(), Some(&ledger))
+    };
+
+    match result {
+        Ok(()) => {
+            if let Some(ref net) = state.network {
+                let net = net.clone();
+                let tx_clone = tx;
+                tokio::spawn(async move { net.broadcast_tx(tx_clone).await; });
+            }
+
+            (StatusCode::OK, Json(serde_json::json!({
+                "ok": true,
+                "tx_id": tx_id,
+                "htlc_id": req.htlc_id,
+                "message": "HTLC refunded – STONE werden im nächsten Block zurückerstattet",
+            }))).into_response()
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": format!("Mempool: {e}")
+        }))).into_response(),
+    }
+}
+
+/// POST /api/v1/htlc/buy
+///
+/// Kauft einen offenen HTLC-Trade automatisch.
+/// Server nutzt das gespeicherte Preimage, Käufer muss es nicht kennen.
+#[derive(Deserialize)]
+pub struct HtlcBuyRequest {
+    /// HTLC Contract-ID
+    pub htlc_id: String,
+    /// Wallet-Adresse des Käufers (dort landen die STONE)
+    pub buyer_wallet: String,
+}
+
+pub async fn handle_htlc_buy(
+    State(state): State<AppState>,
+    Json(req): Json<HtlcBuyRequest>,
+) -> impl IntoResponse {
+    use stone::token::htlc::HTLC_ESCROW_POOL;
+
+    // Käufer-Wallet validieren
+    let buyer = match stone::token::normalize_address(&req.buyer_wallet) {
+        Some(h) if h.len() == 64 && !h.starts_with("pool:") => h,
+        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": "Ungültige buyer_wallet"
+        }))).into_response(),
+    };
+
+    // HTLC-Contract laden
+    let contract = {
+        let store = state.node.htlc_store.read().unwrap_or_else(|e| e.into_inner());
+        store.get(&req.htlc_id).cloned()
+    };
+
+    let contract = match contract {
+        Some(c) => c,
+        None => return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "ok": false, "error": "HTLC nicht gefunden"
+        }))).into_response(),
+    };
+
+    if contract.status != HtlcStatus::Locked {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": format!("HTLC Status ist {:?}, erwartet Locked", contract.status)
+        }))).into_response();
+    }
+
+    // Nur offene Trades (kein fester Empfänger)
+    if !contract.receiver.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": "Kein offener Trade – dieser HTLC hat bereits einen Empfänger"
+        }))).into_response();
+    }
+
+    // Käufer darf nicht Sender sein
+    if buyer == contract.sender {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": "Eigenen Trade kann man nicht kaufen"
+        }))).into_response();
+    }
+
+    // Time-Lock prüfen
+    let now = chrono::Utc::now().timestamp();
+    if now >= contract.time_lock {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": "HTLC ist abgelaufen – Trade nicht mehr verfügbar"
+        }))).into_response();
+    }
+
+    // Escrowed Preimage holen
+    let preimage = {
+        let store = state.node.htlc_store.read().unwrap_or_else(|e| e.into_inner());
+        store.get_escrowed_preimage(&req.htlc_id).cloned()
+    };
+
+    let preimage = match preimage {
+        Some(p) => p,
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": "Kein gespeichertes Preimage – manueller Claim erforderlich"
+        }))).into_response(),
+    };
+
+    // Preimage nochmal gegen Hash-Lock verifizieren
+    if !stone::token::htlc::HtlcStore::verify_preimage(&contract.hash_lock, &preimage) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+            "ok": false, "error": "Gespeichertes Preimage ungültig – inkonsistenter Zustand"
+        }))).into_response();
+    }
+
+    // Claim-TX bauen
+    let memo = serde_json::to_string(&HtlcClaimParams {
+        htlc_id: req.htlc_id.clone(),
+        preimage: preimage.clone(),
+    }).unwrap_or_default();
+
+    let mut tx = TokenTx {
+        tx_id: String::new(),
+        tx_type: TxType::HtlcClaim,
+        from: HTLC_ESCROW_POOL.to_string(),
+        to: buyer.clone(),
+        amount: contract.amount,
+        fee: rust_decimal::Decimal::ZERO,
+        nonce: 0,
+        timestamp: now,
+        signature: "system".to_string(),
+        memo,
+        chain_id: default_chain_id(),
+        fee_tier: stone::token::FeeTier::Standard,
+    };
+    tx.tx_id = compute_tx_id(&tx);
+    let tx_id = tx.tx_id.clone();
+
+    let result = {
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
+        state.node.mempool.add_tx(tx.clone(), Some(&ledger))
+    };
+
+    match result {
+        Ok(()) => {
+            // Preimage aus Escrow entfernen
+            {
+                let mut store = state.node.htlc_store.write().unwrap_or_else(|e| e.into_inner());
+                store.remove_escrowed_preimage(&req.htlc_id);
+                if let Err(e) = store.persist() {
+                    eprintln!("[htlc] ⚠️  Preimage-Cleanup persist fehlgeschlagen: {e}");
+                }
+            }
+
+            if let Some(ref net) = state.network {
+                let net = net.clone();
+                let tx_clone = tx;
+                tokio::spawn(async move { net.broadcast_tx(tx_clone).await; });
+            }
+
+            (StatusCode::OK, Json(serde_json::json!({
+                "ok": true,
+                "tx_id": tx_id,
+                "htlc_id": req.htlc_id,
+                "buyer": buyer,
+                "amount": contract.amount.to_string(),
+                "message": "Kauf erfolgreich – STONE werden im nächsten Block übertragen",
+            }))).into_response()
+        }
+        Err(e) => (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": format!("Mempool: {e}")
+        }))).into_response(),
+    }
+}
+
+/// GET /api/v1/htlc/:htlc_id
+///
+/// Gibt Details eines HTLC-Contracts zurück.
+pub async fn handle_htlc_get(
+    State(state): State<AppState>,
+    Path(htlc_id): Path<String>,
+) -> impl IntoResponse {
+    let store = state.node.htlc_store.read().unwrap_or_else(|e| e.into_inner());
+
+    match store.get(&htlc_id) {
+        Some(contract) => (StatusCode::OK, Json(serde_json::json!({
+            "ok": true,
+            "htlc": {
+                "id": contract.id,
+                "sender": contract.sender,
+                "receiver": contract.receiver,
+                "amount": contract.amount.to_string(),
+                "hash_lock": contract.hash_lock,
+                "time_lock": contract.time_lock,
+                "status": format!("{:?}", contract.status),
+                "created_at_block": contract.created_at_block,
+                "settlement_tx": contract.settlement_tx,
+                "price": contract.price,
+            }
+        }))).into_response(),
+        None => (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "ok": false, "error": "HTLC nicht gefunden"
+        }))).into_response(),
+    }
+}
+
+/// GET /api/v1/htlc/list?address=...
+///
+/// Listet alle HTLCs für eine Wallet-Adresse (als Sender oder Empfänger).
+pub async fn handle_htlc_list(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let address = params.get("address").map(|s| s.as_str()).unwrap_or("");
+
+    let store = state.node.htlc_store.read().unwrap_or_else(|e| e.into_inner());
+    let all = store.list_all();
+
+    let filtered: Vec<_> = if address.is_empty() {
+        all.iter().map(|c| serde_json::json!({
+            "id": c.id,
+            "sender": c.sender,
+            "receiver": c.receiver,
+            "amount": c.amount.to_string(),
+            "hash_lock": c.hash_lock,
+            "time_lock": c.time_lock,
+            "status": format!("{:?}", c.status),
+            "created_at_block": c.created_at_block,
+            "price": c.price,
+        })).collect()
+    } else {
+        all.iter()
+            .filter(|c| c.sender == address || c.receiver == address)
+            .map(|c| serde_json::json!({
+                "id": c.id,
+                "sender": c.sender,
+                "receiver": c.receiver,
+                "amount": c.amount.to_string(),
+                "hash_lock": c.hash_lock,
+                "time_lock": c.time_lock,
+                "status": format!("{:?}", c.status),
+                "created_at_block": c.created_at_block,
+                "price": c.price,
+            }))
+            .collect()
+    };
+
+    (StatusCode::OK, Json(serde_json::json!({
+        "ok": true,
+        "htlcs": filtered,
+        "count": filtered.len(),
+    }))).into_response()
+}
+
+/// POST /api/v1/htlc/generate-preimage
+///
+/// Generiert ein zufälliges Preimage und gibt es mit dem zugehörigen Hash zurück.
+/// Hilfsfunktion für die Client-Seite beim Erstellen eines HTLC.
+pub async fn handle_htlc_generate_preimage() -> impl IntoResponse {
+    let (preimage, hash) = stone::token::htlc::generate_preimage();
+    Json(serde_json::json!({
+        "ok": true,
+        "preimage": preimage,
+        "hash_lock": hash,
+    }))
+}
+
+/// GET /api/v1/htlc/payment-info
+///
+/// Gibt die verfügbaren Payment-Chains, Assets und Safe-Adressen zurück.
+/// Clients nutzen diese Info, um dem Käufer die Zahlungsanweisung anzuzeigen.
+pub async fn handle_htlc_payment_info() -> impl IntoResponse {
+    // Safe-Config aus node_config.json laden
+    let cfg = load_bridge_safes_config();
+
+    let mut chains = Vec::new();
+    for (chain_name, info) in &cfg {
+        let safe_addr = info.get("safe_address").and_then(|v| v.as_str()).unwrap_or("");
+        let tokens: Vec<String> = info.get("tokens")
+            .and_then(|v| v.as_object())
+            .map(|t| t.keys().cloned().collect())
+            .unwrap_or_default();
+
+        chains.push(serde_json::json!({
+            "chain": chain_name,
+            "safe_address": safe_addr,
+            "enabled": !safe_addr.is_empty(),
+            "tokens": tokens,
+        }));
+    }
+
+    Json(serde_json::json!({
+        "ok": true,
+        "supported_chains": stone::token::htlc::SUPPORTED_CHAINS,
+        "supported_assets": stone::token::htlc::SUPPORTED_ASSETS,
+        "chains": chains,
+    }))
+}
+
+/// Hardcoded Bridge-Safe Konfiguration.
+/// Sicherheit: Adressen im Code, nicht in Config-Dateien änderbar.
+pub fn load_bridge_safes_config() -> serde_json::Map<String, serde_json::Value> {
+    let cfg = serde_json::json!({
+        "polygon": {
+            "safe_address": "0x0759a5794D4FF506C2278019A207ac27E8ADA956",
+            "rpc_url": "https://polygon-rpc.com",
+            "safe_api": "https://safe-transaction-polygon.safe.global",
+            "tokens": {
+                "USDT": "0xc2132D05D31c914a87C6611C10748AEb04B58e8F",
+                "USDC": "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359"
+            }
+        },
+        "ethereum": {
+            "safe_address": "0x6A8C85540F0754eA03b34dA9E15a151Aa8e90165",
+            "rpc_url": "https://eth-mainnet.g.alchemy.com/v2/demo",
+            "safe_api": "https://safe-transaction-mainnet.safe.global",
+            "tokens": {
+                "USDT": "0xdAC17F958D2ee523a2206206994597C13D831ec7",
+                "USDC": "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48",
+                "DAI":  "0x6B175474E89094C44Da98b954EedeAC495271d0F"
+            }
+        },
+        "bsc": {
+            "safe_address": "0x0637b3d494F93373a19860Bf106f03820eaABD8b",
+            "rpc_url": "https://bsc-dataseed.binance.org",
+            "safe_api": "https://safe-transaction-bsc.safe.global",
+            "tokens": {
+                "USDT": "0x55d398326f99059fF775485246999027B3197955",
+                "USDC": "0x8AC76a51cc950d9822D68b83fE1Ad97B32Cd580d"
+            }
+        },
+        "arbitrum": {
+            "safe_address": "0xDA5930A6D8da4Fe55618f2E17c7C1E3DebCA0e6b",
+            "rpc_url": "https://arb1.arbitrum.io/rpc",
+            "safe_api": "https://safe-transaction-arbitrum.safe.global",
+            "tokens": {
+                "USDT": "0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9",
+                "USDC": "0xaf88d065e77c8cC2239327C5EDb3A432268e5831"
+            }
+        },
+        "base": {
+            "safe_address": "0xd983ECe14878DD7a290db18E9545e6789eBe311f",
+            "rpc_url": "https://mainnet.base.org",
+            "safe_api": "https://safe-transaction-base.safe.global",
+            "tokens": {
+                "USDC": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+            }
+        }
+    });
+    cfg.as_object().unwrap().clone()
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ─── Bridge (Wrapped Token Bridge) ──────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// GET /api/v1/bridge/summary
+///
+/// Gibt eine Zusammenfassung der Bridge-Aktivität zurück.
+pub async fn handle_bridge_summary(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let store = state.node.bridge_store.read().unwrap_or_else(|e| e.into_inner());
+    let summary = store.summary();
+    let supply: std::collections::HashMap<String, String> = summary.total_supply.iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+    Json(serde_json::json!({
+        "ok": true,
+        "total_supply": supply,
+        "holder_count": summary.holder_count,
+        "total_deposits": summary.total_deposits,
+        "pending_deposits": summary.pending_deposits,
+        "total_withdrawals": summary.total_withdrawals,
+        "pending_withdrawals": summary.pending_withdrawals,
+        "supported_assets": ["wUSDT", "wUSDC", "wBTC", "wETH"],
+    }))
+}
+
+/// GET /api/v1/bridge/balances?address=...
+///
+/// Gibt die Wrapped-Token-Balances für eine Adresse zurück.
+pub async fn handle_bridge_balances(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let address = match params.get("address") {
+        Some(a) => match stone::token::normalize_address(a) {
+            Some(h) if h.len() == 64 => h,
+            _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "ok": false, "error": "Ungültige Adresse"
+            }))).into_response(),
+        },
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": "address Parameter fehlt"
+        }))).into_response(),
+    };
+
+    let store = state.node.bridge_store.read().unwrap_or_else(|e| e.into_inner());
+    let balances = store.balances_for(&address);
+    let bal_map: std::collections::HashMap<String, String> = balances.iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+
+    (StatusCode::OK, Json(serde_json::json!({
+        "ok": true,
+        "address": address,
+        "balances": bal_map,
+    }))).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct BridgeDepositRequest {
+    pub address: String,
+    pub asset: String,
+    pub amount: String,
+    pub external_tx_hash: String,
+}
+
+/// POST /api/v1/bridge/deposit
+///
+/// Erstellt einen neuen Bridge-Deposit (Testnet: automatische Bestätigung).
+/// Auf dem Mainnet würde dies einen Pending-Deposit erstellen, der vom
+/// Bridge-Operator nach Bestätigung auf der externen Chain geminted wird.
+pub async fn handle_bridge_deposit(
+    State(state): State<AppState>,
+    Json(req): Json<BridgeDepositRequest>,
+) -> impl IntoResponse {
+    let address = match stone::token::normalize_address(&req.address) {
+        Some(h) if h.len() == 64 && !h.starts_with("pool:") => h,
+        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": "Ungültige Stone-Adresse"
+        }))).into_response(),
+    };
+
+    let asset = match stone::token::WrappedAsset::parse(&req.asset) {
+        Some(a) => a,
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false,
+            "error": format!("Ungültiges Asset: {}. Erlaubt: wUSDT, wUSDC, wBTC, wETH", req.asset),
+        }))).into_response(),
+    };
+
+    let amount: rust_decimal::Decimal = match req.amount.parse() {
+        Ok(a) if a > rust_decimal::Decimal::ZERO => a,
+        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": "Ungültiger Betrag"
+        }))).into_response(),
+    };
+
+    if req.external_tx_hash.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": "external_tx_hash darf nicht leer sein"
+        }))).into_response();
+    }
+
+    let mut store = state.node.bridge_store.write().unwrap_or_else(|e| e.into_inner());
+
+    let external_chain = asset.external_chain().to_string();
+    let deposit = store.create_deposit(
+        address.clone(),
+        asset.clone(),
+        amount,
+        external_chain,
+        req.external_tx_hash.clone(),
+    );
+
+    // Testnet: automatisch bestätigen
+    let deposit_id = deposit.id.clone();
+    match store.confirm_deposit(&deposit_id) {
+        Ok(confirmed) => {
+            (StatusCode::OK, Json(serde_json::json!({
+                "ok": true,
+                "deposit": {
+                    "id": confirmed.id,
+                    "address": confirmed.stone_address,
+                    "asset": confirmed.asset.to_string(),
+                    "amount": confirmed.amount.to_string(),
+                    "external_chain": confirmed.external_chain,
+                    "external_tx_hash": confirmed.external_tx_hash,
+                    "status": "confirmed",
+                    "created_at": confirmed.created_at,
+                    "confirmed_at": confirmed.confirmed_at,
+                },
+                "message": format!("{} {} geminted an {}", amount, asset, &address[..12]),
+            }))).into_response()
+        }
+        Err(e) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                "ok": false, "error": format!("Deposit-Bestätigung fehlgeschlagen: {e}")
+            }))).into_response()
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+pub struct BridgeWithdrawRequest {
+    pub address: String,
+    pub asset: String,
+    pub amount: String,
+    pub external_address: String,
+    #[serde(default)]
+    pub mnemonic: String,
+}
+
+/// POST /api/v1/bridge/withdraw
+///
+/// Verbrennt Wrapped Tokens und stellt einen Withdrawal-Request.
+pub async fn handle_bridge_withdraw(
+    State(state): State<AppState>,
+    Json(req): Json<BridgeWithdrawRequest>,
+) -> impl IntoResponse {
+    let address = match stone::token::normalize_address(&req.address) {
+        Some(h) if h.len() == 64 && !h.starts_with("pool:") => h,
+        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": "Ungültige Stone-Adresse"
+        }))).into_response(),
+    };
+
+    let asset = match stone::token::WrappedAsset::parse(&req.asset) {
+        Some(a) => a,
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false,
+            "error": format!("Ungültiges Asset: {}", req.asset),
+        }))).into_response(),
+    };
+
+    let amount: rust_decimal::Decimal = match req.amount.parse() {
+        Ok(a) if a > rust_decimal::Decimal::ZERO => a,
+        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": "Ungültiger Betrag"
+        }))).into_response(),
+    };
+
+    if req.external_address.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": "external_address darf nicht leer sein"
+        }))).into_response();
+    }
+
+    let mut store = state.node.bridge_store.write().unwrap_or_else(|e| e.into_inner());
+
+    match store.create_withdrawal(address, asset, amount, req.external_address.clone()) {
+        Ok(wd) => {
+            (StatusCode::OK, Json(serde_json::json!({
+                "ok": true,
+                "withdrawal": {
+                    "id": wd.id,
+                    "address": wd.stone_address,
+                    "asset": wd.asset.to_string(),
+                    "amount": wd.amount.to_string(),
+                    "external_chain": wd.external_chain,
+                    "external_address": wd.external_address,
+                    "status": "pending",
+                    "created_at": wd.created_at,
+                },
+                "message": format!("{} {} verbrannt, Withdrawal pending", wd.amount, wd.asset),
+            }))).into_response()
+        }
+        Err(e) => {
+            let status = match &e {
+                stone::token::BridgeError::InsufficientBalance { .. } => StatusCode::BAD_REQUEST,
+                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            };
+            (status, Json(serde_json::json!({
+                "ok": false,
+                "error": format!("{e}"),
+            }))).into_response()
+        }
+    }
+}
+
+/// GET /api/v1/bridge/deposits?address=...
+///
+/// Listet alle Deposits für eine Adresse.
+pub async fn handle_bridge_deposits(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let store = state.node.bridge_store.read().unwrap_or_else(|e| e.into_inner());
+
+    let deposits = if let Some(addr) = params.get("address") {
+        let addr = stone::token::normalize_address(addr).unwrap_or_default();
+        store.deposits_for(&addr).into_iter().cloned().collect::<Vec<_>>()
+    } else {
+        store.all_deposits().to_vec()
+    };
+
+    let items: Vec<serde_json::Value> = deposits.iter().map(|d| {
+        serde_json::json!({
+            "id": d.id,
+            "address": d.stone_address,
+            "asset": d.asset.to_string(),
+            "amount": d.amount.to_string(),
+            "external_chain": d.external_chain,
+            "external_tx_hash": d.external_tx_hash,
+            "status": format!("{:?}", d.status),
+            "created_at": d.created_at,
+            "confirmed_at": d.confirmed_at,
+        })
+    }).collect();
+
+    Json(serde_json::json!({
+        "ok": true,
+        "deposits": items,
+        "count": items.len(),
+    }))
+}
+
+/// GET /api/v1/bridge/withdrawals?address=...
+///
+/// Listet alle Withdrawals für eine Adresse.
+pub async fn handle_bridge_withdrawals(
+    State(state): State<AppState>,
+    axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let store = state.node.bridge_store.read().unwrap_or_else(|e| e.into_inner());
+
+    let withdrawals = if let Some(addr) = params.get("address") {
+        let addr = stone::token::normalize_address(addr).unwrap_or_default();
+        store.withdrawals_for(&addr).into_iter().cloned().collect::<Vec<_>>()
+    } else {
+        store.all_withdrawals().to_vec()
+    };
+
+    let items: Vec<serde_json::Value> = withdrawals.iter().map(|w| {
+        serde_json::json!({
+            "id": w.id,
+            "address": w.stone_address,
+            "asset": w.asset.to_string(),
+            "amount": w.amount.to_string(),
+            "external_chain": w.external_chain,
+            "external_address": w.external_address,
+            "status": format!("{:?}", w.status),
+            "created_at": w.created_at,
+            "completed_at": w.completed_at,
+            "external_tx_hash": w.external_tx_hash,
+        })
+    }).collect();
+
+    Json(serde_json::json!({
+        "ok": true,
+        "withdrawals": items,
+        "count": items.len(),
+    }))
+}
+
+// ─── HTLC Buy Init / Status (Zahlungsverifizierter Kauf) ────────────────────
+
+#[derive(Deserialize)]
+pub struct HtlcBuyInitRequest {
+    pub htlc_id: String,
+    pub buyer_wallet: String,
+    /// Gewünschte Payment-Chain (z.B. "polygon")
+    #[serde(default)]
+    pub chain: Option<String>,
+    /// Gewünschtes Payment-Asset (z.B. "USDT")
+    #[serde(default)]
+    pub asset: Option<String>,
+}
+
+/// POST /api/v1/htlc/buy/init
+///
+/// Initiiert einen Kaufvorgang mit Zahlungsverifizierung.
+/// Gibt dem Käufer die Zahlungsanweisung (Safe-Adresse, Betrag, Asset, Chain).
+/// Der Bridge Monitor beobachtet die Safe und claimed automatisch bei Zahlung.
+pub async fn handle_htlc_buy_init(
+    State(state): State<AppState>,
+    Json(req): Json<HtlcBuyInitRequest>,
+) -> impl IntoResponse {
+    use stone::token::htlc::{BuyStatus, PendingBuy, SUPPORTED_CHAINS, SUPPORTED_ASSETS};
+
+    // Käufer validieren
+    let buyer = match stone::token::normalize_address(&req.buyer_wallet) {
+        Some(h) if h.len() == 64 && !h.starts_with("pool:") => h,
+        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": "Ungültige buyer_wallet"
+        }))).into_response(),
+    };
+
+    // HTLC laden
+    let contract = {
+        let store = state.node.htlc_store.read().unwrap_or_else(|e| e.into_inner());
+        store.get(&req.htlc_id).cloned()
+    };
+    let contract = match contract {
+        Some(c) => c,
+        None => return (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "ok": false, "error": "HTLC nicht gefunden"
+        }))).into_response(),
+    };
+
+    // Validierungen
+    if contract.status != HtlcStatus::Locked {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": "HTLC ist nicht aktiv"
+        }))).into_response();
+    }
+    if !contract.receiver.is_empty() {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": "HTLC hat bereits einen Empfänger"
+        }))).into_response();
+    }
+    if buyer == contract.sender {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": "Eigenen Trade kann man nicht kaufen"
+        }))).into_response();
+    }
+    let now = chrono::Utc::now().timestamp();
+    if now >= contract.time_lock {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": "HTLC ist abgelaufen"
+        }))).into_response();
+    }
+
+    // Preis muss gesetzt sein
+    let price = match &contract.price {
+        Some(p) => p.clone(),
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": "HTLC hat keinen Preis – normaler Kauf über /api/v1/htlc/buy verwenden"
+        }))).into_response(),
+    };
+
+    // Chain/Asset: Entweder aus Request oder aus HTLC-Preis
+    let chain = req.chain.as_deref().unwrap_or(&price.chain);
+    let asset = req.asset.as_deref().unwrap_or(&price.asset);
+
+    if !SUPPORTED_CHAINS.contains(&chain) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": format!("Unsupported chain: {chain}")
+        }))).into_response();
+    }
+    if !SUPPORTED_ASSETS.contains(&asset) {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": format!("Unsupported asset: {asset}")
+        }))).into_response();
+    }
+
+    // Prüfen ob für diesen HTLC schon ein aktiver Buy existiert
+    {
+        let store = state.node.htlc_store.read().unwrap_or_else(|e| e.into_inner());
+        if store.has_active_buy_for_htlc(&req.htlc_id) {
+            return (StatusCode::CONFLICT, Json(serde_json::json!({
+                "ok": false, "error": "Für diesen HTLC läuft bereits ein Kaufvorgang"
+            }))).into_response();
+        }
+    }
+
+    // Safe-Adresse für die Chain laden
+    let safes_config = load_bridge_safes_config();
+    let chain_cfg = match safes_config.get(chain) {
+        Some(c) => c,
+        None => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": format!("Chain {chain} nicht konfiguriert")
+        }))).into_response(),
+    };
+    let safe_address = match chain_cfg.get("safe_address").and_then(|v| v.as_str()) {
+        Some(a) if !a.is_empty() => a.to_string(),
+        _ => return (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({
+            "ok": false, "error": format!("Bridge-Safe für {chain} noch nicht eingerichtet")
+        }))).into_response(),
+    };
+
+    // Escrowed Preimage prüfen
+    {
+        let store = state.node.htlc_store.read().unwrap_or_else(|e| e.into_inner());
+        if store.get_escrowed_preimage(&req.htlc_id).is_none() {
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+                "ok": false, "error": "Kein Preimage vorhanden – manueller Kauf nötig"
+            }))).into_response();
+        }
+    }
+
+    // PendingBuy erstellen
+    let buy_id = format!("buy-{:016x}", rand::random::<u64>());
+    // Buy-Timeout: Minimum von 30 Minuten und HTLC time_lock
+    let buy_expires = std::cmp::min(now + 1800, contract.time_lock - 120);
+    if buy_expires <= now {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": "HTLC läuft zu bald ab für verifiziertes Kaufen"
+        }))).into_response();
+    }
+
+    let pending = PendingBuy {
+        buy_id: buy_id.clone(),
+        htlc_id: req.htlc_id.clone(),
+        buyer: buyer.clone(),
+        expected_amount: price.amount.clone(),
+        expected_asset: asset.to_string(),
+        expected_chain: chain.to_string(),
+        safe_address: safe_address.clone(),
+        status: BuyStatus::WaitingForPayment,
+        created_at: now,
+        expires_at: buy_expires,
+        payment_tx_hash: None,
+        claim_tx_id: None,
+    };
+
+    {
+        let mut store = state.node.htlc_store.write().unwrap_or_else(|e| e.into_inner());
+        store.create_pending_buy(pending);
+        if let Err(e) = store.persist() {
+            eprintln!("[htlc] ⚠️  PendingBuy persist fehlgeschlagen: {e}");
+        }
+    }
+
+    println!("[htlc] 🛒 Buy initiiert: {} → HTLC {} ({} {} auf {})",
+        buy_id, req.htlc_id, price.amount, asset, chain);
+
+    (StatusCode::OK, Json(serde_json::json!({
+        "ok": true,
+        "buy_id": buy_id,
+        "htlc_id": req.htlc_id,
+        "status": "WaitingForPayment",
+        "payment": {
+            "safe_address": safe_address,
+            "amount": price.amount,
+            "asset": asset,
+            "chain": chain,
+            "expires_at": buy_expires,
+        },
+        "stone_amount": contract.amount.to_string(),
+        "message": format!("Sende {} {} an {} auf {}", price.amount, asset, safe_address, chain),
+    }))).into_response()
+}
+
+/// GET /api/v1/htlc/buy/status?buy_id=...
+///
+/// Gibt den aktuellen Status eines Kaufvorgangs zurück.
+pub async fn handle_htlc_buy_status(
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> impl IntoResponse {
+    let buy_id = match params.get("buy_id") {
+        Some(id) if !id.is_empty() => id,
+        _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({
+            "ok": false, "error": "buy_id Parameter fehlt"
+        }))).into_response(),
+    };
+
+    let store = state.node.htlc_store.read().unwrap_or_else(|e| e.into_inner());
+    match store.get_pending_buy(buy_id) {
+        Some(buy) => {
+            let status_str = match &buy.status {
+                BuyStatus::WaitingForPayment => "WaitingForPayment",
+                BuyStatus::PaymentDetected => "PaymentDetected",
+                BuyStatus::PaymentConfirmed => "PaymentConfirmed",
+                BuyStatus::Completed => "Completed",
+                BuyStatus::Expired => "Expired",
+                BuyStatus::Failed(_) => "Failed",
+            };
+            let error_msg = match &buy.status {
+                BuyStatus::Failed(msg) => Some(msg.clone()),
+                _ => None,
+            };
+
+            (StatusCode::OK, Json(serde_json::json!({
+                "ok": true,
+                "buy_id": buy.buy_id,
+                "htlc_id": buy.htlc_id,
+                "status": status_str,
+                "payment": {
+                    "safe_address": buy.safe_address,
+                    "amount": buy.expected_amount,
+                    "asset": buy.expected_asset,
+                    "chain": buy.expected_chain,
+                    "expires_at": buy.expires_at,
+                },
+                "payment_tx_hash": buy.payment_tx_hash,
+                "claim_tx_id": buy.claim_tx_id,
+                "error": error_msg,
+            }))).into_response()
+        }
+        None => (StatusCode::NOT_FOUND, Json(serde_json::json!({
+            "ok": false, "error": "Kaufvorgang nicht gefunden"
+        }))).into_response(),
     }
 }

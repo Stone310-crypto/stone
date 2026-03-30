@@ -599,14 +599,13 @@ pub async fn download_snapshot_from_peer(
 /// HTTP-URLs der Bootstrap-Nodes für Konsensverifikation.
 /// Muss mit SEED_NODES in network.rs konsistent gehalten werden.
 const BOOTSTRAP_HTTP_URLS: &[&str] = &[
-    "http://212.227.54.241:8080", // VPS1
-    "http://69.48.200.255:8080",  // VPS2
+    "http://212.227.54.241:3080", // VPS1
+    "http://69.48.200.255:3080",  // VPS2
 ];
 
 /// Minimale Übereinstimmung für Bootstrap-Konsens.
 /// Bei <= 4 Nodes: ALLE müssen übereinstimmen (100%).
 /// Bei >= 5 Nodes: 2/3 Mehrheit reicht.
-const MIN_BOOTSTRAP_NODES_FOR_MAJORITY: usize = 5;
 
 // ─── State-Root Response ─────────────────────────────────────────────────────
 
@@ -620,6 +619,7 @@ struct StateRootResponse {
 
 /// Antwort von `/api/v1/snapshot/meta`
 #[derive(Debug, Deserialize)]
+#[allow(dead_code)]
 struct SnapshotMetaResponse {
     available: Option<bool>,
     block_height: Option<u64>,

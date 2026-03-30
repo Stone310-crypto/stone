@@ -78,6 +78,7 @@ impl RateLimiter {
     }
 
     /// Gibt die verbleibende Anzahl erlaubter Anfragen für einen Key zurück.
+    #[allow(dead_code)]
     pub fn remaining(&self, key: &str) -> u32 {
         let now = Instant::now();
         let window = std::time::Duration::from_secs(self.window_secs);
@@ -123,6 +124,7 @@ impl RateLimiter {
     }
 
     /// Aktuelle Anzahl getrackter Keys (für Monitoring).
+    #[allow(dead_code)]
     pub fn tracked_keys(&self) -> usize {
         self.entries.lock().unwrap_or_else(|e| e.into_inner()).len()
     }

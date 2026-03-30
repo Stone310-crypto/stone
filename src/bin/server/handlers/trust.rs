@@ -17,7 +17,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::json;
-use stone::master_node::TrustStatus;
+use stone::master::TrustStatus;
 
 use super::super::auth_middleware::require_admin;
 use super::super::state::{save_trust, AppState};

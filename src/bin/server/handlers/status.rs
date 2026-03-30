@@ -6,7 +6,7 @@ use axum::{
     response::IntoResponse,
 };
 use serde_json::json;
-use stone::master_node::NodeStatusResponse;
+use stone::master::NodeStatusResponse;
 
 use super::super::state::AppState;
 

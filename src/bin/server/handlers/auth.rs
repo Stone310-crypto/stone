@@ -13,7 +13,7 @@ use stone::{
         create_user_with_phrase, generate_session_token, resolve_phrase, save_users,
         verify_challenge_signature, User, QR_LOGIN_TTL_SECS, SESSION_TOKEN_TTL_SECS,
     },
-    master_node::PeerInfo,
+    master::PeerInfo,
 };
 
 use super::super::auth_middleware::{require_admin, require_user};

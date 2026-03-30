@@ -35,7 +35,7 @@ use std::{net::SocketAddr, sync::Arc};
 use stone::{
     auth::load_users,
     blockchain::{data_dir, NodeRole},
-    master_node::MasterNodeState,
+    master::MasterNodeState,
     network::{start_network, NetworkHandle},
     storage::ChunkStore,
 };
@@ -90,6 +90,35 @@ async fn main() {
         "[master] API-Key geladen: {}...",
         &api_key[..8.min(api_key.len())]
     );
+
+    // ── Snapshot-Bootstrap: Prüfen ob wir eine frische Node sind ──────────
+    {
+        let (chain_height, local_genesis) = {
+            let tmp_chain = stone::blockchain::StoneChain::load_or_create(&api_key);
+            let h = tmp_chain.blocks.len() as u64;
+            let g = tmp_chain.blocks.first().map(|b| b.hash.clone()).unwrap_or_default();
+            (h, g)
+        };
+        if chain_height <= 1 {
+            eprintln!("[snapshot] 🔍 Frische Node – starte verifizierten Snapshot-Sync...");
+            match stone::snapshot::verified_download_snapshot(
+                &local_genesis, chain_height,
+            ).await {
+                Ok(meta) => {
+                    eprintln!(
+                        "[snapshot] ✅ Verifizierter Snapshot geladen: Block #{}, {:.1} MB, state_root: {}",
+                        meta.block_height,
+                        meta.archive_size as f64 / 1_048_576.0,
+                        &meta.state_root[..16.min(meta.state_root.len())],
+                    );
+                }
+                Err(e) => {
+                    eprintln!("[snapshot] ℹ️  Snapshot-Sync nicht möglich: {e}");
+                    eprintln!("[snapshot] Normaler Block-Sync wird verwendet");
+                }
+            }
+        }
+    }
 
     // Master Node State initialisieren
     let node = MasterNodeState::new(node_id.clone(), api_key.as_ref().clone(), NodeRole::Master);
@@ -146,7 +175,7 @@ async fn main() {
             let mut added = 0;
             for url in &bootstrap {
                 if !existing_urls.contains(url) {
-                    let peer = stone::master_node::PeerInfo::new(url);
+                    let peer = stone::master::PeerInfo::new(url);
                     node.upsert_peer(peer);
                     added += 1;
                 }
@@ -213,6 +242,45 @@ async fn main() {
         });
     }
 
+    // ChatIndex vorab erstellen, damit der P2P-Event-Loop ihn nutzen kann
+    let chat_index_arc: Arc<std::sync::Mutex<stone::chat::ChatIndex>> = {
+        let mut idx = stone::chat::load_chat_index();
+        let chain = node.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let chain_len = chain.blocks.len() as u64;
+        let last_chain_block_idx = chain.blocks.last().map(|b| b.index).unwrap_or(0);
+        if idx.last_indexed_block > 0 && chain_len > 0 && idx.last_indexed_block > last_chain_block_idx {
+            println!("[chat-index] ⚠️ Chain-Reset erkannt beim Start! last_indexed_block={} aber letzter Block ist #{}. Rebuild...", idx.last_indexed_block, last_chain_block_idx);
+            let old_content: std::collections::HashMap<String, (String, String)> = idx.conversations.values()
+                .flat_map(|entries| entries.iter())
+                .filter(|e| !e.encrypted_content.is_empty())
+                .map(|e| (e.msg_id.clone(), (e.encrypted_content.clone(), e.nonce.clone())))
+                .collect();
+            let all_blocks: Vec<_> = chain.blocks.iter().collect();
+            idx = stone::chat::ChatIndex::rebuild_from_chain(&all_blocks, Some(&node.message_pool));
+            if !old_content.is_empty() {
+                for entries in idx.conversations.values_mut() {
+                    for entry in entries.iter_mut() {
+                        if entry.encrypted_content.is_empty() {
+                            if let Some((enc, nc)) = old_content.get(&entry.msg_id) {
+                                entry.encrypted_content = enc.clone();
+                                entry.nonce = nc.clone();
+                            }
+                        }
+                    }
+                }
+            }
+            let _ = stone::chat::save_chat_index(&idx);
+            println!("[chat-index] ✅ Rebuild fertig: {} Konversationen, last_indexed_block={}", idx.conversations.len(), idx.last_indexed_block);
+        } else if chain_len > 0 && last_chain_block_idx > idx.last_indexed_block {
+            let new_blocks: Vec<_> = chain.blocks.iter()
+                .filter(|b| b.index > idx.last_indexed_block)
+                .collect();
+            idx.index_new_blocks(&new_blocks, Some(&node.message_pool));
+            let _ = stone::chat::save_chat_index(&idx);
+        }
+        Arc::new(std::sync::Mutex::new(idx))
+    };
+
     // P2P-Netzwerk starten (optional – deaktivieren via STONE_P2P_DISABLED=1)
     let network_handle: Option<NetworkHandle> =
         if std::env::var("STONE_P2P_DISABLED").as_deref() == Ok("1") {
@@ -271,6 +339,7 @@ async fn main() {
                         let node_bg = node.clone();
                         let handle_bg = handle.clone();
                         let api_key_bg = api_key.clone();
+                        let chat_idx_bg = chat_index_arc.clone();
                         tokio::spawn(async move {
                             loop {
                                 let event = match event_rx.recv().await {
@@ -413,6 +482,8 @@ async fn main() {
                                                             node_bg.mempool.remove_tx(&tx.tx_id);
                                                         }
                                                     }
+                                                    // HTLC-TXs verarbeiten (Master-Server P2P-Pfad)
+                                                    stone::master::MasterNodeState::process_htlc_txs(&node_bg, &block_txs, idx);
                                                     // Chat-Batch-Records speichern (für Chat-Index)
                                                     for batch in &chat_batches {
                                                         if !batch.messages.is_empty() {
@@ -436,6 +507,14 @@ async fn main() {
                                                     || e.contains("Reorg abgelehnt") || e.contains("Timestamp") =>
                                                 {
                                                     eprintln!("[p2p] Block #{idx} Fork/Reorg: {e}");
+                                                    BlockResult::Fork
+                                                }
+                                                Err(ref e) if e.contains("PoA") || e.contains("Argon2")
+                                                    || e.contains("Storage-Proof") || e.contains("difficulty")
+                                                    || e.contains("Difficulty") || e.contains("Signer")
+                                                    || e.contains("Signatur") =>
+                                                {
+                                                    eprintln!("[p2p] Block #{idx} validation mismatch (no penalty): {e}");
                                                     BlockResult::Fork
                                                 }
                                                 Err(e) => {
@@ -546,7 +625,7 @@ async fn main() {
                                         }
                                         BlockResult::Rejected => {
                                             // Peer hat ungültigen Block geliefert → Penalty
-                                            handle_bg.report_penalty(&from_peer, 15, "rejected block").await;
+                                            handle_bg.report_penalty(&from_peer, 5, "rejected block").await;
                                         }
                                         _ => {} // Stale, AlreadyKnown, Fork
                                     }
@@ -614,7 +693,7 @@ async fn main() {
                                     }
                                     if let Some(ip) = ip {
                                         let url = format!("http://{}:{}", ip, http_port);
-                                        let mut peer_info = stone::master_node::PeerInfo::new(&url);
+                                        let mut peer_info = stone::master::PeerInfo::new(&url);
                                         peer_info.name = Some(peer_id[..12.min(peer_id.len())].to_string());
                                         node_bg.upsert_peer(peer_info);
                                         if let Ok(json) = serde_json::to_string_pretty(&node_bg.get_peers()) {
@@ -725,7 +804,7 @@ async fn main() {
                                                 &from_peer[..12.min(from_peer.len())], seq,
                                             );
                                             // WebSocket-Push an verbundene Clients
-                                            node_bg.events.publish(stone::master_node::NodeEvent::ChatMessageReceived {
+                                            node_bg.events.publish(stone::master::NodeEvent::ChatMessageReceived {
                                                 msg_id: msg_clone.msg_id.clone(),
                                                 from_wallet: msg_clone.from_wallet.clone(),
                                                 to_wallet: msg_clone.to_wallet.clone(),
@@ -736,6 +815,62 @@ async fn main() {
                                             });
                                         }
                                         Err(_) => {}
+                                    }
+                                }
+
+                                // ── Chat Content Sync (DSGVO off-chain) ───────────
+                                NetworkEvent::ChatContentReceived { content, from_peer } => {
+                                    let chat_index = chat_idx_bg.clone();
+                                    let mut idx = chat_index.lock().unwrap_or_else(|e| e.into_inner());
+                                    let key = stone::chat::ChatIndex::conv_key(&content.from_wallet, &content.to_wallet);
+                                    let updated = if let Some(entries) = idx.conversations.get_mut(&key) {
+                                        if let Some(entry) = entries.iter_mut().find(|e| e.msg_id == content.msg_id) {
+                                            if entry.encrypted_content.is_empty() && !content.encrypted_content.is_empty() {
+                                                entry.encrypted_content = content.encrypted_content.clone();
+                                                entry.nonce = content.nonce.clone();
+                                                true
+                                            } else { false }
+                                        } else {
+                                            // Noch kein Eintrag — Content für spätere Zuordnung vorhalten
+                                            entries.push(stone::chat::ChatEntry {
+                                                msg_id: content.msg_id.clone(),
+                                                from_wallet: content.from_wallet.clone(),
+                                                to_wallet: content.to_wallet.clone(),
+                                                from_user_id: String::new(),
+                                                from_name: String::new(),
+                                                encrypted_content: content.encrypted_content.clone(),
+                                                nonce: content.nonce.clone(),
+                                                content_hash: content.content_hash.clone(),
+                                                timestamp: chrono::Utc::now().timestamp(),
+                                                block_index: 0,
+                                                tx_id: String::new(),
+                                            });
+                                            true
+                                        }
+                                    } else {
+                                        // Neue Konversation — Entry anlegen
+                                        idx.conversations.insert(key, vec![stone::chat::ChatEntry {
+                                            msg_id: content.msg_id.clone(),
+                                            from_wallet: content.from_wallet.clone(),
+                                            to_wallet: content.to_wallet.clone(),
+                                            from_user_id: String::new(),
+                                            from_name: String::new(),
+                                            encrypted_content: content.encrypted_content.clone(),
+                                            nonce: content.nonce.clone(),
+                                            content_hash: content.content_hash.clone(),
+                                            timestamp: chrono::Utc::now().timestamp(),
+                                            block_index: 0,
+                                            tx_id: String::new(),
+                                        }]);
+                                        true
+                                    };
+                                    if updated {
+                                        stone::chat::save_chat_index(&idx);
+                                        println!(
+                                            "[p2p] 📝 Chat-Content sync: msg_id={}… von {}",
+                                            &content.msg_id[..8.min(content.msg_id.len())],
+                                            &from_peer[..12.min(from_peer.len())],
+                                        );
                                     }
                                 }
 
@@ -842,6 +977,8 @@ async fn main() {
                                                                 node_bg.mempool.remove_tx(&tx.tx_id);
                                                             }
                                                         }
+                                                        // HTLC-TXs verarbeiten (Master-Server Range-Sync)
+                                                        stone::master::MasterNodeState::process_htlc_txs(&node_bg, &txs, idx);
                                                         // Chat-Batch-Records speichern
                                                         for batch in &chat_batches {
                                                             if !batch.messages.is_empty() {
@@ -979,37 +1116,24 @@ async fn main() {
             um
         })),
         orgs: Arc::new(std::sync::Mutex::new(stone::organization::load_orgs())),
-        chat_index: {
-            let mut idx = stone::chat::load_chat_index();
-            // Chat-Index aus der Chain aufbauen/aktualisieren
-            let chain = node.chain.lock().unwrap_or_else(|e| e.into_inner());
-            let chain_len = chain.blocks.len() as u64;
-            if idx.last_indexed_block > 0 && chain_len > 0 && idx.last_indexed_block >= chain_len {
-                println!("[chat-index] ⚠️ Chain-Reset erkannt beim Start! last_indexed_block={} aber chain hat nur {} Blöcke. Rebuild...", idx.last_indexed_block, chain_len);
-                let all_blocks: Vec<_> = chain.blocks.iter().collect();
-                idx = stone::chat::ChatIndex::rebuild_from_chain(&all_blocks, Some(&node.message_pool));
-                let _ = stone::chat::save_chat_index(&idx);
-                println!("[chat-index] ✅ Rebuild fertig: {} Konversationen, last_indexed_block={}", idx.conversations.len(), idx.last_indexed_block);
-            } else if chain_len > 0 && (chain_len - 1) > idx.last_indexed_block {
-                let new_blocks: Vec<_> = chain.blocks.iter()
-                    .skip((idx.last_indexed_block + 1) as usize)
-                    .collect();
-                idx.index_new_blocks(&new_blocks, Some(&node.message_pool));
-                let _ = stone::chat::save_chat_index(&idx);
-            }
-            Arc::new(std::sync::Mutex::new(idx))
-        },
+        chat_index: chat_index_arc.clone(),
         contacts: Arc::new(std::sync::Mutex::new(stone::chat::load_contacts())),
         contact_requests: Arc::new(std::sync::Mutex::new(stone::chat::load_contact_requests())),
         challenge_store: stone::auth::ChallengeStore::new(),
         qr_login_store: stone::auth::QrLoginStore::new(),
         miner_status_store: server::state::MinerStatusStore::new(),
         chat_groups: Arc::new(std::sync::Mutex::new(stone::chat::load_chat_groups())),
+        announcements: Arc::new(std::sync::Mutex::new(stone::chat::load_announcements())),
         call_signals: Arc::new(stone::chat::CallSignalStore::default()),
         audio_rooms: server::handlers::audio_relay::new_audio_rooms(),
+        push_tokens: Arc::new(std::sync::Mutex::new(stone::push::load_push_tokens())),
+        fcm_client: Arc::new(stone::push::FcmClient::new()),
     };
 
     let router = build_router(state.clone());
+
+    // ── Bridge Payment Monitor ──────────────────────────────────────────
+    server::bridge_monitor::start_bridge_monitor(state.clone());
 
     // Post-Update Erfolg bestätigen (nach 120s gesundem Betrieb)
     tokio::spawn(async move {

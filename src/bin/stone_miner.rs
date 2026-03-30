@@ -42,7 +42,7 @@ use stone::{
     auth::load_users,
     blockchain::{data_dir, NodeRole},
     consensus::{load_or_create_validator_key, local_validator_pubkey_hex},
-    master_node::{
+    master::{
         MasterNodeState, PeerInfo, HALVING_INTERVAL,
         MINING_INTERVAL_SECS,
     },
@@ -584,6 +584,8 @@ async fn handle_p2p_event(
     node: &Arc<MasterNodeState>,
     handle: &NetworkHandle,
     api_key: &Arc<String>,
+    chat_index_rc: &Arc<std::sync::Mutex<stone::chat::ChatIndex>>,
+    pending_sync_blocks: &std::sync::Mutex<Vec<stone::blockchain::Block>>,
 ) {
     match event {
         NetworkEvent::BlockReceived { block, from_peer } => {
@@ -696,6 +698,8 @@ async fn handle_p2p_event(
                             }
                             // Staking-TXs im StakingPool verarbeiten (P2P-Pfad)
                             node.apply_staking_from_txs(&txs);
+                            // HTLC-TXs verarbeiten (P2P-Pfad)
+                            MasterNodeState::process_htlc_txs(&node, &txs, idx);
                             // Chat-Batch-Records speichern (für Chat-Index)
                             for batch in &chat_batches {
                                 if !batch.messages.is_empty() {
@@ -753,6 +757,13 @@ async fn handle_p2p_event(
                             eprintln!("[p2p] Block #{idx} Fork/Reorg: {e}");
                             BlockResult::Fork
                         }
+                        Err(ref e) if e.contains("PoA") || e.contains("Argon2")
+                            || e.contains("Storage-Proof") || e.contains("difficulty")
+                            || e.contains("Difficulty") || e.contains("Signer")
+                            || e.contains("Signatur") => {
+                            eprintln!("[p2p] Block #{idx} validation mismatch (no penalty): {e}");
+                            BlockResult::Fork
+                        }
                         Err(e) => {
                             eprintln!("[p2p] Block #{idx} abgelehnt: {e}");
                             BlockResult::Rejected
@@ -789,7 +800,7 @@ async fn handle_p2p_event(
                     });
                 }
                 BlockResult::Rejected => {
-                    handle.report_penalty(&from_peer, 15, "rejected block").await;
+                    handle.report_penalty(&from_peer, 5, "rejected block").await;
                 }
                 _ => {} // AlreadyKnown, Stale, Fork — kein Penalty
             }
@@ -797,64 +808,55 @@ async fn handle_p2p_event(
 
         // ── Range-Sync Batch (Fork-Reorg) ─────────────────────────────────
         NetworkEvent::RangeSyncReceived { blocks, from_peer: _from_peer } => {
-            let mut sorted = blocks;
-            sorted.sort_by_key(|b| b.index);
+            // Blöcke in den Puffer aufnehmen, sortieren, Duplikate entfernen
+            {
+                let mut buf = pending_sync_blocks.lock().unwrap_or_else(|e| e.into_inner());
+                buf.extend(blocks);
+                buf.sort_by_key(|b| b.index);
+                buf.dedup_by_key(|b| b.index);
+            }
 
             let reorg_result: Option<(u64, u64)> = {
                 let mut chain = node.chain.lock().unwrap_or_else(|e| e.into_inner());
-                let local_len = chain.blocks.len();
+                let chain_tip = chain.blocks.len() as u64;
 
-                let mut fork_at = 0usize;
-                for block in &sorted {
-                    let idx = block.index as usize;
-                    if idx < local_len {
-                        if chain.blocks[idx].hash == block.hash {
-                            fork_at = idx + 1;
-                        } else {
-                            break;
-                        }
-                    } else {
-                        fork_at = local_len;
+                // Lückenlose Blöcke ab Chain-Tip aus dem Puffer entnehmen
+                let mut buf = pending_sync_blocks.lock().unwrap_or_else(|e| e.into_inner());
+                // Alte Blöcke (< chain_tip) entfernen
+                buf.retain(|b| b.index >= chain_tip);
+
+                let mut contiguous = Vec::new();
+                let mut expected = chain_tip;
+                let mut take_indices = Vec::new();
+                for (i, block) in buf.iter().enumerate() {
+                    if block.index == expected {
+                        contiguous.push(block.clone());
+                        take_indices.push(i);
+                        expected += 1;
+                    } else if block.index > expected {
                         break;
                     }
                 }
+                // Entnommene Blöcke aus dem Puffer entfernen (rückwärts)
+                for &i in take_indices.iter().rev() {
+                    buf.remove(i);
+                }
+                let buf_remaining = buf.len();
+                drop(buf);
 
-                let peer_new: Vec<_> = sorted.into_iter()
-                    .filter(|b| b.index as usize >= fork_at)
-                    .collect();
-                let our_after_fork = local_len.saturating_sub(fork_at);
-
-                if peer_new.len() > our_after_fork {
-                    println!(
-                        "[sync] 🔄 Fork-Reorg: fork_at={fork_at}, lokal={local_len}, peer hat {} neue Blöcke",
-                        peer_new.len()
+                if contiguous.is_empty() {
+                    eprintln!(
+                        "[sync] ⏳ Puffer: {buf_remaining} Blöcke wartend, chain_tip={chain_tip}, nächster im Puffer={}",
+                        pending_sync_blocks.lock().unwrap_or_else(|e| e.into_inner()).first().map(|b| b.index).unwrap_or(0)
                     );
-                    let orphaned = chain.truncate_to(fork_at as u64);
-                    // Orphan-TX-Recovery: User-TXs aus verwaisten Blöcken zurück in Mempool
-                    if !orphaned.is_empty() {
-                        node.mempool.requeue_orphaned_txs(&orphaned);
-                    }
-
-                    // Ledger komplett aus der getrunkten Chain neu aufbauen,
-                    // damit Balancen/Nonces konsistent sind (BUG-11 Fix)
-                    {
-                        let rebuilt = stone::token::TokenLedger::rebuild_from_chain(&chain.blocks);
-                        let mut ledger = node.token_ledger.write().unwrap_or_else(|e| e.into_inner());
-                        *ledger = rebuilt;
-                        eprintln!(
-                            "[sync] Token-Ledger nach Reorg neu aufgebaut: {} Accounts, Supply: {}",
-                            ledger.account_count(),
-                            ledger.total_supply()
-                        );
-                    }
-                    // StakingPool nach fork-Reorg auch neu aufbauen
-                    {
-                        let rebuilt_pool = stone::token::StakingPool::rebuild_from_chain(&chain.blocks);
-                        *node.staking_pool.write().unwrap_or_else(|e| e.into_inner()) = rebuilt_pool;
-                    }
-
+                    None
+                } else {
+                    println!(
+                        "[sync] 📥 Append: {} Blöcke ab #{chain_tip} (Puffer: {buf_remaining} verbleibend)",
+                        contiguous.len()
+                    );
                     let mut applied = 0u64;
-                    for block in peer_new {
+                    for block in contiguous {
                         let idx = block.index;
                         let txs = block.transactions.clone();
                         let _block_signer = block.signer.clone();
@@ -929,6 +931,8 @@ async fn handle_p2p_event(
                                 }
                                 // Staking-TXs im StakingPool verarbeiten (RangeSync-Pfad)
                                 node.apply_staking_from_txs(&txs);
+                                // HTLC-TXs verarbeiten (RangeSync-Pfad)
+                                MasterNodeState::process_htlc_txs(&node, &txs, idx);
                             }
                             Err(e) => {
                                 eprintln!("[sync] ✗ Reorg Block #{idx} fehlgeschlagen: {e}");
@@ -937,14 +941,12 @@ async fn handle_p2p_event(
                         }
                     }
                     Some((chain.blocks.len() as u64, applied))
-                } else {
-                    None
                 }
             }; // chain-Lock hier gedroppt
 
             if let Some((new_count, applied)) = reorg_result {
                 handle.set_chain_count(new_count).await;
-                println!("[sync] ✓ Fork-Reorg abgeschlossen: {applied} Blöcke applied, Chain-Höhe={new_count}");
+                println!("[sync] ✓ Sync abgeschlossen: {applied} Blöcke applied, Chain-Höhe={new_count}");
             }
         }
 
@@ -1060,6 +1062,57 @@ async fn handle_p2p_event(
                 eprintln!("[p2p] 🔌 Peer getrennt: {} (kein HTTP-Peer bekannt)", pid_short);
             }
         },
+        NetworkEvent::ChatContentReceived { content, from_peer } => {
+            let mut idx = chat_index_rc.lock().unwrap_or_else(|e| e.into_inner());
+            let key = stone::chat::ChatIndex::conv_key(&content.from_wallet, &content.to_wallet);
+            let updated = if let Some(entries) = idx.conversations.get_mut(&key) {
+                if let Some(entry) = entries.iter_mut().find(|e| e.msg_id == content.msg_id) {
+                    if entry.encrypted_content.is_empty() && !content.encrypted_content.is_empty() {
+                        entry.encrypted_content = content.encrypted_content.clone();
+                        entry.nonce = content.nonce.clone();
+                        true
+                    } else { false }
+                } else {
+                    entries.push(stone::chat::ChatEntry {
+                        msg_id: content.msg_id.clone(),
+                        from_wallet: content.from_wallet.clone(),
+                        to_wallet: content.to_wallet.clone(),
+                        from_user_id: String::new(),
+                        from_name: String::new(),
+                        encrypted_content: content.encrypted_content.clone(),
+                        nonce: content.nonce.clone(),
+                        content_hash: content.content_hash.clone(),
+                        timestamp: chrono::Utc::now().timestamp(),
+                        block_index: 0,
+                        tx_id: String::new(),
+                    });
+                    true
+                }
+            } else {
+                idx.conversations.insert(key, vec![stone::chat::ChatEntry {
+                    msg_id: content.msg_id.clone(),
+                    from_wallet: content.from_wallet.clone(),
+                    to_wallet: content.to_wallet.clone(),
+                    from_user_id: String::new(),
+                    from_name: String::new(),
+                    encrypted_content: content.encrypted_content.clone(),
+                    nonce: content.nonce.clone(),
+                    content_hash: content.content_hash.clone(),
+                    timestamp: chrono::Utc::now().timestamp(),
+                    block_index: 0,
+                    tx_id: String::new(),
+                }]);
+                true
+            };
+            if updated {
+                stone::chat::save_chat_index(&idx);
+                println!(
+                    "[p2p] 📝 Chat-Content sync: msg_id={}… von {}",
+                    &content.msg_id[..8.min(content.msg_id.len())],
+                    &from_peer[..12.min(from_peer.len())],
+                );
+            }
+        }
         _ => {}
     }
 
@@ -1735,7 +1788,7 @@ fn spawn_pow_solver(
                         elapsed.as_secs_f64(), hashrate,
                     ));
 
-                    let submission = stone::master_node::MiningSubmission {
+                    let submission = stone::master::MiningSubmission {
                         template_id: template_id.clone(),
                         nonce,
                         pow_hash,
@@ -1864,20 +1917,20 @@ fn spawn_log_watcher(
             match events.recv().await {
                 Ok(event) => {
                     let msg = match &event {
-                        stone::master_node::NodeEvent::BlockAdded { index, hash, .. } => {
+                        stone::master::NodeEvent::BlockAdded { index, hash, .. } => {
                             Some(format!("✅ Block #{index} committed ({}…)", &hash[..8.min(hash.len())]))
                         }
-                        stone::master_node::NodeEvent::TokenTransfer { tx_type, amount, from, to, block_index, .. } => {
+                        stone::master::NodeEvent::TokenTransfer { tx_type, amount, from, to, block_index, .. } => {
                             if tx_type == "reward" {
                                 Some(format!("⛏ Reward: {amount} STONE → {}… (Block #{block_index})", &to[..8.min(to.len())]))
                             } else if tx_type == "transfer" {
                                 Some(format!("💸 Transfer: {amount} STONE {}… → {}…", &from[..8.min(from.len())], &to[..8.min(to.len())]))
                             } else { None }
                         }
-                        stone::master_node::NodeEvent::SyncCompleted { peer_url, blocks_added } => {
+                        stone::master::NodeEvent::SyncCompleted { peer_url, blocks_added } => {
                             Some(format!("🔄 Sync: {blocks_added} Blöcke von {peer_url}"))
                         }
-                        stone::master_node::NodeEvent::PeerStatusChanged { url, status } => {
+                        stone::master::NodeEvent::PeerStatusChanged { url, status } => {
                             Some(format!("🔗 Peer {url}: {status:?}"))
                         }
                         _ => None,
@@ -2307,6 +2360,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .or_else(|| std::env::var("STONE_MINER_P2P_PORT").ok()?.parse().ok())
         .unwrap_or(4002u16);
 
+    // ChatIndex vorab erstellen, damit der P2P-Event-Loop ihn nutzen kann
+    let chat_index_arc: Arc<std::sync::Mutex<stone::chat::ChatIndex>> = {
+        let mut idx = stone::chat::load_chat_index();
+        let chain = node.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let chain_len = chain.blocks.len() as u64;
+        let last_chain_block_idx = chain.blocks.last().map(|b| b.index).unwrap_or(0);
+        if idx.last_indexed_block > 0 && chain_len > 0 && idx.last_indexed_block > last_chain_block_idx {
+            let old_content: std::collections::HashMap<String, (String, String)> = idx.conversations.values()
+                .flat_map(|entries| entries.iter())
+                .filter(|e| !e.encrypted_content.is_empty())
+                .map(|e| (e.msg_id.clone(), (e.encrypted_content.clone(), e.nonce.clone())))
+                .collect();
+            let all_blocks: Vec<_> = chain.blocks.iter().collect();
+            idx = stone::chat::ChatIndex::rebuild_from_chain(&all_blocks, Some(&node.message_pool));
+            if !old_content.is_empty() {
+                for entries in idx.conversations.values_mut() {
+                    for entry in entries.iter_mut() {
+                        if entry.encrypted_content.is_empty() {
+                            if let Some((enc, nc)) = old_content.get(&entry.msg_id) {
+                                entry.encrypted_content = enc.clone();
+                                entry.nonce = nc.clone();
+                            }
+                        }
+                    }
+                }
+            }
+            let _ = stone::chat::save_chat_index(&idx);
+        } else if chain_len > 0 && last_chain_block_idx > idx.last_indexed_block {
+            let new_blocks: Vec<_> = chain.blocks.iter()
+                .filter(|b| b.index > idx.last_indexed_block)
+                .collect();
+            idx.index_new_blocks(&new_blocks, Some(&node.message_pool));
+            let _ = stone::chat::save_chat_index(&idx);
+        }
+        Arc::new(std::sync::Mutex::new(idx))
+    };
+
     let network_handle: Option<NetworkHandle> =
         if std::env::var("STONE_P2P_DISABLED").as_deref() == Ok("1") {
             None
@@ -2326,9 +2416,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let node_bg = node.clone();
                         let handle_bg = handle.clone();
                         let api_key_bg = api_key.clone();
+                        let chat_idx_bg = chat_index_arc.clone();
+                        let pending_sync = std::sync::Mutex::new(Vec::<stone::blockchain::Block>::new());
                         tokio::spawn(async move {
-                            while let Ok(event) = event_rx.recv().await {
-                                handle_p2p_event(event, &node_bg, &handle_bg, &api_key_bg).await;
+                            loop {
+                                match event_rx.recv().await {
+                                    Ok(event) => {
+                                        handle_p2p_event(event, &node_bg, &handle_bg, &api_key_bg, &chat_idx_bg, &pending_sync).await;
+                                    }
+                                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                        eprintln!("[p2p] ⚠ {n} Events übersprungen (Lagged)");
+                                        continue;
+                                    }
+                                    Err(_) => break,
+                                }
                             }
                         });
                     }
@@ -2441,26 +2542,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             um
         })),
         orgs: Arc::new(std::sync::Mutex::new(stone::organization::load_orgs())),
-        chat_index: {
-            let mut idx = stone::chat::load_chat_index();
-            let chain = node.chain.lock().unwrap_or_else(|e| e.into_inner());
-            if chain.blocks.len() as u64 > idx.last_indexed_block {
-                let new_blocks: Vec<_> = chain.blocks.iter()
-                    .skip(idx.last_indexed_block as usize)
-                    .collect();
-                idx.index_new_blocks(&new_blocks, Some(&node.message_pool));
-                let _ = stone::chat::save_chat_index(&idx);
-            }
-            Arc::new(std::sync::Mutex::new(idx))
-        },
+        chat_index: chat_index_arc.clone(),
         contacts: Arc::new(std::sync::Mutex::new(stone::chat::load_contacts())),
         contact_requests: Arc::new(std::sync::Mutex::new(stone::chat::load_contact_requests())),
         challenge_store: stone::auth::ChallengeStore::new(),
         qr_login_store: stone::auth::QrLoginStore::new(),
         miner_status_store: server::state::MinerStatusStore::new(),
         chat_groups: Arc::new(std::sync::Mutex::new(stone::chat::load_chat_groups())),
+        announcements: Arc::new(std::sync::Mutex::new(stone::chat::load_announcements())),
         call_signals: Arc::new(stone::chat::CallSignalStore::default()),
         audio_rooms: server::handlers::audio_relay::new_audio_rooms(),
+        push_tokens: Arc::new(std::sync::Mutex::new(stone::push::load_push_tokens())),
+        fcm_client: Arc::new(stone::push::FcmClient::new()),
     };
 
     // Post-Update Erfolg bestätigen (nach 120s gesundem Betrieb)

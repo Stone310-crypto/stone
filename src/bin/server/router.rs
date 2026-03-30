@@ -49,6 +49,13 @@ use super::handlers::{
         handle_group_send, handle_group_messages,
         handle_add_group_member, handle_remove_group_member,
     },
+    announcements::{
+        handle_list_announcements, handle_get_announcement, handle_create_announcement,
+        handle_delete_announcement, handle_react, handle_vote,
+    },
+    push::{
+        handle_push_register, handle_push_unregister, handle_push_status, handle_push_test,
+    },
     orgs::{
         handle_accept_invite, handle_create_channel, handle_create_org,
         handle_decline_invite, handle_get_chat, handle_get_org, handle_invite,
@@ -78,6 +85,13 @@ use super::handlers::{
         handle_staking_info, handle_staking_pool, handle_staker_info,
         handle_mempool_sync,
         handle_ledger_rebuild, handle_admin_airdrop,
+        handle_market_info, handle_market_history,
+        handle_market_buy, handle_market_sell, handle_market_balance,
+        handle_htlc_create, handle_htlc_claim, handle_htlc_refund, handle_htlc_buy,
+        handle_htlc_get, handle_htlc_list, handle_htlc_generate_preimage,
+        handle_htlc_payment_info, handle_htlc_buy_init, handle_htlc_buy_status,
+        handle_bridge_summary, handle_bridge_balances, handle_bridge_deposit,
+        handle_bridge_withdraw, handle_bridge_deposits, handle_bridge_withdrawals,
     },
     trust::{
         handle_trust_approve, handle_trust_check, handle_trust_history,
@@ -285,6 +299,30 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/wallet/{address}/rotations", get(handle_wallet_rotations))
         .route("/api/v1/wallet/{address}", get(handle_wallet_info))
         .route("/api/v1/wallet/{address}/balance", get(handle_wallet_balance))
+        // ─── Testnet-Markt-Simulation (entfernbar) ───────────────────────────
+        .route("/api/v1/token/market", get(handle_market_info))
+        .route("/api/v1/token/market/history", get(handle_market_history))
+        .route("/api/v1/token/market/buy", post(handle_market_buy))
+        .route("/api/v1/token/market/sell", post(handle_market_sell))
+        .route("/api/v1/token/market/balance", get(handle_market_balance))
+        // ─── HTLC (Atomic Swaps) ────────────────────────────────────────────
+        .route("/api/v1/htlc/create", post(handle_htlc_create))
+        .route("/api/v1/htlc/claim", post(handle_htlc_claim))
+        .route("/api/v1/htlc/refund", post(handle_htlc_refund))
+        .route("/api/v1/htlc/{htlc_id}", get(handle_htlc_get))
+        .route("/api/v1/htlc/list", get(handle_htlc_list))
+        .route("/api/v1/htlc/generate-preimage", post(handle_htlc_generate_preimage))
+        .route("/api/v1/htlc/buy", post(handle_htlc_buy))
+        .route("/api/v1/htlc/payment-info", get(handle_htlc_payment_info))
+        .route("/api/v1/htlc/buy/init", post(handle_htlc_buy_init))
+        .route("/api/v1/htlc/buy/status", get(handle_htlc_buy_status))
+        // ─── Bridge (Wrapped Token Bridge) ───────────────────────────────────
+        .route("/api/v1/bridge/summary", get(handle_bridge_summary))
+        .route("/api/v1/bridge/balances", get(handle_bridge_balances))
+        .route("/api/v1/bridge/deposit", post(handle_bridge_deposit))
+        .route("/api/v1/bridge/withdraw", post(handle_bridge_withdraw))
+        .route("/api/v1/bridge/deposits", get(handle_bridge_deposits))
+        .route("/api/v1/bridge/withdrawals", get(handle_bridge_withdrawals))
         // ─── Staking Pool ────────────────────────────────────────────────────
         // SECURITY: /api/v1/token/stake und /unstake entfernt — diese Endpoints
         // akzeptierten raw TXs ohne Auth + ohne Signaturprüfung.
@@ -346,6 +384,16 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/chat/groups/{group_id}/messages", get(handle_group_messages))
         .route("/api/v1/chat/groups/{group_id}/members", post(handle_add_group_member))
         .route("/api/v1/chat/groups/{group_id}/members/{wallet}", delete(handle_remove_group_member))
+        // ─── Community Announcements ─────────────────────────────────────────
+        .route("/api/v1/announcements", get(handle_list_announcements).post(handle_create_announcement))
+        .route("/api/v1/announcements/{id}", get(handle_get_announcement).delete(handle_delete_announcement))
+        .route("/api/v1/announcements/{id}/react", post(handle_react))
+        .route("/api/v1/announcements/{id}/vote", post(handle_vote))
+        // ─── Push Notifications ──────────────────────────────────────────────
+        .route("/api/v1/push/register", post(handle_push_register))
+        .route("/api/v1/push/unregister", post(handle_push_unregister))
+        .route("/api/v1/push/status", get(handle_push_status))
+        .route("/api/v1/push/test", post(handle_push_test))
         // ─── WebRTC Call-Signaling ───────────────────────────────────────────
         .route("/api/v1/call/signal", post(handle_send_signal))
         .route("/api/v1/call/signal/{peer_wallet}", get(handle_get_signals))

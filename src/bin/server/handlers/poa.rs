@@ -14,7 +14,7 @@ use stone::{
         SLASH_DOUBLE_SIGN_PERCENT, SLASH_DOWNTIME_PERCENT, SLASH_INVALID_BLOCK_PERCENT,
         DOWNTIME_THRESHOLD_BLOCKS, SLASH_JAIL_DURATION_SECS,
     },
-    master_node::NodeEvent,
+    master::NodeEvent,
 };
 
 use super::super::auth_middleware::require_admin;

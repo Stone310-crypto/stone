@@ -34,3 +34,13 @@ ca/
 *.tmp
 *.orig
 flycheck*/
+
+# ─── Log-Dateien ─────────────────────────────────────────────────────────────
+*.log
+stonechain-9439b-firebase-adminsdk-fbsvc-dd131971a5.json
+
+/src/bin/stone_keygen.rs
+
+*.sh
+deploy.sh
+start.sh

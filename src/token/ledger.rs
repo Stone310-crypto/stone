@@ -653,6 +653,7 @@ impl TokenLedger {
                 TxType::Transfer | TxType::Burn | TxType::RotateKey
                 | TxType::AccountRegister | TxType::AccountUpdate
                 | TxType::Stake | TxType::Unstake
+                | TxType::HtlcCreate
             );
             if needs_nonce {
                 let expected = pending_nonces
@@ -672,6 +673,7 @@ impl TokenLedger {
             let needs_balance = matches!(
                 tx.tx_type,
                 TxType::Transfer | TxType::Burn | TxType::Stake
+                | TxType::HtlcCreate
             );
             if needs_balance {
                 let total_debit = tx.amount + tx.fee;
@@ -740,7 +742,8 @@ impl TokenLedger {
             && (tx.tx_type == TxType::Transfer || tx.tx_type == TxType::Burn || tx.tx_type == TxType::RotateKey
             || tx.tx_type == TxType::AccountRegister || tx.tx_type == TxType::AccountUpdate
             || tx.tx_type == TxType::Stake || tx.tx_type == TxType::Unstake
-            || tx.tx_type == TxType::Delegate || tx.tx_type == TxType::Undelegate)
+            || tx.tx_type == TxType::Delegate || tx.tx_type == TxType::Undelegate
+            || tx.tx_type == TxType::HtlcCreate)
         {
             // Prüfen ob der Key durch Rotation invalidiert wurde
             if let Some(active) = self.resolve_active_key(&tx.from) {
@@ -966,6 +969,68 @@ impl TokenLedger {
                 *self.balances.entry(format!("escrow:unstake:{}", tx.from))
                     .or_insert(Decimal::ZERO) += tx.amount;
                 self.advance_nonce(&tx.from, tx.nonce);
+            }
+            TxType::HtlcCreate => {
+                // from = Sender-Wallet, to = pool:htlc_escrow, amount = Sperrbetrag
+                // Balance vom Sender abziehen und auf Escrow-Pool gutschreiben
+                let total_debit = tx.amount + tx.fee;
+                let balance = self.balance(&tx.from);
+                if balance < total_debit {
+                    return Err(LedgerError::InsufficientBalance {
+                        account: tx.from.clone(),
+                        available: balance,
+                        required: total_debit,
+                    });
+                }
+                *self.balances.entry(tx.from.clone()).or_insert(Decimal::ZERO) -= total_debit;
+                *self.balances.entry(super::htlc::HTLC_ESCROW_POOL.to_string())
+                    .or_insert(Decimal::ZERO) += tx.amount;
+                if tx.fee > Decimal::ZERO {
+                    self.apply_fee_split(tx.fee);
+                }
+                self.advance_nonce(&tx.from, tx.nonce);
+                println!(
+                    "[token] 🔒 HTLC Create: {} STONE {} → escrow (TX: {})",
+                    tx.amount, &tx.from[..12.min(tx.from.len())], &tx.tx_id[..12]
+                );
+            }
+            TxType::HtlcClaim => {
+                // from = pool:htlc_escrow, to = Empfänger-Wallet, amount = HTLC-Betrag
+                // Balance vom Escrow-Pool abziehen und an Empfänger gutschreiben
+                let pool_balance = self.balance(super::htlc::HTLC_ESCROW_POOL);
+                if pool_balance < tx.amount {
+                    return Err(LedgerError::InsufficientBalance {
+                        account: super::htlc::HTLC_ESCROW_POOL.to_string(),
+                        available: pool_balance,
+                        required: tx.amount,
+                    });
+                }
+                *self.balances.entry(super::htlc::HTLC_ESCROW_POOL.to_string())
+                    .or_insert(Decimal::ZERO) -= tx.amount;
+                *self.balances.entry(tx.to.clone()).or_insert(Decimal::ZERO) += tx.amount;
+                println!(
+                    "[token] 🔓 HTLC Claim: {} STONE escrow → {} (TX: {})",
+                    tx.amount, &tx.to[..12.min(tx.to.len())], &tx.tx_id[..12]
+                );
+            }
+            TxType::HtlcRefund => {
+                // from = pool:htlc_escrow, to = Sender-Wallet (Original-Ersteller), amount = HTLC-Betrag
+                // Balance vom Escrow-Pool zurück an den Sender
+                let pool_balance = self.balance(super::htlc::HTLC_ESCROW_POOL);
+                if pool_balance < tx.amount {
+                    return Err(LedgerError::InsufficientBalance {
+                        account: super::htlc::HTLC_ESCROW_POOL.to_string(),
+                        available: pool_balance,
+                        required: tx.amount,
+                    });
+                }
+                *self.balances.entry(super::htlc::HTLC_ESCROW_POOL.to_string())
+                    .or_insert(Decimal::ZERO) -= tx.amount;
+                *self.balances.entry(tx.to.clone()).or_insert(Decimal::ZERO) += tx.amount;
+                println!(
+                    "[token] ↩️  HTLC Refund: {} STONE escrow → {} (TX: {})",
+                    tx.amount, &tx.to[..12.min(tx.to.len())], &tx.tx_id[..12]
+                );
             }
         }
 

@@ -29,9 +29,9 @@ use std::collections::HashMap;
 /// Minimaler Stake-Betrag: 100 STONE
 pub const MIN_STAKE: &str = "100";
 
-/// Mindest-Stake um als Validator aktiviert zu werden: 500 STONE
+/// Mindest-Stake um als Validator aktiviert zu werden: 1000 STONE
 /// Anti-Sybil: Fake-Nodes wären wirtschaftlich unattraktiv.
-pub const VALIDATOR_MIN_STAKE: &str = "500";
+pub const VALIDATOR_MIN_STAKE: &str = "1000";
 
 /// Mindest-Stake für Snapshot-Signierung: 250 STONE
 pub const SNAPSHOT_SIGNER_MIN_STAKE: &str = "250";
@@ -71,6 +71,33 @@ pub const STAKING_POOL_ADDRESS: &str = "pool:staking";
 /// | Staker         | 1.0×                 | Basis-Gebührenanteil  |
 /// | Node-Betreiber | 1.5×                 | +50% Gebührenbonus    |
 pub const NODE_OPERATOR_FEE_MULTIPLIER: &str = "1.5";
+
+/// Maximales Stimmgewicht eines einzelnen Validators (33%).
+///
+/// Verhindert dass ein großer Staker das Netzwerk dominiert.
+/// Bei Snapshot-Attestation und Validator-Selektion wird das Gewicht
+/// jedes Validators auf diesen Anteil am Gesamtstake begrenzt.
+///
+/// | Staker-Anteil | Effektives Gewicht |
+/// |---------------|--------------------|
+/// | 10%           | 10% (unverändert)  |
+/// | 33%           | 33% (am Cap)       |
+/// | 50%           | 33% (gekappt)      |
+/// | 90%           | 33% (gekappt)      |
+pub const MAX_SINGLE_VALIDATOR_WEIGHT: &str = "0.33";
+
+/// Berechnet das effektive Stimmgewicht eines Validators mit Cap.
+///
+/// `raw_weight = stake / total_stake`, gekappt auf `MAX_SINGLE_VALIDATOR_WEIGHT`.
+/// Verhindert dass einzelne Whale-Staker >33% Einfluss auf Quorum-Entscheidungen haben.
+pub fn compute_vote_weight(stake: Decimal, total_stake: Decimal) -> Decimal {
+    if total_stake <= Decimal::ZERO || stake <= Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+    let max_weight: Decimal = MAX_SINGLE_VALIDATOR_WEIGHT.parse().unwrap();
+    let raw_weight = stake / total_stake;
+    raw_weight.min(max_weight)
+}
 
 // ─── Stake-Level ─────────────────────────────────────────────────────────────
 
@@ -130,7 +157,7 @@ impl StakeLevel {
             StakeLevel::Observer => 0,
             StakeLevel::Participant => 100,
             StakeLevel::Guardian => 250,
-            StakeLevel::Validator => 500,
+            StakeLevel::Validator => 1000,
         }
     }
 }
@@ -799,48 +826,6 @@ impl StakingPool {
         Ok(request)
     }
 
-    /// Verteilt Delegation-Rewards nach Split-Vereinbarung.
-    ///
-    /// Wird NACH der normalen Staker-Verteilung aufgerufen.
-    /// Der Validator hat bereits den vollen Reward für delegierte Coins
-    /// erhalten → wir verschieben `split_pct%` davon zum Delegator.
-    fn distribute_delegation_rewards(&mut self, capped_reward: Decimal) {
-        if self.total_delegated == Decimal::ZERO || self.delegations.is_empty() {
-            return;
-        }
-
-        let keys: Vec<String> = self.delegations.keys().cloned().collect();
-        for key in &keys {
-            if let Some(entry) = self.delegations.get_mut(key) {
-                if entry.amount <= Decimal::ZERO {
-                    continue;
-                }
-                // Anteil dieser Delegation am Gesamtpool
-                let share = entry.amount / self.total_staked;
-                let reward_from_delegation = (capped_reward * share).round_dp(8);
-
-                if reward_from_delegation > Decimal::ZERO {
-                    // Delegator bekommt split_pct% des durch seine Delegation
-                    // generierten Rewards (wird vom Validator-Anteil abgezogen)
-                    let delegator_reward = (reward_from_delegation
-                        * Decimal::from(entry.split_pct as u64)
-                        / Decimal::from(100u64))
-                    .round_dp(8);
-
-                    entry.pending_rewards += delegator_reward;
-                    entry.total_rewards += delegator_reward;
-
-                    // Vom Validator abziehen (hat ihn bereits im Haupt-Loop bekommen)
-                    if let Some(vs) = self.stakers.get_mut(&entry.validator) {
-                        let deduct = delegator_reward.min(vs.pending_rewards);
-                        vs.pending_rewards -= deduct;
-                        vs.total_rewards -= deduct;
-                    }
-                }
-            }
-        }
-    }
-
     /// Alle Delegationen eines Delegators.
     pub fn delegations_of(&self, delegator: &str) -> Vec<&DelegationEntry> {
         self.delegations.values()
@@ -950,7 +935,7 @@ impl StakingPool {
         let total_eligible_stake = self.total_stake_at_level(StakeLevel::Guardian);
 
         let mut valid_signatures = 0usize;
-        let mut attested_stake = Decimal::ZERO;
+        let mut attested_weight = Decimal::ZERO;
         let mut seen_wallets = std::collections::HashSet::new();
 
         for att in attestations {
@@ -986,16 +971,24 @@ impl StakingPool {
                 let stake = self.stakers.get(&att.signer_wallet)
                     .map(|s| s.staked_amount)
                     .unwrap_or(Decimal::ZERO);
-                attested_stake += stake;
+                // Stimmgewicht mit 33%-Cap: ein einzelner Validator kann
+                // maximal 33% des Gesamtstakes als Gewicht einbringen
+                let weight = compute_vote_weight(stake, total_eligible_stake);
+                attested_weight += weight;
             }
         }
 
-        // Quorum: ≥2/3 des eligiblen Stakes
+        // Quorum: ≥2/3 des gewichteten Stakes (nach Cap-Normalisierung)
+        // Durch das Cap summiert sich das Gesamtgewicht auf ≤1.0 (normalisiert).
         let quorum_reached = if total_eligible_stake > Decimal::ZERO {
-            attested_stake * Decimal::from(3) >= total_eligible_stake * Decimal::from(2)
+            let two_thirds: Decimal = Decimal::from(2) / Decimal::from(3);
+            attested_weight >= two_thirds
         } else {
             false
         };
+
+        // attested_stake in absoluten STONE für die Info-Struktur zurückrechnen
+        let attested_stake = attested_weight * total_eligible_stake;
 
         SnapshotTrust {
             valid_signatures,
@@ -1061,29 +1054,36 @@ impl StakingPool {
 
     // ── Persistierung ─────────────────────────────────────────────────────
 
-    /// Speichert den StakingPool in RocksDB.
+    /// Speichert den StakingPool in RocksDB (CF: staking).
     pub fn persist(&self) -> Result<(), String> {
         let db = super::open_token_db()
             .map_err(|e| format!("Staking DB: {e}"))?;
+        let cf = db.cf_handle(super::TOKEN_CF_STAKING)
+            .ok_or("CF staking nicht gefunden")?;
 
         let json = serde_json::to_string(self)
             .map_err(|e| format!("Staking serialize: {e}"))?;
 
-        db.put(b"staking_pool", json.as_bytes())
+        db.put_cf(cf, b"staking_pool", json.as_bytes())
             .map_err(|e| format!("Staking put: {e}"))?;
 
         Ok(())
     }
 
-    /// Lädt den StakingPool aus RocksDB.
+    /// Lädt den StakingPool aus RocksDB (CF: staking, Fallback: default).
     pub fn load() -> Self {
         let db = match super::open_token_db() {
             Ok(db) => db,
             Err(_) => return StakingPool::new(),
         };
 
-        match db.get(b"staking_pool") {
-            Ok(Some(bytes)) => {
+        // Erst neue CF, dann Fallback auf default
+        let bytes = db.cf_handle(super::TOKEN_CF_STAKING)
+            .and_then(|cf| db.get_cf(cf, b"staking_pool").ok().flatten())
+            .or_else(|| db.get(b"staking_pool").ok().flatten());
+
+        match bytes {
+            Some(bytes) => {
                 match serde_json::from_slice::<StakingPool>(&bytes) {
                     Ok(pool) => {
                         println!(

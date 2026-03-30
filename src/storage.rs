@@ -341,6 +341,17 @@ impl ChainStore {
         }
     }
 
+    /// Setzt block_count und latest_hash in der DB (für Chain-Reparatur).
+    pub fn repair_meta(&self, block_count: u64, latest_hash: &str) -> Result<(), StorageError> {
+        let cf = self.db.cf_handle("meta")
+            .ok_or_else(|| StorageError::NotFound("CF 'meta'".into()))?;
+        let mut batch = WriteBatch::default();
+        batch.put_cf(cf, b"block_count", block_count.to_le_bytes());
+        batch.put_cf(cf, b"latest_hash", latest_hash.as_bytes());
+        self.db.write(batch)?;
+        Ok(())
+    }
+
     /// Genesis-Hash (leer = keine Chain vorhanden).
     pub fn genesis_hash(&self) -> Result<String, StorageError> {
         let cf = self.db.cf_handle("meta")

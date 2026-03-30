@@ -1,6 +1,7 @@
 //! Handler module – re-exports all sub-handler modules.
 
 pub mod audio_relay;
+pub mod announcements;
 pub mod auth;
 pub mod blocks;
 pub mod game;
@@ -15,6 +16,7 @@ pub mod orgs;
 pub mod p2p;
 pub mod peers;
 pub mod poa;
+pub mod push;
 pub mod reputation;
 pub mod snapshot;
 pub mod status;

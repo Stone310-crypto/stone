@@ -80,6 +80,18 @@ pub enum TxType {
     /// Undelegation: Delegation zurückziehen → 7-Tage Escrow.
     /// `from` = Delegator-Wallet, `to` = Validator-Wallet, `amount` = Betrag
     Undelegate,
+    /// HTLC erstellen: Coins in Escrow sperren.
+    /// `from` = Sender-Wallet, `to` = "pool:htlc_escrow", `amount` = Sperrbetrag
+    /// `memo` = JSON: {"hash_lock":"...","time_lock":1234567890,"receiver":"..."}
+    HtlcCreate,
+    /// HTLC claimen: Preimage enthüllen, Coins an Empfänger.
+    /// `from` = "pool:htlc_escrow", `to` = Empfänger-Wallet, `amount` = HTLC-Betrag
+    /// `memo` = JSON: {"htlc_id":"...","preimage":"..."}
+    HtlcClaim,
+    /// HTLC refunden: Timeout abgelaufen, Coins zurück an Sender.
+    /// `from` = "pool:htlc_escrow", `to` = Sender-Wallet, `amount` = HTLC-Betrag
+    /// `memo` = JSON: {"htlc_id":"..."}
+    HtlcRefund,
 }
 
 // ─── Fee-Tier ────────────────────────────────────────────────────────────────
@@ -149,6 +161,9 @@ impl std::fmt::Display for TxType {
             TxType::Onboard         => write!(f, "onboard"),
             TxType::Delegate        => write!(f, "delegate"),
             TxType::Undelegate      => write!(f, "undelegate"),
+            TxType::HtlcCreate      => write!(f, "htlc_create"),
+            TxType::HtlcClaim       => write!(f, "htlc_claim"),
+            TxType::HtlcRefund      => write!(f, "htlc_refund"),
         }
     }
 }
@@ -319,8 +334,9 @@ pub fn create_signed_tx(
     } else if tx_type == TxType::Stake || tx_type == TxType::Unstake
         || tx_type == TxType::Delegate || tx_type == TxType::Undelegate
         || tx_type == TxType::Onboard
+        || tx_type == TxType::HtlcCreate
     {
-        // Stake/Unstake/Delegate/Undelegate/Onboard: amount muss positiv sein
+        // Stake/Unstake/Delegate/Undelegate/Onboard/HtlcCreate: amount muss positiv sein
         if amount <= Decimal::ZERO {
             return Err(TxError::InvalidAmount("Betrag muss positiv sein".into()));
         }
@@ -333,8 +349,10 @@ pub fn create_signed_tx(
     if amount.scale() > 8 {
         return Err(TxError::InvalidAmount("Maximal 8 Dezimalstellen".into()));
     }
-    // Memo-Limit: ChatMessage darf größere Memos (verschlüsselte Nachrichten), andere TXs 256 Bytes
-    let memo_limit = if tx_type == TxType::ChatMessage { 4096 } else { 256 };
+    // Memo-Limit: ChatMessage 4096, HTLC 512 (JSON mit hash_lock/preimage), andere 256 Bytes
+    let memo_limit = if tx_type == TxType::ChatMessage { 4096 }
+        else if tx_type == TxType::HtlcCreate || tx_type == TxType::HtlcClaim || tx_type == TxType::HtlcRefund { 512 }
+        else { 256 };
     if memo.len() > memo_limit {
         return Err(TxError::MissingField(format!("Memo darf maximal {} Bytes sein (hat {})", memo_limit, memo.len())));
     }
@@ -393,6 +411,17 @@ pub fn verify_tx_signature(tx: &TokenTx) -> Result<(), TxError> {
 
     // Memorial-Transaktionen: keine Signatur nötig (System-TX in jedem Block)
     if tx.tx_type == TxType::Memorial {
+        return Ok(());
+    }
+
+    // Testnet-Markt: Sell-TXs werden serverseitig erstellt (nach API-Auth).
+    // Signatur "market-sell" ist ein Platzhalter — kein User-Key nötig.
+    if tx.signature == "market-sell" && tx.memo.starts_with("Market Sell:") {
+        return Ok(());
+    }
+
+    // HTLC Claim/Refund: System-TXs von pool:htlc_escrow (serverseitig erstellt).
+    if tx.tx_type == TxType::HtlcClaim || tx.tx_type == TxType::HtlcRefund {
         return Ok(());
     }
 
@@ -506,6 +535,7 @@ pub fn validate_tx(tx: &TokenTx) -> Result<(), TxError> {
     } else if tx.tx_type == TxType::Stake || tx.tx_type == TxType::Unstake
         || tx.tx_type == TxType::Delegate || tx.tx_type == TxType::Undelegate
         || tx.tx_type == TxType::Onboard
+        || tx.tx_type == TxType::HtlcCreate
     {
         if tx.amount <= Decimal::ZERO {
             return Err(TxError::InvalidAmount("Betrag muss positiv sein".into()));

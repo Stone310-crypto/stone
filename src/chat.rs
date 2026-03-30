@@ -60,6 +60,18 @@ pub struct ChatEntry {
     pub tx_id: String,
 }
 
+/// Leichtgewichtiger Off-chain Content-Sync (DSGVO: P2P-Gossip).
+/// Wird parallel zur TX per `stone/chat-content/v1` Topic verbreitet.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct ChatContentSync {
+    pub msg_id: String,
+    pub from_wallet: String,
+    pub to_wallet: String,
+    pub encrypted_content: String,
+    pub nonce: String,
+    pub content_hash: String,
+}
+
 // ─── Konversation (zwischen zwei Usern) ──────────────────────────────────────
 
 /// Zusammenfassung einer Konversation für die Übersicht.
@@ -930,10 +942,6 @@ pub fn gdpr_purge_wallet_contacts(
 
 // ─── Call-Signaling ──────────────────────────────────────────────────────────
 
-fn call_signals_file() -> String {
-    format!("{}/call_signals.json", data_dir())
-}
-
 /// Typ eines WebRTC-Signaling-Signals.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "lowercase")]
@@ -1028,5 +1036,100 @@ impl CallSignalStore {
             sigs.retain(|s| now - s.timestamp < CALL_SIGNAL_TTL_SECS);
             !sigs.is_empty()
         });
+    }
+}
+
+// ─── Community Announcements ─────────────────────────────────────────────────
+
+fn announcements_file() -> String {
+    format!("{}/announcements.json", data_dir())
+}
+
+/// Typ eines Announcements.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum AnnouncementType {
+    Update,
+    Maintenance,
+    Poll,
+    Emergency,
+    General,
+}
+
+/// Eine Abstimmungs-Option innerhalb eines Polls.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct PollOption {
+    pub id: String,
+    pub text: String,
+    /// Wallet-Adressen die für diese Option gestimmt haben (max. 1 Vote pro Wallet).
+    pub votes: Vec<String>,
+}
+
+/// Ein Announcement im Community Channel.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct Announcement {
+    pub id: String,
+    pub title: String,
+    pub content: String,
+    pub announcement_type: AnnouncementType,
+    pub timestamp: i64,
+    /// Ed25519 Signatur über `title + content + timestamp` mit dem Gründer-Key.
+    pub signature: String,
+    /// Öffentlicher Schlüssel des Autors (Hex, 64 Zeichen / 32 Byte).
+    pub author_pubkey: String,
+    /// Poll-Optionen (nur bei `AnnouncementType::Poll`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub poll_options: Option<Vec<PollOption>>,
+    /// Reaktionen: Emoji → Liste von Wallet-Adressen.
+    #[serde(default)]
+    pub reactions: HashMap<String, Vec<String>>,
+    /// Optionale Deadline (Unix-Timestamp) – nach Ablauf kann nicht mehr abgestimmt werden.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline: Option<i64>,
+}
+
+impl Announcement {
+    /// Erstellt die Signatur-Nachricht (deterministisch).
+    pub fn signing_message(title: &str, content: &str, timestamp: i64) -> Vec<u8> {
+        format!("stone-announcement:{}:{}:{}", title, content, timestamp).into_bytes()
+    }
+}
+
+/// Announcement-Store: Alle Community-Announcements auf dieser Node.
+#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+pub struct AnnouncementStore {
+    pub announcements: Vec<Announcement>,
+    /// Autorisierte Gründer-Pubkeys (Hex). Nur diese dürfen Announcements posten.
+    #[serde(default)]
+    pub founder_pubkeys: Vec<String>,
+}
+
+impl AnnouncementStore {
+    pub fn find(&self, id: &str) -> Option<&Announcement> {
+        self.announcements.iter().find(|a| a.id == id)
+    }
+
+    pub fn find_mut(&mut self, id: &str) -> Option<&mut Announcement> {
+        self.announcements.iter_mut().find(|a| a.id == id)
+    }
+
+    /// Prüft ob ein Pubkey als Gründer autorisiert ist.
+    pub fn is_founder(&self, pubkey: &str) -> bool {
+        self.founder_pubkeys.iter().any(|k| k == pubkey)
+    }
+}
+
+pub fn load_announcements() -> AnnouncementStore {
+    if let Ok(data) = fs::read_to_string(announcements_file()) {
+        serde_json::from_str(&data).unwrap_or_default()
+    } else {
+        AnnouncementStore::default()
+    }
+}
+
+pub fn save_announcements(store: &AnnouncementStore) {
+    if let Ok(json) = serde_json::to_string_pretty(store) {
+        let _ = fs::create_dir_all(data_dir());
+        let _ = fs::write(announcements_file(), json);
     }
 }

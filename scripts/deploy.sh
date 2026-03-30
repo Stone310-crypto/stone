@@ -252,6 +252,14 @@ upload_to_node() {
             echo "[upload] ✅ Service-File staged auf $name"
         fi
 
+        # announcements.json (Founder-Pubkeys) synchronisieren
+        local ann_src="$PROJECT_DIR/stone_data/announcements.json"
+        if [ -f "$ann_src" ]; then
+            ssh -p "$port" "$user@$host" "mkdir -p $root/stone_data"
+            scp -P "$port" -q "$ann_src" "$user@$host:$root/stone_data/announcements.json"
+            echo "[upload] ✅ announcements.json synchronisiert auf $name"
+        fi
+
         echo "[upload] ✅ $name bereit für Restart"
     } > "$log" 2>&1
 

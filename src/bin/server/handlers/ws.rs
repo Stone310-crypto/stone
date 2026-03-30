@@ -11,7 +11,7 @@ use axum::{
     response::IntoResponse,
 };
 use std::{sync::Arc, sync::atomic::Ordering};
-use stone::master_node::{MasterNodeState, NodeEvent};
+use stone::master::{MasterNodeState, NodeEvent};
 use tokio::sync::broadcast;
 
 use super::super::auth_middleware::{resolve_user_by_key, resolve_user_by_session_token};

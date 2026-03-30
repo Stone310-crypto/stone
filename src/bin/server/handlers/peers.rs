@@ -7,7 +7,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::json;
-use stone::master_node::{AddPeerRequest, PeerInfo, PeerStatus};
+use stone::master::{AddPeerRequest, PeerInfo, PeerStatus};
 
 use super::super::auth_middleware::require_admin;
 use super::super::state::{save_peers, AppState};

@@ -357,14 +357,25 @@ impl ValidatorSet {
         // Basis-Gewicht: 1 STONE (damit Validatoren ohne Stake mitmachen können)
         let base_weight = rust_decimal::Decimal::ONE;
 
-        // Gewichte berechnen: Stake + Basis (alles in ganzen STONE-Einheiten als u64)
+        // Gesamtstake berechnen (für Cap-Berechnung)
+        let total_stake: rust_decimal::Decimal = candidates.iter().map(|v| {
+            let wallet = wallet_map.get(&v.node_id);
+            wallet.and_then(|w| stakes.get(w)).copied()
+                .unwrap_or(rust_decimal::Decimal::ZERO) + base_weight
+        }).sum();
+
+        // Max-Gewicht pro Validator: 33% des Gesamtstakes (Anti-Whale-Schutz)
+        let max_weight: rust_decimal::Decimal = crate::token::staking::MAX_SINGLE_VALIDATOR_WEIGHT.parse().unwrap();
+        let max_weight_abs = total_stake * max_weight;
+
+        // Gewichte berechnen: Stake + Basis, gekappt auf 33% (in milli-STONE als u64)
         let weights: Vec<u64> = candidates.iter().map(|v| {
             let wallet = wallet_map.get(&v.node_id);
             let stake = wallet
                 .and_then(|w| stakes.get(w))
                 .copied()
                 .unwrap_or(rust_decimal::Decimal::ZERO);
-            let total = stake + base_weight;
+            let total = (stake + base_weight).min(max_weight_abs);
             // In "milli-STONE" umrechnen für Ganzzahl-Genauigkeit (× 1000)
             use rust_decimal::prelude::ToPrimitive;
             (total * rust_decimal::Decimal::from(1000u64))
@@ -504,13 +515,23 @@ impl ValidatorSet {
         let seed = u64::from_le_bytes(hash[24..32].try_into().unwrap());
 
         let base_weight = rust_decimal::Decimal::ONE;
+
+        // Gesamtstake + Cap (gleich wie select_validator_weighted)
+        let total_stake: rust_decimal::Decimal = candidates.iter().map(|v| {
+            let wallet = wallet_map.get(&v.node_id);
+            wallet.and_then(|w| stakes.get(w)).copied()
+                .unwrap_or(rust_decimal::Decimal::ZERO) + base_weight
+        }).sum();
+        let max_weight: rust_decimal::Decimal = crate::token::staking::MAX_SINGLE_VALIDATOR_WEIGHT.parse().unwrap();
+        let max_weight_abs = total_stake * max_weight;
+
         let weights: Vec<u64> = candidates.iter().map(|v| {
             let wallet = wallet_map.get(&v.node_id);
             let stake = wallet
                 .and_then(|w| stakes.get(w))
                 .copied()
                 .unwrap_or(rust_decimal::Decimal::ZERO);
-            let total = stake + base_weight;
+            let total = (stake + base_weight).min(max_weight_abs);
             use rust_decimal::prelude::ToPrimitive;
             (total * rust_decimal::Decimal::from(1000u64))
                 .to_u64()
@@ -2186,6 +2207,9 @@ pub fn cumulative_stake_weight(
     wallet_map: &HashMap<String, String>,
 ) -> u64 {
     use rust_decimal::prelude::ToPrimitive;
+    if from_index >= blocks.len() {
+        return 0;
+    }
     blocks[from_index..].iter()
         .map(|b| {
             let wallet = wallet_map.get(&b.signer);

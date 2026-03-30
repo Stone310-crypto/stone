@@ -79,6 +79,9 @@ aes-gcm         = "0.10"
 # Argon2id KDF für Key-Encryption (Validator-Schlüssel)
 argon2          = "0.5"
 
+# JWT für Google Service Account OAuth2 (Push Notifications)
+jsonwebtoken    = "9"
+
 # ─── P2P-Netzwerk (libp2p) ───────────────────────────────────────────────────
 libp2p = { version = "0.55", features = [
     "tcp",

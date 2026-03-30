@@ -9,11 +9,12 @@ use serde::{Deserialize, Serialize};
 use stone::{
     auth::{User, ChallengeStore, QrLoginStore},
     blockchain::{ChunkRef, data_dir, CHUNK_SIZE, Document},
-    chat::{ChatIndex, ContactList, ContactRequestStore, ChatGroupStore, CallSignalStore},
+    chat::{ChatIndex, ContactList, ContactRequestStore, ChatGroupStore, CallSignalStore, AnnouncementStore},
+    push::{PushTokenStore, FcmClient},
 };
 use super::handlers::audio_relay::AudioRooms;
 use stone::{
-    master_node::{MasterNodeState, PeerInfo, TrustEntry, TrustVote},
+    master::{MasterNodeState, PeerInfo, TrustEntry, TrustVote},
     network::NetworkHandle,
     organization::Organization,
     storage::{ChunkStore, StoneStore},
@@ -62,10 +63,16 @@ pub struct AppState {
     pub miner_status_store: MinerStatusStore,
     /// Gruppenchats
     pub chat_groups: Arc<Mutex<ChatGroupStore>>,
+    /// Community Announcements (read-only Channel)
+    pub announcements: Arc<Mutex<AnnouncementStore>>,
     /// Call-Signaling (ephemeral, WebRTC)
     pub call_signals: Arc<CallSignalStore>,
     /// Audio-Relay Rooms (live calls)
     pub audio_rooms: AudioRooms,
+    /// Push-Token-Store (FCM-Registrierungen)
+    pub push_tokens: Arc<Mutex<PushTokenStore>>,
+    /// FCM-Client (Google Service Account basiert)
+    pub fcm_client: Arc<FcmClient>,
 }
 
 // ─── Miner Status Relay Store ────────────────────────────────────────────────

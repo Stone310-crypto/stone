@@ -36,11 +36,14 @@ pub const STAKER_FEE_POOL: &str = "pool:staker_fees";
 pub const DISTRIBUTION_INTERVAL: u64 = 720;
 
 /// Fee-Split Anteile (Summe = 100)
-/// 20% burn, 37% miner, 28% staker-pool, 10% node-operator-pool, 5% governance
+/// 20% burn, 30% miner, 38% staker-pool, 7% node-operator-pool, 5% governance
+/// → Staker+Node-Ops+Governance = 50% (Stakeholder-Mehrheit)
+/// → Miner = 30% (Mining-Anreiz)
+/// → Burn = 20% (Deflation)
 pub const FEE_BURN_PCT: u64 = 20;
-pub const FEE_VALIDATOR_PCT: u64 = 37;
-pub const FEE_STAKER_PCT: u64 = 28;
-pub const FEE_NODE_POOL_PCT: u64 = 10;
+pub const FEE_VALIDATOR_PCT: u64 = 30;
+pub const FEE_STAKER_PCT: u64 = 38;
+pub const FEE_NODE_POOL_PCT: u64 = 7;
 pub const FEE_GOVERNANCE_PCT: u64 = 5;
 
 /// Maximaler Reputation-Score
@@ -363,11 +366,13 @@ impl ReputationRegistry {
     pub fn persist(&self) -> Result<(), String> {
         let db = super::open_token_db()
             .map_err(|e| format!("Reputation DB: {e}"))?;
+        let cf = db.cf_handle(super::TOKEN_CF_REPUTATION)
+            .ok_or("CF reputation nicht gefunden")?;
 
         let json = serde_json::to_string(self)
             .map_err(|e| format!("Reputation serialize: {e}"))?;
 
-        db.put(b"reputation_registry", json.as_bytes())
+        db.put_cf(cf, b"reputation_registry", json.as_bytes())
             .map_err(|e| format!("Reputation put: {e}"))?;
 
         Ok(())
@@ -379,8 +384,13 @@ impl ReputationRegistry {
             Err(_) => return ReputationRegistry::new(),
         };
 
-        match db.get(b"reputation_registry") {
-            Ok(Some(bytes)) => {
+        // Erst neue CF, dann Fallback auf default
+        let bytes = db.cf_handle(super::TOKEN_CF_REPUTATION)
+            .and_then(|cf| db.get_cf(cf, b"reputation_registry").ok().flatten())
+            .or_else(|| db.get(b"reputation_registry").ok().flatten());
+
+        match bytes {
+            Some(bytes) => {
                 match serde_json::from_slice::<ReputationRegistry>(&bytes) {
                     Ok(reg) => {
                         println!(

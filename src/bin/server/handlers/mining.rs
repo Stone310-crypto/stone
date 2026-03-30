@@ -713,7 +713,7 @@ pub async fn handle_bind_mining_wallet(
         let mut mw = state.node.mining_wallet.write().unwrap_or_else(|e| e.into_inner());
         *mw = new_wallet.clone();
     }
-    stone::master_node::MasterNodeState::save_mining_wallet(&new_wallet);
+    stone::master::MasterNodeState::save_mining_wallet(&new_wallet);
 
     println!(
         "[mining] 🔒 Mining-Wallet gebunden: {} (durch User: {})",
@@ -833,7 +833,7 @@ pub async fn handle_mining_template(
 /// Prüft den PoW, committed den Block und broadcastet ihn ans Netzwerk.
 pub async fn handle_mining_submit(
     State(state): State<AppState>,
-    axum::Json(submission): axum::Json<stone::master_node::MiningSubmission>,
+    axum::Json(submission): axum::Json<stone::master::MiningSubmission>,
 ) -> impl IntoResponse {
     // Validierung: pow_hash muss gültiges Hex sein
     if submission.pow_hash.len() != 64
@@ -851,7 +851,7 @@ pub async fn handle_mining_submit(
     match state.node.submit_mining_solution(&submission) {
         Ok(block) => {
             // Post-Block-Hooks ausführen (Staking, Slashing, Reputation, ChatPolicy)
-            stone::master_node::MasterNodeState::run_post_block_hooks(&state.node, &block);
+            stone::master::MasterNodeState::run_post_block_hooks(&state.node, &block);
 
             // Block via P2P-Gossipsub broadcasten
             {
