@@ -157,7 +157,7 @@ const BAN_THRESHOLD: u32 = 200;
 const PENALTY_DECAY_MINS: u64 = 30;
 
 /// Aufeinanderfolgende Rate-Limit-Verletzungen bevor Penalty vergeben wird
-const RATE_LIMIT_GRACE: u32 = 5;
+const RATE_LIMIT_GRACE: u32 = 15;
 
 // ─── Persistierte Ban-Liste ───────────────────────────────────────────────────
 

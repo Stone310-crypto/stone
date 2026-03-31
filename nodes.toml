@@ -2,7 +2,14 @@
 # Stone Node Deployment Config
 #
 # Jeder [[node]] Block ist ein Server, zu dem deployed wird.
+#
+# Feld "network": mainnet | testnet | both (default: both)
+#   - mainnet  → nur bei --mainnet Deploy
+#   - testnet  → nur bei --testnet Deploy
+#   - both     → bei beiden (shared Binary, 2 Services auf einem Server)
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ── Testnet Nodes ─────────────────────────────────────────────────────────────
 
 [[node]]
 name    = "server1"
@@ -13,9 +20,10 @@ root    = "/opt/stone-node"
 path    = "/opt/stone-node/target/release"
 service = "stone-node"
 bins    = "stone-setup stone-master"
+network = "testnet"
 
 [[node]]
-name    = "VPSServer"
+name    = "VPSServer-testnet"
 host    = "212.227.54.241"
 user    = "root"
 port    = "22"
@@ -23,9 +31,10 @@ root    = "/home"
 path    = "/home"
 service = "stone-node"
 bins    = "stone-setup stone-master"
+network = "testnet"
 
 [[node]]
-name    = "VPS2"
+name    = "VPS2-testnet"
 host    = "69.48.200.255"
 user    = "root"
 port    = "22"
@@ -33,3 +42,28 @@ root    = "/home"
 path    = "/home"
 service = "stone-node"
 bins    = "stone-setup stone-master"
+network = "testnet"
+
+# ── Mainnet Nodes ─────────────────────────────────────────────────────────────
+
+[[node]]
+name    = "VPSServer-mainnet"
+host    = "212.227.54.241"
+user    = "root"
+port    = "22"
+root    = "/home/mainnet"
+path    = "/home/mainnet"
+service = "stone-node-mainnet"
+bins    = "stone-setup stone-master"
+network = "mainnet"
+
+[[node]]
+name    = "VPS2-mainnet"
+host    = "69.48.200.255"
+user    = "root"
+port    = "22"
+root    = "/home/mainnet"
+path    = "/home/mainnet"
+service = "stone-node-mainnet"
+bins    = "stone-setup stone-master"
+network = "mainnet"

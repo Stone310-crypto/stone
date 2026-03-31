@@ -1,7 +1,7 @@
 /// Kleines Debug-Tool: Liest die RocksDB und gibt Block-Count + alle Block-Hashes aus.
 /// Ausführen: cargo run --bin db_dump
 fn main() {
-    dotenvy::dotenv().ok();
+    dotenvy::from_filename(".env").ok();
 
     let store = match stone::storage::ChainStore::open() {
         Ok(s) => s,

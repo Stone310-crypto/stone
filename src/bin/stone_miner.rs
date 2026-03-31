@@ -2150,7 +2150,7 @@ fn spawn_status_relay_push(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    dotenvy::dotenv().ok();
+    dotenvy::from_filename(".env").ok();
 
     // UPnP-Panic abfangen (libp2p-upnp 0.3 Bug: panicked wenn Sender dropped wird)
     let default_hook = std::panic::take_hook();

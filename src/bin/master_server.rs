@@ -50,8 +50,8 @@ use server::{
 
 #[tokio::main]
 async fn main() {
-    // ── .env laden (falls vorhanden) ──────────────────────────────────────────
-    match dotenvy::dotenv() {
+    // ── .env laden (nur aus CWD, nicht aus Parent-Verzeichnissen) ─────────────
+    match dotenvy::from_filename(".env") {
         Ok(path) => println!("[master] .env geladen: {}", path.display()),
         Err(dotenvy::Error::Io(_)) => { /* .env nicht gefunden – kein Fehler */ }
         Err(e) => eprintln!("[master] .env Warnung: {e}"),

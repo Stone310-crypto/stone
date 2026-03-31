@@ -12,11 +12,13 @@
 #   → Minimale Versions-Divergenz zwischen den Nodes
 #
 # Usage:
-#   ./scripts/deploy.sh                  # Alle Nodes aus nodes.toml
-#   ./scripts/deploy.sh server1          # Nur einen bestimmten Node
+#   ./scripts/deploy.sh                  # Interaktive Auswahl: mainnet / testnet / beide
+#   ./scripts/deploy.sh --mainnet        # Nur Mainnet-Nodes
+#   ./scripts/deploy.sh --testnet        # Nur Testnet-Nodes
+#   ./scripts/deploy.sh --all            # Beide Netzwerke
+#   ./scripts/deploy.sh --mainnet server1  # Nur einen bestimmten Node
 #   ./scripts/deploy.sh --build-only     # Nur kompilieren, nicht deployen
 #   ./scripts/deploy.sh --skip-build     # Nur deployen (Binary schon gebaut)
-#   ./scripts/deploy.sh --sequential     # Alte sequenzielle Methode
 #
 # Voraussetzungen:
 #   brew install zig
@@ -47,19 +49,54 @@ BUILD=true
 DEPLOY=true
 SEQUENTIAL=false
 SPECIFIC_NODE=""
+NETWORK_FILTER=""  # mainnet, testnet, all, oder leer (interaktiv)
 
 for arg in "$@"; do
     case "$arg" in
         --build-only)   DEPLOY=false ;;
         --skip-build)   BUILD=false ;;
         --sequential)   SEQUENTIAL=true ;;
+        --mainnet)      NETWORK_FILTER="mainnet" ;;
+        --testnet)      NETWORK_FILTER="testnet" ;;
+        --all)          NETWORK_FILTER="all" ;;
         --help|-h)
-            echo "Usage: $0 [node-name] [--build-only] [--skip-build] [--sequential]"
+            echo "Usage: $0 [--mainnet|--testnet|--all] [node-name] [--build-only] [--skip-build]"
+            echo ""
+            echo "Netzwerk:"
+            echo "  --mainnet     Nur Mainnet-Nodes deployen"
+            echo "  --testnet     Nur Testnet-Nodes deployen"
+            echo "  --all         Beide Netzwerke deployen"
+            echo "  (ohne Flag)   Interaktive Auswahl"
+            echo ""
+            echo "Optionen:"
+            echo "  node-name     Nur einen bestimmten Node deployen"
+            echo "  --build-only  Nur kompilieren, nicht deployen"
+            echo "  --skip-build  Nur deployen (Binary schon gebaut)"
             exit 0
             ;;
         *)  SPECIFIC_NODE="$arg" ;;
     esac
 done
+
+# ─── Interaktive Netzwerk-Auswahl ────────────────────────────────────────────
+
+if [ "$DEPLOY" = true ] && [ -z "$NETWORK_FILTER" ]; then
+    echo ""
+    echo -e "${CYAN}  Welches Netzwerk deployen?${NC}"
+    echo ""
+    echo -e "    ${GREEN}1)${NC}  Testnet"
+    echo -e "    ${GREEN}2)${NC}  Mainnet"
+    echo -e "    ${GREEN}3)${NC}  Beide"
+    echo ""
+    read -rp "  Auswahl [1/2/3]: " choice
+    case "$choice" in
+        1)  NETWORK_FILTER="testnet" ;;
+        2)  NETWORK_FILTER="mainnet" ;;
+        3)  NETWORK_FILTER="all" ;;
+        *)  echo -e "${RED}Ungültige Auswahl.${NC}"; exit 1 ;;
+    esac
+    echo ""
+fi
 
 # ─── Version ermitteln ────────────────────────────────────────────────────────
 
@@ -71,6 +108,13 @@ echo ""
 echo -e "${CYAN}  ┌─────────────────────────────────────────────┐${NC}"
 echo -e "${CYAN}  │${NC}  🪨  ${GREEN}Stone Node Deploy${NC}                       ${CYAN}│${NC}"
 echo -e "${CYAN}  │${NC}     v${VERSION} (${GIT_HASH})                     ${CYAN}│${NC}"
+if [ "$DEPLOY" = true ]; then
+    case "$NETWORK_FILTER" in
+        mainnet) echo -e "${CYAN}  │${NC}     Netzwerk: ${RED}MAINNET${NC}                     ${CYAN}│${NC}" ;;
+        testnet) echo -e "${CYAN}  │${NC}     Netzwerk: ${YELLOW}TESTNET${NC}                     ${CYAN}│${NC}" ;;
+        all)     echo -e "${CYAN}  │${NC}     Netzwerk: ${GREEN}MAINNET + TESTNET${NC}            ${CYAN}│${NC}" ;;
+    esac
+fi
 echo -e "${CYAN}  └─────────────────────────────────────────────┘${NC}"
 echo ""
 
@@ -127,17 +171,39 @@ declare -a NODE_PATHS=()
 declare -a NODE_SERVICES=()
 declare -a NODE_BINS=()
 declare -a NODE_ROOTS=()
+declare -a NODE_NETWORKS=()
 
 parse_nodes() {
     local current_name="" current_host="" current_user="root"
     local current_port="22" current_path="" current_service=""
     local current_bins="stone-setup stone-master"
     local current_root=""
+    local current_network="both"
     local in_node=false
 
     flush_node() {
         if [ "$in_node" = true ] && [ -n "$current_name" ] && [ -n "$current_host" ]; then
-            if [ -z "$SPECIFIC_NODE" ] || [ "$SPECIFIC_NODE" = "$current_name" ]; then
+            # Name-Filter
+            if [ -n "$SPECIFIC_NODE" ] && [ "$SPECIFIC_NODE" != "$current_name" ]; then
+                return
+            fi
+            # Netzwerk-Filter
+            local include=false
+            case "$NETWORK_FILTER" in
+                all)
+                    include=true
+                    ;;
+                mainnet)
+                    [ "$current_network" = "mainnet" ] || [ "$current_network" = "both" ] && include=true
+                    ;;
+                testnet)
+                    [ "$current_network" = "testnet" ] || [ "$current_network" = "both" ] && include=true
+                    ;;
+                *)
+                    include=true
+                    ;;
+            esac
+            if [ "$include" = true ]; then
                 NODE_NAMES+=("$current_name")
                 NODE_HOSTS+=("$current_host")
                 NODE_USERS+=("$current_user")
@@ -146,6 +212,7 @@ parse_nodes() {
                 NODE_SERVICES+=("$current_service")
                 NODE_BINS+=("$current_bins")
                 NODE_ROOTS+=("${current_root:-$current_path}")
+                NODE_NETWORKS+=("$current_network")
             fi
         fi
     }
@@ -160,6 +227,7 @@ parse_nodes() {
             current_port="22" current_path="" current_service=""
             current_bins="stone-setup stone-master"
             current_root=""
+            current_network="both"
             in_node=true
             continue
         fi
@@ -176,6 +244,7 @@ parse_nodes() {
                 root)    current_root="$val" ;;
                 service) current_service="$val" ;;
                 bins)    current_bins="$val" ;;
+                network) current_network="$val" ;;
             esac
         fi
     done < "$NODES_FILE"
@@ -183,7 +252,7 @@ parse_nodes() {
     flush_node
 
     if [ -n "$SPECIFIC_NODE" ] && [ ${#NODE_NAMES[@]} -eq 0 ]; then
-        echo -e "${RED}[error]${NC} Node '$SPECIFIC_NODE' nicht in nodes.toml gefunden!"
+        echo -e "${RED}[error]${NC} Node '$SPECIFIC_NODE' nicht in nodes.toml gefunden (Netzwerk: $NETWORK_FILTER)!"
         echo "  Verfügbare Nodes:"
         grep 'name.*=' "$NODES_FILE" | sed 's/.*"\(.*\)".*/    - \1/'
         exit 1
@@ -198,7 +267,10 @@ if [ "$TOTAL" -eq 0 ]; then
     exit 1
 fi
 
-echo -e "${BLUE}[deploy]${NC} ${TOTAL} Node(s): ${NODE_NAMES[*]}"
+echo -e "${BLUE}[deploy]${NC} ${TOTAL} Node(s):"
+for i in $(seq 0 $((TOTAL - 1))); do
+    echo -e "  ${YELLOW}${NODE_NAMES[$i]}${NC} (${NODE_NETWORKS[$i]}) → ${NODE_HOSTS[$i]}"
+done
 echo ""
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -215,6 +287,7 @@ upload_to_node() {
     local root="${NODE_ROOTS[$idx]}"
     local service="${NODE_SERVICES[$idx]}"
     local bins="${NODE_BINS[$idx]}"
+    local network="${NODE_NETWORKS[$idx]}"
     local log="$LOG_DIR/${name}.log"
 
     {
@@ -225,6 +298,12 @@ upload_to_node() {
             echo "[upload] ❌ SSH-Verbindung zu $name fehlgeschlagen!"
             return 1
         fi
+
+        # Remote-Verzeichnisse erstellen falls nicht vorhanden
+        local data_dir="stone_data"
+        [ "$network" = "mainnet" ] && data_dir="stone_data_mainnet"
+        ssh -p "$port" "$user@$host" "mkdir -p $path && mkdir -p $root/$data_dir"
+        echo "[upload] ✅ Verzeichnisse erstellt ($path, $root/$data_dir)"
 
         # Binaries als .staged hochladen (NICHT tauschen, NICHT restarten!)
         for bin in $bins; do
@@ -246,7 +325,7 @@ upload_to_node() {
         local service_src="$PROJECT_DIR/configs/stone-node.service"
         if [ -n "$service" ] && [ -f "$service_src" ]; then
             local tmp_service="/tmp/stone-node-${name}.service"
-            sed -e "s|__STONE_ROOT__|$root|g" -e "s|__STONE_PATH__|$path|g" "$service_src" > "$tmp_service"
+            sed -e "s|__STONE_ROOT__|$root|g" -e "s|__STONE_PATH__|$path|g" -e "s|__STONE_NETWORK__|$network|g" "$service_src" > "$tmp_service"
             scp -P "$port" -q "$tmp_service" "$user@$host:/tmp/stone-node.service.staged"
             rm -f "$tmp_service"
             echo "[upload] ✅ Service-File staged auf $name"
@@ -255,9 +334,14 @@ upload_to_node() {
         # announcements.json (Founder-Pubkeys) synchronisieren
         local ann_src="$PROJECT_DIR/stone_data/announcements.json"
         if [ -f "$ann_src" ]; then
-            ssh -p "$port" "$user@$host" "mkdir -p $root/stone_data"
-            scp -P "$port" -q "$ann_src" "$user@$host:$root/stone_data/announcements.json"
-            echo "[upload] ✅ announcements.json synchronisiert auf $name"
+            scp -P "$port" -q "$ann_src" "$user@$host:$root/$data_dir/announcements.json"
+            echo "[upload] ✅ announcements.json synchronisiert auf $name ($data_dir)"
+        fi
+
+        # .env mit netzwerk-spezifischen Ports erstellen/aktualisieren
+        if [ "$network" = "mainnet" ]; then
+            ssh -p "$port" "$user@$host" "printf 'STONE_NETWORK=mainnet\nSTONE_HTTP_PORT=8180\nSTONE_P2P_PORT=5001\nSTONE_WS_PORT=5002\n' > $root/.env && echo OK"
+            echo "[upload] ✅ .env für mainnet auf $name"
         fi
 
         echo "[upload] ✅ $name bereit für Restart"
@@ -335,11 +419,12 @@ swap_on_node() {
     local service="${NODE_SERVICES[$idx]}"
     local bins="${NODE_BINS[$idx]}"
 
-    ssh -p "$port" "$user@$host" bash -s -- "$path" "$bins" "$service" <<'SWAP_SCRIPT'
+    ssh -p "$port" "$user@$host" bash -s -- "$path" "$service" "$bins" <<'SWAP_SCRIPT'
         set -e
         PATH_DIR="$1"
-        BINS="$2"
-        SERVICE="$3"
+        SERVICE="$2"
+        shift 2
+        BINS="$*"
         cd "$PATH_DIR"
 
         # Backup + Atomar tauschen
@@ -350,10 +435,18 @@ swap_on_node() {
             fi
         done
 
-        # Service-File tauschen
+        # Service-File tauschen + bei Erstinstallation aktivieren
         if [ -n "$SERVICE" ] && [ -f /tmp/stone-node.service.staged ]; then
+            FIRST_INSTALL=false
+            if [ ! -f "/etc/systemd/system/${SERVICE}.service" ]; then
+                FIRST_INSTALL=true
+            fi
             mv /tmp/stone-node.service.staged "/etc/systemd/system/${SERVICE}.service"
             systemctl daemon-reload
+            if [ "$FIRST_INSTALL" = true ]; then
+                systemctl enable "$SERVICE" 2>/dev/null || true
+                echo "SERVICE_ENABLED"
+            fi
         fi
 
         echo "SWAP_OK"
@@ -398,6 +491,7 @@ restart_node() {
     local path="${NODE_PATHS[$idx]}"
     local service="${NODE_SERVICES[$idx]}"
     local bins="${NODE_BINS[$idx]}"
+    local network="${NODE_NETWORKS[$idx]}"
     local log="$LOG_DIR/${name}_restart.log"
 
     {
@@ -407,32 +501,57 @@ restart_node() {
         fi
 
         echo "[restart] 🔄 $name — systemctl restart $service ..."
-        ssh -p "$port" "$user@$host" bash -s -- "$service" "$path" "$bins" <<'RESTART_SCRIPT'
+        ssh -p "$port" "$user@$host" bash -s -- "$service" "$path" "$network" "$bins" <<'RESTART_SCRIPT'
             set -e
             SERVICE="$1"
             BIN_PATH="$2"
-            BINS="$3"
+            NETWORK="$3"
+            shift 3
+            BINS="$*"
+
+            # Ports je nach Netzwerk
+            if [ "$NETWORK" = "mainnet" ]; then
+                P2P_PORT=5001
+                HTTP_PORT=3180
+            else
+                P2P_PORT=4001
+                HTTP_PORT=3080
+            fi
+
+            # Sicherstellen dass systemd die Service-Datei kennt
+            systemctl daemon-reload
+
+            # Erstinstallation: Service aktivieren falls noch nicht enabled
+            if ! systemctl is-enabled --quiet "$SERVICE" 2>/dev/null; then
+                if [ -f "/etc/systemd/system/${SERVICE}.service" ]; then
+                    systemctl enable "$SERVICE"
+                    echo "✅ $SERVICE erstmalig aktiviert"
+                else
+                    echo "❌ Service-Datei /etc/systemd/system/${SERVICE}.service nicht gefunden!"
+                    exit 1
+                fi
+            fi
 
             systemctl restart "$SERVICE"
             sleep 3
 
             if systemctl is-active --quiet "$SERVICE"; then
-                echo "✅ $SERVICE läuft"
+                echo "✅ $SERVICE läuft ($NETWORK)"
 
                 # Health-Checks
                 sleep 2
                 if command -v ss &>/dev/null; then
-                    if ss -tlnp 2>/dev/null | grep -q ":4001 "; then
-                        echo "✅ P2P-Port 4001 lauscht"
+                    if ss -tlnp 2>/dev/null | grep -q ":$P2P_PORT "; then
+                        echo "✅ P2P-Port $P2P_PORT lauscht"
                     else
-                        echo "⚠ P2P-Port 4001 noch nicht bereit"
+                        echo "⚠ P2P-Port $P2P_PORT noch nicht bereit"
                     fi
                 fi
                 if command -v curl &>/dev/null; then
-                    if curl -sf -o /dev/null --max-time 5 http://127.0.0.1:8080/api/v1/health 2>/dev/null; then
-                        echo "✅ HTTP-API erreichbar"
+                    if curl -sf -o /dev/null --max-time 5 http://127.0.0.1:$HTTP_PORT/api/v1/health 2>/dev/null; then
+                        echo "✅ HTTP-API erreichbar (Port $HTTP_PORT)"
                     else
-                        echo "⚠ HTTP-API noch nicht erreichbar"
+                        echo "⚠ HTTP-API noch nicht erreichbar (Port $HTTP_PORT)"
                     fi
                 fi
             else

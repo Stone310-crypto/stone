@@ -598,10 +598,23 @@ pub async fn download_snapshot_from_peer(
 
 /// HTTP-URLs der Bootstrap-Nodes für Konsensverifikation.
 /// Muss mit SEED_NODES in network.rs konsistent gehalten werden.
-const BOOTSTRAP_HTTP_URLS: &[&str] = &[
+const BOOTSTRAP_HTTP_URLS_TESTNET: &[&str] = &[
     "http://212.227.54.241:3080", // VPS1
     "http://69.48.200.255:3080",  // VPS2
 ];
+
+const BOOTSTRAP_HTTP_URLS_MAINNET: &[&str] = &[
+    "http://212.227.54.241:3180", // VPS1
+    "http://69.48.200.255:3180",  // VPS2
+];
+
+fn active_bootstrap_urls() -> &'static [&'static str] {
+    if crate::network::is_mainnet() {
+        BOOTSTRAP_HTTP_URLS_MAINNET
+    } else {
+        BOOTSTRAP_HTTP_URLS_TESTNET
+    }
+}
 
 /// Minimale Übereinstimmung für Bootstrap-Konsens.
 /// Bei <= 4 Nodes: ALLE müssen übereinstimmen (100%).
@@ -666,7 +679,7 @@ pub async fn verified_download_snapshot(
 
     let bootstrap_urls: Vec<String> = std::env::var("STONE_BOOTSTRAP_HTTP")
         .map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
-        .unwrap_or_else(|_| BOOTSTRAP_HTTP_URLS.iter().map(|s| s.to_string()).collect());
+        .unwrap_or_else(|_| active_bootstrap_urls().iter().map(|s| s.to_string()).collect());
 
     let total_nodes = bootstrap_urls.len();
     if total_nodes == 0 {

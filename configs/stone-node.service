@@ -1,5 +1,5 @@
 [Unit]
-Description=Stone Node (Unified Setup + Full Node)
+Description=Stone Node __STONE_NETWORK__ (Unified Setup + Full Node)
 After=network-online.target
 Wants=network-online.target
 
@@ -7,13 +7,14 @@ Wants=network-online.target
 Type=simple
 User=root
 WorkingDirectory=__STONE_ROOT__
-EnvironmentFile=__STONE_ROOT__/.env
+EnvironmentFile=-__STONE_ROOT__/.env
+Environment=STONE_NETWORK=__STONE_NETWORK__
 ExecStart=__STONE_PATH__/stone-setup
 Restart=on-failure
 RestartSec=5
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=stone-node
+SyslogIdentifier=stone-node-__STONE_NETWORK__
 LimitNOFILE=65535
 
 # Graceful shutdown

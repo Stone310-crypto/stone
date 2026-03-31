@@ -163,8 +163,8 @@ struct SetupState {
 async fn main() {
     print_banner();
 
-    // .env laden
-    match dotenvy::dotenv() {
+    // .env laden (nur aus CWD, nicht aus Parent-Verzeichnissen)
+    match dotenvy::from_filename(".env") {
         Ok(path) => println!("[setup] .env geladen: {}", path.display()),
         Err(dotenvy::Error::Io(_)) => {}
         Err(e) => eprintln!("[setup] .env Warnung: {e}"),

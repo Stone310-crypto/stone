@@ -742,8 +742,8 @@ impl PeerRateLimiter {
             gossip_blocks: TokenBucket::new(10.0, 10.0),
             // Max 120 TXs/min
             gossip_txs: TokenBucket::new(30.0, 120.0),
-            // Max 600 Requests/min, Burst 120 (Sync kann viele Range-Requests erzeugen)
-            requests: TokenBucket::new(120.0, 600.0),
+            // Max 1800 Requests/min, Burst 300 (Initial-Sync kann hunderte Range-Requests erzeugen)
+            requests: TokenBucket::new(300.0, 1800.0),
         }
     }
 }
