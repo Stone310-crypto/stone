@@ -221,12 +221,13 @@ async fn main() {
         .fallback(forward_to_node_api)
         .with_state(state.clone());
 
-    // Port: STONE_PORT aus .env (default 8080)
-    let port: u16 = std::env::var("STONE_HTTP_PORT")
+    // Port: STONE_DASHBOARD_PORT / STONE_PORT aus .env (default 8080/8180)
+    let default_dashboard_port: u16 = if stone::network::is_mainnet() { 8180 } else { 8080 };
+    let port: u16 = std::env::var("STONE_DASHBOARD_PORT")
         .or_else(|_| std::env::var("STONE_PORT"))
         .ok()
         .and_then(|v| v.parse().ok())
-        .unwrap_or(config.http_port);
+        .unwrap_or(default_dashboard_port);
 
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
     let local_ip = get_local_ip().unwrap_or_else(|| "127.0.0.1".into());
@@ -742,10 +743,11 @@ async fn start_full_node(state: SetupState) {
     // Für externen Zugriff via Cloudflare Tunnel (chain.unrooted.dev).
     // Dashboard bleibt nur auf dem Haupt-Port (8080) erreichbar.
     {
+        let default_api_port: u16 = if stone::network::is_mainnet() { 3180 } else { 3080 };
         let api_port: u16 = std::env::var("STONE_API_PORT")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(3080);
+            .unwrap_or(default_api_port);
 
         let api_router = build_router(node_app_state.clone());
 
@@ -2321,10 +2323,11 @@ struct TokenEconomyInfo {
 
 #[derive(Serialize)]
 struct PeerEntry {
-    url: String,
-    name: String,
+    peer_id: String,
     healthy: bool,
     block_height: u64,
+    latency_ms: Option<u128>,
+    last_seen: i64,
 }
 
 #[derive(Serialize)]
@@ -2522,14 +2525,44 @@ async fn api_dashboard(State(state): State<SetupState>) -> Json<DashboardData> {
         }
     };
 
-    // ── Connected Peers ─────────────────────────────────────────────────
+    // ── Connected Peers (dedupliziert nach Peer-ID, 24h Offline-Limit) ──
     let connected_peers = if let Some(ref ns) = *ns {
-        ns.node.get_peers().iter().map(|p| PeerEntry {
-            url: p.url.clone(),
-            name: p.name.clone().unwrap_or_default(),
-            healthy: p.is_healthy(),
-            block_height: p.block_height,
-        }).collect()
+        use std::collections::HashMap;
+        let now = chrono::Utc::now().timestamp();
+        let cutoff = now - 86400; // 24 Stunden
+        let all_peers = ns.node.get_peers();
+        let mut by_id: HashMap<String, PeerEntry> = HashMap::new();
+        for p in &all_peers {
+            let pid = p.name.clone().unwrap_or_else(|| p.url.clone());
+            if pid.is_empty() { continue; }
+            // Offline länger als 24h → überspringen
+            if !p.is_healthy() && p.last_seen > 0 && p.last_seen < cutoff {
+                continue;
+            }
+            if !p.is_healthy() && p.last_seen == 0 && p.sync_failures > 100 {
+                continue; // Nie erreichbar gewesen + viele Fehler → raus
+            }
+            let entry = PeerEntry {
+                peer_id: pid.clone(),
+                healthy: p.is_healthy(),
+                block_height: p.block_height,
+                latency_ms: p.latency_ms,
+                last_seen: p.last_seen,
+            };
+            // Bester Eintrag pro Peer-ID behalten (Healthy > Unhealthy, dann höchster Block)
+            if let Some(existing) = by_id.get(&pid) {
+                if entry.healthy && !existing.healthy
+                    || (entry.healthy == existing.healthy && entry.block_height > existing.block_height)
+                {
+                    by_id.insert(pid, entry);
+                }
+            } else {
+                by_id.insert(pid, entry);
+            }
+        }
+        let mut result: Vec<PeerEntry> = by_id.into_values().collect();
+        result.sort_by(|a, b| b.healthy.cmp(&a.healthy).then(b.block_height.cmp(&a.block_height)));
+        result
     } else {
         vec![]
     };

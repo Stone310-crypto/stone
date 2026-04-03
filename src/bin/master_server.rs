@@ -215,7 +215,6 @@ async fn main() {
     }
 
     // Hintergrund-Tasks starten
-    // HINWEIS: Mining wurde entfernt — nur stone-miner erzeugt neue Blöcke.
     // master_server ist ein reiner Full-Node (Sync, API, Validierung, Storage).
     MasterNodeState::start_heartbeat(node.clone(), HEARTBEAT_INTERVAL);
     spawn_auto_sync_task(node.clone(), api_key.clone(), users.clone());

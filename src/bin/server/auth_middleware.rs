@@ -112,12 +112,15 @@ pub fn require_admin(headers: &HeaderMap, state: &AppState) -> Result<(), Respon
         )
             .into_response()
     })?;
-    if constant_time_eq(&key, state.admin_key.as_str()) {
+    // Admin-Key ODER normaler API-Key (Node-Besitzer ist immer Admin)
+    if constant_time_eq(&key, state.admin_key.as_str())
+        || constant_time_eq(&key, state.api_key.as_str())
+    {
         Ok(())
     } else {
         Err((
             StatusCode::FORBIDDEN,
-            axum::Json(json!({"error": "Admin-Rechte erforderlich"})),
+            axum::Json(json!({"error": "Admin-Rechte erforderlich – verwende den API-Key aus token.bin oder den Admin-Key"})),
         )
             .into_response())
     }

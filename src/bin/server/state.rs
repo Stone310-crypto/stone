@@ -170,9 +170,10 @@ pub fn load_api_key() -> String {
     key
 }
 
-/// Lädt den separaten Admin-Key aus `STONE_ADMIN_KEY`.
-/// Falls nicht gesetzt, wird der normale API-Key als Fallback verwendet.
+/// Lädt den separaten Admin-Key.
+/// Priorität: 1) STONE_ADMIN_KEY env  2) stone_data/admin_key.bin  3) Fallback auf api_key
 pub fn load_admin_key(fallback_api_key: &str) -> String {
+    // 1. Umgebungsvariable
     if let Ok(v) = std::env::var("STONE_ADMIN_KEY") {
         let v = v.trim().to_string();
         if !v.is_empty() {
@@ -180,7 +181,18 @@ pub fn load_admin_key(fallback_api_key: &str) -> String {
             return v;
         }
     }
-    println!("[auth] ⚠️  Kein STONE_ADMIN_KEY gesetzt – verwende API-Key als Admin-Key (unsicher!)");
+    // 2. admin_key.bin (generiert via stone-keygen --admin-key)
+    let admin_path = format!("{}/admin_key.bin", data_dir());
+    if let Ok(data) = std::fs::read_to_string(&admin_path) {
+        let t = data.trim().to_string();
+        if !t.is_empty() {
+            println!("[auth] Admin-Key aus {admin_path} geladen");
+            return t;
+        }
+    }
+    // 3. Fallback
+    println!("[auth] ⚠️  Kein separater Admin-Key – verwende API-Key als Fallback");
+    println!("[auth]    Generiere einen mit: stone-keygen --admin-key");
     fallback_api_key.to_string()
 }
 

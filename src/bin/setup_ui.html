@@ -22,18 +22,19 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,san
 @keyframes shimmer{from{background-position:200% 0}to{background-position:-200% 0}}
 @keyframes fadeIn{from{opacity:0}to{opacity:1}}
 @keyframes statusPulse{0%,100%{box-shadow:0 0 0 0 rgba(63,185,80,.4)}70%{box-shadow:0 0 0 8px rgba(63,185,80,0)}}
+@keyframes gradientShift{0%{background-position:0% 50%}50%{background-position:100% 50%}100%{background-position:0% 50%}}
 
 /* ─── Navbar ─── */
-.navbar{background:var(--nav-bg);border-bottom:1px solid var(--border);padding:0 24px;
+.navbar{background:rgba(1,4,9,.85);border-bottom:1px solid rgba(48,54,61,.6);padding:0 24px;
   display:flex;align-items:center;height:56px;position:sticky;top:0;z-index:100;
-  backdrop-filter:blur(12px);-webkit-backdrop-filter:blur(12px)}
+  backdrop-filter:blur(16px) saturate(180%);-webkit-backdrop-filter:blur(16px) saturate(180%)}
 .nav-logo{font-size:18px;font-weight:700;color:var(--accent);margin-right:32px;display:flex;align-items:center;gap:8px}
 .nav-logo .logo-icon{font-size:22px;filter:drop-shadow(0 0 6px rgba(88,166,255,.4))}
 .nav-links{display:flex;gap:4px}
 .nav-links button{background:none;border:none;color:var(--muted);font-size:14px;padding:8px 16px;
-  border-radius:6px;cursor:pointer;transition:all .2s;font-weight:500;position:relative}
-.nav-links button:hover{color:var(--text);background:var(--card)}
-.nav-links button.active{color:var(--text);background:var(--card)}
+  border-radius:8px;cursor:pointer;transition:all .25s ease;font-weight:500;position:relative}
+.nav-links button:hover{color:var(--text);background:rgba(22,27,34,.8)}
+.nav-links button.active{color:var(--text);background:rgba(22,27,34,.9)}
 .nav-links button.active::after{content:'';position:absolute;bottom:-1px;left:50%;transform:translateX(-50%);width:24px;height:2px;background:var(--accent);border-radius:1px}
 .nav-wallet{margin-left:auto;display:flex;align-items:center;gap:16px;font-size:13px}
 .nav-balance{color:var(--green);font-weight:700;font-size:15px;transition:color .3s}
@@ -44,28 +45,29 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,san
 .hidden{display:none!important}
 
 /* ─── Cards ─── */
-.card{background:var(--card);border:1px solid var(--border);border-radius:12px;padding:28px;margin-bottom:20px;
-  transition:border-color .3s,box-shadow .3s;animation:slideUp .4s ease-out}
-.card:hover{border-color:rgba(88,166,255,.15);box-shadow:0 4px 24px rgba(0,0,0,.2)}
+.card{background:rgba(22,27,34,.75);border:1px solid rgba(48,54,61,.5);border-radius:14px;padding:28px;margin-bottom:20px;
+  transition:border-color .3s,box-shadow .3s,transform .2s;animation:slideUp .4s ease-out;
+  backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)}
+.card:hover{border-color:rgba(88,166,255,.18);box-shadow:0 8px 32px rgba(0,0,0,.25);transform:translateY(-1px)}
 .card h2{font-size:20px;margin-bottom:8px}
 .card p.sub{color:var(--muted);font-size:14px;margin-bottom:20px}
 label{display:block;font-size:13px;color:var(--muted);margin-bottom:6px;margin-top:16px}
 label:first-of-type{margin-top:0}
 input[type=text],input[type=password],input[type=number],textarea{
-  width:100%;padding:10px 12px;background:var(--input-bg);border:1px solid var(--border);
-  border-radius:8px;color:var(--text);font-size:14px;outline:none;transition:border .2s,box-shadow .2s}
-input:focus,textarea:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(88,166,255,.1)}
+  width:100%;padding:10px 12px;background:rgba(13,17,23,.8);border:1px solid rgba(48,54,61,.6);
+  border-radius:10px;color:var(--text);font-size:14px;outline:none;transition:border .25s,box-shadow .25s}
+input:focus,textarea:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(88,166,255,.12)}
 textarea{resize:vertical;min-height:80px;font-family:monospace;font-size:13px}
-.btn{display:inline-block;padding:10px 24px;border:none;border-radius:8px;font-size:14px;
-  font-weight:600;cursor:pointer;transition:all .2s;text-align:center;position:relative;overflow:hidden}
-.btn::after{content:'';position:absolute;inset:0;background:linear-gradient(120deg,transparent 30%,rgba(255,255,255,.08) 50%,transparent 70%);
-  transform:translateX(-100%);transition:transform .5s}
+.btn{display:inline-block;padding:10px 24px;border:none;border-radius:10px;font-size:14px;
+  font-weight:600;cursor:pointer;transition:all .25s ease;text-align:center;position:relative;overflow:hidden}
+.btn::after{content:'';position:absolute;inset:0;background:linear-gradient(120deg,transparent 30%,rgba(255,255,255,.06) 50%,transparent 70%);
+  transform:translateX(-100%);transition:transform .6s}
 .btn:hover::after{transform:translateX(100%)}
 .btn-block{width:100%;margin-top:20px}
-.btn-primary{background:var(--accent);color:#fff}
-.btn-primary:hover{background:#79c0ff;transform:translateY(-1px);box-shadow:0 4px 12px rgba(88,166,255,.3)}
-.btn-green{background:var(--green);color:#fff}
-.btn-green:hover{background:#56d364;transform:translateY(-1px);box-shadow:0 4px 12px rgba(63,185,80,.3)}
+.btn-primary{background:linear-gradient(135deg,var(--accent),#79c0ff);color:#fff}
+.btn-primary:hover{transform:translateY(-1px);box-shadow:0 6px 16px rgba(88,166,255,.35)}
+.btn-green{background:linear-gradient(135deg,var(--green),#56d364);color:#fff}
+.btn-green:hover{transform:translateY(-1px);box-shadow:0 6px 16px rgba(63,185,80,.35)}
 .btn-sm{padding:8px 16px;font-size:13px}
 .btn-outline{background:transparent;border:1px solid var(--border);color:var(--muted)}
 .btn-outline:hover{border-color:var(--accent);color:var(--accent)}
@@ -89,9 +91,10 @@ textarea{resize:vertical;min-height:80px;font-family:monospace;font-size:13px}
 .dash-grid-6{display:grid;grid-template-columns:repeat(6,1fr);gap:12px;margin-bottom:20px}
 @media(max-width:900px){.dash-grid-6{grid-template-columns:repeat(3,1fr)}}
 @media(max-width:500px){.dash-grid-6{grid-template-columns:1fr 1fr}}
-.stat{background:var(--bg);border:1px solid var(--border);border-radius:10px;padding:18px;
-  transition:all .3s;position:relative;overflow:hidden}
-.stat:hover{border-color:rgba(88,166,255,.2);transform:translateY(-2px);box-shadow:0 4px 16px rgba(0,0,0,.3)}
+.stat{background:rgba(13,17,23,.8);border:1px solid rgba(48,54,61,.5);border-radius:12px;padding:18px;
+  transition:all .3s ease;position:relative;overflow:hidden;
+  backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px)}
+.stat:hover{border-color:rgba(88,166,255,.25);transform:translateY(-2px);box-shadow:0 6px 20px rgba(0,0,0,.35)}
 .stat .label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.6px}
 .stat .value{font-size:24px;font-weight:700;margin-top:6px;transition:color .3s}
 .stat .value.green{color:var(--green)}
@@ -102,9 +105,9 @@ textarea{resize:vertical;min-height:80px;font-family:monospace;font-size:13px}
 /* Metric grid (inside cards) */
 .metric-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;margin-top:16px}
 @media(max-width:700px){.metric-grid{grid-template-columns:repeat(2,1fr)}}
-.metric-item{background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:12px;
-  display:flex;flex-direction:column;gap:4px;transition:border-color .3s}
-.metric-item:hover{border-color:rgba(88,166,255,.2)}
+.metric-item{background:rgba(13,17,23,.7);border:1px solid rgba(48,54,61,.5);border-radius:10px;padding:12px;
+  display:flex;flex-direction:column;gap:4px;transition:all .25s ease}
+.metric-item:hover{border-color:rgba(88,166,255,.25);transform:translateY(-1px);box-shadow:0 4px 12px rgba(0,0,0,.2)}
 .mi-label{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px}
 .mi-val{font-size:18px;font-weight:700;color:var(--text)}
 .mi-val.green{color:var(--green)}
@@ -121,14 +124,14 @@ textarea{resize:vertical;min-height:80px;font-family:monospace;font-size:13px}
 
 /* Peer table */
 .peer-table{width:100%;border-collapse:collapse;font-size:13px}
-.peer-table th{text-align:left;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px;padding:8px 12px;border-bottom:1px solid var(--border)}
-.peer-table td{padding:8px 12px;border-bottom:1px solid var(--border);color:var(--text);font-family:monospace;font-size:12px}
+.peer-table th{text-align:left;font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;padding:10px 14px;border-bottom:1px solid rgba(48,54,61,.5)}
+.peer-table td{padding:10px 14px;border-bottom:1px solid rgba(48,54,61,.3);color:var(--text);font-family:monospace;font-size:12px}
 .peer-table td:nth-child(2){font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif}
-.peer-table tr{transition:background .2s}
-.peer-table tbody tr:hover{background:rgba(88,166,255,.04)}
-.peer-status{display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600}
-.peer-status.healthy{background:rgba(63,185,80,.15);color:var(--green)}
-.peer-status.unhealthy{background:rgba(248,81,73,.15);color:var(--red)}
+.peer-table tr{transition:background .25s ease}
+.peer-table tbody tr:hover{background:rgba(88,166,255,.06)}
+.peer-status{display:inline-block;padding:3px 10px;border-radius:12px;font-size:11px;font-weight:600}
+.peer-status.healthy{background:rgba(63,185,80,.12);color:var(--green)}
+.peer-status.unhealthy{background:rgba(248,81,73,.12);color:var(--red)}
 
 /* Sections */
 .section{margin-bottom:20px}
@@ -137,6 +140,10 @@ textarea{resize:vertical;min-height:80px;font-family:monospace;font-size:13px}
 /* Settings grid */
 .settings-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
 @media(max-width:600px){.settings-grid{grid-template-columns:1fr}}
+
+/* Read-only field */
+.readonly-field{padding:10px 12px;background:rgba(13,17,23,.6);border:1px solid rgba(48,54,61,.4);
+  border-radius:8px;color:var(--text);font-size:14px;font-weight:500}
 
 /* Shard Health */
 .shard-status-badge{display:inline-block;padding:3px 10px;border-radius:12px;font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.5px}
@@ -635,18 +642,93 @@ textarea{resize:vertical;min-height:80px;font-family:monospace;font-size:13px}
       </div>
     </div>
 
-    <!-- ═══ Connected Peers ═══ -->
+    <!-- ═══ Verfügbare Nodes ═══ -->
     <div class="card">
-      <h2 style="margin-bottom:12px">🌐 Verbundene Peers</h2>
+      <h2 style="margin-bottom:4px">🌐 Verfügbare Nodes</h2>
+      <p class="sub">Alle bekannten Nodes im Netzwerk und deren aktueller Status.</p>
       <div id="peers-list-container">
         <table class="peer-table" id="peers-table">
-          <thead><tr><th>URL</th><th>Name</th><th>Blocks</th><th>Status</th></tr></thead>
-          <tbody id="peers-tbody"><tr><td colspan="4" style="text-align:center;color:var(--muted)">Keine Peers</td></tr></tbody>
+          <thead><tr><th>Peer ID</th><th>Block Height</th><th>Latenz</th><th>Zuletzt gesehen</th><th>Status</th></tr></thead>
+          <tbody id="peers-tbody"><tr><td colspan="5" style="text-align:center;color:var(--muted);padding:24px 0">Keine Nodes gefunden</td></tr></tbody>
         </table>
       </div>
     </div>
 
-    <!-- ═══ OTA Update Panel ═══ -->
+    <!-- ═══ Send STONE ═══ -->
+    <div class="send-panel">
+      <div class="send-card">
+        <h3>📤 STONE senden</h3>
+        <label>Empfänger-Adresse (64 hex)</label>
+        <input type="text" id="send-to" placeholder="abc123...def456" maxlength="64">
+        <label>Betrag (STONE)</label>
+        <input type="number" id="send-amount" placeholder="0.0" min="0" step="0.0001">
+        <div class="error" id="send-error"></div>
+        <div class="tx-result" id="send-result"></div>
+        <button class="btn btn-primary btn-block" onclick="doSend()">Senden</button>
+      </div>
+      <div class="send-card">
+        <h3>🌐 Seed-Peers</h3>
+        <ul class="peer-list" id="dash-peer-list"><li>—</li></ul>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════ SETTINGS ═══════════════════ -->
+  <div id="view-settings" class="hidden">
+    <div class="card">
+      <h2>⚙️ Einstellungen</h2>
+      <p class="sub">Node-Konfiguration anpassen. Name und Ports sind nach dem Setup fix.</p>
+
+      <!-- Read-only Info -->
+      <div class="section" style="margin-bottom:24px">
+        <div class="section-title" style="margin-bottom:12px">Node-Info (nur lesen)</div>
+        <div class="settings-grid">
+          <div>
+            <label>Node-Name</label>
+            <div class="readonly-field" id="set-name-display">—</div>
+          </div>
+          <div>
+            <label>HTTP-Port</label>
+            <div class="readonly-field" id="set-http-display">—</div>
+          </div>
+          <div>
+            <label>P2P-Port</label>
+            <div class="readonly-field" id="set-p2p-display">—</div>
+          </div>
+          <div>
+            <label>Öffentliche IP</label>
+            <div class="readonly-field" style="color:var(--accent);font-family:monospace" id="set-public-ip">—</div>
+          </div>
+        </div>
+      </div>
+
+      <div style="border-top:1px solid var(--border);margin:20px 0"></div>
+
+      <!-- Editable Settings -->
+      <div class="section-title" style="margin-bottom:12px">Konfiguration</div>
+      <div class="settings-grid">
+        <div style="grid-column:1/-1">
+          <label>Daten-Verzeichnis</label>
+          <input type="text" id="set-datadir">
+        </div>
+        <div style="grid-column:1/-1">
+          <label>Seed-Peers (eine pro Zeile)</label>
+          <textarea id="set-peers" rows="4"></textarea>
+        </div>
+      </div>
+      <div style="display:flex;gap:12px;margin-top:20px">
+        <button class="btn btn-green" onclick="saveSettings()">💾 Speichern</button>
+      </div>
+      <div class="success" id="set-success">Einstellungen gespeichert!</div>
+      <div class="error" id="set-error"></div>
+
+      <div style="margin-top:24px;padding-top:20px;border-top:1px solid var(--border)">
+        <label>Wallet-Adresse (nur lesen)</label>
+        <div class="wallet-addr" id="set-wallet">—</div>
+      </div>
+    </div>
+
+    <!-- ═══ OTA Update Panel (in Settings) ═══ -->
     <div class="card update-card" id="update-panel">
       <div style="display:flex;align-items:center;gap:12px">
         <h2 style="margin:0">🔄 Software-Update</h2>
@@ -705,66 +787,6 @@ textarea{resize:vertical;min-height:80px;font-family:monospace;font-size:13px}
             <option value="6">06:00 Uhr</option>
           </select>
         </div>
-      </div>
-    </div>
-
-    <!-- ═══ Send STONE ═══ -->
-    <div class="send-panel">
-      <div class="send-card">
-        <h3>📤 STONE senden</h3>
-        <label>Empfänger-Adresse (64 hex)</label>
-        <input type="text" id="send-to" placeholder="abc123...def456" maxlength="64">
-        <label>Betrag (STONE)</label>
-        <input type="number" id="send-amount" placeholder="0.0" min="0" step="0.0001">
-        <div class="error" id="send-error"></div>
-        <div class="tx-result" id="send-result"></div>
-        <button class="btn btn-primary btn-block" onclick="doSend()">Senden</button>
-      </div>
-      <div class="send-card">
-        <h3>🌐 Seed-Peers</h3>
-        <ul class="peer-list" id="dash-peer-list"><li>—</li></ul>
-      </div>
-    </div>
-  </div>
-
-  <!-- ═══════════════════ SETTINGS ═══════════════════ -->
-  <div id="view-settings" class="hidden">
-    <div class="card">
-      <h2>⚙️ Einstellungen</h2>
-      <p class="sub">Hier kannst du die Node-Konfiguration anpassen. Änderungen werden sofort in die .env geschrieben.</p>
-      <div class="settings-grid">
-        <div>
-          <label>Node-Name</label>
-          <input type="text" id="set-name">
-        </div>
-        <div>
-          <label>HTTP-Port</label>
-          <input type="number" id="set-http">
-        </div>
-        <div>
-          <label>P2P-Port</label>
-          <input type="number" id="set-p2p">
-        </div>
-        <div style="grid-column:1/-1">
-          <label>Daten-Verzeichnis</label>
-          <input type="text" id="set-datadir">
-        </div>
-        <div style="grid-column:1/-1">
-          <label>Seed-Peers (eine pro Zeile)</label>
-          <textarea id="set-peers" rows="4"></textarea>
-        </div>
-      </div>
-      <div style="display:flex;gap:12px;margin-top:20px">
-        <button class="btn btn-green" onclick="saveSettings()">💾 Speichern</button>
-      </div>
-      <div class="success" id="set-success">Einstellungen gespeichert!</div>
-      <div class="error" id="set-error"></div>
-
-      <div style="margin-top:24px;padding-top:20px;border-top:1px solid var(--border)">
-        <label>Wallet-Adresse (nur lesen)</label>
-        <div class="wallet-addr" id="set-wallet">—</div>
-        <label style="margin-top:12px">Öffentliche IP</label>
-        <div style="color:var(--accent);font-family:monospace" id="set-public-ip">—</div>
       </div>
     </div>
   </div>
@@ -1099,27 +1121,48 @@ function renderNetworkMetrics(nm) {
 function renderConnectedPeers(peers) {
   const tbody = document.getElementById('peers-tbody');
   if (!peers || peers.length === 0) {
-    tbody.innerHTML = '<tr><td colspan="4" style="text-align:center;color:var(--muted)">Keine Peers verbunden</td></tr>';
+    tbody.innerHTML = '<tr><td colspan="5" style="text-align:center;color:var(--muted);padding:24px 0">Keine Nodes gefunden</td></tr>';
     return;
   }
   tbody.innerHTML = '';
   peers.forEach(p => {
     const tr = document.createElement('tr');
-    const urlTd = document.createElement('td');
-    urlTd.textContent = p.url;
-    urlTd.style.maxWidth = '200px'; urlTd.style.overflow = 'hidden'; urlTd.style.textOverflow = 'ellipsis';
-    urlTd.title = p.url;
-    const nameTd = document.createElement('td');
-    nameTd.textContent = p.name || '—';
+    // Peer ID (gekürzt)
+    const idTd = document.createElement('td');
+    const fullId = p.peer_id || '—';
+    idTd.textContent = fullId.length > 16 ? fullId.substring(0, 16) + '…' : fullId;
+    idTd.title = fullId;
+    idTd.style.fontFamily = 'monospace';
+    idTd.style.fontSize = '12px';
+    // Block Height
     const blocksTd = document.createElement('td');
-    blocksTd.textContent = p.block_height;
+    blocksTd.textContent = p.block_height || 0;
     blocksTd.style.fontVariantNumeric = 'tabular-nums';
+    // Latenz
+    const latencyTd = document.createElement('td');
+    latencyTd.textContent = p.latency_ms != null ? p.latency_ms + ' ms' : '—';
+    latencyTd.style.fontVariantNumeric = 'tabular-nums';
+    latencyTd.style.color = p.latency_ms != null && p.latency_ms < 100 ? 'var(--green)' : p.latency_ms > 500 ? 'var(--red)' : 'var(--orange)';
+    // Zuletzt gesehen
+    const seenTd = document.createElement('td');
+    if (p.last_seen && p.last_seen > 0) {
+      const ago = Math.floor(Date.now()/1000) - p.last_seen;
+      if (ago < 60) seenTd.textContent = 'gerade eben';
+      else if (ago < 3600) seenTd.textContent = Math.floor(ago/60) + ' Min.';
+      else if (ago < 86400) seenTd.textContent = Math.floor(ago/3600) + ' Std.';
+      else seenTd.textContent = Math.floor(ago/86400) + ' Tage';
+    } else {
+      seenTd.textContent = '—';
+    }
+    seenTd.style.color = 'var(--muted)';
+    seenTd.style.fontSize = '12px';
+    // Status
     const statusTd = document.createElement('td');
     const badge = document.createElement('span');
     badge.className = 'peer-status ' + (p.healthy ? 'healthy' : 'unhealthy');
     badge.textContent = p.healthy ? 'Online' : 'Offline';
     statusTd.appendChild(badge);
-    tr.appendChild(urlTd); tr.appendChild(nameTd); tr.appendChild(blocksTd); tr.appendChild(statusTd);
+    tr.appendChild(idTd); tr.appendChild(blocksTd); tr.appendChild(latencyTd); tr.appendChild(seenTd); tr.appendChild(statusTd);
     tbody.appendChild(tr);
   });
 }
@@ -1184,21 +1227,19 @@ async function doSend() {
 async function loadSettings() {
   const { data } = await api('/api/settings', 'GET');
   if (!data.ok) return;
-  document.getElementById('set-name').value = data.node_name;
-  document.getElementById('set-http').value = data.http_port;
-  document.getElementById('set-p2p').value = data.p2p_port;
+  document.getElementById('set-name-display').textContent = data.node_name || '—';
+  document.getElementById('set-http-display').textContent = data.http_port || '—';
+  document.getElementById('set-p2p-display').textContent = data.p2p_port || '—';
   document.getElementById('set-datadir').value = data.data_dir;
   document.getElementById('set-peers').value = data.seed_peers.join('\n');
   document.getElementById('set-wallet').textContent = data.wallet_address;
   document.getElementById('set-public-ip').textContent = data.public_ip || '—';
+  refreshUpdatePanel();
 }
 async function saveSettings() {
   hideError('set-error');
   document.getElementById('set-success').style.display = 'none';
   const body = {
-    node_name: document.getElementById('set-name').value,
-    http_port: parseInt(document.getElementById('set-http').value) || 8080,
-    p2p_port: parseInt(document.getElementById('set-p2p').value) || 4001,
     data_dir: document.getElementById('set-datadir').value,
     seed_peers: document.getElementById('set-peers').value.split('\n').map(l=>l.trim()).filter(l=>l),
   };
@@ -1512,6 +1553,7 @@ async function saveUpdateSchedule() {
 // Auto-refresh
 setInterval(() => {
   if (!document.getElementById('view-dashboard').classList.contains('hidden')) refreshDashboard();
+  if (!document.getElementById('view-settings').classList.contains('hidden')) refreshUpdatePanel();
 }, 5000);
 
 init();

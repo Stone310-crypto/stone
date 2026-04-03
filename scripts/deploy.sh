@@ -340,7 +340,7 @@ upload_to_node() {
 
         # .env mit netzwerk-spezifischen Ports erstellen/aktualisieren
         if [ "$network" = "mainnet" ]; then
-            ssh -p "$port" "$user@$host" "printf 'STONE_NETWORK=mainnet\nSTONE_HTTP_PORT=8180\nSTONE_P2P_PORT=5001\nSTONE_WS_PORT=5002\n' > $root/.env && echo OK"
+            ssh -p "$port" "$user@$host" "printf 'STONE_NETWORK=mainnet\nSTONE_DATA_DIR=./stone_data_mainnet\nSTONE_P2P_PORT=5001\nSTONE_P2P_LISTEN=/ip4/0.0.0.0/tcp/5001\n' > $root/.env && echo OK"
             echo "[upload] ✅ .env für mainnet auf $name"
         fi
 

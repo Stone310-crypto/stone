@@ -142,7 +142,8 @@ use super::handlers::{
         handle_snapshot_meta, handle_snapshot_download, handle_snapshot_create,
         handle_snapshot_state_root,
     },
-    users::{handle_delete_user, handle_delete_own_account, handle_list_users, handle_list_users_public},
+    users::{handle_delete_user, handle_delete_own_account, handle_list_users, handle_list_users_public,
+           handle_testnet_users, handle_submit_bug_report, handle_list_bug_reports},
     ws::handle_websocket,
 };
 
@@ -333,6 +334,10 @@ pub fn build_router(state: AppState) -> Router {
         // ─── Admin: Ledger & Airdrop ─────────────────────────────────────────
         .route("/api/v1/admin/ledger/rebuild", post(handle_ledger_rebuild))
         .route("/api/v1/admin/airdrop", post(handle_admin_airdrop))
+        // ─── Admin: Testnet Users & Bug-Reports ──────────────────────────────
+        .route("/api/v1/admin/testnet-users", get(handle_testnet_users))
+        .route("/api/v1/admin/bug-reports", get(handle_list_bug_reports))
+        .route("/api/v1/bug-report", post(handle_submit_bug_report))
         // ─── OTA Updates ─────────────────────────────────────────────────────
         .route("/api/v1/updates/status", get(handle_update_status))
         .route("/api/v1/updates/chunk/{index}", get(handle_update_chunk))

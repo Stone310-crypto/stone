@@ -12,6 +12,45 @@ use stone::auth::save_users;
 use super::super::auth_middleware::{require_admin, require_user};
 use super::super::state::AppState;
 
+// ─── Bug Reports ─────────────────────────────────────────────────────────────
+
+/// In-memory + file-persisted bug report store.
+use std::sync::OnceLock;
+use std::sync::Mutex as StdMutex;
+
+#[derive(Clone, serde::Serialize, serde::Deserialize, Debug)]
+pub struct BugReport {
+    pub id: String,
+    pub user_id: String,
+    pub user_name: String,
+    pub wallet: String,
+    pub mainnet_wallet: String,
+    pub network: String,
+    pub description: String,
+    pub created_at: i64,
+}
+
+fn bug_reports_file() -> String {
+    format!("{}/bug_reports.json", stone::blockchain::data_dir())
+}
+
+fn bug_report_store() -> &'static StdMutex<Vec<BugReport>> {
+    static STORE: OnceLock<StdMutex<Vec<BugReport>>> = OnceLock::new();
+    STORE.get_or_init(|| {
+        let reports = std::fs::read_to_string(bug_reports_file())
+            .ok()
+            .and_then(|d| serde_json::from_str::<Vec<BugReport>>(&d).ok())
+            .unwrap_or_default();
+        StdMutex::new(reports)
+    })
+}
+
+fn save_bug_reports(reports: &[BugReport]) {
+    if let Ok(json) = serde_json::to_string_pretty(reports) {
+        let _ = std::fs::write(bug_reports_file(), json);
+    }
+}
+
 #[derive(Deserialize)]
 pub struct UserQuery {
     #[serde(default)]
@@ -306,6 +345,136 @@ pub async fn handle_delete_own_account(
                 "group_messages_purged": group_purged,
                 "contacts_removed": contacts_removed,
             }
+        })),
+    ))
+}
+
+// ─── Testnet Users ───────────────────────────────────────────────────────────
+
+/// GET /api/v1/admin/testnet-users – Alle Testnet-Accounts (Name beginnt mit "Test-Net").
+pub async fn handle_testnet_users(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, Response> {
+    require_admin(&headers, &state)?;
+
+    let users = state.users.lock().unwrap_or_else(|e| e.into_inner());
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as f64;
+
+    let testnet_users: Vec<serde_json::Value> = users
+        .iter()
+        .filter(|u| u.name.starts_with("Test-Net"))
+        .map(|u| {
+            json!({
+                "user_id": u.id,
+                "name": u.name,
+                "wallet_address": u.wallet_address,
+                "mainnet_wallet": "",
+                "created_at": 0.0,
+                "last_seen": now,
+            })
+        })
+        .collect();
+
+    Ok((
+        StatusCode::OK,
+        axum::Json(json!({
+            "ok": true,
+            "count": testnet_users.len(),
+            "users": testnet_users,
+        })),
+    ))
+}
+
+// ─── Bug Reports ─────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct BugReportRequest {
+    pub description: String,
+    #[serde(default)]
+    pub mainnet_wallet: String,
+}
+
+/// POST /api/v1/bug-report – Bug-Report einreichen (nur Testnet-User).
+pub async fn handle_submit_bug_report(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    axum::Json(req): axum::Json<BugReportRequest>,
+) -> Result<impl IntoResponse, Response> {
+    let user = require_user(&headers, &state)?;
+
+    if req.description.trim().is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"error": "Description darf nicht leer sein"})),
+        ).into_response());
+    }
+
+    let report = BugReport {
+        id: format!("br-{}", uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("0000")),
+        user_id: user.id.clone(),
+        user_name: user.name.clone(),
+        wallet: user.wallet_address.clone(),
+        mainnet_wallet: req.mainnet_wallet,
+        network: "testnet".to_string(),
+        description: req.description.trim().to_string(),
+        created_at: chrono::Utc::now().timestamp(),
+    };
+
+    let report_id = report.id.clone();
+    {
+        let mut store = bug_report_store().lock().unwrap_or_else(|e| e.into_inner());
+        store.push(report);
+        save_bug_reports(&store);
+    }
+
+    println!("[bug-report] Neuer Report von '{}': {}", user.name, &report_id);
+
+    Ok((
+        StatusCode::CREATED,
+        axum::Json(json!({
+            "ok": true,
+            "id": report_id,
+            "message": "Bug-Report gespeichert. Danke!",
+        })),
+    ))
+}
+
+/// GET /api/v1/admin/bug-reports – Alle Bug-Reports anzeigen (Admin).
+pub async fn handle_list_bug_reports(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, Response> {
+    require_admin(&headers, &state)?;
+
+    let store = bug_report_store().lock().unwrap_or_else(|e| e.into_inner());
+    let reports: Vec<serde_json::Value> = store
+        .iter()
+        .rev()
+        .map(|r| {
+            json!({
+                "id": r.id,
+                "user_id": r.user_id,
+                "user_name": r.user_name,
+                "wallet": r.wallet,
+                "mainnet_wallet": r.mainnet_wallet,
+                "network": r.network,
+                "description": r.description,
+                "created_at": r.created_at,
+            })
+        })
+        .collect();
+
+    Ok((
+        StatusCode::OK,
+        axum::Json(json!({
+            "ok": true,
+            "count": reports.len(),
+            "reports": reports,
         })),
     ))
 }
