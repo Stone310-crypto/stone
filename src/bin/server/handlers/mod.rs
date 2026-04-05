@@ -20,6 +20,7 @@ pub mod push;
 pub mod reputation;
 pub mod snapshot;
 pub mod status;
+pub mod testnet_hub;
 pub mod token;
 pub mod trust;
 pub mod updates;

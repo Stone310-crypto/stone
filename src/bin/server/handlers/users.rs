@@ -26,7 +26,16 @@ pub struct BugReport {
     pub wallet: String,
     pub mainnet_wallet: String,
     pub network: String,
+    pub category: String,
     pub description: String,
+    #[serde(default)]
+    pub steps_to_reproduce: Vec<String>,
+    #[serde(default)]
+    pub device_info: String,
+    #[serde(default)]
+    pub app_version: String,
+    #[serde(default)]
+    pub logs: String,
     pub created_at: i64,
 }
 
@@ -397,6 +406,16 @@ pub struct BugReportRequest {
     pub description: String,
     #[serde(default)]
     pub mainnet_wallet: String,
+    #[serde(default)]
+    pub category: String,
+    #[serde(default)]
+    pub steps_to_reproduce: Vec<String>,
+    #[serde(default)]
+    pub device_info: String,
+    #[serde(default)]
+    pub app_version: String,
+    #[serde(default)]
+    pub logs: String,
 }
 
 /// POST /api/v1/bug-report – Bug-Report einreichen (nur Testnet-User).
@@ -414,6 +433,11 @@ pub async fn handle_submit_bug_report(
         ).into_response());
     }
 
+    let category = match req.category.as_str() {
+        "network" | "payment" | "crash" | "messenger" => req.category.clone(),
+        _ => "other".to_string(),
+    };
+
     let report = BugReport {
         id: format!("br-{}", uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("0000")),
         user_id: user.id.clone(),
@@ -421,7 +445,12 @@ pub async fn handle_submit_bug_report(
         wallet: user.wallet_address.clone(),
         mainnet_wallet: req.mainnet_wallet,
         network: "testnet".to_string(),
+        category,
         description: req.description.trim().to_string(),
+        steps_to_reproduce: req.steps_to_reproduce,
+        device_info: req.device_info,
+        app_version: req.app_version,
+        logs: if req.logs.len() > 500_000 { req.logs[..500_000].to_string() } else { req.logs },
         created_at: chrono::Utc::now().timestamp(),
     };
 
@@ -434,6 +463,29 @@ pub async fn handle_submit_bug_report(
 
     println!("[bug-report] Neuer Report von '{}': {}", user.name, &report_id);
 
+    // ── Bug-Report an forge-nomad weiterleiten ───────────────────────────
+    {
+        let node_url = std::env::var("PUBLIC_URL").unwrap_or_default();
+        let store = bug_report_store().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(r) = store.iter().rev().find(|r| r.id == report_id) {
+            super::super::handlers::auth::forward_to_nomad("/stone/testnet/report", serde_json::json!({
+                "report_id": r.id,
+                "user_id": r.user_id,
+                "user_name": r.user_name,
+                "wallet": r.wallet,
+                "mainnet_wallet": r.mainnet_wallet,
+                "network": r.network,
+                "category": r.category,
+                "description": r.description,
+                "steps_to_reproduce": r.steps_to_reproduce,
+                "device_info": r.device_info,
+                "app_version": r.app_version,
+                "logs": r.logs,
+                "node_url": node_url,
+            }));
+        }
+    }
+
     Ok((
         StatusCode::CREATED,
         axum::Json(json!({
@@ -442,6 +494,121 @@ pub async fn handle_submit_bug_report(
             "message": "Bug-Report gespeichert. Danke!",
         })),
     ))
+}
+
+/// GET /api/v1/my-bug-reports – Eigene Bug-Reports einsehen (User).
+pub async fn handle_my_bug_reports(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Result<impl IntoResponse, Response> {
+    let user = require_user(&headers, &state)?;
+
+    let store = bug_report_store().lock().unwrap_or_else(|e| e.into_inner());
+    let my_reports: Vec<serde_json::Value> = store
+        .iter()
+        .rev()
+        .filter(|r| r.user_id == user.id || r.wallet == user.wallet_address)
+        .map(|r| json!({
+            "id": r.id,
+            "category": r.category,
+            "description": r.description,
+            "steps_to_reproduce": r.steps_to_reproduce,
+            "mainnet_wallet": r.mainnet_wallet,
+            "device_info": r.device_info,
+            "app_version": r.app_version,
+            "created_at": r.created_at,
+            "status": "open",
+        }))
+        .collect();
+
+    Ok(axum::Json(json!({
+        "ok": true,
+        "count": my_reports.len(),
+        "reports": my_reports,
+    })))
+}
+
+/// PATCH /api/v1/bug-report/{id} – Bug-Report aktualisieren (nur eigene).
+///
+/// Erlaubte Felder: mainnet_wallet, description (Nachtrag), steps_to_reproduce
+#[derive(Deserialize)]
+pub struct BugReportUpdateRequest {
+    #[serde(default)]
+    pub mainnet_wallet: Option<String>,
+    #[serde(default)]
+    pub description_addendum: Option<String>,
+    #[serde(default)]
+    pub steps_to_reproduce: Option<Vec<String>>,
+}
+
+pub async fn handle_update_bug_report(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Path(report_id): Path<String>,
+    axum::Json(req): axum::Json<BugReportUpdateRequest>,
+) -> Result<impl IntoResponse, Response> {
+    let user = require_user(&headers, &state)?;
+
+    let mut store = bug_report_store().lock().unwrap_or_else(|e| e.into_inner());
+    let idx = store.iter().position(|r| r.id == report_id);
+
+    let idx = match idx {
+        Some(i) => i,
+        None => return Err((
+            StatusCode::NOT_FOUND,
+            axum::Json(json!({"error": "Report nicht gefunden"})),
+        ).into_response()),
+    };
+
+    // Nur eigene Reports bearbeiten
+    if store[idx].user_id != user.id && store[idx].wallet != user.wallet_address {
+        return Err((
+            StatusCode::FORBIDDEN,
+            axum::Json(json!({"error": "Nur eigene Reports können bearbeitet werden"})),
+        ).into_response());
+    }
+
+    if let Some(wallet) = &req.mainnet_wallet {
+        store[idx].mainnet_wallet = wallet.trim().to_string();
+    }
+    if let Some(addendum) = &req.description_addendum {
+        let trimmed = addendum.trim();
+        if !trimmed.is_empty() {
+            store[idx].description = format!("{}\n\n--- Nachtrag ---\n{}", store[idx].description, trimmed);
+        }
+    }
+    if let Some(steps) = &req.steps_to_reproduce {
+        store[idx].steps_to_reproduce = steps.clone();
+    }
+
+    let report_clone = store[idx].clone();
+    save_bug_reports(&store);
+    drop(store);
+
+    // Auch an Hub weiterleiten (Update)
+    {
+        let node_url = std::env::var("PUBLIC_URL").unwrap_or_default();
+        super::super::handlers::auth::forward_to_nomad("/stone/testnet/report", json!({
+            "report_id": report_clone.id,
+            "user_id": report_clone.user_id,
+            "user_name": report_clone.user_name,
+            "wallet": report_clone.wallet,
+            "mainnet_wallet": report_clone.mainnet_wallet,
+            "network": report_clone.network,
+            "category": report_clone.category,
+            "description": report_clone.description,
+            "steps_to_reproduce": report_clone.steps_to_reproduce,
+            "device_info": report_clone.device_info,
+            "app_version": report_clone.app_version,
+            "logs": report_clone.logs,
+            "node_url": node_url,
+        }));
+    }
+
+    Ok(axum::Json(json!({
+        "ok": true,
+        "message": "Report aktualisiert",
+    })))
 }
 
 /// GET /api/v1/admin/bug-reports – Alle Bug-Reports anzeigen (Admin).
@@ -463,7 +630,12 @@ pub async fn handle_list_bug_reports(
                 "wallet": r.wallet,
                 "mainnet_wallet": r.mainnet_wallet,
                 "network": r.network,
+                "category": r.category,
                 "description": r.description,
+                "steps_to_reproduce": r.steps_to_reproduce,
+                "device_info": r.device_info,
+                "app_version": r.app_version,
+                "logs": r.logs,
                 "created_at": r.created_at,
             })
         })

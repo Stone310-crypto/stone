@@ -15,6 +15,8 @@
 #   STONE_P2P_PORT       – P2P-Port (default: 4001 testnet, 5001 mainnet)
 #   STONE_ADMIN_KEY      – Separater Admin-Key (optional, empfohlen)
 #   STONE_VALIDATOR_PASSPHRASE – Passphrase für Validator-Key-Verschlüsselung
+#   NOMAD_URL            – URL von chain.unrooted.dev (Testnet-Sammelpunkt)
+#   NODE_SECRET           – Shared secret für Nomad-Forwarding
 # ─────────────────────────────────────────────────────────────────────────────
 set -e
 

@@ -49,6 +49,7 @@ use stone::{
     network::{start_network, NetworkEvent, NetworkHandle},
     shard::ShardStore,
     storage::ChunkStore,
+    token::genesis::NetworkMode,
     token::transaction::{create_signed_tx, TxType},
 };
 
@@ -119,8 +120,15 @@ fn default_node_name() -> String {
         .and_then(|h| h.into_string().ok())
         .unwrap_or_else(|| "stone-miner".into())
 }
-fn default_http_port() -> u16 { 8081 }
-fn default_dashboard_port() -> u16 { 6969 }
+fn default_http_port() -> u16 {
+    if NetworkMode::from_env().is_testnet() { 8081 } else { 8082 }
+}
+fn default_dashboard_port() -> u16 {
+    if NetworkMode::from_env().is_testnet() { 6969 } else { 6970 }
+}
+fn default_p2p_port() -> u16 {
+    if NetworkMode::from_env().is_testnet() { 4002 } else { 5002 }
+}
 
 impl MinerConfig {
     fn config_path() -> String {
@@ -367,6 +375,7 @@ async fn handle_miner_stats(State(state): State<MinerWebState>) -> impl IntoResp
         "info": {
             "version": env!("CARGO_PKG_VERSION"),
             "node_name": config.node_name,
+            "network": NetworkMode::from_env().to_string(),
             "uptime_secs": state.uptime_secs(),
             "uptime_human": state.uptime_str(),
         },
@@ -2169,6 +2178,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut headless = false;
     let mut port_arg: Option<u16> = None;
     let mut p2p_port_arg: Option<u16> = None;
+    let mut network_arg: Option<String> = None;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -2199,29 +2209,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     std::process::exit(1);
                 }
             }
+            "--network" | "-n" => {
+                if i + 1 < args.len() {
+                    network_arg = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    eprintln!("Fehler: --network benötigt 'testnet' oder 'mainnet'");
+                    std::process::exit(1);
+                }
+            }
+            "--testnet" => { network_arg = Some("testnet".into()); i += 1; }
+            "--mainnet" => { network_arg = Some("mainnet".into()); i += 1; }
             "--headless" => { headless = true; i += 1; }
             "--help" | "-h" => {
                 println!("stone-miner — StoneChain Standalone Miner mit Web-Dashboard");
                 println!();
                 println!("Usage:");
-                println!("  stone-miner                        Start mit Web-Dashboard");
+                println!("  stone-miner                        Start im Testnet (Default)");
+                println!("  stone-miner --mainnet              Start im Mainnet");
+                println!("  stone-miner --testnet              Start im Testnet (explizit)");
                 println!("  stone-miner --wallet <ADRESSE>     Wallet direkt angeben");
                 println!("  stone-miner --headless             Ohne Dashboard (Log-Modus)");
-                println!("  stone-miner --port 8081            Node-API-Port (Default: 8081)");
-                println!("  stone-miner --p2p-port 4002        P2P-Port (Default: 4002)");
                 println!();
-                println!("Optionen:");
+                println!("Netzwerk:");
+                println!("  -n, --network <NET>    'testnet' oder 'mainnet' (Default: testnet)");
+                println!("      --testnet          Kurzform für --network testnet");
+                println!("      --mainnet          Kurzform für --network mainnet");
+                println!();
+                println!("Ports (Defaults: Testnet / Mainnet):");
+                println!("  -p, --port <PORT>      Node-API-Port (8081 / 8082)");
+                println!("      --p2p-port <PORT>  P2P-Port (4002 / 5002)");
+                println!("      Dashboard-Port wird per STONE_DASHBOARD_PORT gesetzt (6969 / 6970)");
+                println!();
+                println!("Weitere Optionen:");
                 println!("  -w, --wallet <ADDR>    Payout-Wallet-Adresse (64 Hex-Zeichen)");
-                println!("  -p, --port <PORT>      Node-API-Port (Default: 8081)");
-                println!("      --p2p-port <PORT>  P2P-Netzwerk-Port (Default: 4002)");
                 println!("      --headless         Log-Modus ohne Web-Dashboard");
                 println!("  -h, --help             Diese Hilfe anzeigen");
                 println!();
-                println!("Dashboard: http://localhost:<port>/ui (Default: 6969)");
+                println!("Umgebungsvariablen:");
+                println!("  STONE_NETWORK=testnet|mainnet    Netzwerk (überschrieben durch --network)");
+                println!("  STONE_MINER_PORT=8081            Node-API-Port");
+                println!("  STONE_DASHBOARD_PORT=6969        Dashboard-Port");
+                println!("  STONE_MINER_P2P_PORT=4002        P2P-Port");
                 std::process::exit(0);
             }
             _ => { i += 1; }
         }
+    }
+
+    // CLI --network/--testnet/--mainnet überschreibt STONE_NETWORK env var
+    if let Some(net) = network_arg {
+        std::env::set_var("STONE_NETWORK", &net);
     }
 
     // Auto-detect headless
@@ -2354,11 +2392,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
-    // P2P starten – Miner verwendet Port 4002 (statt 4001 wie stone-setup)
-    // damit beide gleichzeitig laufen können.
+    // P2P starten – Miner verwendet eigene Ports pro Netzwerk
+    // (Testnet: 4002, Mainnet: 5002), damit kein Konflikt mit stone-setup.
     let miner_p2p_port = p2p_port_arg
         .or_else(|| std::env::var("STONE_MINER_P2P_PORT").ok()?.parse().ok())
-        .unwrap_or(4002u16);
+        .unwrap_or_else(default_p2p_port);
 
     // ChatIndex vorab erstellen, damit der P2P-Event-Loop ihn nutzen kann
     let chat_index_arc: Arc<std::sync::Mutex<stone::chat::ChatIndex>> = {
@@ -2630,6 +2668,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dashboard_listener = try_bind_port(dashboard_port, "Dashboard").await?;
     let actual_dashboard_port = dashboard_listener.local_addr()?.port();
 
+    let network = NetworkMode::from_env();
+    let net_label = if network.is_testnet() { "TESTNET" } else { "MAINNET" };
+
+    miner_state.add_log(format!("Netzwerk: {net_label}"));
     miner_state.add_log(format!("Node: {node_id}"));
     miner_state.add_log(format!("Mining Wallet: {}...", &validator_wallet[..16.min(validator_wallet.len())]));
     miner_state.add_log(format!("Payout Wallet: {}...", &config.payout_wallet[..16.min(config.payout_wallet.len())]));
@@ -2641,8 +2683,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     println!();
-    println!("  Stone Miner v{} gestartet", env!("CARGO_PKG_VERSION"));
+    println!("  Stone Miner v{} gestartet [{net_label}]", env!("CARGO_PKG_VERSION"));
     println!("  -------------------------------------");
+    println!("  Netzwerk: {net_label}");
+    println!("  Data:     {}", data_dir());
     println!("  Node:     {node_id}");
     println!("  Wallet:   {}...", &validator_wallet[..16.min(validator_wallet.len())]);
     println!("  Payout:   {}...", &config.payout_wallet[..16.min(config.payout_wallet.len())]);
@@ -2657,7 +2701,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if headless {
         // === HEADLESS MODUS ===
-        println!("[miner] Headless-Modus (kein Dashboard)");
+        println!("[miner] Headless-Modus [{net_label}] (kein Dashboard)");
         println!("[miner] Node-API auf Port {actual_http_port}, Dashboard auf Port {actual_dashboard_port}, P2P auf Port {miner_p2p_port}");
 
         // Node-API im Hintergrund
@@ -2763,7 +2807,13 @@ async fn try_bind_port(
 }
 
 fn print_banner() {
-    eprintln!("\x1b[36;1m");
+    let network = NetworkMode::from_env();
+    let (color, label) = if network.is_testnet() {
+        ("\x1b[36;1m", "TESTNET") // Cyan
+    } else {
+        ("\x1b[32;1m", "MAINNET") // Grün
+    };
+    eprintln!("{color}");
     eprintln!(r"  ███████╗████████╗ ██████╗ ███╗   ██╗███████╗");
     eprintln!(r"  ██╔════╝╚══██╔══╝██╔═══██╗████╗  ██║██╔════╝");
     eprintln!(r"  ███████╗   ██║   ██║   ██║██╔██╗ ██║█████╗  ");
@@ -2771,6 +2821,6 @@ fn print_banner() {
     eprintln!(r"  ███████║   ██║   ╚██████╔╝██║ ╚████║███████╗");
     eprintln!(r"  ╚══════╝   ╚═╝    ╚═════╝ ╚═╝  ╚═══╝╚══════╝");
     eprintln!("\x1b[0m");
-    eprintln!("  \x1b[1mStone Miner — Standalone Mining Client\x1b[0m");
+    eprintln!("  \x1b[1mStone Miner — Standalone Mining Client [{label}]\x1b[0m");
     eprintln!("  \x1b[2m──────────────────────────────────────────────────\x1b[0m");
 }

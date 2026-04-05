@@ -385,9 +385,15 @@ pub async fn handle_token_faucet(
         }
     }
 
-    // ── Mint-TX erstellen (wird durch Mempool + P2P gesynct) ──
-    // Pool-Balance prüfen
-    {
+    // ── Faucet-TX erstellen ──
+    // Im Testnet: direktes Mint (TxType::Mint) statt Pool-Transfer,
+    // da der Community-Pool im Testnet nicht zwingend gefüllt ist.
+    // Im Mainnet: Transfer aus pool:community.
+    let (from_addr, tx_type) = if network.is_testnet() {
+        // Testnet: Mint direkt an Empfänger — kein Pool-Balance nötig
+        ("system:faucet".to_string(), TxType::Mint)
+    } else {
+        // Mainnet: aus Community-Pool transferieren — Balance prüfen
         let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
         let available = ledger.balance(pool);
         if available < amount {
@@ -399,20 +405,21 @@ pub async fn handle_token_faucet(
                 })),
             );
         }
-    }
-
-    // Nonce aus Ledger holen + pending TXs (pool:community)
-    let nonce = {
-        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
-        let base = ledger.nonce(pool);
-        base + state.node.mempool.sender_pending_count(pool)
+        (pool.to_string(), TxType::Transfer)
     };
 
-    // TokenTx mit TxType::Transfer erstellen – Pool-Signatur wird übersprungen
+    // Nonce
+    let nonce = {
+        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
+        let base = ledger.nonce(&from_addr);
+        base + state.node.mempool.sender_pending_count(&from_addr)
+    };
+
+    // TokenTx erstellen
     let mut tx = TokenTx {
         tx_id: String::new(),
-        tx_type: TxType::Transfer,
-        from: pool.to_string(),
+        tx_type,
+        from: from_addr,
         to: faucet_addr.clone(),
         amount,
         fee: rust_decimal::Decimal::ZERO,
@@ -421,7 +428,7 @@ pub async fn handle_token_faucet(
         signature: "system-faucet".to_string(),
         memo: "Testnet Faucet".to_string(),
         chain_id: default_chain_id(),
-        fee_tier: stone::token::FeeTier::Standard,
+        fee_tier: stone::token::FeeTier::Priority,
     };
     tx.tx_id = compute_tx_id(&tx);
 

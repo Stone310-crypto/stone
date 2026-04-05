@@ -766,6 +766,62 @@ async fn start_full_node(state: SetupState) {
         }
     }
 
+    // ── Hintergrund-Task: Alle User an Testnet-Hub melden ──────────────
+    {
+        let users_arc = stone::auth::load_users();
+        // User-Liste sofort kopieren (Lock nicht über await halten)
+        let user_snapshot: Vec<(String, String, String)> = {
+            let guard = users_arc.lock().unwrap_or_else(|e| e.into_inner());
+            guard.iter().map(|u| (u.id.clone(), u.name.clone(), u.wallet_address.clone())).collect()
+        };
+        tokio::spawn(async move {
+            // Kurz warten bis der Node hochgefahren ist
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+            let nomad_url = match std::env::var("NOMAD_URL") {
+                Ok(u) if !u.is_empty() => u.trim_end_matches('/').to_string(),
+                _ => return,
+            };
+            let node_secret = std::env::var("NODE_SECRET").unwrap_or_default();
+            let public_url = std::env::var("PUBLIC_URL").unwrap_or_default();
+
+            let user_list: Vec<serde_json::Value> = user_snapshot.iter().map(|(id, name, wallet)| {
+                serde_json::json!({
+                    "user_id": id,
+                    "name": name,
+                    "wallet_address": wallet,
+                })
+            }).collect();
+
+            if user_list.is_empty() { return; }
+
+            let url = format!("{}/stone/testnet/sync-users", nomad_url);
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .danger_accept_invalid_certs(true)
+                .build()
+                .unwrap_or_default();
+
+            match client.post(&url)
+                .header("X-Node-Secret", &node_secret)
+                .json(&serde_json::json!({
+                    "node_url": public_url,
+                    "users": user_list,
+                }))
+                .send()
+                .await
+            {
+                Ok(resp) if resp.status().is_success() => {
+                    if let Ok(body) = resp.text().await {
+                        println!("[hub-sync] ✓ Bulk-Sync erfolgreich: {}", body);
+                    }
+                }
+                Ok(resp) => eprintln!("[hub-sync] ✗ HTTP {}", resp.status()),
+                Err(e) => eprintln!("[hub-sync] ✗ {}", e),
+            }
+        });
+    }
+
     // ── Hintergrund-Task: Chat-Index nach Sync aktualisieren ────────────
     {
         let chat_idx = node_app_state.chat_index.clone();

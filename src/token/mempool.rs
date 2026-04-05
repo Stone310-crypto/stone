@@ -208,20 +208,23 @@ impl Mempool {
             }
 
             // Balance prüfen (grob – berücksichtigt pending TXs)
-            let pending_debit: rust_decimal::Decimal = inner.queue.iter()
-                .filter(|ptx| ptx.from == tx.from)
-                .map(|ptx| ptx.amount + ptx.fee)
-                .sum();
-            let available = ledger.balance(&tx.from) - pending_debit;
-            let required = tx.amount + tx.fee;
+            // Mint-TXs überspringen — sie erstellen Coins aus dem Nichts
+            if tx.tx_type != crate::token::TxType::Mint {
+                let pending_debit: rust_decimal::Decimal = inner.queue.iter()
+                    .filter(|ptx| ptx.from == tx.from)
+                    .map(|ptx| ptx.amount + ptx.fee)
+                    .sum();
+                let available = ledger.balance(&tx.from) - pending_debit;
+                let required = tx.amount + tx.fee;
 
-            if available < required {
-                return Err(MempoolError::InsufficientBalance(format!(
-                    "{} hat {} verfügbar (nach pending TXs), benötigt {}",
-                    &tx.from[..12.min(tx.from.len())],
-                    available,
-                    required
-                )));
+                if available < required {
+                    return Err(MempoolError::InsufficientBalance(format!(
+                        "{} hat {} verfügbar (nach pending TXs), benötigt {}",
+                        &tx.from[..12.min(tx.from.len())],
+                        available,
+                        required
+                    )));
+                }
             }
             } // end !skip_ledger_check
         }

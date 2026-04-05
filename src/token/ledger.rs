@@ -29,8 +29,10 @@ use super::transaction::{TokenTx, TxError, TxType, validate_tx};
 
 // ─── Konstanten ──────────────────────────────────────────────────────────────
 
-/// Maximales Token-Supply: 55.000.000 STONE
+/// Maximales Token-Supply: 55.000.000 STONE (Mainnet)
 pub const MAX_SUPPLY: &str = "55000000";
+/// Testnet Max-Supply: 550.000.000 STONE (10x Mainnet, damit Faucet nicht blockiert)
+pub const MAX_SUPPLY_TESTNET: &str = "550000000";
 
 /// Minimale Transaktionsgebühr (0.0001 STONE — Basis-Fee, wird geburnt)
 pub const MIN_FEE: &str = "0.0001";
@@ -220,11 +222,13 @@ pub struct TokenLedger {
 impl TokenLedger {
     /// Neuen leeren Ledger erstellen.
     pub fn new() -> Self {
+        let network = crate::token::NetworkMode::from_env();
+        let supply_str = if network.is_testnet() { MAX_SUPPLY_TESTNET } else { MAX_SUPPLY };
         TokenLedger {
             balances: HashMap::new(),
             nonces: HashMap::new(),
             total_supply: Decimal::ZERO,
-            max_supply: MAX_SUPPLY.parse().expect("MAX_SUPPLY parse"),
+            max_supply: supply_str.parse().expect("MAX_SUPPLY parse"),
             processed_txs: std::collections::HashSet::new(),
             key_rotations: HashMap::new(),
             key_rotation_history: HashMap::new(),

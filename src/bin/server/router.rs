@@ -4,7 +4,7 @@ use axum::{
     Router,
     extract::DefaultBodyLimit,
     http::Method,
-    routing::{delete, get, post},
+    routing::{delete, get, patch, post},
 };
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::compression::CompressionLayer;
@@ -39,6 +39,7 @@ use super::handlers::{
         handle_chat_send_coins, handle_chat_request_coins,
         handle_send_contact_request, handle_list_contact_requests,
         handle_accept_contact_request, handle_decline_contact_request,
+        handle_system_message,
     },
     chat_policy::{
         handle_chat_policy_status, handle_chat_policy_message,
@@ -143,7 +144,13 @@ use super::handlers::{
         handle_snapshot_state_root,
     },
     users::{handle_delete_user, handle_delete_own_account, handle_list_users, handle_list_users_public,
-           handle_testnet_users, handle_submit_bug_report, handle_list_bug_reports},
+           handle_testnet_users, handle_submit_bug_report, handle_list_bug_reports,
+           handle_my_bug_reports, handle_update_bug_report},
+    testnet_hub::{
+        handle_hub_register, handle_hub_report, handle_hub_users, handle_hub_bug_reports,
+        handle_hub_bulk_sync, handle_hub_send_message, handle_hub_send_coins,
+        handle_hub_support_reply, handle_hub_get_support_replies,
+    },
     ws::handle_websocket,
 };
 
@@ -334,10 +341,22 @@ pub fn build_router(state: AppState) -> Router {
         // ─── Admin: Ledger & Airdrop ─────────────────────────────────────────
         .route("/api/v1/admin/ledger/rebuild", post(handle_ledger_rebuild))
         .route("/api/v1/admin/airdrop", post(handle_admin_airdrop))
-        // ─── Admin: Testnet Users & Bug-Reports ──────────────────────────────
+        // ─── Admin: Testnet Users & Bug-Reports (lokaler Node) ────────────
         .route("/api/v1/admin/testnet-users", get(handle_testnet_users))
         .route("/api/v1/admin/bug-reports", get(handle_list_bug_reports))
         .route("/api/v1/bug-report", post(handle_submit_bug_report))
+        .route("/api/v1/bug-report/{id}", patch(handle_update_bug_report))
+        .route("/api/v1/my-bug-reports", get(handle_my_bug_reports))
+        // ─── Testnet Hub (zentraler Sammelpunkt: chain.unrooted.dev) ─────
+        .route("/stone/testnet/register", post(handle_hub_register))
+        .route("/stone/testnet/report", post(handle_hub_report))
+        .route("/stone/testnet/users", get(handle_hub_users))
+        .route("/stone/testnet/bug-reports", get(handle_hub_bug_reports))
+        .route("/stone/testnet/sync-users", post(handle_hub_bulk_sync))
+        .route("/stone/testnet/send-message", post(handle_hub_send_message))
+        .route("/stone/testnet/send-coins", post(handle_hub_send_coins))
+        .route("/stone/testnet/support-reply", post(handle_hub_support_reply))
+        .route("/stone/testnet/support-replies", get(handle_hub_get_support_replies))
         // ─── OTA Updates ─────────────────────────────────────────────────────
         .route("/api/v1/updates/status", get(handle_update_status))
         .route("/api/v1/updates/chunk/{index}", get(handle_update_chunk))
@@ -364,6 +383,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/orgs/{org_id}/chat/{channel_id}", get(handle_get_chat))
         // ─── Globaler Chat ───────────────────────────────────────────────────
         .route("/api/v1/chat/send", post(handle_chat_send))
+        .route("/api/v1/admin/system-message", post(handle_system_message))
         .route("/api/v1/chat/conversations", get(handle_chat_conversations))
         .route("/api/v1/chat/messages/{peer_wallet}", get(handle_chat_messages))
         .route("/api/v1/chat/pending", get(handle_chat_pending))

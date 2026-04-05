@@ -20,6 +20,44 @@ use super::super::auth_middleware::{require_admin, require_user};
 use super::super::rate_limiter::{check_rate_limit_tuple, extract_client_ip};
 use super::super::state::AppState;
 
+// ── Nomad-Forwarding (Testnet-Sammelpunkt) ───────────────────────────────────
+
+/// Leitet Testnet-Daten fire-and-forget an forge-nomad weiter.
+pub fn forward_to_nomad(path: &str, body: serde_json::Value) {
+    let nomad_url = match std::env::var("NOMAD_URL") {
+        Ok(u) if !u.is_empty() => u.trim_end_matches('/').to_string(),
+        _ => return, // Kein NOMAD_URL → stille Rückkehr
+    };
+    let node_secret = std::env::var("NODE_SECRET").unwrap_or_default();
+    let url = format!("{}{}", nomad_url, path);
+    let path_owned = path.to_string();
+
+    tokio::spawn(async move {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap_or_default();
+        match client
+            .post(&url)
+            .header("X-Node-Secret", &node_secret)
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                if resp.status().is_success() {
+                    println!("[nomad] ✓ Forwarded to {}", path_owned);
+                } else {
+                    eprintln!("[nomad] ✗ {} → HTTP {}", path_owned, resp.status());
+                }
+            }
+            Err(e) => eprintln!("[nomad] ✗ {} → {}", path_owned, e),
+        }
+    });
+}
+
 #[derive(Deserialize)]
 pub struct SignupRequest {
     pub name: String,
@@ -117,6 +155,17 @@ pub async fn handle_signup(
     tokio::spawn(async move {
         push_user_to_peers(&push_user, &peers, &api_key).await;
     });
+
+    // ── User an Testnet-Hub weiterleiten ────────────────────────────────
+    {
+        let node_url = std::env::var("PUBLIC_URL").unwrap_or_default();
+        forward_to_nomad("/stone/testnet/register", json!({
+            "user_id": id,
+            "name": new_user.name,
+            "wallet_address": new_user.wallet_address,
+            "node_url": node_url,
+        }));
+    }
 
     (
         StatusCode::CREATED,

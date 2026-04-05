@@ -167,13 +167,17 @@ impl MasterNodeState {
                 // nicht committed werden. TXs zurück in den Mempool legen!
                 let mut restored = 0u32;
                 for tx in &block.transactions {
-                    // Nur echte User-TXs zurücklegen (keine System-TXs wie Reward/Memorial)
-                    if tx.tx_type != TxType::Reward && tx.tx_type != TxType::Mint
-                        && tx.tx_type != crate::token::transaction::TxType::Memorial
+                    // System-TXs nicht zurücklegen (Reward, Memorial) — aber Faucet-Mints schon!
+                    if tx.tx_type == TxType::Reward
+                        || tx.tx_type == crate::token::transaction::TxType::Memorial
                     {
-                        if let Ok(()) = self.mempool.add_tx(tx.clone(), None) {
-                            restored += 1;
-                        }
+                        continue;
+                    }
+                    if tx.tx_type == TxType::Mint && tx.from != "system:faucet" {
+                        continue;
+                    }
+                    if let Ok(()) = self.mempool.add_tx(tx.clone(), None) {
+                        restored += 1;
                     }
                 }
                 if restored > 0 {
@@ -223,6 +227,18 @@ impl MasterNodeState {
             let pool_balance = ledger.balance("pool:mining_rewards");
             (Self::calculate_block_reward(next_idx, pool_balance), next_idx, prev)
         };
+
+        // ── Alte Template-TXs zurück in Mempool ─────────────────────────
+        // Wenn ein altes Template existiert dessen Block nicht committed wurde,
+        // müssen dessen User-TXs zurück in den Mempool bevor neu gedrained wird.
+        // Ohne diesen Schritt gehen TXs verloren wenn ein Peer-Block das
+        // Template invalidiert (z.B. Faucet-TXs im Testnet).
+        {
+            let tmpl = self.current_mining_template.read().unwrap_or_else(|e| e.into_inner());
+            if let Some((_, ref old_block)) = *tmpl {
+                self.restore_block_txs(old_block);
+            }
+        }
 
         // ── Mempool-TXs + Reward-TX sammeln ────────────────────────────
         let mut pending_txs = self.mempool.drain_all_for_block();
@@ -523,11 +539,17 @@ impl MasterNodeState {
     /// Stellt TXs eines gescheiterten Blocks zurück in den Mempool.
     fn restore_block_txs(&self, block: &Block) {
         for tx in &block.transactions {
-            if tx.tx_type != TxType::Reward && tx.tx_type != TxType::Mint
-                && tx.tx_type != crate::token::transaction::TxType::Memorial
+            // System-TXs nicht zurücklegen (Reward, Memorial) — aber Faucet-Mints schon!
+            if tx.tx_type == TxType::Reward
+                || tx.tx_type == crate::token::transaction::TxType::Memorial
             {
-                let _ = self.mempool.add_tx(tx.clone(), None);
+                continue;
             }
+            // Mint-TXs nur zurücklegen wenn sie vom Faucet kommen (system:faucet)
+            if tx.tx_type == TxType::Mint && tx.from != "system:faucet" {
+                continue;
+            }
+            let _ = self.mempool.add_tx(tx.clone(), None);
         }
         for batch in &block.chat_batches {
             self.message_pool.unbatch(&batch.merkle_root);
@@ -1175,7 +1197,13 @@ impl MasterNodeState {
                             .unwrap_or(0)
                     };
                     if max_peer_height > our_height + 1 {
-                        // Template invalidieren wenn wir hinterher sind
+                        // Template-TXs zurück in Mempool legen bevor invalidiert wird
+                        {
+                            let tmpl = state.current_mining_template.read().unwrap_or_else(|e| e.into_inner());
+                            if let Some((_, ref old_block)) = *tmpl {
+                                state.restore_block_txs(old_block);
+                            }
+                        }
                         *state.current_mining_template.write().unwrap_or_else(|e| e.into_inner()) = None;
                         continue;
                     }

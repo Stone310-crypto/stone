@@ -25,10 +25,12 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
 }
 
 pub fn extract_api_key(headers: &HeaderMap) -> Option<String> {
+    // Akzeptiere sowohl "x-api-key" (Legacy) als auch "X-Admin-Key" (Mac App)
     headers
         .get("x-api-key")
+        .or_else(|| headers.get("x-admin-key"))
         .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_string())
+        .map(|s| s.trim().to_string())
 }
 
 /// Extrahiert einen Bearer-Token aus dem `Authorization`-Header.
@@ -105,16 +107,23 @@ pub fn require_user(headers: &HeaderMap, state: &AppState) -> Result<User, Respo
 }
 
 pub fn require_admin(headers: &HeaderMap, state: &AppState) -> Result<(), Response> {
-    let key = extract_api_key(headers).ok_or_else(|| {
+    // Akzeptiere x-api-key, x-admin-key ODER x-node-secret Header
+    let key = extract_api_key(headers)
+        .or_else(|| headers.get("x-node-secret")
+            .and_then(|v| v.to_str().ok())
+            .map(|s| s.trim().to_string()))
+        .ok_or_else(|| {
         (
             StatusCode::UNAUTHORIZED,
             axum::Json(json!({"error": "x-api-key Header fehlt"})),
         )
             .into_response()
     })?;
-    // Admin-Key ODER normaler API-Key (Node-Besitzer ist immer Admin)
+    // Admin-Key, normaler API-Key (Node-Besitzer), oder NODE_SECRET (inter-node)
+    let node_secret = std::env::var("NODE_SECRET").unwrap_or_default();
     if constant_time_eq(&key, state.admin_key.as_str())
         || constant_time_eq(&key, state.api_key.as_str())
+        || (!node_secret.is_empty() && constant_time_eq(&key, &node_secret))
     {
         Ok(())
     } else {
