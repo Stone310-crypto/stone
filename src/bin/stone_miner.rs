@@ -697,16 +697,16 @@ async fn handle_p2p_event(
                                 // replay_mode aktivieren um Nonce-Checks zu überspringen
                                 // (bei Initial-Sync hat der Ledger noch nicht alle Nonces)
                                 ledger.replay_mode = true;
-                                let _ = ledger.apply_block_txs(&txs, idx);
+                                let receipts = ledger.apply_block_txs(&txs, idx);
                                 ledger.replay_mode = false;
                                 let _ = ledger.persist();
                                 for tx in &txs {
                                     node.mempool.mark_known(&tx.tx_id);
                                     node.mempool.remove_tx(&tx.tx_id);
                                 }
+                                // Staking-TXs im StakingPool verarbeiten (P2P-Pfad)
+                                node.apply_staking_from_txs(&txs, &receipts);
                             }
-                            // Staking-TXs im StakingPool verarbeiten (P2P-Pfad)
-                            node.apply_staking_from_txs(&txs);
                             // HTLC-TXs verarbeiten (P2P-Pfad)
                             MasterNodeState::process_htlc_txs(&node, &txs, idx);
                             // Chat-Batch-Records speichern (für Chat-Index)
@@ -930,16 +930,16 @@ async fn handle_p2p_event(
                                 if !txs.is_empty() {
                                     let mut ledger = node.token_ledger.write().unwrap_or_else(|e| e.into_inner());
                                     ledger.replay_mode = true;
-                                    let _ = ledger.apply_block_txs(&txs, idx);
+                                    let receipts = ledger.apply_block_txs(&txs, idx);
                                     ledger.replay_mode = false;
                                     let _ = ledger.persist();
                                     for tx in &txs {
                                         node.mempool.mark_known(&tx.tx_id);
                                         node.mempool.remove_tx(&tx.tx_id);
                                     }
+                                    // Staking-TXs im StakingPool verarbeiten (RangeSync-Pfad)
+                                    node.apply_staking_from_txs(&txs, &receipts);
                                 }
-                                // Staking-TXs im StakingPool verarbeiten (RangeSync-Pfad)
-                                node.apply_staking_from_txs(&txs);
                                 // HTLC-TXs verarbeiten (RangeSync-Pfad)
                                 MasterNodeState::process_htlc_txs(&node, &txs, idx);
                             }

@@ -917,26 +917,7 @@ impl MasterNodeState {
         }
 
         // ── Lite-PoW lösen (nur bei Fallback-Mining) ─────────────────────
-        if is_pow_fallback {
-            use crate::consensus::{solve_lite_pow, BLOCK_POW_DIFFICULTY};
-            let pow_nonce = solve_lite_pow(
-                &block.previous_hash,
-                block.index,
-                &self.node_id,
-                BLOCK_POW_DIFFICULTY,
-            );
-            block.pow_nonce = pow_nonce;
-            // Hash neu berechnen (pow_nonce fließt in den Hash ein)
-            block.hash = crate::blockchain::calculate_hash(&block);
-            block.signature = crate::blockchain::sign_hash(&self.cluster_key, &block.hash);
-            block.validator_signature = sign_block(&signing_key, &block.hash);
-            println!(
-                "[mining] 🔨 Lite-PoW gelöst für Block #{}: nonce={pow_nonce} (difficulty={})",
-                block.index, BLOCK_POW_DIFFICULTY
-            );
-        }
-
-        // ── Argon2id CPU-PoW lösen (ab Activation-Block) ────────────────
+        // ── PoW lösen: Argon2id hat Vorrang, Lite-PoW nur als Fallback ──
         {
             use crate::consensus::{
                 get_current_pow_difficulty, solve_argon2_pow,
@@ -947,6 +928,7 @@ impl MasterNodeState {
             drop(chain_ref);
 
             if block.index >= ARGON2_POW_ACTIVATION_BLOCK && difficulty > 0 {
+                // Argon2id PoW (primär)
                 println!(
                     "[mining] ⛏️  Starte Argon2id-PoW für Block #{} (Difficulty: {} Bits, Memory: 64 MiB)…",
                     block.index, difficulty,
@@ -965,6 +947,23 @@ impl MasterNodeState {
                 block.hash = crate::blockchain::calculate_hash(&block);
                 block.signature = crate::blockchain::sign_hash(&self.cluster_key, &block.hash);
                 block.validator_signature = sign_block(&signing_key, &block.hash);
+            } else if is_pow_fallback {
+                // Lite-PoW nur wenn Argon2id nicht aktiv ist
+                use crate::consensus::{solve_lite_pow, BLOCK_POW_DIFFICULTY};
+                let pow_nonce = solve_lite_pow(
+                    &block.previous_hash,
+                    block.index,
+                    &self.node_id,
+                    BLOCK_POW_DIFFICULTY,
+                );
+                block.pow_nonce = pow_nonce;
+                block.hash = crate::blockchain::calculate_hash(&block);
+                block.signature = crate::blockchain::sign_hash(&self.cluster_key, &block.hash);
+                block.validator_signature = sign_block(&signing_key, &block.hash);
+                println!(
+                    "[mining] 🔨 Lite-PoW gelöst für Block #{}: nonce={pow_nonce} (difficulty={})",
+                    block.index, BLOCK_POW_DIFFICULTY
+                );
             }
         }
 
@@ -1013,7 +1012,7 @@ impl MasterNodeState {
             ledger.set_current_validator(None);
 
             // ── Staking-TXs im StakingPool verarbeiten ────────────────────
-            self.apply_staking_from_txs(&block.transactions);
+            self.apply_staking_from_txs(&block.transactions, &receipts);
 
             if !receipts.is_empty() {
                 if let Err(e) = ledger.persist() {

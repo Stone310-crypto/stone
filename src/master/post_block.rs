@@ -530,7 +530,7 @@ impl MasterNodeState {
     fn post_block_chat_policy(state: &Arc<Self>, block: &Block, chat_index: Option<&std::sync::Arc<std::sync::Mutex<crate::chat::ChatIndex>>>) {
         let mut policy = state.chat_policy.write().unwrap_or_else(|e| e.into_inner());
 
-        // 1. Neue ChatMessage-TXs tracken
+        // 1a. Neue ChatMessage-TXs tracken (Backward-Compat: alte Einzelnachrichten)
         for tx in &block.transactions {
             if tx.tx_type != TxType::ChatMessage {
                 continue;
@@ -553,6 +553,29 @@ impl MasterNodeState {
                     tx.timestamp,
                     block.index,
                 );
+            }
+        }
+
+        // 1b. Chat-Batch-Nachrichten aus Merkle-Batches tracken
+        for batch in &block.chat_batches {
+            for msg in &batch.messages {
+                // Falls bereits getrackt (z.B. vom Sender-Node), nur block_index aktualisieren
+                if let Some(entry) = policy.ttl_entries.get_mut(&msg.msg_id) {
+                    if entry.block_index == 0 {
+                        entry.block_index = block.index;
+                    }
+                } else {
+                    // Neuer Eintrag (empfangener Batch von anderem Node)
+                    policy.track_message(
+                        &msg.msg_id,
+                        &batch.merkle_root,
+                        &msg.from_wallet,
+                        &msg.to_wallet,
+                        crate::chat_policy::MessageTtl::default(),
+                        msg.timestamp,
+                        block.index,
+                    );
+                }
             }
         }
 

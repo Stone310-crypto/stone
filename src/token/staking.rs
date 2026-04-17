@@ -790,15 +790,20 @@ impl StakingPool {
 
         entry.amount -= amount;
         self.total_delegated -= amount;
-        self.total_staked -= amount;
 
-        // Vom Validator-Stake abziehen
-        if let Some(vs) = self.stakers.get_mut(validator) {
-            vs.staked_amount -= amount.min(vs.staked_amount);
+        // Vom Validator-Stake abziehen — nach Slashing kann staked_amount < amount sein.
+        // total_staked darf nur um den tatsächlich abgezogenen Betrag sinken.
+        let actual_removed = if let Some(vs) = self.stakers.get_mut(validator) {
+            let remove = amount.min(vs.staked_amount);
+            vs.staked_amount -= remove;
             if vs.staked_amount == Decimal::ZERO && vs.pending_rewards == Decimal::ZERO {
                 self.stakers.remove(validator);
             }
-        }
+            remove
+        } else {
+            Decimal::ZERO
+        };
+        self.total_staked -= actual_removed;
 
         // Leere Delegation entfernen
         if entry.amount == Decimal::ZERO && entry.pending_rewards == Decimal::ZERO {

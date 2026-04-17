@@ -7,6 +7,7 @@ use axum::{
 };
 use serde_json::json;
 use stone::chat_policy::MessageTtl;
+use stone::message_pool::PooledMessage;
 use stone::token::{transaction::TxType, Wallet};
 
 use crate::server::auth_middleware::require_user;
@@ -167,138 +168,157 @@ pub async fn handle_chat_send(
         ).into_response();
     }
 
-    let memo = json!({
-        "msg_id": msg_id,
-        "content_hash": content_hash,
-        "from_user_id": user.id,
-        "from_name": user.name,
-        "ttl": ttl.to_string(),
-    })
-    .to_string();
+    // ── Stake-Gate: Mindest-Stake prüfen ────────────────────────────────
+    let staked_amount = {
+        let pool = state.node.staking_pool.read().unwrap_or_else(|e| e.into_inner());
+        pool.stakers.get(&wallet.address())
+            .map(|e| e.staked_amount)
+            .unwrap_or(rust_decimal::Decimal::ZERO)
+    };
+    if let Err(msg) = stone::chat_policy::ChatPolicyStore::check_stake_gate(staked_amount) {
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(json!({"ok": false, "error": msg, "stake_required": true})),
+        )
+            .into_response();
+    }
 
-    // Nonce für die TX
-    let nonce = {
-        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
-        let base = ledger.nonce(&wallet.address());
-        let pending = state.node.mempool.sender_pending_count(&wallet.address());
-        base + pending
+    // ── MessagePool: Nachricht bauen, signieren, in Pool einfügen ──────
+    let now = chrono::Utc::now().timestamp();
+    let from_wallet = wallet.address();
+
+    // Deterministische msg_id berechnen
+    let pool_msg_id = PooledMessage::compute_msg_id(
+        &from_wallet,
+        &to_wallet,
+        &req.encrypted_content,
+        &req.nonce,
+        now,
+    );
+
+    // Ed25519-Signatur über SHA256(msg_id)
+    let sig_hash = {
+        use sha2::{Sha256, Digest};
+        let mut hasher = Sha256::new();
+        hasher.update(pool_msg_id.as_bytes());
+        hasher.finalize()
+    };
+    let signature = {
+        use ed25519_dalek::Signer;
+        wallet.signing_key().sign(&sig_hash)
     };
 
-    // TX signieren (amount=0, fee=0 für Chat – ChatMessages sind gebührenfrei)
-    let tx = match wallet.sign_tx(
-        TxType::ChatMessage,
-        to_wallet.clone(),
-        rust_decimal::Decimal::ZERO,
-        rust_decimal::Decimal::ZERO,
-        nonce,
-        memo,
-    ) {
-        Ok(t) => t,
+    // Lite-PoW lösen (Spam-Filter, ~2-5ms)
+    let pow_nonce = stone::consensus::solve_message_pow(
+        &pool_msg_id,
+        stone::consensus::MESSAGE_POW_DIFFICULTY,
+    );
+
+    let pool_msg = PooledMessage {
+        msg_id: pool_msg_id.clone(),
+        sequence: 0, // wird vom Pool vergeben
+        from_wallet: from_wallet.clone(),
+        to_wallet: to_wallet.clone(),
+        from_user_id: user.id.clone(),
+        from_name: user.name.clone(),
+        encrypted_content: req.encrypted_content.clone(),
+        nonce: req.nonce.clone(),
+        timestamp: now,
+        signature: hex::encode(signature.to_bytes()),
+        pow_nonce,
+        status: stone::message_pool::MessageStatus::Pending,
+    };
+
+    // In MessagePool einfügen (Validierung + Sequenznummer)
+    let seq = match state.node.message_pool.add_message(pool_msg.clone()) {
+        Ok(s) => s,
         Err(e) => {
             return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                axum::Json(json!({"ok": false, "error": format!("TX-Signierung fehlgeschlagen: {e}")})),
+                StatusCode::CONFLICT,
+                axum::Json(json!({"ok": false, "error": format!("MessagePool: {e}")})),
             )
                 .into_response()
         }
     };
 
-    // In Mempool einfügen
-    let result = {
-        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
-        state.node.mempool.add_tx(tx.clone(), Some(&ledger))
-    };
-
-    match result {
-        Ok(()) => {
-            // DSGVO: Encrypted content off-chain in ChatIndex speichern (sofort)
-            {
-                let entry = stone::chat::ChatEntry {
-                    msg_id: msg_id.clone(),
-                    from_wallet: wallet.address(),
-                    to_wallet: to_wallet.clone(),
-                    from_user_id: user.id.clone(),
-                    from_name: user.name.clone(),
-                    encrypted_content: req.encrypted_content.clone(),
-                    nonce: req.nonce.clone(),
-                    content_hash: content_hash.clone(),
-                    timestamp: tx.timestamp,
-                    block_index: 0,
-                    tx_id: tx.tx_id.clone(),
-                };
-                let mut idx = state.chat_index.lock().unwrap_or_else(|e| e.into_inner());
-                idx.add_message(entry);
-                stone::chat::save_chat_index(&idx);
-            }
-
-            // P2P broadcast (TX)
-            if let Some(ref net) = state.network {
-                let net = net.clone();
-                let tx_clone = tx.clone();
-                tokio::spawn(async move {
-                    net.broadcast_tx(tx_clone).await;
-                });
-            }
-
-            // P2P gossip: off-chain encrypted content an andere Nodes senden
-            if let Some(ref net) = state.network {
-                let sync = stone::chat::ChatContentSync {
-                    msg_id: msg_id.clone(),
-                    from_wallet: wallet.address(),
-                    to_wallet: to_wallet.clone(),
-                    encrypted_content: req.encrypted_content.clone(),
-                    nonce: req.nonce.clone(),
-                    content_hash: content_hash.clone(),
-                };
-                if let Ok(data) = serde_json::to_vec(&sync) {
-                    let net = net.clone();
-                    tokio::spawn(async move {
-                        net.publish_gossip(stone::network::TOPIC_CHAT_CONTENT, data).await;
-                    });
-                }
-            }
-
-            // Push-Benachrichtigung an Empfänger senden (Fire & Forget)
-            {
-                let push_store = state.push_tokens.lock().unwrap().clone();
-                let fcm = state.fcm_client.clone();
-                let sender_name = user.name.clone();
-                let recipient = to_wallet.clone();
-                tokio::spawn(async move {
-                    let body = format!("Nachricht von {}", sender_name);
-                    let sent = fcm.notify_wallet_with_body(
-                        &push_store,
-                        &recipient,
-                        &stone::push::PushType::NewMessage,
-                        &body,
-                    ).await;
-                    if sent {
-                        println!("[push] 📬 Chat-Push an {} gesendet", recipient);
-                    }
-                });
-            }
-
-            (
-                StatusCode::ACCEPTED,
-                axum::Json(json!({
-                    "ok": true,
-                    "msg_id": msg_id,
-                    "tx_id": tx.tx_id,
-                    "from": tx.from,
-                    "to": tx.to,
-                    "status": "pending",
-                    "ttl": ttl.to_string(),
-                    "message": "Nachricht wird beim nächsten Mining-Block bestätigt",
-                })),
-            )
-                .into_response()
-        }
-        Err(e) => (
-            StatusCode::CONFLICT,
-            axum::Json(json!({"ok": false, "error": format!("Mempool-Fehler: {e}")})),
-        )
-            .into_response(),
+    // Sofort im ChatIndex sichtbar (off-chain, block_index=0 = pending)
+    {
+        let entry = stone::chat::ChatEntry {
+            msg_id: pool_msg_id.clone(),
+            from_wallet: from_wallet.clone(),
+            to_wallet: to_wallet.clone(),
+            from_user_id: user.id.clone(),
+            from_name: user.name.clone(),
+            encrypted_content: req.encrypted_content.clone(),
+            nonce: req.nonce.clone(),
+            content_hash: content_hash.clone(),
+            timestamp: now,
+            block_index: 0,
+            tx_id: String::new(),
+        };
+        let mut idx = state.chat_index.lock().unwrap_or_else(|e| e.into_inner());
+        idx.add_message(entry);
+        stone::chat::save_chat_index(&idx);
     }
+
+    // TTL im ChatPolicy-Store registrieren
+    {
+        let mut policy = state.node.chat_policy.write().unwrap_or_else(|e| e.into_inner());
+        policy.track_message(
+            &pool_msg_id,
+            "", // tx_id wird beim Batch-Confirm gesetzt
+            &from_wallet,
+            &to_wallet,
+            ttl.clone(),
+            now,
+            0, // block_index wird beim Batch-Confirm aktualisiert
+        );
+    }
+
+    // P2P Gossip: PooledMessage an alle Peers senden (sofortige Zustellung)
+    if let Some(ref net) = state.network {
+        if let Ok(data) = serde_json::to_vec(&pool_msg) {
+            let net = net.clone();
+            tokio::spawn(async move {
+                net.publish_gossip(stone::network::TOPIC_CHAT, data).await;
+            });
+        }
+    }
+
+    // Push-Benachrichtigung an Empfänger senden (Fire & Forget)
+    {
+        let push_store = state.push_tokens.lock().unwrap().clone();
+        let fcm = state.fcm_client.clone();
+        let sender_name = user.name.clone();
+        let recipient = to_wallet.clone();
+        tokio::spawn(async move {
+            let body = format!("Nachricht von {}", sender_name);
+            let sent = fcm.notify_wallet_with_body(
+                &push_store,
+                &recipient,
+                &stone::push::PushType::NewMessage,
+                &body,
+            ).await;
+            if sent {
+                println!("[push] 📬 Chat-Push an {} gesendet", recipient);
+            }
+        });
+    }
+
+    (
+        StatusCode::ACCEPTED,
+        axum::Json(json!({
+            "ok": true,
+            "msg_id": pool_msg_id,
+            "sequence": seq,
+            "from": from_wallet,
+            "to": to_wallet,
+            "status": "pending",
+            "ttl": ttl.to_string(),
+            "message": "Nachricht sofort zugestellt, wird im nächsten Block per Merkle-Batch bestätigt",
+        })),
+    )
+        .into_response()
 }
 
 /// GET /api/v1/chat/conversations — Alle Konversationen des Users

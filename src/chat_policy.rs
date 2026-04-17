@@ -16,8 +16,6 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::blockchain::data_dir;
-
 // ═══════════════════════════════════════════════════════════════════════════════
 // Konstanten
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -637,8 +635,21 @@ impl ChatPolicyStore {
 
     /// Prüft ob ein Wallet den Messenger nutzen darf (Minimum-Stake erforderlich).
     ///
+    /// `staked_amount` ist der aktuelle Stake des Wallets (aus StakingPool).
     /// Gibt `Ok(staked_amount)` zurück wenn der Stake ausreicht,
-    /// sonst `Err(fehlender_betrag)`.
+    /// sonst `Err(fehlender Betrag als String)`.
+    pub fn check_stake_gate(staked_amount: Decimal) -> Result<Decimal, String> {
+        let min_stake: Decimal = crate::token::staking::GOVERNANCE_MIN_STAKE.parse().unwrap_or(Decimal::from(100));
+        if staked_amount >= min_stake {
+            Ok(staked_amount)
+        } else {
+            let missing = min_stake - staked_amount;
+            Err(format!(
+                "Mindest-Stake nicht erreicht: {} STONE gestaked, {} STONE benötigt (fehlen: {} STONE)",
+                staked_amount, min_stake, missing,
+            ))
+        }
+    }
 
     // ─── Query-Methoden ───────────────────────────────────────────────────
 
@@ -681,9 +692,7 @@ impl ChatPolicyStore {
     // ─── Persistierung ────────────────────────────────────────────────────
 
     pub fn persist(&self) -> Result<(), String> {
-        let db_path = format!("{}/token_db", data_dir());
-        let db = rocksdb::DB::open_default(&db_path)
-            .map_err(|e| format!("ChatPolicy DB open: {e}"))?;
+        let db = crate::token::open_token_db()?;
 
         let json = serde_json::to_string(self)
             .map_err(|e| format!("ChatPolicy serialize: {e}"))?;
@@ -695,8 +704,7 @@ impl ChatPolicyStore {
     }
 
     pub fn load() -> Self {
-        let db_path = format!("{}/token_db", data_dir());
-        let db = match rocksdb::DB::open_default(&db_path) {
+        let db = match crate::token::open_token_db() {
             Ok(db) => db,
             Err(_) => return ChatPolicyStore::new(),
         };

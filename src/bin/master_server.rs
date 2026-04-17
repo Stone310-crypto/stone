@@ -280,6 +280,18 @@ async fn main() {
         Arc::new(std::sync::Mutex::new(idx))
     };
 
+    // GC: Abgelaufene Nachrichten beim Start bereinigen
+    {
+        let mut policy = node.chat_policy.write().unwrap_or_else(|e| e.into_inner());
+        let mut idx = chat_index_arc.lock().unwrap_or_else(|e| e.into_inner());
+        let purged = stone::chat_policy::gc_expired_messages(&mut policy, &mut idx);
+        if purged > 0 {
+            stone::chat::save_chat_index(&idx);
+            let _ = policy.persist();
+            println!("[startup] 🗑️ {} abgelaufene Nachrichten beim Start bereinigt", purged);
+        }
+    }
+
     // P2P-Netzwerk starten (optional – deaktivieren via STONE_P2P_DISABLED=1)
     let network_handle: Option<NetworkHandle> =
         if std::env::var("STONE_P2P_DISABLED").as_deref() == Ok("1") {

@@ -946,11 +946,16 @@ impl MasterNodeState {
 
     /// Staking-TXs aus einem Block im StakingPool verarbeiten + persistieren.
     /// Wird von allen Block-Ingestion-Pfaden aufgerufen (lokal, P2P, RangeSync).
-    pub fn apply_staking_from_txs(&self, txs: &[crate::token::TokenTx]) {
+    /// Nur TXs die im Ledger erfolgreich waren (receipt vorhanden) werden verarbeitet.
+    pub fn apply_staking_from_txs(&self, txs: &[crate::token::TokenTx], receipts: &[crate::token::TxReceipt]) {
         use crate::token::TxType;
+        let successful: std::collections::HashSet<&str> = receipts.iter().map(|r| r.tx_id.as_str()).collect();
         let mut pool = self.staking_pool.write().unwrap_or_else(|e| e.into_inner());
         let mut changed = false;
         for tx in txs {
+            if !successful.contains(tx.tx_id.as_str()) {
+                continue;
+            }
             match tx.tx_type {
                 TxType::Stake => {
                     if let Err(e) = pool.stake(&tx.from, tx.amount) {
