@@ -15,11 +15,15 @@
 //! Der Block-Reward folgt einem **Halving-Schema**: alle `HALVING_INTERVAL`
 //! Blöcke halbiert sich der Reward. Mining stoppt wenn `pool:mining_rewards` leer ist.
 
+pub mod miner_registry;
 pub mod mining;
 pub mod post_block;
 pub mod trust;
 pub mod types;
 
+pub use miner_registry::{
+    AutoMiningConfig, BlockTimer, MinerConnectMsg, MinerHeartbeat, MinerIdentity, MinerRegistry,
+};
 pub use types::*;
 
 use crate::blockchain::{Block, Document, DocumentTombstone, NodeRole, StoneChain};
@@ -308,6 +312,13 @@ pub struct MasterNodeState {
     /// Bridge Store: Wrapped Token Bridge für Cross-Chain Transfers
     pub bridge_store: RwLock<crate::token::BridgeStore>,
 
+    /// Laufzeit-Config für Auto-Mining / BlockTimer.
+    pub auto_mining_config: AutoMiningConfig,
+    /// Registry aller aktiven externen Miner (Heartbeat-basiert).
+    pub miner_registry: RwLock<MinerRegistry>,
+    /// Auto-Block-Timer (120 s Default wenn keine Miner aktiv).
+    pub block_timer: Mutex<BlockTimer>,
+
     // ─── Caches (Performance: vermeidet teure Berechnungen bei jedem API-Request) ───
     /// Gecachte Chain-Zusammenfassung (wird bei jedem neuen Block aktualisiert)
     pub cached_summary: RwLock<Option<ChainSummary>>,
@@ -506,6 +517,22 @@ impl MasterNodeState {
             testnet_market: RwLock::new(crate::token::TestnetMarket::load_or_default()),
             htlc_store: RwLock::new(crate::token::HtlcStore::load()),
             bridge_store: RwLock::new(crate::token::BridgeStore::load()),
+            auto_mining_config: {
+                let c = AutoMiningConfig::load();
+                println!(
+                    "[auto-mining] enabled={}, timeout={}s, hb_timeout={}s, partial_delta={}",
+                    c.enabled, c.auto_timeout_secs, c.heartbeat_timeout_secs, c.heartbeat_partial_delta,
+                );
+                c
+            },
+            miner_registry: {
+                let c = AutoMiningConfig::load();
+                RwLock::new(MinerRegistry::new(c.heartbeat_timeout_secs))
+            },
+            block_timer: {
+                let c = AutoMiningConfig::load();
+                Mutex::new(BlockTimer::new(c.auto_timeout_secs, c.enabled))
+            },
             cached_summary: RwLock::new(None),
             cached_data_dir_bytes: AtomicU64::new(0),
             cached_memory_rss_kb: AtomicU64::new(0),

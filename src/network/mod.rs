@@ -103,6 +103,8 @@ pub const TOPIC_STORAGE: &str = "stone/storage/v1";
 pub const TOPIC_CHAT: &str = "stone/chat/v1";
 /// Off-chain Content-Sync für DSGVO-Chat (nur encrypted_content, kein PoW nötig)
 pub const TOPIC_CHAT_CONTENT: &str = "stone/chat-content/v1";
+/// Miner-Identity & Heartbeats (Auto-Block-Timer Cluster-Awareness)
+pub const TOPIC_MINERS: &str = "stone/miners/v1";
 
 /// Protokoll-Version für den Sync-Handshake.
 /// Peers mit einer anderen Major-Version werden abgelehnt.
@@ -447,6 +449,16 @@ pub enum NetworkEvent {
     /// verarbeitet um Fork-Punkt zu finden und Chain zu reorgen.
     RangeSyncReceived {
         blocks: Vec<Block>,
+        from_peer: String,
+    },
+
+    /// Miner-Identity/Heartbeat über Gossipsub (für Cluster-weite
+    /// Sichtbarkeit aktiver Miner und damit den BlockTimer pausieren).
+    MinerGossipReceived {
+        /// "connect" oder "heartbeat"
+        kind: String,
+        /// JSON-serialisierte MinerConnectMsg oder MinerHeartbeat
+        payload: Vec<u8>,
         from_peer: String,
     },
 }

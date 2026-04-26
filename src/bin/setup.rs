@@ -362,7 +362,10 @@ async fn start_full_node(state: SetupState) {
     // Hintergrund-Tasks
     // HINWEIS: Mining wurde entfernt — nur stone-miner erzeugt neue Blöcke.
     // setup ist ein reiner Full-Node (Sync, API, Validierung, Storage).
+    // Auto-Block-Timer: produziert nach auto_timeout_secs einen Block, wenn
+    // kein externer Miner aktiv ist (Liveness-Garantie für stilles Netz).
     MasterNodeState::start_heartbeat(node.clone(), HEARTBEAT_INTERVAL);
+    MasterNodeState::start_block_timer(node.clone());
     spawn_auto_sync_task(node.clone(), api_key.clone(), users.clone());
 
     // Peer-Discovery: Bei Bootstrap-Nodes registrieren & Health-Check starten
@@ -1067,6 +1070,11 @@ async fn handle_p2p_event(
             match result {
                 BlockResult::Accepted(count) => {
                     handle.set_chain_count(count).await;
+                    // BlockTimer zurücksetzen (Gossip-Block); sonst erzeugen
+                    // alle Master nach 120s parallel Auto-Blöcke.
+                    if let Ok(mut t) = node.block_timer.lock() {
+                        t.reset();
+                    }
                 }
                 BlockResult::NeedsResync { idx, from, err } => {
                     eprintln!("[p2p] Block #{idx}: {err} → Resync");
@@ -1226,6 +1234,73 @@ async fn handle_p2p_event(
             if let Some((new_count, applied)) = reorg_result {
                 handle.set_chain_count(new_count).await;
                 println!("[sync] ✓ Sync abgeschlossen: {applied} Blöcke applied, Chain-Höhe={new_count}");
+                if let Ok(mut t) = node.block_timer.lock() {
+                    t.reset();
+                }
+            }
+        }
+
+        // ── Miner Connect/Heartbeat über Gossipsub ───────────────────────
+        NetworkEvent::MinerGossipReceived { kind, payload, from_peer } => {
+            let now = chrono::Utc::now().timestamp();
+            match kind.as_str() {
+                "connect" => {
+                    if let Ok(msg) = serde_json::from_slice::<stone::master::MinerConnectMsg>(&payload) {
+                        if stone::master::miner_registry::validate_connect(&msg, now).is_ok() {
+                            let mut reg = node.miner_registry.write().unwrap_or_else(|e| e.into_inner());
+                            reg.register_miner(
+                                msg.wallet.clone(),
+                                msg.pubkey.clone(),
+                                msg.signature.clone(),
+                                msg.timestamp,
+                            );
+                        } else {
+                            handle.report_penalty(&from_peer, 2, "invalid miner-connect").await;
+                        }
+                    }
+                }
+                "heartbeat" => {
+                    if let Ok(msg) = serde_json::from_slice::<stone::master::MinerHeartbeat>(&payload) {
+                        let template = {
+                            let tmpl = node.current_mining_template.read().unwrap_or_else(|e| e.into_inner());
+                            tmpl.as_ref().map(|(t, _)| t.clone())
+                        };
+                        let partial_delta = node.auto_mining_config.heartbeat_partial_delta;
+                        if let Some(template) = template {
+                            match stone::master::miner_registry::validate_heartbeat_with_template(
+                                &msg, now, &template, partial_delta,
+                            ) {
+                                Ok(()) => {
+                                    let eff = if template.effective_difficulty > 0 {
+                                        template.effective_difficulty
+                                    } else {
+                                        template.difficulty
+                                    };
+                                    let mut reg = node.miner_registry.write().unwrap_or_else(|e| e.into_inner());
+                                    if reg.get(&msg.wallet).is_none() {
+                                        reg.register_miner(
+                                            msg.wallet.clone(),
+                                            msg.pubkey.clone(),
+                                            msg.signature.clone(),
+                                            msg.timestamp,
+                                        );
+                                    }
+                                    let _ = reg.record_heartbeat(
+                                        &msg.wallet,
+                                        &msg.template_id,
+                                        msg.nonce,
+                                        msg.timestamp,
+                                        eff as u64,
+                                    );
+                                }
+                                Err(_) => {
+                                    handle.report_penalty(&from_peer, 2, "invalid miner-heartbeat").await;
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
             }
         }
 

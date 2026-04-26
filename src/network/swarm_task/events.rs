@@ -255,6 +255,23 @@ impl SwarmTask {
                             from_peer: propagation_source.to_string(),
                         });
                     }
+                } else if topic == crate::network::TOPIC_MINERS {
+                    // Payload-Format: 1 Byte kind-Tag (0=connect, 1=heartbeat) + JSON
+                    if message.data.len() < 2 {
+                        let _ = message_id;
+                    } else {
+                        let kind = match message.data[0] {
+                            0 => "connect",
+                            1 => "heartbeat",
+                            _ => "unknown",
+                        }.to_string();
+                        let payload = message.data[1..].to_vec();
+                        let _ = self.event_tx.send(NetworkEvent::MinerGossipReceived {
+                            kind,
+                            payload,
+                            from_peer: propagation_source.to_string(),
+                        });
+                    }
                 } else {
                     let _ = message_id; // acknowledged
                 }

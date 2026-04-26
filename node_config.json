@@ -16,5 +16,9 @@
   "storage_offered_gb": 100,
   "reward_per_day": 95.0,
   "public_ip": "61.8.141.250",
-  "wallet_balance": 1000.0
+  "wallet_balance": 1000.0,
+  "auto_mining_enabled": true,
+  "auto_mining_timeout_secs": 120,
+  "miner_heartbeat_timeout_secs": 30,
+  "miner_heartbeat_partial_delta": 6
 }

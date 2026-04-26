@@ -1009,3 +1009,192 @@ pub async fn handle_mining_remote_status(
         ).into_response(),
     }
 }
+
+// ─── Miner Connect & Heartbeat (Auto-Block-Timer) ──────────────────────────
+
+/// POST /api/v1/miners/connect — Miner registriert sich am Netzwerk.
+///
+/// Body: `MinerConnectMsg { wallet, pubkey, timestamp, signature }`.
+/// Signatur über `"stone-miner-connect|{wallet}|{timestamp}"`.
+///
+/// Kein Login nötig — die Ed25519-Signatur beweist Ownership der Wallet.
+/// Die Registrierung pausiert den Auto-Block-Timer **nicht** direkt; dafür
+/// braucht es mindestens einen gültigen Heartbeat.
+pub async fn handle_miner_connect(
+    State(state): State<AppState>,
+    axum::Json(msg): axum::Json<stone::master::MinerConnectMsg>,
+) -> impl IntoResponse {
+    let now = chrono::Utc::now().timestamp();
+    if let Err(e) = stone::master::miner_registry::validate_connect(&msg, now) {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({ "ok": false, "error": e })),
+        )
+            .into_response();
+    }
+
+    {
+        let mut reg = state.node.miner_registry.write().unwrap_or_else(|e| e.into_inner());
+        reg.register_miner(
+            msg.wallet.clone(),
+            msg.pubkey.clone(),
+            msg.signature.clone(),
+            msg.timestamp,
+        );
+    }
+
+    // Propagation via Gossipsub (Cluster-weite Sichtbarkeit).
+    if let (Ok(json), Some(net)) = (serde_json::to_vec(&msg), state.network.as_ref()) {
+        let mut payload = Vec::with_capacity(json.len() + 1);
+        payload.push(stone::master::mining::MINER_GOSSIP_KIND_CONNECT);
+        payload.extend_from_slice(&json);
+        let net = net.clone();
+        tokio::spawn(async move {
+            net.publish_gossip(stone::network::TOPIC_MINERS, payload).await;
+        });
+    }
+
+    println!(
+        "[miner-registry] 🔌 Miner verbunden: {}",
+        &msg.wallet[..16.min(msg.wallet.len())]
+    );
+
+    (
+        StatusCode::OK,
+        axum::Json(json!({
+            "ok": true,
+            "connected_at": msg.timestamp,
+            "heartbeat_interval_hint_secs": 15,
+            "partial_delta": state.node.auto_mining_config.heartbeat_partial_delta,
+        })),
+    )
+        .into_response()
+}
+
+/// POST /api/v1/miners/heartbeat — Miner sendet Heartbeat mit Partial-PoW.
+///
+/// Body: `MinerHeartbeat { wallet, pubkey, timestamp, template_id, nonce,
+/// partial_hash, signature }`.
+///
+/// Server verifiziert:
+/// 1. Signatur über `"stone-miner-heartbeat|wallet|timestamp|template_id|nonce"`
+/// 2. Timestamp frisch (±60s)
+/// 3. Template-ID matcht das aktuelle Template
+/// 4. Argon2id(inputs) == partial_hash
+/// 5. leading_zero_bits(partial_hash) >= effective_difficulty - partial_delta
+pub async fn handle_miner_heartbeat(
+    State(state): State<AppState>,
+    axum::Json(msg): axum::Json<stone::master::MinerHeartbeat>,
+) -> impl IntoResponse {
+    let now = chrono::Utc::now().timestamp();
+
+    // Aktuelles Template holen
+    let template = {
+        let tmpl = state
+            .node
+            .current_mining_template
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        tmpl.as_ref().map(|(t, _)| t.clone())
+    };
+    let Some(template) = template else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(json!({
+                "ok": false,
+                "error": "kein aktives Mining-Template – Heartbeat nicht verifizierbar",
+            })),
+        )
+            .into_response();
+    };
+
+    let partial_delta = state.node.auto_mining_config.heartbeat_partial_delta;
+    if let Err(e) = stone::master::miner_registry::validate_heartbeat_with_template(
+        &msg, now, &template, partial_delta,
+    ) {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({ "ok": false, "error": e })),
+        )
+            .into_response();
+    }
+
+    // In Registry eintragen
+    let eff = if template.effective_difficulty > 0 {
+        template.effective_difficulty
+    } else {
+        template.difficulty
+    };
+    {
+        let mut reg = state
+            .node
+            .miner_registry
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Err(e) = reg.record_heartbeat(
+            &msg.wallet,
+            &msg.template_id,
+            msg.nonce,
+            msg.timestamp,
+            eff as u64,
+        ) {
+            return (
+                StatusCode::CONFLICT,
+                axum::Json(json!({ "ok": false, "error": e })),
+            )
+                .into_response();
+        }
+    }
+
+    // Propagation via Gossipsub
+    if let (Ok(json), Some(net)) = (serde_json::to_vec(&msg), state.network.as_ref()) {
+        let mut payload = Vec::with_capacity(json.len() + 1);
+        payload.push(stone::master::mining::MINER_GOSSIP_KIND_HEARTBEAT);
+        payload.extend_from_slice(&json);
+        let net = net.clone();
+        tokio::spawn(async move {
+            net.publish_gossip(stone::network::TOPIC_MINERS, payload).await;
+        });
+    }
+
+    (
+        StatusCode::OK,
+        axum::Json(json!({
+            "ok": true,
+            "accepted_at": now,
+        })),
+    )
+        .into_response()
+}
+
+/// GET /api/v1/miners/active — Liste aller aktuell als aktiv verfolgten Miner.
+///
+/// Public (read-only, öffentlich sichtbar).
+pub async fn handle_miners_active(State(state): State<AppState>) -> impl IntoResponse {
+    let miners = {
+        let reg = state
+            .node
+            .miner_registry
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        reg.snapshot()
+    };
+    let timer = {
+        let t = state.node.block_timer.lock().unwrap_or_else(|e| e.into_inner());
+        json!({
+            "enabled": t.enabled,
+            "auto_timeout_secs": t.auto_timeout_secs,
+            "elapsed_secs": t.elapsed_secs(),
+        })
+    };
+    (
+        StatusCode::OK,
+        axum::Json(json!({
+            "ok": true,
+            "count": miners.len(),
+            "miners": miners,
+            "timer": timer,
+        })),
+    )
+        .into_response()
+}

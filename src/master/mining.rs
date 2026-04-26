@@ -14,6 +14,11 @@ use super::types::NodeEvent;
 use super::{TARGET_BLOCK_TIME_SECS, MINING_INTERVAL_SECS, INITIAL_BLOCK_REWARD,
     HALVING_INTERVAL, MIN_BLOCK_REWARD, TEMPLATE_REFRESH_SECS};
 
+/// Gossipsub-Tag für Miner-Connect-Nachrichten (Byte 0 der Payload).
+pub const MINER_GOSSIP_KIND_CONNECT: u8 = 0;
+/// Gossipsub-Tag für Miner-Heartbeat-Nachrichten.
+pub const MINER_GOSSIP_KIND_HEARTBEAT: u8 = 1;
+
 impl MasterNodeState {
     // ─── Block-Mining (Interval-Mining) ───────────────────────────────────────
 
@@ -53,6 +58,16 @@ impl MasterNodeState {
 
     /// Erstellt eine System-Reward-TX für den Block-Validator.
     fn create_reward_tx(validator_wallet: &str, amount: Decimal, block_index: u64) -> TokenTx {
+        Self::create_reward_tx_to(validator_wallet, amount, block_index, "Mining Reward")
+    }
+
+    /// Generische Reward-TX (System): pool:mining_rewards → `to_addr`.
+    fn create_reward_tx_to(
+        to_addr: &str,
+        amount: Decimal,
+        block_index: u64,
+        memo_suffix: &str,
+    ) -> TokenTx {
         let chain_id = std::env::var("STONE_NETWORK")
             .map(|n| {
                 if n == "mainnet" || n == "main" {
@@ -67,18 +82,56 @@ impl MasterNodeState {
             tx_id: String::new(),
             tx_type: TxType::Reward,
             from: "pool:mining_rewards".to_string(),
-            to: validator_wallet.to_string(),
+            to: to_addr.to_string(),
             amount,
             fee: Decimal::ZERO,
             nonce: 0,
             timestamp: Utc::now().timestamp(),
             signature: String::new(), // System-TXs brauchen keine Signatur
-            memo: format!("Block #{block_index} Mining Reward"),
+            memo: format!("Block #{block_index} {memo_suffix}"),
             chain_id,
             fee_tier: crate::token::FeeTier::Priority,
         };
         tx.tx_id = compute_tx_id(&tx);
         tx
+    }
+
+    /// Splittet den Auto-Block-Reward auf die drei Netzwerk-Pools:
+    ///   40% → `pool:onboarding`     (Startguthaben für neue Nutzer)
+    ///   20% → `pool:bug_bounty`     (Tester- und Audit-Belohnungen)
+    ///   40% → bleibt in `pool:mining_rewards` (zukünftige Miner-Rewards)
+    ///
+    /// Liefert die zwei tatsächlich nötigen Transfer-TXs zurück (die 40% in
+    /// `pool:mining_rewards` werden gar nicht erst entnommen). 0 STONE
+    /// Anteile werden ausgelassen.
+    fn create_auto_block_split_rewards(
+        total: Decimal,
+        block_index: u64,
+    ) -> Vec<TokenTx> {
+        if total <= Decimal::ZERO {
+            return Vec::new();
+        }
+        // Decimal-Mathematik: 40% / 20% mit 8 Nachkommastellen
+        let pct_40 = (total * Decimal::new(40, 2)).round_dp(8);
+        let pct_20 = (total * Decimal::new(20, 2)).round_dp(8);
+        let mut out = Vec::new();
+        if pct_40 > Decimal::ZERO {
+            out.push(Self::create_reward_tx_to(
+                "pool:onboarding",
+                pct_40,
+                block_index,
+                "Auto-Block Reward → Onboarding (40%)",
+            ));
+        }
+        if pct_20 > Decimal::ZERO {
+            out.push(Self::create_reward_tx_to(
+                "pool:bug_bounty",
+                pct_20,
+                block_index,
+                "Auto-Block Reward → Bug-Bounty (20%)",
+            ));
+        }
+        out
     }
 
     /// Sammelt pending ChallengeResponses und validiert sie gegen offene Challenges in der Chain.
@@ -159,7 +212,18 @@ impl MasterNodeState {
     /// Single-Node-Modus: Block wird direkt committed.
     /// Multi-Node-Modus: Verwende `prepare_mining_block()` + `commit_mining_block()`.
     pub fn mint_block(&self) -> Result<Block, String> {
-        let block = self.prepare_mining_block()?;
+        self.mint_block_inner(false)
+    }
+
+    /// Auto-Block: gleicher Ablauf wie `mint_block`, aber der Block-Reward wird
+    /// gemäß Auto-Block-Schema (40/20/40 → Onboarding/Bug-Bounty/Mining-Pool)
+    /// auf die Netzwerk-Pools verteilt statt an den Validator ausgeschüttet.
+    pub fn mint_auto_block(&self) -> Result<Block, String> {
+        self.mint_block_inner(true)
+    }
+
+    fn mint_block_inner(&self, auto_mode: bool) -> Result<Block, String> {
+        let block = self.prepare_mining_block(auto_mode)?;
         match self.commit_mining_block(block.clone()) {
             Ok(()) => Ok(block),
             Err(e) => {
@@ -602,7 +666,11 @@ impl MasterNodeState {
     /// Der Block ist vollständig (Hash, Validator-Signatur) und kann
     /// an Peers zur Abstimmung gesendet werden.
     /// Erst `commit_mining_block()` wendet ihn auf Chain, Ledger und StakingPool an.
-    pub fn prepare_mining_block(&self) -> Result<Block, String> {
+    ///
+    /// `auto_mode = true` aktiviert das Auto-Block-Reward-Schema (40/20/40
+    /// Onboarding/Bug-Bounty/Mining-Pool) anstelle der einzelnen Validator-
+    /// Belohnung.
+    pub fn prepare_mining_block(&self, auto_mode: bool) -> Result<Block, String> {
         // ── Validator-Schlüssel laden (Wallet = Ed25519 Public Key Hex) ───
         let signing_key = load_or_create_validator_key();
         let validator_wallet = local_validator_pubkey_hex(&signing_key);
@@ -721,8 +789,22 @@ impl MasterNodeState {
         // Reward-TX hinzufügen (falls Reward > 0)
         let has_user_txs = !pending_txs.is_empty();
         if reward_amount > Decimal::ZERO {
-            let reward_tx = Self::create_reward_tx(&reward_wallet, reward_amount, next_index);
-            pending_txs.push(reward_tx);
+            if auto_mode {
+                // Auto-Block: Reward auf Netzwerk-Pools splitten
+                // 40% Onboarding + 20% Bug-Bounty werden transferiert,
+                // 40% bleiben in pool:mining_rewards (gar nicht erst entnommen).
+                let split_txs = Self::create_auto_block_split_rewards(reward_amount, next_index);
+                if !split_txs.is_empty() {
+                    println!(
+                        "[auto-mining] 💰 Reward {} STONE → split: 40% Onboarding, 20% Bug-Bounty, 40% Mining-Pool (verbleibt)",
+                        reward_amount
+                    );
+                }
+                pending_txs.extend(split_txs);
+            } else {
+                let reward_tx = Self::create_reward_tx(&reward_wallet, reward_amount, next_index);
+                pending_txs.push(reward_tx);
+            }
         }
 
         // ── Pre-Block-Validierung: Ungültige TXs herausfiltern ──────────
@@ -916,6 +998,10 @@ impl MasterNodeState {
             }
         }
 
+        // Outer chain-Lock hier explizit freigeben, sonst Deadlock im
+        // PoW-Block weiter unten (std::sync::Mutex ist nicht reentrant).
+        drop(chain);
+
         // ── Lite-PoW lösen (nur bei Fallback-Mining) ─────────────────────
         // ── PoW lösen: Argon2id hat Vorrang, Lite-PoW nur als Fallback ──
         {
@@ -1099,6 +1185,18 @@ impl MasterNodeState {
             &validator_wallet[..16.min(validator_wallet.len())],
         );
 
+        // ── Block-Timer zurücksetzen & Miner-Stat erhöhen ─────────────────
+        {
+            if let Ok(mut t) = self.block_timer.lock() {
+                t.reset();
+            }
+            // Wenn der Block-Signer (validator_pub_key) zu einem registrierten
+            // Miner gehört, dessen blocks_found Zähler inkrementieren.
+            if let Ok(mut reg) = self.miner_registry.write() {
+                reg.record_block_found(&block.validator_pub_key);
+            }
+        }
+
         // ── Auto-Snapshot (alle SNAPSHOT_INTERVAL Blöcke, NUR Bootstrap-Nodes) ──
         if crate::snapshot::should_create_snapshot(block.index)
             && crate::network::is_bootstrap_node()
@@ -1268,6 +1366,134 @@ impl MasterNodeState {
                     };
                     if let Some(block) = block {
                         Self::post_block_checkpoint(&state, &block).await;
+                    }
+                }
+            }
+        });
+    }
+
+    /// Startet den Auto-Block-Timer.
+    ///
+    /// Produziert alle `auto_timeout_secs` einen Block, wenn:
+    /// - Auto-Mining in der Config aktiviert ist,
+    /// - der Initial-Sync abgeschlossen ist,
+    /// - kein externer Miner (mit gültigem Heartbeat) aktiv ist,
+    /// - seit dem letzten Block mehr als `auto_timeout_secs` vergangen sind.
+    ///
+    /// Hard-Fallback: Selbst bei "aktiven" Minern wird nach
+    /// `HARD_FALLBACK_MULT × auto_timeout_secs` ein Block erzeugt, damit
+    /// gefakete Heartbeats die Kette nicht zum Stillstand bringen können.
+    pub fn start_block_timer(state: Arc<Self>) {
+        if !state.auto_mining_config.enabled {
+            println!("[auto-mining] 🚫 disabled per config – BlockTimer startet nicht");
+            return;
+        }
+        let timeout = state.auto_mining_config.auto_timeout_secs;
+        let hb_timeout = state.auto_mining_config.heartbeat_timeout_secs;
+        println!(
+            "[auto-mining] ⏲️  BlockTimer gestartet: timeout={timeout}s, miner_hb_timeout={hb_timeout}s"
+        );
+
+        tokio::spawn(async move {
+            // Grace-Period nach Start damit P2P & Sync greifen
+            tokio::time::sleep(Duration::from_secs(20)).await;
+            let mut ticker = tokio::time::interval(Duration::from_secs(1));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+            loop {
+                ticker.tick().await;
+
+                // Warten bis Initial-Sync fertig — wenn nach 60s noch nicht
+                // gesetzt, prüfen wir den Chain-Zustand selbst (auf setup.rs
+                // wird das Flag nie gesetzt, wenn keine neuen Blöcke gepullt
+                // wurden, weil wir bereits aktuell sind).
+                if !state.metrics.initial_sync_done.load(Ordering::Relaxed) {
+                    let uptime = (chrono::Utc::now().timestamp() - state.started_at).max(0) as u64;
+                    if uptime < 60 {
+                        continue;
+                    }
+                    let chain_ok = {
+                        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+                        chain.blocks.len() > 1
+                    };
+                    if !chain_ok {
+                        continue;
+                    }
+                    state.metrics.initial_sync_done.store(true, Ordering::Relaxed);
+                    println!("[auto-mining] ✓ Initial-Sync per Fallback bestätigt (uptime>{uptime}s, chain non-empty)");
+                }
+
+                // HINWEIS: mining_throttle_pct ist absichtlich KEIN Stop-Kriterium.
+                // Throttle steuert nur die Bonus-Mining-Loop in stone-master; der
+                // Auto-Block-Timer ist ein Liveness-Mechanismus und muss auch auf
+                // Master-Nodes ohne Mining-Loop (throttle=0) Blöcke produzieren.
+
+                // Tote Miner kicken
+                let (cleaned, has_active) = {
+                    let mut reg = state
+                        .miner_registry
+                        .write()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let n = reg.cleanup_inactive();
+                    (n, reg.has_active_miners())
+                };
+                if cleaned > 0 {
+                    println!(
+                        "[auto-mining] 🧹 {cleaned} inaktive Miner entfernt, {} aktiv",
+                        if has_active { "Timer PAUSIERT" } else { "Timer LÄUFT" }
+                    );
+                }
+
+                // Timer prüfen
+                let should_mine = {
+                    let t = state.block_timer.lock().unwrap_or_else(|e| e.into_inner());
+                    t.should_auto_mine(has_active)
+                };
+                if !should_mine {
+                    continue;
+                }
+
+                // Gate: Nur Auto-Blöcke produzieren wenn auch User-TXs warten.
+                // Verhindert Block-Flood durch leere Reward-only Blöcke.
+                let pending = state.mempool.pending_count();
+                if pending == 0 {
+                    // Timer NICHT zurücksetzen — sobald TXs kommen soll sofort
+                    // gemined werden, ohne erneut auto_timeout_secs zu warten.
+                    continue;
+                }
+
+                // Nur dieser Node soll Auto-Block bauen wenn er ausgewählter
+                // Validator ist (Round-Robin oder Stake-Weighted). Sonst
+                // parallele Auto-Blöcke auf allen Masters → Forks.
+                // Die bestehende Template-Prepare-Funktion prüft das bereits.
+                match state.mint_auto_block() {
+                    Ok(block) => {
+                        println!(
+                            "[auto-mining] ⛏️  Auto-Block #{} produziert ({} User-TXs, kein Miner aktiv seit {}s)",
+                            block.index,
+                            pending,
+                            state.block_timer.lock().map(|t| t.elapsed_secs()).unwrap_or(0)
+                        );
+                        // Broadcast + reset
+                        {
+                            let tx = state.block_broadcast_tx.lock().unwrap_or_else(|e| e.into_inner());
+                            if let Some(ref sender) = *tx {
+                                let _ = sender.send(block.clone());
+                            }
+                        }
+                        if let Ok(mut t) = state.block_timer.lock() {
+                            t.reset();
+                        }
+                    }
+                    Err(e) => {
+                        // Häufiger Fall: "kein aktiver Validator" auf dieser Node → still ignorieren
+                        if !e.contains("kein aktiver") && !e.contains("nicht der aktuelle") {
+                            eprintln!("[auto-mining] ⚠ Auto-Block fehlgeschlagen: {e}");
+                        }
+                        // Reset auch bei Fehlschlag, damit wir nicht jede Sekunde retry'en
+                        if let Ok(mut t) = state.block_timer.lock() {
+                            t.reset();
+                        }
                     }
                 }
             }

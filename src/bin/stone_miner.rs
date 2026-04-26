@@ -1844,6 +1844,183 @@ fn spawn_pow_solver(
         .expect("PoW coordinator thread");
 }
 
+// ─── Miner-Heartbeat Task ──────────────────────────────────────────────────
+
+/// Sendet periodisch einen signierten Heartbeat mit partiellem PoW-Beweis.
+///
+/// Zweck: Pausiert den Auto-Block-Timer in allen Master-Nodes, solange dieser
+/// Miner aktiv am Netz ist. Ohne Heartbeat würden die Master nach
+/// `auto_mining_timeout_secs` (Default 120 s) selbst Blöcke bauen — auch wenn
+/// dieser Miner gerade am PoW rechnet.
+///
+/// Ablauf:
+/// 1. Alle 15 s: aktuelles Template holen.
+/// 2. Kurzer Argon2id-Suchlauf über max. `MAX_HB_ATTEMPTS` Nonces.
+/// 3. Akzeptiert wird jeder Hash mit
+///    `leading_zero_bits >= (eff_difficulty - partial_delta)` —
+///    also ca. 2^delta leichter als ein Vollblock.
+/// 4. Ergebnis wird Ed25519-signiert, lokal in die Miner-Registry eingetragen
+///    und via Gossipsub an alle Peers verbreitet.
+fn spawn_miner_heartbeat_task(
+    node: Arc<MasterNodeState>,
+    network: Option<NetworkHandle>,
+    miner_wallet: String,
+    log_tx: std::sync::mpsc::Sender<String>,
+) {
+    use ed25519_dalek::Signer;
+
+    const HEARTBEAT_INTERVAL_SECS: u64 = 15;
+    /// Max. Nonces pro Heartbeat-Versuch. Bei ~100 ms/Argon2id → max ~12 s
+    /// CPU für einen Heartbeat. Bei typischen 6 Bit Delta ist 1/64 der
+    /// Erwartungswert, wir finden fast immer in <40 Versuchen.
+    const MAX_HB_ATTEMPTS: u64 = 128;
+
+    tokio::spawn(async move {
+        // Grace-Period: 15 s nachdem PoW-Solver angelaufen ist
+        tokio::time::sleep(Duration::from_secs(15)).await;
+
+        // Einmalig Connect-Message via Gossipsub + lokale Registry
+        let connect_ts = Utc::now().timestamp();
+        let sk = load_or_create_validator_key();
+        let connect_payload =
+            stone::master::miner_registry::connect_sign_payload(&miner_wallet, connect_ts);
+        let connect_sig = hex::encode(sk.sign(connect_payload.as_bytes()).to_bytes());
+        let connect_msg = stone::master::MinerConnectMsg {
+            wallet: miner_wallet.clone(),
+            pubkey: miner_wallet.clone(),
+            timestamp: connect_ts,
+            signature: connect_sig,
+        };
+        {
+            let mut reg = node.miner_registry.write().unwrap_or_else(|e| e.into_inner());
+            reg.register_miner(
+                connect_msg.wallet.clone(),
+                connect_msg.pubkey.clone(),
+                connect_msg.signature.clone(),
+                connect_msg.timestamp,
+            );
+        }
+        if let (Ok(json), Some(ref net)) = (serde_json::to_vec(&connect_msg), network.as_ref()) {
+            let mut payload = Vec::with_capacity(json.len() + 1);
+            payload.push(stone::master::mining::MINER_GOSSIP_KIND_CONNECT);
+            payload.extend_from_slice(&json);
+            net.publish_gossip(stone::network::TOPIC_MINERS, payload).await;
+        }
+        let _ = log_tx.send(format!(
+            "🔌 Miner-Session gestartet: wallet={}…",
+            &miner_wallet[..16.min(miner_wallet.len())]
+        ));
+
+        let partial_delta = node.auto_mining_config.heartbeat_partial_delta;
+        let mut ticker = tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Aktuelle Nonce-Start-Position (rotiert, um nicht immer dieselben
+        // Nonces wie die PoW-Worker zu testen)
+        let mut hb_nonce_start: u64 = 0xF000_0000_0000_0000; // hoher Offset
+        loop {
+            ticker.tick().await;
+
+            // Initial-Sync abwarten
+            if !node
+                .metrics
+                .initial_sync_done
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                continue;
+            }
+
+            // Aktuelles Template holen
+            let template = {
+                let tmpl = node
+                    .current_mining_template
+                    .read()
+                    .unwrap_or_else(|e| e.into_inner());
+                tmpl.as_ref().map(|(t, _)| t.clone())
+            };
+            let Some(template) = template else {
+                continue;
+            };
+            let eff = if template.effective_difficulty > 0 {
+                template.effective_difficulty
+            } else {
+                template.difficulty
+            };
+            let required = eff.saturating_sub(partial_delta).max(1);
+
+            // Kurzer Suchlauf in einem Blocking-Thread (Argon2id ist CPU-schwer)
+            let prev_hash = template.previous_hash.clone();
+            let block_index = template.block_index;
+            let validator_pubkey = template.validator_pubkey.clone();
+            let template_id = template.template_id.clone();
+            let start_nonce = hb_nonce_start;
+            hb_nonce_start = hb_nonce_start.wrapping_add(MAX_HB_ATTEMPTS);
+
+            let search = tokio::task::spawn_blocking(move || -> Option<(u64, String)> {
+                for i in 0..MAX_HB_ATTEMPTS {
+                    let nonce = start_nonce.wrapping_add(i);
+                    let hash = stone::consensus::compute_argon2_pow_hash(
+                        &prev_hash,
+                        block_index,
+                        &validator_pubkey,
+                        nonce,
+                    );
+                    if stone::consensus::leading_zero_bits(&hash) >= required {
+                        return Some((nonce, hex::encode(hash)));
+                    }
+                }
+                None
+            })
+            .await;
+
+            let Ok(Some((nonce, partial_hash))) = search else {
+                // Kein Near-Miss gefunden → Heartbeat überspringen.
+                // Wenn der Miner wirklich aktiv ist, findet er beim nächsten
+                // Tick einen. Kein Problem: der Miner-Timeout ist 30 s, wir
+                // ticken alle 15 s.
+                continue;
+            };
+
+            let ts = Utc::now().timestamp();
+            let payload_str = stone::master::miner_registry::heartbeat_sign_payload(
+                &miner_wallet,
+                ts,
+                &template_id,
+                nonce,
+            );
+            let sig = hex::encode(sk.sign(payload_str.as_bytes()).to_bytes());
+            let hb = stone::master::MinerHeartbeat {
+                wallet: miner_wallet.clone(),
+                pubkey: miner_wallet.clone(),
+                timestamp: ts,
+                template_id: template_id.clone(),
+                nonce,
+                partial_hash,
+                signature: sig,
+            };
+
+            // Lokale Registry updaten
+            {
+                let mut reg = node.miner_registry.write().unwrap_or_else(|e| e.into_inner());
+                let _ = reg.record_heartbeat(
+                    &hb.wallet,
+                    &hb.template_id,
+                    hb.nonce,
+                    hb.timestamp,
+                    eff as u64,
+                );
+            }
+
+            // Gossipsub propagieren
+            if let (Ok(json), Some(ref net)) = (serde_json::to_vec(&hb), network.as_ref()) {
+                let mut payload = Vec::with_capacity(json.len() + 1);
+                payload.push(stone::master::mining::MINER_GOSSIP_KIND_HEARTBEAT);
+                payload.extend_from_slice(&json);
+                net.publish_gossip(stone::network::TOPIC_MINERS, payload).await;
+            }
+        }
+    });
+}
+
 // ─── System Metrics Worker ──────────────────────────────────────────────────
 
 fn spawn_system_metrics_worker(
@@ -2540,6 +2717,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ── PoW Solver (Argon2id Mining) ────────────────────────────────────
     spawn_pow_solver(node.clone(), pow_metrics.clone(), log_tx.clone());
+
+    // ── Miner-Heartbeat Task (Auto-Block-Timer Awareness) ───────────────
+    spawn_miner_heartbeat_task(
+        node.clone(),
+        network_handle.clone(),
+        validator_wallet.clone(),
+        log_tx.clone(),
+    );
 
     // ── Mempool Sync (Pending TXs von Peers holen) ─────────────────────
     spawn_mempool_sync(node.clone(), config.seed_peers.clone(), api_key.clone());

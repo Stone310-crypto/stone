@@ -335,7 +335,7 @@ pub(super) struct SyncHandshake {
 // ─── Gossipsub: Topics abonnieren ─────────────────────────────────────────────
 
 pub(crate) fn subscribe_all_topics(gossipsub: &mut gossipsub::Behaviour) -> Result<(), String> {
-    for topic in [TOPIC_BLOCKS, TOPIC_PEERS, TOPIC_SYNC_HANDSHAKE, TOPIC_MEMPOOL, TOPIC_CHAT, TOPIC_CHAT_CONTENT, crate::updater::TOPIC_UPDATES, TOPIC_STORAGE] {
+    for topic in [TOPIC_BLOCKS, TOPIC_PEERS, TOPIC_SYNC_HANDSHAKE, TOPIC_MEMPOOL, TOPIC_CHAT, TOPIC_CHAT_CONTENT, crate::updater::TOPIC_UPDATES, TOPIC_STORAGE, crate::network::TOPIC_MINERS] {
         gossipsub.subscribe(&IdentTopic::new(topic))
             .map_err(|e| format!("Subscribe '{topic}': {e}"))?;
     }

@@ -28,6 +28,7 @@ use super::handlers::{
         handle_bind_mining_wallet, handle_mining_wallet_info,
         handle_mining_template, handle_mining_submit,
         handle_mining_report, handle_mining_remote_status,
+        handle_miner_connect, handle_miner_heartbeat, handle_miners_active,
     },
     calls::{handle_send_signal, handle_get_signals},
     audio_relay::handle_audio_relay,
@@ -442,6 +443,10 @@ pub fn build_router(state: AppState) -> Router {
         // ─── Miner Status Relay (Bootstrap-Server als Relay) ────────────
         .route("/api/v1/mining/report", post(handle_mining_report))
         .route("/api/v1/mining/remote-status/{wallet}", get(handle_mining_remote_status))
+        // ─── Miner Connect / Heartbeat (Auto-Block-Timer) ───────────────
+        .route("/api/v1/miners/connect", post(handle_miner_connect))
+        .route("/api/v1/miners/heartbeat", post(handle_miner_heartbeat))
+        .route("/api/v1/miners/active", get(handle_miners_active))
         // ─── Reputation ──────────────────────────────────────────────────────
         .route("/api/v1/reputation/status", get(handle_reputation_status))
         .route("/api/v1/reputation/nodes", get(handle_reputation_nodes))
