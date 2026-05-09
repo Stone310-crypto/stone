@@ -532,6 +532,24 @@ restart_node() {
                 fi
             fi
 
+            # Pre-restart Cleanup: Stop + verwaiste Prozesse aus diesem BIN_PATH töten.
+            # Grund: stone-setup forkt stone-master als Child; wenn der Parent durch
+            # systemctl SIGTERM stirbt, kann der Child manchmal überleben und Port 8080
+            # weiterhin halten → "Address already in use" beim Neustart.
+            # Wir filtern strikt nach BIN_PATH, damit das andere Netz (z.B. mainnet
+            # unter /home/mainnet) auf demselben Server NICHT angefasst wird.
+            systemctl stop "$SERVICE" 2>/dev/null || true
+            for proc in stone-setup stone-master; do
+                # pkill -f matched gegen die volle Cmdline; BIN_PATH/proc trifft nur
+                # diesen Node, nicht das andere Netz.
+                pkill -TERM -f "${BIN_PATH}/${proc}" 2>/dev/null || true
+            done
+            # Kurz warten und ggf. SIGKILL nachschieben, falls etwas hängt.
+            sleep 2
+            for proc in stone-setup stone-master; do
+                pkill -KILL -f "${BIN_PATH}/${proc}" 2>/dev/null || true
+            done
+
             systemctl restart "$SERVICE"
             sleep 3
 

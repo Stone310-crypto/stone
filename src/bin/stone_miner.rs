@@ -289,7 +289,10 @@ impl MinerWebState {
 
     fn is_mining(&self) -> bool {
         self.throttle() > 0
-            && self.node.metrics.initial_sync_done.load(std::sync::atomic::Ordering::Relaxed)
+            && (
+                self.node.metrics.initial_sync_done.load(std::sync::atomic::Ordering::Relaxed)
+                    || self.pow_metrics.read().unwrap_or_else(|e| e.into_inner()).solving
+            )
     }
 
     fn next_payout_str(&self) -> String {
@@ -1549,6 +1552,87 @@ fn spawn_shard_repair_worker(
 
 // ─── PoW Solver Worker (Argon2id Mining) ────────────────────────────────────
 
+fn collect_mining_peer_urls(node: &Arc<MasterNodeState>, seed_peers: &[String]) -> Vec<String> {
+    let mut out = Vec::new();
+    for p in seed_peers {
+        let s = p.trim().trim_end_matches('/');
+        if !s.is_empty() {
+            out.push(s.to_string());
+        }
+    }
+    for p in node.get_peers() {
+        let s = p.url.trim().trim_end_matches('/');
+        if !s.is_empty() && !out.iter().any(|x| x == s) {
+            out.push(s.to_string());
+        }
+    }
+    out
+}
+
+async fn fetch_remote_template_from_peers(
+    client: &reqwest::Client,
+    peer_urls: &[String],
+) -> Result<(stone::master::MiningTemplate, String), String> {
+    for base in peer_urls {
+        let url = format!("{}/api/v1/mining/template", base.trim_end_matches('/'));
+        let resp = match client.get(&url).send().await {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        if !resp.status().is_success() {
+            continue;
+        }
+        let body: serde_json::Value = match resp.json().await {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let ok = body.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+        if !ok {
+            continue;
+        }
+        if let Some(tval) = body.get("template") {
+            if let Ok(template) = serde_json::from_value::<stone::master::MiningTemplate>(tval.clone()) {
+                return Ok((template, base.clone()));
+            }
+        }
+    }
+    Err("Kein erreichbarer Mining-Template-Endpoint gefunden".into())
+}
+
+async fn submit_remote_solution_to_peer(
+    client: &reqwest::Client,
+    peer_base: &str,
+    submission: &stone::master::MiningSubmission,
+) -> Result<u64, String> {
+    let url = format!("{}/api/v1/mining/submit", peer_base.trim_end_matches('/'));
+    let resp = client
+        .post(&url)
+        .json(submission)
+        .send()
+        .await
+        .map_err(|e| format!("Submit-Request fehlgeschlagen: {e}"))?;
+
+    let status = resp.status();
+    let body: serde_json::Value = resp
+        .json()
+        .await
+        .map_err(|e| format!("Submit-Response ungültig: {e}"))?;
+
+    let ok = body.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+    if !ok {
+        let err = body
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Unbekannter Submit-Fehler");
+        return Err(format!("{status}: {err}"));
+    }
+
+    Ok(body
+        .get("block_index")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0))
+}
+
 /// Background task: continuously solves Argon2id PoW puzzles using templates
 /// from the local node.
 ///
@@ -1563,6 +1647,7 @@ fn spawn_shard_repair_worker(
 /// eigene Nonce-Range. Erster Fund stoppt alle via AtomicBool.
 fn spawn_pow_solver(
     node: Arc<MasterNodeState>,
+    seed_peers: Vec<String>,
     pow_metrics: Arc<std::sync::RwLock<PowMetrics>>,
     log_tx: std::sync::mpsc::Sender<String>,
 ) {
@@ -1576,11 +1661,38 @@ fn spawn_pow_solver(
     std::thread::Builder::new()
         .name("pow-coordinator".into())
         .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = log_tx.send(format!("❌ Tokio-Runtime für PoW konnte nicht gestartet werden: {e}"));
+                    return;
+                }
+            };
+            let http = reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .build()
+                .unwrap_or_else(|_| reqwest::Client::new());
+                const SYNC_FALLBACK_SECS: u64 = 45;
+                let sync_wait_started = Instant::now();
+
             // Warte auf Initial-Sync (blockierend)
             loop {
                 if node.metrics.initial_sync_done.load(Ordering::Relaxed) {
                     break;
                 }
+                    let local_height = {
+                        let chain = node.chain.lock().unwrap_or_else(|e| e.into_inner());
+                        chain.blocks.len() as u64
+                    };
+                    if sync_wait_started.elapsed().as_secs() >= SYNC_FALLBACK_SECS && local_height > 0 {
+                        let _ = log_tx.send(format!(
+                            "⚠ Initial-Sync-Flag blieb aus, starte Mining-Fallback (uptime>{SYNC_FALLBACK_SECS}s, height={local_height})"
+                        ));
+                        break;
+                    }
                 std::thread::sleep(Duration::from_secs(2));
             }
 
@@ -1601,35 +1713,21 @@ fn spawn_pow_solver(
                     continue;
                 }
 
-                // Template holen (oder erstellen)
-                let template = {
-                    let tmpl = node.current_mining_template.read().unwrap_or_else(|e| e.into_inner());
-                    if let Some((t, _)) = tmpl.as_ref() {
-                        let chain = node.chain.lock().unwrap_or_else(|e| e.into_inner());
-                        let current_height = chain.blocks.len() as u64;
-                        if t.block_index == current_height {
-                            Some(t.clone())
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    }
-                };
-
-                let template = match template {
-                    Some(t) => t,
-                    None => {
-                        match node.prepare_block_template() {
-                            Ok(t) => t,
-                            Err(e) => {
-                                if !e.contains("Kein Reward") {
-                                    let _ = log_tx.send(format!("⚠ Template-Fehler: {e}"));
-                                }
-                                std::thread::sleep(Duration::from_secs(5));
-                                continue;
-                            }
-                        }
+                // Template IMMER von Remote-Mastern holen.
+                // So bleiben Signer/Validator-Identität konsistent und der Miner
+                // muss kein aktiver PoA-Validator sein.
+                let peers = collect_mining_peer_urls(&node, &seed_peers);
+                if peers.is_empty() {
+                    let _ = log_tx.send("⚠ Keine Seed-/Peer-URLs für Remote-Mining vorhanden".into());
+                    std::thread::sleep(Duration::from_secs(5));
+                    continue;
+                }
+                let (template, submit_peer) = match rt.block_on(fetch_remote_template_from_peers(&http, &peers)) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = log_tx.send(format!("⚠ Template-Fehler: {e}"));
+                        std::thread::sleep(Duration::from_secs(3));
+                        continue;
                     }
                 };
 
@@ -1685,7 +1783,6 @@ fn spawn_pow_solver(
                     let result_tx_c = result_tx.clone();
                     let prev_hash = template.previous_hash.clone();
                     let validator_pub = template.validator_pubkey.clone();
-                    let tmpl_id = template_id.clone();
                     let node_c = node.clone();
 
                     let handle = std::thread::Builder::new()
@@ -1717,19 +1814,8 @@ fn spawn_pow_solver(
 
                                 nonce += stride;
 
-                                // Alle 5 Hashes pro Thread: Staleness-Check
+                                // Alle 5 Hashes pro Thread: Stop/Throttle-Check
                                 if (nonce / stride) % 5 == 0 {
-                                    let stale = {
-                                        let tmpl = node_c.current_mining_template.read().unwrap_or_else(|e| e.into_inner());
-                                        match tmpl.as_ref() {
-                                            Some((t, _)) => t.template_id != tmpl_id,
-                                            None => true,
-                                        }
-                                    };
-                                    if stale {
-                                        found_c.store(true, Ordering::Relaxed);
-                                        break;
-                                    }
                                     // Throttle-Stop Check
                                     let thr = node_c.metrics.mining_throttle_pct.load(Ordering::Relaxed);
                                     if thr == 0 {
@@ -1803,32 +1889,22 @@ fn spawn_pow_solver(
                         pow_hash,
                     };
 
-                    match node.submit_mining_solution(&submission) {
-                        Ok(block) => {
-                            MasterNodeState::run_post_block_hooks(&node, &block);
-
-                            {
-                                let tx = node.block_broadcast_tx.lock().unwrap_or_else(|e| e.into_inner());
-                                if let Some(ref sender) = *tx {
-                                    let _ = sender.send(block.clone());
-                                }
-                            }
-
+                    match rt.block_on(submit_remote_solution_to_peer(&http, &submit_peer, &submission)) {
+                        Ok(block_index) => {
                             {
                                 let mut m = pow_metrics.write().unwrap_or_else(|e| e.into_inner());
                                 m.blocks_solved += 1;
-                                m.last_solved_block = block.index;
+                                m.last_solved_block = block_index;
                                 m.last_solve_elapsed_secs = elapsed.as_secs_f64();
                                 m.hashrate = hashrate;
                             }
-
                             let _ = log_tx.send(format!(
-                                "📦 Block #{} committed + broadcastet ({} TXs)",
-                                block.index, block.transactions.len(),
+                                "📦 Remote-Submit akzeptiert: Block #{block_index} via {}",
+                                submit_peer,
                             ));
                         }
                         Err(e) => {
-                            let _ = log_tx.send(format!("⚠ Submit fehlgeschlagen: {e}"));
+                            let _ = log_tx.send(format!("⚠ Remote-Submit fehlgeschlagen: {e}"));
                         }
                     }
                 } else {
@@ -1864,6 +1940,7 @@ fn spawn_pow_solver(
 fn spawn_miner_heartbeat_task(
     node: Arc<MasterNodeState>,
     network: Option<NetworkHandle>,
+    seed_peers: Vec<String>,
     miner_wallet: String,
     log_tx: std::sync::mpsc::Sender<String>,
 ) {
@@ -1876,6 +1953,11 @@ fn spawn_miner_heartbeat_task(
     const MAX_HB_ATTEMPTS: u64 = 128;
 
     tokio::spawn(async move {
+        let http = reqwest::Client::builder()
+            .timeout(Duration::from_secs(8))
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+
         // Grace-Period: 15 s nachdem PoW-Solver angelaufen ist
         tokio::time::sleep(Duration::from_secs(15)).await;
 
@@ -1906,12 +1988,24 @@ fn spawn_miner_heartbeat_task(
             payload.extend_from_slice(&json);
             net.publish_gossip(stone::network::TOPIC_MINERS, payload).await;
         }
+        // HTTP-Fallback: direkt an bekannte Master melden (falls P2P-Gossip
+        // zwischen Miner und Master nicht zuverlässig zustande kommt).
+        for base in collect_mining_peer_urls(&node, &seed_peers) {
+            let _ = http
+                .post(format!("{}/api/v1/miners/connect", base.trim_end_matches('/')))
+                .json(&connect_msg)
+                .send()
+                .await;
+        }
         let _ = log_tx.send(format!(
             "🔌 Miner-Session gestartet: wallet={}…",
             &miner_wallet[..16.min(miner_wallet.len())]
         ));
 
         let partial_delta = node.auto_mining_config.heartbeat_partial_delta;
+        const SYNC_FALLBACK_SECS: u64 = 45;
+        let sync_wait_started = Instant::now();
+        let mut sync_fallback_logged = false;
         let mut ticker = tokio::time::interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECS));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Aktuelle Nonce-Start-Position (rotiert, um nicht immer dieselben
@@ -1921,25 +2015,44 @@ fn spawn_miner_heartbeat_task(
             ticker.tick().await;
 
             // Initial-Sync abwarten
-            if !node
+            let sync_done = node
                 .metrics
                 .initial_sync_done
-                .load(std::sync::atomic::Ordering::Relaxed)
-            {
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let local_height = {
+                let chain = node.chain.lock().unwrap_or_else(|e| e.into_inner());
+                chain.blocks.len() as u64
+            };
+            let sync_fallback_ready =
+                sync_wait_started.elapsed().as_secs() >= SYNC_FALLBACK_SECS && local_height > 0;
+            if !sync_done && !sync_fallback_ready {
                 continue;
             }
+            if !sync_done && sync_fallback_ready && !sync_fallback_logged {
+                let _ = log_tx.send(format!(
+                    "⚠ Heartbeat-Sync-Fallback aktiv (uptime>{SYNC_FALLBACK_SECS}s, height={local_height})"
+                ));
+                sync_fallback_logged = true;
+            }
 
-            // Aktuelles Template holen
-            let template = {
+            // Aktuelles Template holen (lokal oder HTTP-Fallback)
+            let template_local = {
                 let tmpl = node
                     .current_mining_template
                     .read()
                     .unwrap_or_else(|e| e.into_inner());
                 tmpl.as_ref().map(|(t, _)| t.clone())
             };
-            let Some(template) = template else {
-                continue;
+            let template = if let Some(t) = template_local {
+                Some(t)
+            } else {
+                let peers = collect_mining_peer_urls(&node, &seed_peers);
+                match fetch_remote_template_from_peers(&http, &peers).await {
+                    Ok((t, _)) => Some(t),
+                    Err(_) => None,
+                }
             };
+            let Some(template) = template else { continue; };
             let eff = if template.effective_difficulty > 0 {
                 template.effective_difficulty
             } else {
@@ -2016,6 +2129,15 @@ fn spawn_miner_heartbeat_task(
                 payload.push(stone::master::mining::MINER_GOSSIP_KIND_HEARTBEAT);
                 payload.extend_from_slice(&json);
                 net.publish_gossip(stone::network::TOPIC_MINERS, payload).await;
+            }
+            // HTTP-Fallback zusätzlich pushen, damit Master den Miner auch ohne
+            // direkte Gossip-Pfade als aktiv erkennen.
+            for base in collect_mining_peer_urls(&node, &seed_peers) {
+                let _ = http
+                    .post(format!("{}/api/v1/miners/heartbeat", base.trim_end_matches('/')))
+                    .json(&hb)
+                    .send()
+                    .await;
             }
         }
     });
@@ -2522,7 +2644,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let signing_key = load_or_create_validator_key();
     let validator_wallet = local_validator_pubkey_hex(&signing_key);
 
-    let node = MasterNodeState::new(node_id.clone(), api_key.as_ref().clone(), NodeRole::Master);
+    let node = MasterNodeState::new(node_id.clone(), api_key.as_ref().clone(), NodeRole::Replica);
 
     // Peers laden
     let saved_peers = load_peers_from_disk();
@@ -2547,7 +2669,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Hintergrund-Tasks
     MasterNodeState::start_heartbeat(node.clone(), HEARTBEAT_INTERVAL);
-    MasterNodeState::start_mining_loop(node.clone());
+    // WICHTIG: Kein lokaler Master-Mining-Loop im Miner-Binary.
+    // Der Miner nutzt Remote-Templates + Remote-Submit gegen Master-Nodes.
     spawn_auto_sync_task(node.clone(), api_key.clone(), users.clone());
 
     // Peer-Discovery: Bei Bootstrap-Nodes registrieren & Health-Check starten
@@ -2716,12 +2839,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     spawn_system_metrics_worker(system_metrics.clone());
 
     // ── PoW Solver (Argon2id Mining) ────────────────────────────────────
-    spawn_pow_solver(node.clone(), pow_metrics.clone(), log_tx.clone());
+    spawn_pow_solver(
+        node.clone(),
+        config.seed_peers.clone(),
+        pow_metrics.clone(),
+        log_tx.clone(),
+    );
 
     // ── Miner-Heartbeat Task (Auto-Block-Timer Awareness) ───────────────
     spawn_miner_heartbeat_task(
         node.clone(),
         network_handle.clone(),
+        config.seed_peers.clone(),
         validator_wallet.clone(),
         log_tx.clone(),
     );
