@@ -121,7 +121,7 @@ fn default_node_name() -> String {
         .unwrap_or_else(|| "stone-miner".into())
 }
 fn default_http_port() -> u16 {
-    if NetworkMode::from_env().is_testnet() { 8081 } else { 8082 }
+    if NetworkMode::from_env().is_testnet() { 3080 } else { 3080 }
 }
 fn default_dashboard_port() -> u16 {
     if NetworkMode::from_env().is_testnet() { 6969 } else { 6970 }
@@ -1008,7 +1008,7 @@ async fn handle_p2p_event(
 
                 if !ip_already_known {
                     // Kandidaten-Ports in Prioritätsreihenfolge
-                    let candidate_ports = [8081u16, 3080, 3030];
+                    let candidate_ports = [3080u16, 3080, 3030];
                     for port in candidate_ports {
                         let url = format!("http://{}:{}", ip, port);
                         if !known_peers.iter().any(|p| p.url.trim_end_matches('/') == url.trim_end_matches('/')) {
@@ -2935,6 +2935,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         fcm_client: Arc::new(stone::push::FcmClient::new()),
         action_store: server::state::ActionStore::new(),
         play_drops: server::state::PlayDropTracker::new(server::state::PlayDropConfig::from_env()),
+        watchdog: stone::watchdog::WatchdogState::new(),
+        pop_mining: stone::pop_mining::PopMiningState::new(),
     };
 
     // Post-Update Erfolg bestätigen (nach 120s gesundem Betrieb)

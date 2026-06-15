@@ -177,6 +177,12 @@ pub(crate) struct SwarmTask {
     /// Verhindert Connect-Disconnect-Storms wenn beide Seiten gleichzeitig dialen.
     pub(crate) reconnect_backoff: HashMap<PeerId, (Instant, Duration)>,
 
+    /// Zeitpunkt der ersten (stabilen) Verbindung pro Peer. Dient der Flap-
+    /// Erkennung: bricht eine Verbindung nach <STABLE_CONNECTION_SECS wieder ab,
+    /// behandeln wir den Peer als flappend und setzen Backoff statt ihn sofort
+    /// erneut zu dialen (verhindert Connect-Disconnect-Storms).
+    pub(crate) peer_connected_since: HashMap<PeerId, Instant>,
+
     /// Menge aller Bootstrap-PeerIds (aus konfigurierten Multiaddrs extrahiert).
     pub(crate) bootstrap_peer_ids: HashSet<PeerId>,
 
@@ -868,9 +874,17 @@ impl SwarmTask {
             }
         }
 
-        // Backoff für erfolgreich verbundene Peers zurücksetzen
-        for pid in self.swarm.connected_peers().cloned().collect::<Vec<_>>() {
-            self.reconnect_backoff.remove(&pid);
+        // Backoff nur für STABIL verbundene Peers zurücksetzen (>= STABLE_CONNECTION_SECS).
+        // Ein gerade erst (oder flappend) verbundener Peer behält seinen Backoff,
+        // damit ein sofortiges erneutes Trennen keinen Reconnect-Storm auslöst.
+        let connected: Vec<PeerId> = self.swarm.connected_peers().cloned().collect();
+        for pid in connected {
+            let stable = self.peer_connected_since.get(&pid)
+                .map(|t| t.elapsed() >= Duration::from_secs(STABLE_CONNECTION_SECS))
+                .unwrap_or(false);
+            if stable {
+                self.reconnect_backoff.remove(&pid);
+            }
         }
 
         let mut attempted = 0u32;
@@ -973,11 +987,24 @@ impl SwarmTask {
 
     async fn handle_swarm_event(&mut self, event: SwarmEvent<StoneBehaviourEvent>) {
         match event {
-            SwarmEvent::ConnectionEstablished { peer_id, endpoint, num_established, .. } => {
+            SwarmEvent::ConnectionEstablished { peer_id, connection_id, endpoint, num_established, .. } => {
                 // Gebannte Peers sofort trennen
                 if self.is_peer_banned(&peer_id) {
                     eprintln!("[p2p] 🔨 Verbindung von gebantem Peer {peer_id} getrennt");
                     let _ = self.swarm.disconnect_peer_id(peer_id);
+                    return;
+                }
+
+                // Per-Peer-Connection-Cap: überzählige Verbindungen sofort schließen.
+                // Schützt gegen Connection-Storms durch flappende/inkompatible Peers
+                // (z. B. veraltete PeerId/Genesis), die sonst hunderte Parallel-
+                // verbindungen aufbauen und FDs/Netz erschöpfen würden.
+                if num_established.get() > MAX_CONNECTIONS_PER_PEER {
+                    eprintln!(
+                        "[p2p] ⚠ {peer_id}: {} Verbindungen > Limit {MAX_CONNECTIONS_PER_PEER} – schließe überzählige",
+                        num_established.get(),
+                    );
+                    self.swarm.close_connection(connection_id);
                     return;
                 }
 
@@ -1005,6 +1032,7 @@ impl SwarmTask {
 
                 // Events + Sync nur bei erster Verbindung
                 if num_established.get() == 1 {
+                    self.peer_connected_since.insert(peer_id, Instant::now());
                     self.update_bootstrap_score(peer_id, 3, "connection established");
                     let _ = self.event_tx.send(NetworkEvent::PeerConnected {
                         peer_id: peer_id.to_string(),
@@ -1057,6 +1085,26 @@ impl SwarmTask {
                 if num_established == 0 {
                     println!("[p2p] ✗ Getrennt: {peer_id} ({reason})");
                     self.update_bootstrap_score(peer_id, -1, "connection closed");
+
+                    // Flap-Erkennung: hielt die Verbindung <STABLE_CONNECTION_SECS,
+                    // setzen wir exponentiellen Reconnect-Backoff statt sofort erneut
+                    // zu dialen. Verhindert Hot-Loop-Reconnects (Storm) bei Peers, die
+                    // uns sofort wieder trennen (z. B. inkompatible PeerId/Genesis).
+                    let was_stable = self.peer_connected_since.remove(&peer_id)
+                        .map(|t| t.elapsed() >= Duration::from_secs(STABLE_CONNECTION_SECS))
+                        .unwrap_or(true);
+                    if !was_stable {
+                        let prev = self.reconnect_backoff.get(&peer_id)
+                            .map(|(_, d)| *d)
+                            .unwrap_or(Duration::from_secs(5));
+                        let next = (prev * 2).min(Duration::from_secs(300));
+                        let jitter = self.jitter_for_peer(&peer_id);
+                        self.reconnect_backoff.insert(peer_id, (Instant::now() + next + jitter, next));
+                        eprintln!(
+                            "[p2p] ⚠ {peer_id} flappt (Verbindung <{STABLE_CONNECTION_SECS}s) – Reconnect-Backoff {}s",
+                            next.as_secs(),
+                        );
+                    }
                     if Some(peer_id) == self.sync_target_peer {
                         self.sync_target_peer = None;
                         self.sync_last_recovery_reason = "sync target disconnected".to_string();

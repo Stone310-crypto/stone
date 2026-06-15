@@ -86,7 +86,7 @@ impl MasterNodeState {
             amount,
             fee: Decimal::ZERO,
             nonce: 0,
-            timestamp: Utc::now().timestamp(),
+            timestamp: 0, // System-TXs need no wall-clock timestamp; non-determinism avoided
             signature: String::new(), // System-TXs brauchen keine Signatur
             memo: format!("Block #{block_index} {memo_suffix}"),
             chain_id,
@@ -305,6 +305,19 @@ impl MasterNodeState {
             }
         }
 
+        // ── Gate: KEINE leeren Templates (kein Spam-Mining). ────────────
+        // Der Miner soll nur Templates bekommen wenn echte Nutzlast anliegt:
+        //   - TXs im Mempool (lokal ODER per Gossip), ODER
+        //   - ein Chat-Batch bereit ist.
+        // Ohne diesen Check mined der Miner leere Blöcke → block_timer wird
+        // ständig resetted → Auto-Block kommt nie zum Zug.
+        let has_pending_tx = self.mempool.pending_count() > 0;
+        let chat_batch_ready = self.message_pool.batch_ready();
+        if !has_pending_tx && !chat_batch_ready {
+            // Keine Nutzlast → kein Template. Miner pausiert, Auto-Block übernimmt.
+            return Err("Mining: Mempool leer — kein Template".into());
+        }
+
         // ── Mempool-TXs + Reward-TX sammeln ────────────────────────────
         let mut pending_txs = self.mempool.drain_all_for_block();
         let user_tx_count = pending_txs.len(); // vor reward
@@ -319,7 +332,12 @@ impl MasterNodeState {
         // in den Block aufgenommen werden (Double-Spend-Schutz).
         let pending_txs = {
             let ledger = self.token_ledger.read().unwrap_or_else(|e| e.into_inner());
-            let valid = ledger.filter_valid_txs(&pending_txs);
+            let mut valid = ledger.filter_valid_txs(&pending_txs);
+            // Deterministic ordering: sort by tx_id (SHA-256 hash) after fee tier sort.
+            // Fee-tier sort happens in drain_all_for_block, but within each tier,
+            // insertion order (which differs per node) would determine order.
+            // Sorting by tx_id guarantees identical blocks on all nodes.
+            valid.sort_by(|a, b| a.tx_id.cmp(&b.tx_id));
 
             // Abgelehnte User-TXs mit zukünftiger Nonce zurück in den Mempool legen.
             // Diese TXs könnten gültig werden wenn vorherige TXs eintreffen.
@@ -695,10 +713,24 @@ impl MasterNodeState {
         // Phase 1: Round-Robin — Jeder aktive Validator kommt der Reihe nach dran.
         // Phase 2: Lite-PoW Fallback — wenn der Primäre ausfällt, darf jeder
         //          aktive Validator mit einem gelösten PoW-Puzzle einspringen.
+        // Lock-Sicherheit: std::sync::RwLock ist NICHT reentrant und die Lock-
+        // Ordnung ist chain → validator_set. Daher BEIDES vor dem vs-Guard
+        // berechnen: build_selection_context() liest selbst validator_set
+        // (sonst rekursiver Read-Deadlock), last_block_age braucht chain.lock()
+        // (sonst chain↔validator_set in falscher Reihenfolge).
+        let (stakes, jailed, wallet_map) = self.build_selection_context();
+        let last_block_age = {
+            let chain = self.chain.lock().unwrap_or_else(|e| e.into_inner());
+            chain.blocks.last()
+                .map(|b| (Utc::now().timestamp() - b.timestamp) as u64)
+                .unwrap_or(u64::MAX)
+        };
         let mut is_pow_fallback = false;
+        let validators_present;
         {
             let vs = self.validator_set.read().unwrap_or_else(|e| e.into_inner());
-            if !vs.validators.is_empty() {
+            validators_present = !vs.validators.is_empty();
+            if validators_present {
                 if !vs.is_active_validator(&self.node_id) {
                     return Err("Mining: Node ist kein aktiver Validator".into());
                 }
@@ -719,8 +751,6 @@ impl MasterNodeState {
                         );
                     }
 
-                let (stakes, jailed, wallet_map) = self.build_selection_context();
-
                 // Beide Algorithmen prüfen: gewichtete Auswahl (= Peer-Validierung)
                 // UND Round-Robin (= lokale Rotation). Primary wenn einer zutrifft.
                 let is_weighted_turn = vs.is_selected_validator_weighted(
@@ -731,15 +761,9 @@ impl MasterNodeState {
                 let is_primary = is_weighted_turn || is_rr_turn;
 
                 if !is_primary {
-                    // Nicht unser Slot.
-                    // Prüfe ob der primäre Validator seinen Slot verpasst hat.
-                    let last_block_age = {
-                        let chain = self.chain.lock().unwrap_or_else(|e| e.into_inner());
-                        chain.blocks.last()
-                            .map(|b| (Utc::now().timestamp() - b.timestamp) as u64)
-                            .unwrap_or(u64::MAX)
-                    };
-
+                    // Nicht unser Slot. Prüfe ob der primäre Validator seinen Slot
+                    // verpasst hat (last_block_age oben vor dem vs-Guard berechnet,
+                    // um chain.lock() unter gehaltenem validator_set zu vermeiden).
                     // Fallback erst nach 2× MINING_INTERVAL (gibt dem Primären genug Zeit)
                     let fallback_threshold = MINING_INTERVAL_SECS * 2;
                     if last_block_age < fallback_threshold {
@@ -760,6 +784,32 @@ impl MasterNodeState {
                     is_pow_fallback = true;
                 }
                 } // end active >= 2
+            }
+        }
+
+        // ── Single-Miner-Gate für die Bootstrap-Phase (kein Validator-Set) ──
+        // Ohne registriertes Validator-Set gibt es keine Leader-Rotation – sonst
+        // würde JEDE Node mit Auto-Mining denselben Block #N bauen → Forks. Daher:
+        // im Auto-Modus ohne Validator-Set mint nur die DESIGNIERTE Node
+        // (STONE_AUTO_MINER=1). Solo-Betrieb (keine verbundenen Peers) mint immer,
+        // damit Single-Node-Dev weiterhin funktioniert. Sobald ein echtes
+        // Validator-Set registriert ist, greift wieder die PoA-Rotation oben.
+        if auto_mode && !validators_present {
+            let designated = std::env::var("STONE_AUTO_MINER")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if !designated {
+                let connected_peers = self.peers.read()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .iter()
+                    .filter(|p| p.status == super::PeerStatus::Healthy)
+                    .count();
+                if connected_peers > 0 {
+                    return Err(format!(
+                        "auto-mine übersprungen: nicht designierter Miner (STONE_AUTO_MINER) \
+                         ohne Validator-Set bei {connected_peers} Peer(s) — verhindert Parallel-Mining/Forks"
+                    ));
+                }
             }
         }
 
@@ -1095,25 +1145,35 @@ impl MasterNodeState {
 
         // ── Token-TXs im Ledger verarbeiten ──────────────────────────────
         if !block.transactions.is_empty() {
-            let mut ledger = self.token_ledger.write().unwrap_or_else(|e| e.into_inner());
-            // Fee-Split: Validator-Wallet setzen BEVOR TXs verarbeitet werden
-            ledger.set_current_validator(Some(validator_wallet.clone()));
-            // TXs wurden bereits durch filter_valid_txs() validiert →
-            // Trotzdem Balance/Nonce prüfen (kein replay_mode), damit
-            // auch per Gossip empfangene Blöcke korrekt geprüft werden.
-            let receipts = ledger.apply_block_txs(&block.transactions, block.index);
-            ledger.set_current_validator(None);
+            let receipts;
+            {
+                let mut ledger = self.token_ledger.write().unwrap_or_else(|e| e.into_inner());
+                // Fee-Split: Validator-Wallet setzen BEVOR TXs verarbeitet werden
+                ledger.set_current_validator(Some(validator_wallet.clone()));
+                // TXs wurden bereits durch filter_valid_txs() validiert →
+                // Trotzdem Balance/Nonce prüfen (kein replay_mode), damit
+                // auch per Gossip empfangene Blöcke korrekt geprüft werden.
+                receipts = ledger.apply_block_txs(&block.transactions, block.index);
+                ledger.set_current_validator(None);
 
-            // ── Staking-TXs im StakingPool verarbeiten ────────────────────
-            self.apply_staking_from_txs(&block.transactions, &receipts);
+                // ── Staking-TXs im StakingPool verarbeiten ────────────────────
+                self.apply_staking_from_txs(&block.transactions, &receipts);
 
+                // Sync-Marker aktualisieren (wichtig für Replay-Schutz)
+                ledger.set_last_synced_block(block.index);
+            }
+            // ── Persist außerhalb des Write-Locks ────────────────────────
+            // Der Write-Lock (token_ledger.write()) wird VOR persist() freigegeben,
+            // damit HTTP-Requests (die token_ledger.read() brauchen) nicht blockieren.
+            // persist() liest nur die In-Memory-Daten (die nach dem Lock-Drop
+            // unverändert bleiben, da das Mining single-threaded ist).
+            // RocksDB-I/O kann Hunderte von ms dauern — ohne Lock-Freigabe
+            // erscheint die Node währenddessen als "tot" (keine API-Antworten).
             if !receipts.is_empty() {
-                if let Err(e) = ledger.persist() {
+                if let Err(e) = self.token_ledger.read().unwrap_or_else(|e| e.into_inner()).persist() {
                     eprintln!("[mining] Ledger-Persistierung nach Block #{} fehlgeschlagen: {e}", block.index);
                 }
             }
-            // Sync-Marker aktualisieren (auch wenn keine Receipts — Block ist in der Chain)
-            ledger.set_last_synced_block(block.index);
         }
 
         // Block wurde bereits durch commit_block() → persist_last_block() persistiert.
@@ -1384,13 +1444,13 @@ impl MasterNodeState {
     /// Produziert alle `auto_timeout_secs` einen Block, wenn:
     /// - Auto-Mining in der Config aktiviert ist,
     /// - der Initial-Sync abgeschlossen ist,
-    /// - kein externer Miner (mit gültigem Heartbeat) aktiv ist,
+    /// - kein CPU-Miner (mit gültigem Heartbeat) aktiv ist,
+    /// - kein Minecraft-Server mit aktiven Spielern verbunden ist (PoP-Mining),
     /// - seit dem letzten Block mehr als `auto_timeout_secs` vergangen sind.
     ///
     /// Hard-Fallback: Selbst bei "aktiven" Minern wird nach
-    /// `HARD_FALLBACK_MULT × auto_timeout_secs` ein Block erzeugt, damit
-    /// gefakete Heartbeats die Kette nicht zum Stillstand bringen können.
-    pub fn start_block_timer(state: Arc<Self>) {
+    /// `HARD_FALLBACK_MULT × auto_timeout_secs` ein Block erzeugt.
+    pub fn start_block_timer(state: Arc<Self>, pop_mining: crate::pop_mining::PopMiningState) {
         if !state.auto_mining_config.enabled {
             println!("[auto-mining] 🚫 disabled per config – BlockTimer startet nicht");
             return;
@@ -1406,28 +1466,40 @@ impl MasterNodeState {
             tokio::time::sleep(Duration::from_secs(20)).await;
             let mut ticker = tokio::time::interval(Duration::from_secs(1));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut heartbeat_tick: u64 = 0;
 
             loop {
                 ticker.tick().await;
+                heartbeat_tick = heartbeat_tick.wrapping_add(1);
 
                 // Warten bis Initial-Sync fertig — wenn nach 60s noch nicht
-                // gesetzt, prüfen wir den Chain-Zustand selbst (auf setup.rs
-                // wird das Flag nie gesetzt, wenn keine neuen Blöcke gepullt
-                // wurden, weil wir bereits aktuell sind).
+                // gesetzt, forcieren wir den Start. Auf einer frischen Node
+                // (nur Genesis, keine Peers) würde das Flag sonst nie gesetzt.
                 if !state.metrics.initial_sync_done.load(Ordering::Relaxed) {
                     let uptime = (chrono::Utc::now().timestamp() - state.started_at).max(0) as u64;
                     if uptime < 60 {
                         continue;
                     }
+                    // Prüfe ob die Chain schon >1 Blöcke hat ODER ob wir
+                    // allein im Netzwerk sind (keine Peers → keine Sync-Quelle)
                     let chain_ok = {
                         let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
                         chain.blocks.len() > 1
                     };
-                    if !chain_ok {
-                        continue;
+                    let has_peers = {
+                        let peers = state.peers.read().unwrap_or_else(|e| e.into_inner());
+                        !peers.is_empty()
+                    };
+                    if !chain_ok && has_peers {
+                        continue; // Warte auf Sync von Peers
                     }
                     state.metrics.initial_sync_done.store(true, Ordering::Relaxed);
-                    println!("[auto-mining] ✓ Initial-Sync per Fallback bestätigt (uptime>{uptime}s, chain non-empty)");
+                    println!(
+                        "[auto-mining] ✓ Initial-Sync per Fallback bestätigt \
+                         (uptime={uptime}s, chain={} blk, peers={})",
+                        if chain_ok { "ok" } else { "genesis-only" },
+                        has_peers,
+                    );
                 }
 
                 // HINWEIS: mining_throttle_pct ist absichtlich KEIN Stop-Kriterium.
@@ -1435,8 +1507,9 @@ impl MasterNodeState {
                 // Auto-Block-Timer ist ein Liveness-Mechanismus und muss auch auf
                 // Master-Nodes ohne Mining-Loop (throttle=0) Blöcke produzieren.
 
-                // Tote Miner kicken
-                let (cleaned, has_active) = {
+                // ── CPU-Miner aufräumen ──────────────────────────────────────
+                let hb_timeout = state.auto_mining_config.heartbeat_timeout_secs;
+                let (cleaned, has_cpu_miners) = {
                     let mut reg = state
                         .miner_registry
                         .write()
@@ -1446,8 +1519,42 @@ impl MasterNodeState {
                 };
                 if cleaned > 0 {
                     println!(
-                        "[auto-mining] 🧹 {cleaned} inaktive Miner entfernt, {} aktiv",
-                        if has_active { "Timer PAUSIERT" } else { "Timer LÄUFT" }
+                        "[auto-mining] 🧹 {cleaned} inaktive CPU-Miner entfernt"
+                    );
+                }
+
+                // ── PoP-Mining: aktive Minecraft-Server prüfen ───────────────
+                // Ein Minecraft-Server gilt als aktiv wenn ein Spieler in den
+                // letzten heartbeat_timeout_secs einen Block abgebaut hat
+                // (Plugin meldet via POST /api/v1/sdk/mining/activity, throttled 1/15s).
+                let has_pop_activity = pop_mining.has_recent_activity(hb_timeout);
+
+                // Timer pausiert wenn CPU-Miner ODER aktive PoP-Gameplay-Aktivität
+                let has_active = has_cpu_miners || has_pop_activity;
+
+                if !has_active && (cleaned > 0 || has_pop_activity) {
+                    println!(
+                        "[auto-mining] Timer LÄUFT (cpu_miners={has_cpu_miners}, pop_active={has_pop_activity})"
+                    );
+                }
+
+                // ── Heartbeat: Logge alle 30s den Timer-Status, damit man
+                // in den Logs sehen kann ob der Timer läuft.
+                if heartbeat_tick % 30 == 0 {
+                    let pending = state.mempool.pending_count();
+                    let elapsed = state.block_timer.lock().map(|t| t.elapsed_secs()).unwrap_or(0);
+                    let height = state.chain.lock().unwrap_or_else(|e| e.into_inner()).blocks.len() as u64;
+                    println!(
+                        "[auto-mining] 💓 Heartbeat: Height={height}, PendingTXs={pending}, Elapsed={elapsed}s, \
+                         HasMiners={has_active}, AutoTimeout={}s, Threshold={}s",
+                        state.auto_mining_config.auto_timeout_secs,
+                        if has_active {
+                            state.auto_mining_config.auto_timeout_secs.saturating_mul(
+                                crate::master::miner_registry::HARD_FALLBACK_MULT
+                            )
+                        } else {
+                            state.auto_mining_config.auto_timeout_secs
+                        },
                     );
                 }
 
@@ -1460,14 +1567,61 @@ impl MasterNodeState {
                     continue;
                 }
 
-                // Gate: Auto-Blöcke nur wenn echte Nutzlast anliegt.
-                // Nutzlast ist entweder mindestens eine User-TX ODER ein fälliger
-                // Chat-Batch (MessagePool threshold/timeout erreicht).
-                let pending = state.mempool.pending_count();
+                // ── Round-Robin Pre-Check: Nur der designierte Validator darf den
+                // Auto-Block-Timer auslösen. Alle anderen Nodes warten auf den
+                // Gossip-Block der ausgewählten Node. Ohne diesen Check versuchen
+                // ALLE Nodes gleichzeitig `mint_auto_block()` → Mempool-Drain-Races,
+                // unnötige Fehlerlogs und verschwendete CPU-Zyklen.
+                // Der volle Check (mit Jailed-Set, Backup-Proposer) erfolgt weiterhin
+                // in `prepare_mining_block()` — dieser Pre-Check filtert nur den
+                // offensichtlichen Fall "nicht mein Slot" heraus.
+                //
+                // LOCK-ORDER (wie prepare_mining_block): chain + build_selection_context
+                // VOR validator_set lesen, da build_selection_context() selbst
+                // validator_set.read() aufruft und std::sync::RwLock NICHT reentrant ist.
+                {
+                    // Phase 1: chain + selection context (VOR validator_set-Lock)
+                    let next_index = {
+                        let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
+                        chain.blocks.len() as u64
+                    };
+                    let (_, jailed, _) = state.build_selection_context();
+
+                    // Phase 2: validator_set lesen + Round-Robin-Check
+                    let vs = state.validator_set.read().unwrap_or_else(|e| e.into_inner());
+                    if !vs.validators.is_empty() {
+                        let is_my_turn = vs.is_round_robin_turn(&state.node_id, next_index, &jailed);
+                        if !is_my_turn {
+                            let selected = vs.select_validator_round_robin(next_index, &jailed)
+                                .map(|v| v.node_id.as_str())
+                                .unwrap_or("?");
+                            if next_index % 10 == 0 {
+                                println!(
+                                    "[auto-mining] ⏭️  Block #{}: nicht mein Slot (designiert: '{}', ich: '{}')",
+                                    next_index, selected, &state.node_id,
+                                );
+                            }
+                            continue;
+                        }
+                        println!(
+                            "[auto-mining] 🎯 Block #{}: MEIN Round-Robin-Slot – starte Auto-Block",
+                            next_index,
+                        );
+                    }
+                }
+
+                // Gate: KEINE leeren Blöcke (Spam-Schutz). Ein Auto-Block entsteht
+                // nur wenn echte Nutzlast anliegt:
+                //   - mindestens eine TX im Mempool (lokal ODER per Gossip), ODER
+                //   - ein Chat-Batch bereit ist, ODER
+                //   - aktive PoP-Gameplay-Aktivität läuft.
+                // Hinweis: Früher zählten nur LOKALE TXs (Fork-Workaround). Das ist
+                // nicht mehr nötig — Parallel-Mining wird jetzt durch das
+                // Single-Miner-/Validator-Gate in prepare_mining_block verhindert.
+                // Dadurch nimmt der designierte Miner auch gegossipte TXs auf.
+                let has_pending_tx = state.mempool.pending_count() > 0;
                 let chat_batch_ready = state.message_pool.batch_ready();
-                if pending == 0 && !chat_batch_ready {
-                    // Timer NICHT zurücksetzen — sobald Nutzlast kommt soll sofort
-                    // gemined werden, ohne erneut auto_timeout_secs zu warten.
+                if !has_pending_tx && !chat_batch_ready && !has_pop_activity {
                     continue;
                 }
 
@@ -1475,13 +1629,25 @@ impl MasterNodeState {
                 // Validator ist (Round-Robin oder Stake-Weighted). Sonst
                 // parallele Auto-Blöcke auf allen Masters → Forks.
                 // Die bestehende Template-Prepare-Funktion prüft das bereits.
-                match state.mint_auto_block() {
-                    Ok(block) => {
+                // ── Block in spawn_blocking minen ────────────────────────
+                // mint_auto_block() enthält Argon2id-PoW (64 MiB, ~Sekunden)
+                // und persist_last_block() (RocksDB I/O). Beide würden den
+                // Tokio-Runtime-Thread blockieren → P2P-Requests timeout →
+                // Sync-Stall-Detector reißt Verbindungen ab.
+                let state_clone = state.clone();
+                let mine_result = tokio::task::spawn_blocking(move || {
+                    state_clone.mint_auto_block()
+                }).await;
+                match mine_result {
+                    Ok(Ok(block)) => {
+                        let tx_count = state.mempool.pending_count();
                         println!(
-                            "[auto-mining] ⛏️  Auto-Block #{} produziert ({} User-TXs, chat_batch_ready={}, kein Miner aktiv seit {}s)",
+                            "[auto-mining] ⛏️  Auto-Block #{} produziert ({} TXs, tx={}, chat={}, pop_active={}, seit {}s)",
                             block.index,
-                            pending,
+                            tx_count,
+                            has_pending_tx,
                             chat_batch_ready,
+                            has_pop_activity,
                             state.block_timer.lock().map(|t| t.elapsed_secs()).unwrap_or(0)
                         );
                         // Broadcast + reset
@@ -1495,15 +1661,17 @@ impl MasterNodeState {
                             t.reset();
                         }
                     }
-                    Err(e) => {
+                    Ok(Err(e)) => {
                         // Häufiger Fall: "kein aktiver Validator" auf dieser Node → still ignorieren
-                        if !e.contains("kein aktiver") && !e.contains("nicht der aktuelle") {
+                        if !e.contains("kein aktiver") && !e.contains("nicht der aktuelle") && !e.contains("auto-mine übersprungen") {
                             eprintln!("[auto-mining] ⚠ Auto-Block fehlgeschlagen: {e}");
                         }
-                        // Reset auch bei Fehlschlag, damit wir nicht jede Sekunde retry'en
                         if let Ok(mut t) = state.block_timer.lock() {
                             t.reset();
                         }
+                    }
+                    Err(join_err) => {
+                        eprintln!("[auto-mining] ⚠ spawn_blocking fehlgeschlagen: {join_err}");
                     }
                 }
             }

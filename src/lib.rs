@@ -18,3 +18,5 @@ pub mod storage;
 pub mod storage_proof;
 pub mod token;
 pub mod updater;
+pub mod watchdog;
+pub mod pop_mining;

@@ -158,6 +158,7 @@ pub enum TxType {
 /// |----------|-------------|--------------------------------------|
 /// | Priority | 0.001       | Bevorzugt im nächsten Block          |
 /// | Standard | 0.0001      | Basis-Fee (wird geburnt)             |
+/// | Verified | 0.00005     | 50% Rabatt für verifizierte Server   |
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum FeeTier {
@@ -165,6 +166,9 @@ pub enum FeeTier {
     #[serde(alias = "express")]
     Priority,
     Standard,
+    /// 50% reduzierte Fee für verifizierte Server.
+    #[serde(alias = "verified_server")]
+    Verified,
 }
 
 impl Default for FeeTier {
@@ -178,6 +182,7 @@ impl std::fmt::Display for FeeTier {
         match self {
             FeeTier::Priority => write!(f, "priority"),
             FeeTier::Standard => write!(f, "standard"),
+            FeeTier::Verified => write!(f, "verified"),
         }
     }
 }
@@ -188,6 +193,7 @@ impl FeeTier {
         match self {
             FeeTier::Priority => Decimal::new(1, 3),   // 0.001 STONE
             FeeTier::Standard => Decimal::new(1, 4),   // 0.0001 STONE (Basis-Fee, wird geburnt)
+            FeeTier::Verified => Decimal::new(5, 5),   // 0.00005 STONE (50% Rabatt)
         }
     }
 
@@ -195,6 +201,7 @@ impl FeeTier {
     pub fn priority_order(&self) -> u8 {
         match self {
             FeeTier::Priority => 0,
+            FeeTier::Verified => 0, // Gleiche Prio wie Priority
             FeeTier::Standard => 1,
         }
     }

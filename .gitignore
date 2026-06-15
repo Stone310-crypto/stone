@@ -4,6 +4,7 @@
 # ─── Secrets & API-Keys (NIE committen) ──────────────────────────────────────
 .env
 *.env.local
+.env
 token.bin
 /stone_data/shared/
 

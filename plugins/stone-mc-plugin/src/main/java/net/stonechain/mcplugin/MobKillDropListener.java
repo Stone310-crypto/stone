@@ -47,6 +47,9 @@ public final class MobKillDropListener implements Listener {
         if (killer == null) return;
         if (killer.getGameMode().name().equals("CREATIVE")) return;
 
+        // PoP Mining: mob kills count as gameplay activity
+        if (plugin.popMiner() != null) plugin.popMiner().onPlayerActivity(killer);
+
         String type = event.getEntityType().name();
         Double amount = tiers.get(type);
         if (amount == null || amount <= 0.0) return;

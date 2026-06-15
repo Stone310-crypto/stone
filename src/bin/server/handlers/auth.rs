@@ -214,7 +214,7 @@ pub async fn handle_sync_users(
 }
 
 /// Pusht einen einzelnen Nutzer an alle bekannten HTTP-Peers via Sync-Port.
-pub async fn push_user_to_peers(user: &User, peers: &[PeerInfo], _api_key: &str) {
+pub async fn push_user_to_peers(user: &User, peers: &[PeerInfo], api_key: &str) {
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(10))
         .danger_accept_invalid_certs(
@@ -228,9 +228,15 @@ pub async fn push_user_to_peers(user: &User, peers: &[PeerInfo], _api_key: &str)
         Err(_) => return,
     };
 
+    // Inkludiere api_key, damit andere Nodes den User per x-api-key authentifizieren
+    // können (QR-Login, Challenge-Response). Ohne api_key führt require_user() auf
+    // Peers zu 401 Unauthorized.
+    // Zusätzlich senden wir den api_key als x-api-key Header, damit das /sync-users
+    // Endpoint den Admin-Check besteht (vorher war _api_key ungenutzt → 401 auf Peers).
     let sync_user = serde_json::json!([{
         "id": user.id,
         "name": user.name,
+        "api_key": user.api_key,
         "wallet_address": user.wallet_address,
     }]);
 
@@ -239,6 +245,7 @@ pub async fn push_user_to_peers(user: &User, peers: &[PeerInfo], _api_key: &str)
         let url = format!("{}/sync-users", sync_url);
         match client
             .post(&url)
+            .header("x-api-key", api_key)
             .json(&sync_user)
             .send()
             .await
@@ -290,11 +297,20 @@ pub async fn handle_login(
         } else {
             users[idx].wallet_address.clone()
         };
+        // Session-Token für Cross-Platform Auth erzeugen (QR-Login, mobile App)
+        let session_token = generate_session_token(
+            &users[idx].id,
+            &wallet_addr,
+            &state.api_key,
+            SESSION_TOKEN_TTL_SECS,
+        );
+
         let resp = json!({
             "id": users[idx].id,
             "name": users[idx].name,
             "api_key": users[idx].api_key,
             "wallet_address": wallet_addr,
+            "session_token": session_token,
         });
         if needs_save {
             save_users(&users);
@@ -400,11 +416,20 @@ pub async fn handle_login(
         users.push(new_user);
         save_users(&users);
 
+        // Session-Token für Cross-Platform Auth erzeugen
+        let session_token = generate_session_token(
+            &new_id,
+            &wallet_addr,
+            &state.api_key,
+            SESSION_TOKEN_TTL_SECS,
+        );
+
         let resp = json!({
             "id": new_id,
             "name": display_name,
             "api_key": users.last().map(|u| &u.api_key).unwrap(),
             "wallet_address": wallet_addr,
+            "session_token": session_token,
         });
 
         println!("[auth] 🔗 Bestehende Wallet verknüpft: {} (on-chain: {})", &wallet_addr[..16], is_on_chain);
@@ -683,6 +708,12 @@ pub struct QrApproveRequest {
     pub login_token: String,
     /// Optionale Mnemonic-Phrase für Chat-Signierung im QR-Login
     pub phrase: Option<String>,
+    /// Wallet-Adresse (Ed25519 Public Key Hex, 64 Zeichen) — für Signatur-Auth
+    #[serde(default)]
+    pub wallet_address: Option<String>,
+    /// Ed25519-Signatur des login_token (128 Hex-Zeichen) — beweist Wallet-Besitz
+    #[serde(default)]
+    pub wallet_signature: Option<String>,
 }
 
 /// POST /api/v1/auth/qr/create
@@ -784,24 +815,18 @@ pub async fn handle_qr_status(
 
 /// POST /api/v1/auth/qr/approve
 ///
-/// Die iOS App genehmigt eine QR-Login-Session.
-/// Erfordert einen gültigen Bearer-Token (der User muss in der App eingeloggt sein).
-/// Nach FaceID-Bestätigung sendet die App diesen Request.
+/// Die Handy-App genehmigt eine QR-Login-Session.
+/// Authentifizierung: Entweder wallet_signature (bevorzugt, cross-node) oder
+/// lokaler User (Legacy: x-api-key / Bearer Token).
 ///
-/// Body: `{ "login_token": "hex" }`
+/// Body: `{ "login_token": "hex", "wallet_address": "...", "wallet_signature": "...", "phrase": "..." }`
 /// Antwort: `{ "ok": true }`
 pub async fn handle_qr_approve(
     State(state): State<AppState>,
     headers: HeaderMap,
     axum::Json(req): axum::Json<QrApproveRequest>,
 ) -> impl IntoResponse {
-    // Der User muss authentifiziert sein (Bearer Token aus der App)
-    let user = match require_user(&headers, &state) {
-        Ok(u) => u,
-        Err(resp) => return resp,
-    };
-
-    let login_token = req.login_token.trim();
+    let login_token = req.login_token.trim().to_string();
     if login_token.is_empty() || login_token.len() != 64 {
         return (
             StatusCode::BAD_REQUEST,
@@ -810,40 +835,132 @@ pub async fn handle_qr_approve(
             .into_response();
     }
 
-    // Neuen Session-Token für das Website-Login generieren
+    // ── 1. Wallet-Signatur-Auth (cross-node, bevorzugt) ─────────────────────
+    // Die App signiert den login_token mit dem Ed25519 Private Key der Wallet.
+    // Das beweist Besitz der Wallet – unabhängig davon ob der User in der
+    // lokalen users.json existiert.
+    if let (Some(ref wallet), Some(ref sig)) = (req.wallet_address.as_deref(), req.wallet_signature.as_deref()) {
+        let wallet = wallet.trim();
+        let sig = sig.trim();
+        if !wallet.is_empty() && wallet.len() == 64 && !sig.is_empty() && sig.len() == 128 {
+            if verify_challenge_signature(wallet, &login_token, sig) {
+                // User anhand Wallet-Adresse finden (lokal oder Fallback)
+                let user = {
+                    let users = state.users.lock().unwrap_or_else(|e| e.into_inner());
+                    users.iter().find(|u| u.wallet_address == wallet).cloned()
+                        .or_else(|| {
+                            // Fallback: minimalen User aus Wallet-Adresse bauen
+                            Some(stone::auth::User {
+                                id: format!("u-{}", &wallet[..8]),
+                                name: format!("Wallet-{}", &wallet[..12]),
+                                api_key: String::new(),
+                                phrase_hash: String::new(),
+                                quota_bytes: stone::auth::default_quota_bytes(),
+                                wallet_address: wallet.to_string(),
+                                account_type: stone::auth::default_account_type(),
+                                org_id: String::new(),
+                                org_role: String::new(),
+                                discord_id: String::new(),
+                                discord_username: String::new(),
+                            })
+                        })
+                };
+
+                if let Some(user) = user {
+                    let session_token = generate_session_token(
+                        &user.id, &user.wallet_address, &state.api_key, SESSION_TOKEN_TTL_SECS,
+                    );
+
+                    if state.qr_login_store.approve_session(&login_token, session_token, &user, req.phrase.clone()) {
+                        println!(
+                            "[auth] 📱✅ QR-Login genehmigt von {} (Wallet {}…) via Signature",
+                            user.name, &wallet[..16],
+                        );
+                        return (
+                            StatusCode::OK,
+                            axum::Json(json!({"ok": true, "message": "QR-Login erfolgreich genehmigt"})),
+                        ).into_response();
+                    }
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        axum::Json(json!({"ok": false, "error": "QR-Session ungültig oder abgelaufen"})),
+                    ).into_response();
+                }
+            }
+        }
+    }
+
+    // ── 2. Legacy: Lokaler User (x-api-key / Bearer Token) ──────────────────
+    let user = match require_user(&headers, &state) {
+        Ok(u) => u,
+        Err(resp) => return resp.into_response(),
+    };
+
     let session_token = generate_session_token(
-        &user.id,
-        &user.wallet_address,
-        &state.api_key,
-        SESSION_TOKEN_TTL_SECS,
+        &user.id, &user.wallet_address, &state.api_key, SESSION_TOKEN_TTL_SECS,
     );
 
-    if state.qr_login_store.approve_session(login_token, session_token, &user, req.phrase.clone()) {
+    if state.qr_login_store.approve_session(&login_token, session_token, &user, req.phrase.clone()) {
         println!(
-            "[auth] 📱✅ QR-Login genehmigt von {} ({}) für Token {}…",
+            "[auth] 📱✅ QR-Login genehmigt von {} ({}) via Legacy-Auth",
             user.name,
             &user.wallet_address.get(..16).unwrap_or(&user.wallet_address),
-            &login_token[..16]
         );
-
         (
             StatusCode::OK,
-            axum::Json(json!({
-                "ok": true,
-                "message": "QR-Login erfolgreich genehmigt",
-            })),
-        )
-            .into_response()
+            axum::Json(json!({"ok": true, "message": "QR-Login erfolgreich genehmigt"})),
+        ).into_response()
     } else {
         (
             StatusCode::BAD_REQUEST,
-            axum::Json(json!({
-                "ok": false,
-                "error": "QR-Session ungültig, abgelaufen oder bereits genehmigt",
-            })),
-        )
-            .into_response()
+            axum::Json(json!({"ok": false, "error": "QR-Session ungültig oder abgelaufen"})),
+        ).into_response()
     }
+}
+
+// ─── Profile Update ──────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct UpdateProfileRequest {
+    pub name: Option<String>,
+}
+
+/// POST /api/v1/auth/profile/update
+///
+/// Erlaubt einem authentifizierten Benutzer das Ändern seines Benutzernamens.
+/// Sendet eine AccountRegister-TX mit dem neuen Namen an die Chain.
+pub async fn handle_profile_update(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::Json(req): axum::Json<UpdateProfileRequest>,
+) -> impl IntoResponse {
+    let user = match require_user(&headers, &state) {
+        Ok(u) => u,
+        Err(resp) => return resp.into_response(),
+    };
+
+    let new_name = match req.name {
+        Some(n) if !n.trim().is_empty() => n.trim().to_string(),
+        _ => return (StatusCode::BAD_REQUEST, "Kein Name angegeben").into_response(),
+    };
+
+    // User in der lokalen users.json aktualisieren
+    {
+        let mut users = state.users.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(u) = users.iter_mut().find(|u| u.api_key == user.api_key || u.wallet_address == user.wallet_address) {
+            if u.name == new_name {
+                return (StatusCode::OK, axum::Json(json!({"name": u.name, "message": "Name unverändert"}))).into_response();
+            }
+            u.name = new_name.clone();
+            save_users(&users);
+        } else {
+            return (StatusCode::NOT_FOUND, "User nicht in lokaler DB gefunden").into_response();
+        }
+    }
+
+    println!("[auth] Benutzername geändert: {} -> {}", user.name, new_name);
+
+    (StatusCode::OK, axum::Json(json!({"name": new_name, "message": "Name erfolgreich geändert"}))).into_response()
 }
 
 // ─── Discord OAuth2 Login ─────────────────────────────────────────────────────

@@ -15,7 +15,9 @@ use super::handlers::{
         handle_action_create, handle_action_mobile_approve,
         handle_action_mobile_pending, handle_action_mobile_reject,
     },
-    auth::{handle_login, handle_signup, handle_sync_users, handle_wallet_claim,
+    auth::{
+        handle_login, handle_signup, handle_sync_users, handle_wallet_claim,
+        handle_profile_update,
            handle_request_challenge, handle_verify_challenge,
            handle_qr_create, handle_qr_status, handle_qr_approve,
            handle_discord_login, handle_discord_callback},
@@ -74,8 +76,9 @@ use super::handlers::{
     orgs::{
         handle_accept_invite, handle_create_channel, handle_create_org,
         handle_decline_invite, handle_get_chat, handle_get_org, handle_invite,
-        handle_leave_org, handle_list_orgs, handle_my_invites,
-        handle_remove_member, handle_send_message, handle_set_role,
+        handle_create_category, handle_leave_org, handle_list_orgs,
+        handle_my_invites, handle_remove_member, handle_send_message,
+        handle_set_role,
     },
     p2p::{
         handle_p2p_chaos_penalty, handle_p2p_config, handle_p2p_dial, handle_p2p_info,
@@ -147,11 +150,13 @@ use super::handlers::{
         handle_sdk_game_reward, handle_sdk_game_burn, handle_sdk_game_drop,
         handle_sdk_play_drop, handle_sdk_play_drop_stats, handle_sdk_play_drop_pool_status,
         handle_sdk_play_sell, handle_sdk_pool_rate,
+        handle_sdk_game_heartbeat, handle_sdk_verified_servers,
         handle_owner_gaming_pool_configure, handle_owner_gaming_pool_delete, handle_owner_gaming_pool_status,
         handle_owner_gaming_pool_refill,
         handle_sdk_game_leaderboard, handle_sdk_tournament_prize,
         handle_sdk_game_server_add, handle_sdk_game_server_revoke,
         handle_sdk_game_servers_list,
+        handle_sdk_server_heartbeat, handle_game_live_info,
         handle_game_config_upload, handle_game_config_read, handle_game_config_history,
         // SDK Game – Forks & Ownership
         handle_sdk_game_transfer_ownership,
@@ -184,6 +189,11 @@ use super::handlers::{
         handle_hub_register, handle_hub_report, handle_hub_users, handle_hub_bug_reports,
         handle_hub_bulk_sync, handle_hub_send_message, handle_hub_send_coins,
         handle_hub_support_reply, handle_hub_get_support_replies,
+    },
+    watchdog::{handle_watchdog_client_proof, handle_watchdog_behavior_report},
+    pop_mining::{
+        handle_pop_challenge, handle_pop_submit, handle_pop_stats,
+        handle_pop_register_hash, handle_pop_activity,
     },
     ws::handle_websocket,
     game_chain::{
@@ -304,6 +314,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/auth/discord", post(handle_discord_login))
         .route("/api/v1/auth/discord/callback", get(handle_discord_callback))
         .route("/api/v1/auth/wallet-claim", post(handle_wallet_claim))
+        .route("/api/v1/auth/profile/update", post(handle_profile_update))
         // Challenge-Response Auth (Cross-Platform Login)
         .route("/api/v1/auth/challenge", post(handle_request_challenge))
         .route("/api/v1/auth/verify", post(handle_verify_challenge))
@@ -460,6 +471,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/orgs/{org_id}/leave", post(handle_leave_org))
         .route("/api/v1/orgs/{org_id}/members/remove", post(handle_remove_member))
         .route("/api/v1/orgs/{org_id}/members/role", post(handle_set_role))
+        .route("/api/v1/orgs/{org_id}/categories", post(handle_create_category))
         .route("/api/v1/orgs/{org_id}/channels", post(handle_create_channel))
         .route("/api/v1/orgs/{org_id}/chat", post(handle_send_message))
         .route("/api/v1/orgs/{org_id}/chat/{channel_id}", get(handle_get_chat))
@@ -588,6 +600,16 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/sdk/game/play-drop/stats", get(handle_sdk_play_drop_stats))
         .route("/api/v1/sdk/game/play-sell", post(handle_sdk_play_sell))
         .route("/api/v1/sdk/game/pool/rate", get(handle_sdk_pool_rate))
+        .route("/api/v1/sdk/game/heartbeat", post(handle_sdk_game_heartbeat))
+        .route("/api/v1/sdk/watchdog/client-proof", post(handle_watchdog_client_proof))
+        .route("/api/v1/sdk/watchdog/behavior-report", post(handle_watchdog_behavior_report))
+        // PoP Mining – VRF-basiertes Gameplay-Mining
+        .route("/api/v1/sdk/mining/challenge", get(handle_pop_challenge))
+        .route("/api/v1/sdk/mining/submit", post(handle_pop_submit))
+        .route("/api/v1/sdk/mining/stats", get(handle_pop_stats))
+        .route("/api/v1/sdk/mining/register-hash", post(handle_pop_register_hash))
+        .route("/api/v1/sdk/mining/activity", post(handle_pop_activity))
+        .route("/api/v1/sdk/game/verified-servers", get(handle_sdk_verified_servers))
         .route("/api/v1/sdk/game/pool/status", get(handle_sdk_play_drop_pool_status))
         .route("/api/v1/sdk/owner/gaming-pool/configure", post(handle_owner_gaming_pool_configure))
         .route("/api/v1/sdk/owner/gaming-pool/delete", post(handle_owner_gaming_pool_delete))
@@ -597,6 +619,8 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/sdk/game/server/add",    post(handle_sdk_game_server_add))
         .route("/api/v1/sdk/game/server/revoke", post(handle_sdk_game_server_revoke))
         .route("/api/v1/sdk/game/{game_id}/servers", get(handle_sdk_game_servers_list))
+        .route("/api/v1/sdk/game/server/heartbeat", post(handle_sdk_server_heartbeat))
+        .route("/api/v1/games/{game_id}/live", get(handle_game_live_info))
         .route("/api/v1/sdk/game/burn", post(handle_sdk_game_burn))
         .route("/api/v1/sdk/game/leaderboard", get(handle_sdk_game_leaderboard))
         .route("/api/v1/sdk/game/tournament/prize", post(handle_sdk_tournament_prize))

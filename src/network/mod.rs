@@ -89,6 +89,17 @@ use std::{
 /// Wie viele Block-Hashes im Seen-Cache behalten werden (LRU-Approximation via VecDeque)
 const SEEN_CACHE_SIZE: usize = 2048;
 
+/// Maximale Anzahl gleichzeitiger Verbindungen zu EINEM Peer. Überzählige
+/// Verbindungen werden sofort geschlossen. Verhindert, dass ein flappender
+/// oder inkompatibler Peer (z. B. mit veralteter PeerId/Genesis) den Node mit
+/// hunderten Parallelverbindungen flutet. 3 lässt TCP+QUIC sowie Relay→DCUtR-
+/// Upgrades zu, kappt aber jeden Storm hart.
+pub(crate) const MAX_CONNECTIONS_PER_PEER: u32 = 3;
+
+/// Mindestdauer (Sekunden), die eine Verbindung halten muss, um als „stabil"
+/// zu gelten. Bricht sie früher ab, wird der Peer als flappend behandelt.
+pub(crate) const STABLE_CONNECTION_SECS: u64 = 10;
+
 // ─── Konstanten ───────────────────────────────────────────────────────────────
 
 const DEFAULT_DATA_DIR: &str = "stone_data";
@@ -173,32 +184,33 @@ pub fn is_mainnet() -> bool {
 //          Das ist nützlich für komplett private / isolierte Netzwerke.
 
 /// Testnet Seed-Nodes (Port 4001) – Standard-Netzwerk für Entwicklung.
+///
+/// Bewusst NUR TCP (kein quic-v1): Die öffentlichen VPS verbinden sich über
+/// eine interkontinentale Strecke (DE↔US). QUIC/UDP riss dort periodisch ab
+/// (Paketverlust / Stateful-Firewall-UDP-Timeout) → Reconnect-Schleife. TCP
+/// ist über diese Strecke stabil. Die Nodes LAUSCHEN weiterhin auf QUIC (für
+/// NAT-Peers); wir dialen die Seeds nur nicht mehr über QUIC.
 const SEED_NODES_TESTNET: &[&str] = &[
     // ── VPS1 (212.227.54.241) – primärer Testnet-Bootstrap + Relay ───
-    "/ip4/212.227.54.241/tcp/4001/p2p/12D3KooWNz9GTNsFks567mHaQLKR4Ai6MCiw5WUDWAgvny1ow4tJ",
-    "/ip4/212.227.54.241/udp/4001/quic-v1/p2p/12D3KooWNz9GTNsFks567mHaQLKR4Ai6MCiw5WUDWAgvny1ow4tJ",
-    "/ip6/2a02:2479:a0:fa00::1/tcp/4001/p2p/12D3KooWNz9GTNsFks567mHaQLKR4Ai6MCiw5WUDWAgvny1ow4tJ",
-    "/ip6/2a02:2479:a0:fa00::1/udp/4001/quic-v1/p2p/12D3KooWNz9GTNsFks567mHaQLKR4Ai6MCiw5WUDWAgvny1ow4tJ",
+    "/ip4/212.227.54.241/tcp/4001/p2p/12D3KooWECEPy5EnZ7HwvwnABBwnJwU4jSMh5U1HpzRBaXK9kmoP",
+    "/ip6/2a02:2479:a0:fa00::1/tcp/4001/p2p/12D3KooWECEPy5EnZ7HwvwnABBwnJwU4jSMh5U1HpzRBaXK9kmoP",
     // ── VPS2 (69.48.200.255) – sekundärer Testnet-Bootstrap + Relay ───
-    "/ip4/69.48.200.255/tcp/4001/p2p/12D3KooWQ4yo42uYwihPAJx1qXm85rTVVXEbH5oWu4GHrrNMs564",
-    "/ip4/69.48.200.255/udp/4001/quic-v1/p2p/12D3KooWQ4yo42uYwihPAJx1qXm85rTVVXEbH5oWu4GHrrNMs564",
-    "/ip6/2607:f1c0:f074:4300::1/tcp/4001/p2p/12D3KooWQ4yo42uYwihPAJx1qXm85rTVVXEbH5oWu4GHrrNMs564",
-    "/ip6/2607:f1c0:f074:4300::1/udp/4001/quic-v1/p2p/12D3KooWQ4yo42uYwihPAJx1qXm85rTVVXEbH5oWu4GHrrNMs564",
+    "/ip4/69.48.200.255/tcp/4001/p2p/12D3KooWFkXVx4zBFMmsdC6Qr5pAn5FdPLbeyCFTsFhsn2CW39Tw",
+    "/ip6/2607:f1c0:f074:4300::1/tcp/4001/p2p/12D3KooWFkXVx4zBFMmsdC6Qr5pAn5FdPLbeyCFTsFhsn2CW39Tw",
 ];
 
 /// Mainnet Seed-Nodes (Port 5001) – Produktionsnetzwerk.
 /// Dieselben VPS, aber auf separaten Ports → komplette Netzwerk-Isolation.
 const SEED_NODES_MAINNET: &[&str] = &[
     // ── VPS1 (212.227.54.241) – primärer Mainnet-Bootstrap + Relay ───
+    // NUR TCP (siehe Begründung bei SEED_NODES_TESTNET).
+    // HINWEIS: PeerIds hier sind noch die ALTEN – bei Mainnet-Reaktivierung
+    //          mit den aktuellen PeerIds der Mainnet-Nodes ersetzen.
     "/ip4/212.227.54.241/tcp/5001/p2p/12D3KooWJvLC6jmFoHr5JFbH4XFomdGMCGHnFWKGgEmMSS4KcSjN",
-    "/ip4/212.227.54.241/udp/5001/quic-v1/p2p/12D3KooWJvLC6jmFoHr5JFbH4XFomdGMCGHnFWKGgEmMSS4KcSjN",
     "/ip6/2a02:2479:a0:fa00::1/tcp/5001/p2p/12D3KooWJvLC6jmFoHr5JFbH4XFomdGMCGHnFWKGgEmMSS4KcSjN",
-    "/ip6/2a02:2479:a0:fa00::1/udp/5001/quic-v1/p2p/12D3KooWJvLC6jmFoHr5JFbH4XFomdGMCGHnFWKGgEmMSS4KcSjN",
     // ── VPS2 (69.48.200.255) – sekundärer Mainnet-Bootstrap + Relay ───
     "/ip4/69.48.200.255/tcp/5001/p2p/12D3KooWJ1VKWsboQB5mf8w4iLCSJYCB1xxGTUPySm2tAwN4Uwyz",
-    "/ip4/69.48.200.255/udp/5001/quic-v1/p2p/12D3KooWJ1VKWsboQB5mf8w4iLCSJYCB1xxGTUPySm2tAwN4Uwyz",
     "/ip6/2607:f1c0:f074:4300::1/tcp/5001/p2p/12D3KooWJ1VKWsboQB5mf8w4iLCSJYCB1xxGTUPySm2tAwN4Uwyz",
-    "/ip6/2607:f1c0:f074:4300::1/udp/5001/quic-v1/p2p/12D3KooWJ1VKWsboQB5mf8w4iLCSJYCB1xxGTUPySm2tAwN4Uwyz",
 ];
 
 /// Gibt die Seed-Nodes für das aktive Netzwerk zurück.
@@ -1068,8 +1080,8 @@ pub fn read_peer_id() -> Option<String> {
 
 /// PeerIds der eingebauten Seed/Bootstrap-Nodes (aus SEED_NODES extrahiert).
 const BOOTSTRAP_PEER_IDS: &[&str] = &[
-    "12D3KooWNz9GTNsFks567mHaQLKR4Ai6MCiw5WUDWAgvny1ow4tJ", // VPS1
-    "12D3KooWQ4yo42uYwihPAJx1qXm85rTVVXEbH5oWu4GHrrNMs564", // VPS2
+    "12D3KooWECEPy5EnZ7HwvwnABBwnJwU4jSMh5U1HpzRBaXK9kmoP", // VPS1
+    "12D3KooWFkXVx4zBFMmsdC6Qr5pAn5FdPLbeyCFTsFhsn2CW39Tw", // VPS2
 ];
 
 /// Prüft ob dieser Node ein Bootstrap-/Seed-Node ist.

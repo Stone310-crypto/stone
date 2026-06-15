@@ -1786,30 +1786,24 @@ impl TokenLedger {
         let db = super::open_token_db()
             .map_err(|e| LedgerError::Persistence(format!("Persistierungsfehler: {e}")))?;
 
-        // Balancen
-        for (addr, bal) in &self.balances {
-            let key = format!("bal/{}", addr);
-            db.put(key.as_bytes(), bal.to_string().as_bytes())
-                .map_err(|e| LedgerError::Persistence(format!("put balance: {e}")))?;
-        }
+        let mut batch = rocksdb::WriteBatch::default();
 
-        // Nonces
+        // Balances & Nonces in einem Batch (atomar)
+        for (addr, bal) in &self.balances {
+            batch.put(format!("bal/{addr}").as_bytes(), bal.to_string().as_bytes());
+        }
         for (addr, nonce) in &self.nonces {
-            let key = format!("nonce/{}", addr);
-            db.put(key.as_bytes(), nonce.to_le_bytes())
-                .map_err(|e| LedgerError::Persistence(format!("put nonce: {e}")))?;
+            batch.put(format!("nonce/{addr}").as_bytes(), nonce.to_le_bytes());
         }
 
         // Supply
-        db.put(b"supply", self.total_supply.to_string().as_bytes())
-            .map_err(|e| LedgerError::Persistence(format!("put supply: {e}")))?;
+        batch.put(b"supply", self.total_supply.to_string().as_bytes());
 
-        // Key-Rotations (forward: old → new)
+        // Key-Rotations
         for (old_key, new_key) in &self.key_rotations {
-            let key = format!("keyrot/{}", old_key);
-            db.put(key.as_bytes(), new_key.as_bytes())
-                .map_err(|e| LedgerError::Persistence(format!("put keyrot: {e}")))?;
+            batch.put(format!("keyrot/{old_key}").as_bytes(), new_key.as_bytes());
         }
+        db.write(batch).map_err(|e| LedgerError::Persistence(format!("write batch: {e}")))?;
 
         // Account-Registry: name
         for (wallet, name) in &self.account_names {

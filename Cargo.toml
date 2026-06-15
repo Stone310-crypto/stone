@@ -34,6 +34,10 @@ path = "src/bin/stone_publish_update.rs"
 name = "stone-miner"
 path = "src/bin/stone_miner.rs"
 
+[[bin]]
+name = "stone-app-node"
+path = "src/bin/app_node.rs"
+
 # ─── Abhängigkeiten ───────────────────────────────────────────────────────────
 [dependencies]
 # Serialisierung
@@ -144,3 +148,9 @@ tokio-tungstenite = "0.26"
 
 # ─── System-Metriken (Miner Dashboard) ───────────────────────────────────────
 sysinfo     = "0.33"
+
+# ─── Release-Profil: Debug-Symbole für Backtraces (Deadlock-Diagnose) ─────────
+# debug=1 erzeugt Line-Tables, strip=false behält Symbole → gdb/backtrace zeigt
+# echte Funktionsnamen+Zeilen. Performance bleibt (Optimierungen aktiv).
+[profile.release]
+strip = false

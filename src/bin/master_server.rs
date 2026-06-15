@@ -387,8 +387,9 @@ async fn main() {
     spawn_auto_sync_task(node.clone(), api_key.clone(), users.clone());
 
     // Auto-Block-Timer: produziert nach auto_timeout_secs einen Block, wenn
-    // kein externer Miner aktiv ist (Liveness-Garantie für stilles Netz).
-    MasterNodeState::start_block_timer(node.clone());
+    // kein CPU-Miner und kein aktiver Minecraft-PoP-Server verbunden ist.
+    let pop_mining_shared = stone::pop_mining::PopMiningState::new();
+    MasterNodeState::start_block_timer(node.clone(), pop_mining_shared.clone());
 
     // Peer-Discovery: Bei Bootstrap-Nodes registrieren & Health-Check starten
     bootstrap_announce(&node).await;
@@ -680,18 +681,22 @@ async fn main() {
                                                             ledger.total_supply()
                                                         );
                                                     } else if !block_txs.is_empty() {
-                                                        let mut ledger = node_bg.token_ledger.write().unwrap_or_else(|e| e.into_inner());
-                                                        // Block ist bereits in Chain aufgenommen → replay_mode
-                                                        // (Nonce/Balance-Checks überspringen, Block ist finalisiert)
-                                                        ledger.replay_mode = true;
-                                                        let receipts = ledger.apply_block_txs(&block_txs, idx);
-                                                        ledger.replay_mode = false;
+                                                        let receipts;
+                                                        {
+                                                            let mut ledger = node_bg.token_ledger.write().unwrap_or_else(|e| e.into_inner());
+                                                            // Block ist bereits in Chain aufgenommen → replay_mode
+                                                            // (Nonce/Balance-Checks überspringen, Block ist finalisiert)
+                                                            ledger.replay_mode = true;
+                                                            receipts = ledger.apply_block_txs(&block_txs, idx);
+                                                            ledger.replay_mode = false;
+                                                            ledger.set_last_synced_block(idx);
+                                                        }
+                                                        // ── Persist außerhalb des Write-Locks ──
                                                         if !receipts.is_empty() {
-                                                            if let Err(e) = ledger.persist() {
+                                                            if let Err(e) = node_bg.token_ledger.read().unwrap_or_else(|e| e.into_inner()).persist() {
                                                                 eprintln!("[token] Ledger-Persist nach Peer-Block #{idx}: {e}");
                                                             }
                                                         }
-                                                        ledger.set_last_synced_block(idx);
                                                         for tx in &block_txs {
                                                             node_bg.mempool.mark_known(&tx.tx_id);
                                                             node_bg.mempool.remove_tx(&tx.tx_id);
@@ -859,8 +864,12 @@ async fn main() {
 
                                 // ── Token-TX per Gossipsub empfangen → in Mempool ──
                                 NetworkEvent::TxReceived { tx, from_peer } => {
-                                    let ledger = node_bg.token_ledger.read().unwrap_or_else(|e| e.into_inner());
-                                    match node_bg.mempool.add_tx(*tx, Some(&ledger)) {
+                                    // WICHTIG: P2P-Gossip-TXs NICHT als "local" markieren!
+                                    // add_tx(tx, None) verhindert dass has_local_txs() true wird,
+                                    // sonst triggern ALLE Nodes gleichzeitig den Auto-Block-Timer
+                                    // und produzieren parallele Blöcke derselben TX → Fork.
+                                    // Nur HTTP-TXs (add_tx(tx, Some(&ledger))) sind lokal.
+                                    match node_bg.mempool.add_tx(*tx, None) {
                                         Ok(()) => {
                                             println!(
                                                 "[p2p] 💸 TX von {from_peer} in Mempool aufgenommen (size={})",
@@ -1502,6 +1511,8 @@ async fn main() {
         fcm_client: Arc::new(stone::push::FcmClient::new()),
         action_store: server::state::ActionStore::new(),
         play_drops: server::state::PlayDropTracker::new(server::state::PlayDropConfig::from_env()),
+        watchdog: stone::watchdog::WatchdogState::new(),
+        pop_mining: pop_mining_shared,
     };
 
     let router = build_router(state.clone());

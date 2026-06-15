@@ -838,6 +838,7 @@ pub async fn handle_token_send(
     let tier = match req.fee_tier.as_deref() {
         Some("express") | Some("priority") => stone::token::FeeTier::Priority,
         Some("standard") | None => stone::token::FeeTier::Standard,
+        Some("verified") => stone::token::FeeTier::Verified,
         Some(other) => return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -897,6 +898,7 @@ pub async fn handle_token_send(
                     "message": match tx.fee_tier {
                         stone::token::FeeTier::Priority => "Priority-TX im Mempool – wird im nächsten Block verarbeitet",
                         stone::token::FeeTier::Standard => "Standard-TX im Mempool – wird beim nächsten Dokument-Upload verarbeitet",
+                        stone::token::FeeTier::Verified => "Verified-TX im Mempool – priorisierte Verarbeitung (50% Fee-Rabatt)",
                     },
                 })),
             )
@@ -996,6 +998,7 @@ pub async fn handle_token_send_authenticated(
     let tier = match req.fee_tier.as_str() {
         "express" | "priority" => stone::token::FeeTier::Priority,
         "standard" => stone::token::FeeTier::Standard,
+        "verified" => stone::token::FeeTier::Verified,
         other => return (
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
@@ -1077,6 +1080,7 @@ pub async fn handle_token_send_authenticated(
                     "message": match tx.fee_tier {
                         stone::token::FeeTier::Priority => "Priority-TX – wird im nächsten Block verarbeitet",
                         stone::token::FeeTier::Standard => "Standard-TX – wird beim nächsten Dokument-Upload verarbeitet",
+                        stone::token::FeeTier::Verified => "Verified-TX – priorisierte Verarbeitung (50% Fee-Rabatt)",
                     },
                 })),
             )

@@ -78,6 +78,9 @@ pub const MAX_TX_BYTES: usize = 64 * 1024;
 /// 50k normale TXs und gleichzeitig hart genug um OOM zu vermeiden.
 pub const MAX_MEMPOOL_BYTES: usize = 128 * 1024 * 1024;
 
+/// Game-IDs die als "Verified" markiert sind → priorisierte TX-Verarbeitung.
+pub type VerifiedGamesSet = std::collections::HashSet<String>;
+
 /// Grobe Größenabschätzung einer TX (in Bytes).
 ///
 /// Zählt die variabel langen Felder + 96 Byte fixen Overhead (Decimals,
@@ -163,6 +166,8 @@ impl From<TxError> for MempoolError {
 /// schreiben (add/drain) ist exklusiv.
 pub struct Mempool {
     inner: RwLock<MempoolInner>,
+    /// Verified game-IDs → priorisierte TX-Verarbeitung
+    verified_games: RwLock<VerifiedGamesSet>,
 }
 
 struct MempoolInner {
@@ -172,6 +177,9 @@ struct MempoolInner {
     known_ids: HashSet<String>,
     /// Anzahl der Requeue-Versuche pro TX-ID
     requeue_counts: HashMap<String, u32>,
+    /// TX-IDs die lokal (per HTTP) eingereicht wurden (nicht via P2P-Gossip).
+    /// Wird vom Auto-Block-Timer genutzt: nur lokale TXs triggern Auto-Mining.
+    local_tx_ids: HashSet<String>,
 }
 
 impl Mempool {
@@ -182,7 +190,9 @@ impl Mempool {
                 queue: VecDeque::new(),
                 known_ids: HashSet::new(),
                 requeue_counts: HashMap::new(),
+                local_tx_ids: HashSet::new(),
             }),
+            verified_games: RwLock::new(HashSet::new()),
         }
     }
 
@@ -308,6 +318,14 @@ impl Mempool {
         );
 
         inner.known_ids.insert(tx.tx_id.clone());
+
+        // Auto-Detect: TXs die mit Ledger-Pre-Check eingereicht werden (HTTP-Handler)
+        // sind lokal. TXs ohne Ledger (P2P-Gossip) sind nicht lokal.
+        // Nur lokale TXs triggern den Auto-Block-Timer.
+        if ledger.is_some() {
+            inner.local_tx_ids.insert(tx.tx_id.clone());
+        }
+
         inner.queue.push_back(tx);
 
         Ok(())
@@ -350,6 +368,7 @@ impl Mempool {
         // werden sie via mark_known() korrekt wieder eingetragen.
         for tx in &to_drain {
             inner.known_ids.remove(&tx.tx_id);
+            inner.local_tx_ids.remove(&tx.tx_id);
         }
 
         if !to_drain.is_empty() {
@@ -382,6 +401,7 @@ impl Mempool {
         // werden sie via mark_known() korrekt wieder eingetragen.
         for tx in &standard {
             inner.known_ids.remove(&tx.tx_id);
+            inner.local_tx_ids.remove(&tx.tx_id);
         }
 
         if !standard.is_empty() {
@@ -427,6 +447,7 @@ impl Mempool {
         // werden sie via mark_known() korrekt wieder eingetragen.
         for tx in &txs {
             inner.known_ids.remove(&tx.tx_id);
+            inner.local_tx_ids.remove(&tx.tx_id);
         }
 
         if !txs.is_empty() {
@@ -460,6 +481,25 @@ impl Mempool {
     /// Anzahl der pending TXs.
     pub fn pending_count(&self) -> usize {
         self.inner.read().unwrap_or_else(|e| e.into_inner()).queue.len()
+    }
+
+    /// Markiert eine TX als lokal eingereicht (per HTTP, nicht via P2P-Gossip).
+    /// Wird vom Auto-Block-Timer verwendet: nur lokale TXs triggern Auto-Mining.
+    pub fn mark_tx_local(&self, tx_id: &str) {
+        self.inner.write().unwrap_or_else(|e| e.into_inner())
+            .local_tx_ids.insert(tx_id.to_string());
+    }
+
+    /// Prüft ob es pending TXs gibt die lokal (per HTTP) eingereicht wurden.
+    /// TXs die nur via P2P-Gossip kamen, werden ignoriert.
+    /// Wird vom Auto-Block-Timer statt `pending_count() > 0` verwendet,
+    /// um zu verhindern dass alle Nodes parallel Blöcke für dieselben TXs minen.
+    pub fn has_local_txs(&self) -> bool {
+        let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
+        if inner.local_tx_ids.is_empty() {
+            return false;
+        }
+        inner.queue.iter().any(|tx| inner.local_tx_ids.contains(&tx.tx_id))
     }
 
     /// Anzahl der pending TXs eines bestimmten Senders.
@@ -575,6 +615,28 @@ impl Mempool {
         }
 
         removed
+    }
+
+    // ── Verified Games ────────────────────────────────────────────────────
+
+    /// Registriert eine Game-ID als verified (priorisierte TX-Verarbeitung).
+    pub fn add_verified_game(&self, game_id: &str) {
+        self.verified_games.write().unwrap_or_else(|e| e.into_inner()).insert(game_id.to_string());
+    }
+
+    /// Entfernt eine Game-ID aus der Verified-Liste.
+    pub fn remove_verified_game(&self, game_id: &str) {
+        self.verified_games.write().unwrap_or_else(|e| e.into_inner()).remove(game_id);
+    }
+
+    /// Prüft ob eine Game-ID verified ist.
+    pub fn is_verified_game(&self, game_id: &str) -> bool {
+        self.verified_games.read().unwrap_or_else(|e| e.into_inner()).contains(game_id)
+    }
+
+    /// Gibt alle verified Game-IDs zurück.
+    pub fn verified_games_list(&self) -> Vec<String> {
+        self.verified_games.read().unwrap_or_else(|e| e.into_inner()).iter().cloned().collect()
     }
 
     /// Statistiken für Monitoring/API.

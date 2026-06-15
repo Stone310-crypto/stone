@@ -56,6 +56,10 @@ public final class StoneMcPlugin extends JavaPlugin {
     public ShardLedger shardLedger() { return shardLedger; }
     private LightP2pNode lightNode;
     public LightP2pNode lightNode() { return lightNode; }
+    private ProofOfClientHash proofOfClientHash;
+    private ClientViolationDetector violationDetector;
+    private PopMiner popMiner;
+    public PopMiner popMiner() { return popMiner; }
     private double autoRedeemThreshold;
     /** PoolCoin Counter: game_id → player UUID → coin count. Bei 20 → Auto-Sell. */
     private final java.util.Map<String, java.util.Map<java.util.UUID, Integer>> poolCoinCounters = new java.util.concurrent.ConcurrentHashMap<>();
@@ -154,8 +158,11 @@ public final class StoneMcPlugin extends JavaPlugin {
         this.redeemMaxCoins  = cfg.getDouble("redeem.max_coins", 5.0);
         this.redeemLimitMode = cfg.getString("redeem.limit_mode", "per_day");
 
+        this.violationDetector = new ClientViolationDetector(this);
+        getServer().getPluginManager().registerEvents(violationDetector, this);
+
         getServer().getPluginManager().registerEvents(
-            new BlockBreakDropListener(this, dropConfig, nodeClient, walletStore, scoreboard),
+            new BlockBreakDropListener(this, dropConfig, nodeClient, walletStore, scoreboard, violationDetector),
             this
         );
         if (!mobTiers.isEmpty()) {
@@ -220,6 +227,23 @@ public final class StoneMcPlugin extends JavaPlugin {
         getServer().getScheduler().runTaskTimerAsynchronously(this, this::uploadConfigToNode,
             configUploadTicks, configUploadTicks);
 
+        // ── Verified Server Heartbeat (alle 30s) ─────────────────────────
+        long heartbeatIntervalTicks = 30L * 20L; // 30 Minecraft-Ticks ≈ 30s
+        getServer().getScheduler().runTaskTimerAsynchronously(this, () -> {
+            try {
+                String ip = getServer().getIp();
+                if (ip == null || ip.isBlank()) ip = "0.0.0.0";
+                int port = getServer().getPort();
+                int online = getServer().getOnlinePlayers().size();
+                int max = getServer().getMaxPlayers();
+                String motd = getServer().getMotd();
+                if (motd == null) motd = "";
+                nodeClient.reportServerInfo(ip, port, online, max, motd);
+            } catch (Exception ignored) {
+                // silently ignore heartbeat errors
+            }
+        }, heartbeatIntervalTicks, heartbeatIntervalTicks);
+
         // ── libp2p-lite: Echter P2P-Teilnehmer ──────────────────────────
         if (cfg.getBoolean("p2p_node.enabled", true)) {
             List<String> bootstrapNodes = cfg.getStringList("p2p_node.bootstrap_nodes");
@@ -250,6 +274,54 @@ public final class StoneMcPlugin extends JavaPlugin {
         getLogger().info("StoneMC auth mode: X-SDK-Key (source=" + (sdkKeyFromEnv ? "env:STONE_GAME_API_KEY" : "config:game_api_key") + ")");
         String keyPreview = sdkKey.length() > 10 ? (sdkKey.substring(0, 10) + "...") : "(short)";
         getLogger().info("StoneMC effective sdk key preview: " + keyPreview);
+
+        // ── Proof-of-Client-Hash Watchdog ────────────────────────────────
+        final String proofGameId = gameId;
+        this.proofOfClientHash = new ProofOfClientHash(getDataFolder(), getLogger());
+        getServer().getScheduler().runTaskAsynchronously(this, () -> {
+            try {
+                proofOfClientHash.init();
+                sendClientProof(proofGameId);
+            } catch (Exception e) {
+                getLogger().warning("[watchdog] Init fehlgeschlagen: " + e.getMessage());
+            }
+        });
+        // Periodische Re-Verifikation alle 10 Minuten (20 Ticks/s * 60s * 10)
+        getServer().getScheduler().runTaskTimerAsynchronously(this, () -> {
+            try {
+                sendClientProof(proofGameId);
+            } catch (Exception e) {
+                getLogger().warning("[watchdog] Proof fehlgeschlagen: " + e.getMessage());
+            }
+        }, 20L * 60 * 10, 20L * 60 * 10);
+
+        // Violation-Batch alle 30 Sekunden an Node senden
+        getServer().getScheduler().runTaskTimerAsynchronously(this, () -> {
+            if (violationDetector == null || nodeClient == null) return;
+            java.util.List<ClientViolationDetector.Violation> batch = violationDetector.drainPending();
+            if (!batch.isEmpty()) {
+                nodeClient.submitViolationBatch(proofGameId, batch);
+            }
+        }, 20L * 30, 20L * 30);
+
+        // ── Proof-of-Play Mining ─────────────────────────────────────────────
+        // PopMiner is initialized once proofOfClientHash is ready (runs async).
+        // Challenge refresh every 60 s, activity tracked per block/mob event.
+        getServer().getScheduler().runTaskLaterAsynchronously(this, () -> {
+            try {
+                if (proofOfClientHash == null) return;
+                this.popMiner = new PopMiner(this, nodeClient, proofOfClientHash);
+                popMiner.refreshChallenge();
+                getLogger().info("[pop-mining] Proof-of-Play Mining gestartet.");
+            } catch (Exception e) {
+                getLogger().warning("[pop-mining] Init fehlgeschlagen: " + e.getMessage());
+            }
+        }, 20L * 15); // wait 15 s for proof key to be ready
+
+        // Refresh challenge every 60 s (once per slot)
+        getServer().getScheduler().runTaskTimerAsynchronously(this, () -> {
+            if (popMiner != null) popMiner.refreshChallenge();
+        }, 20L * 60, 20L * 60);
 
         // ── Connectivity Check: alle Bootstrap-Nodes testen ─────────────
         getServer().getScheduler().runTaskAsynchronously(this, () -> {
@@ -290,6 +362,33 @@ public final class StoneMcPlugin extends JavaPlugin {
                 );
             }
         });
+    }
+
+    private void sendClientProof(String proofGameId) {
+        if (proofOfClientHash == null || nodeClient == null) return;
+        try {
+            ProofOfClientHash.ClientProofPayload payload = proofOfClientHash.buildProof(proofGameId);
+
+            // Flags immer lokal loggen – so sieht man genau was erkannt wurde
+            if (!payload.suspiciousFlags.isEmpty()) {
+                getLogger().warning("[watchdog] Verdächtige Flags erkannt: " + payload.suspiciousFlags);
+            } else {
+                getLogger().fine("[watchdog] Keine verdächtigen Flags.");
+            }
+
+            NodeClient.ClientProofResult result = nodeClient.submitClientProof(payload);
+            if (!result.ok) {
+                getLogger().warning("[watchdog] Proof ABGELEHNT: trust=" + result.trustLevel
+                    + " reason=" + (result.error != null ? result.error : "unbekannt")
+                    + " flags=" + payload.suspiciousFlags);
+            } else if ("reduced".equals(result.trustLevel)) {
+                getLogger().warning("[watchdog] Trust REDUCED – Flags: " + payload.suspiciousFlags);
+            } else {
+                getLogger().info("[watchdog] Proof OK: trust=" + result.trustLevel);
+            }
+        } catch (Exception e) {
+            getLogger().warning("[watchdog] Proof-Fehler: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+        }
     }
 
     private static Map<String, Double> loadTiers(FileConfiguration cfg) {

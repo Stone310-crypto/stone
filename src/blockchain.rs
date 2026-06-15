@@ -679,7 +679,6 @@ impl StoneChain {
 
         self.blocks.push(block);
         self.latest_hash = hash;
-        self.persist_last_block();
 
         println!(
             "[chain] Block #{} committed – {} Dok., {} TXs, {} Bytes, d={}/{}, cd={}",
@@ -769,76 +768,65 @@ impl StoneChain {
                         .unwrap_or(false)
                 };
                 if prev_ok {
-                    // ── Heaviest-Chain-Regel: Nur reorgen wenn der Fork schwerer ist ──
+                    // ── Heaviest-Chain-Regel + Peak-Advance ────────────
                     let our_tip_cd = self.blocks.last()
                         .map(|b| b.cumulative_difficulty)
                         .unwrap_or(0);
                     let incoming_cd = if block.cumulative_difficulty > 0 {
                         block.cumulative_difficulty
                     } else {
-                        // Legacy-Block: berechne CD manuell
                         let parent_cd = self.blocks.get((block.index - 1) as usize)
                             .map(|b| b.cumulative_difficulty)
                             .unwrap_or(0);
                         parent_cd + block_work_effective(block.effective_difficulty, block.pow_difficulty)
                     };
 
-                    // Nur reorgen wenn der Fork-Block mehr kumulative Arbeit hat als
-                    // unser Tip. Bei gleicher Tiefe (1 Block): direkter Vergleich.
-                    // Bei tieferem Reorg: einzelner Block kann unseren Tip nicht schlagen
-                    // → im Fork-Cache speichern für spätere Auflösung.
-                    if incoming_cd > our_tip_cd {
-                        // Reorg-Schutz: finalisierter Checkpoint darf nicht verletzt werden.
+                    // Peak-Advance: Bei tiefen Reorgs (>10 Blöcke) und annähernd
+                    // gleicher CD wie unser Tip, vertraue der Peer-Chain.
+                    let cd_close = incoming_cd + 1000 >= our_tip_cd;
+                    let deep_reorg = reorg_depth > 10;
+
+                    if incoming_cd > our_tip_cd || (deep_reorg && cd_close) {
                         if let Some(cps) = checkpoints {
                             cps.check_reorg_allowed(block.index)
                                 .map_err(|e| format!("Checkpoint-Schutz: {e}"))?;
                         }
+                        let reason = if incoming_cd > our_tip_cd {
+                            format!("cd: {} > {}", incoming_cd, our_tip_cd)
+                        } else {
+                            format!("Peak-Advance: depth={} cd_close=true", reorg_depth)
+                        };
                         println!(
-                            "[chain] 🔄 Fork-Reorg bei Block #{}: lokal={}… peer={}… (Tiefe: {}, cd: {} > {}) – ersetze lokale Blöcke",
+                            "[chain] 🔄 Fork-Reorg bei Block #{}: lokal={}… peer={}… ({})",
                             block.index,
                             &existing.hash[..8.min(existing.hash.len())],
                             &block.hash[..8.min(block.hash.len())],
-                            reorg_depth, incoming_cd, our_tip_cd,
+                            reason,
                         );
                         let orphaned = self.truncate_to(block.index);
                         self.orphaned_blocks = orphaned;
-                        // Weiter mit normaler Block-Akzeptanz
                     } else if incoming_cd == our_tip_cd && reorg_depth == 1 {
-                        // Tiebreaker bei gleicher CD und Tiefe 1:
-                        // 1. TX-Blöcke haben Vorrang vor reinen Reward-Blöcken
-                        // 2. Bei Gleichstand: niedrigerer Hash gewinnt (deterministisch)
                         let incoming_has_user_txs = block.transactions.iter()
                             .any(|tx| tx.tx_type != TxType::Reward && tx.tx_type != TxType::Mint);
                         let existing_has_user_txs = existing.transactions.iter()
                             .any(|tx| tx.tx_type != TxType::Reward && tx.tx_type != TxType::Mint);
 
                         let prefer_incoming = if incoming_has_user_txs && !existing_has_user_txs {
-                            // Incoming hat User-TXs, bestehender nicht → Incoming gewinnt
-                            println!(
-                                "[chain] 🔄 Fork-Tiebreak bei Block #{}: Incoming hat {} User-TXs, lokal nur Rewards → Incoming gewinnt",
-                                block.index, block.transactions.iter()
-                                    .filter(|tx| tx.tx_type != TxType::Reward && tx.tx_type != TxType::Mint).count(),
-                            );
                             true
                         } else if !incoming_has_user_txs && existing_has_user_txs {
-                            // Bestehender hat User-TXs → behalten
                             false
                         } else {
-                            // Beide haben TXs oder beide nicht → Hash-Tiebreaker
                             block.hash < existing.hash
                         };
 
                         if prefer_incoming {
-                            // Reorg-Schutz: finalisierter Checkpoint darf nicht verletzt werden.
                             if let Some(cps) = checkpoints {
                                 cps.check_reorg_allowed(block.index)
                                     .map_err(|e| format!("Checkpoint-Schutz: {e}"))?;
                             }
                             println!(
-                                "[chain] 🔄 Fork-Tiebreak bei Block #{}: lokal={}… peer={}…",
-                                block.index,
-                                &existing.hash[..8.min(existing.hash.len())],
-                                &block.hash[..8.min(block.hash.len())],
+                                "[chain] 🔄 Fork-Tiebreak bei Block #{}",
+                                block.index
                             );
                             let orphaned = self.truncate_to(block.index);
                             self.orphaned_blocks = orphaned;
@@ -846,16 +834,15 @@ impl StoneChain {
                             let bi = block.index;
                             self.store_fork_block(block);
                             return Err(format!(
-                                "Fork bei Block #{}: Tiebreak verloren (cd gleich, bestehender Block bevorzugt) – gespeichert",
+                                "Fork bei Block #{}: Tiebreak verloren – gespeichert",
                                 bi,
                             ));
                         }
                     } else {
-                        // Fork ist nicht schwerer → im Cache speichern
                         let bi = block.index;
                         self.store_fork_block(block);
                         return Err(format!(
-                            "Fork bei Block #{}: nicht schwerer als aktuelle Chain (cd: {} ≤ {}) – gespeichert",
+                            "Fork bei Block #{}: nicht schwerer (cd: {} ≤ {}) – gespeichert",
                             bi, incoming_cd, our_tip_cd,
                         ));
                     }
@@ -1169,7 +1156,10 @@ impl StoneChain {
 
         self.latest_hash = block.hash.clone();
         self.blocks.push(block);
-        self.persist_last_block();
+        // Chain-Persistierung erfolgt im Caller NACH Freigabe des chain-Locks.
+        // persist_last_block() öffnet RocksDB frisch + sync-Write — das würde
+        // den chain-Lock für 100+ ms blockieren und alle P2P-Block-Requests
+        // (die chain_ref.lock() brauchen) zum Timeout bringen → HTTP 503.
 
         // Fork-Cache aufräumen: Blöcke die jetzt hinter der Chain liegen entfernen
         self.prune_fork_blocks();
@@ -1181,7 +1171,21 @@ impl StoneChain {
 
     /// Speichert einen Fork-Block im Cache für spätere Auflösung.
     /// Begrenzt auf 50 Einträge (älteste werden entfernt).
-    pub fn store_fork_block(&mut self, block: Block) {
+    /// Blockiert leere/Fremd-Blöcke ohne Parent in Chain oder Fork-Cache.
+    pub fn store_fork_block(&mut self, block: Block) -> bool {
+        // Fork-Blöcke nur speichern wenn der Parent in der Hauptchain ODER
+        // im Fork-Cache existiert. Ansonsten ist es ein Fremd-Block von
+        // einer inkompatiblen Chain (= anderer Genesis).
+        let parent_exists = self.blocks.iter().any(|b| b.hash == block.previous_hash)
+            || self.fork_blocks.contains_key(&block.previous_hash);
+        if !parent_exists {
+            eprintln!(
+                "[fork] ❌ Fremd-Block #{} verworfen – kein Parent in Chain oder Cache",
+                block.index
+            );
+            return false;
+        }
+
         const MAX_FORK_BLOCKS: usize = 50;
         println!(
             "[fork] 📦 Fork-Block #{} gespeichert (hash={}…, cd={})",
@@ -1201,6 +1205,7 @@ impl StoneChain {
                 break;
             }
         }
+        true
     }
 
     /// Entfernt Fork-Blöcke die weit hinter der Chain liegen.
@@ -1327,7 +1332,7 @@ impl StoneChain {
                     self.fork_blocks.remove(&fb.hash);
                     self.latest_hash = fb.hash.clone();
                     self.blocks.push(fb);
-                    self.persist_last_block();
+                    // Kein persist_last_block() im hot-Pfad — siehe accept_peer_block
                 }
 
                 return Ok(true);
@@ -1613,6 +1618,14 @@ pub fn has_valid_memorial(block: &Block) -> bool {
 fn genesis_block(cluster_key: &str) -> Block {
     let merkle_root = format!("{:x}", Sha256::digest(b"genesis"));
 
+    // Genesis previous_hash hängt vom Netzwerk ab (testnet/mainnet),
+    // NICHT vom cluster_key. So haben alle Nodes im selben Netzwerk
+    // denselben Genesis-Hash, aber unterschiedliche Netzwerke sind isoliert.
+    let network = std::env::var("STONE_NETWORK").unwrap_or_else(|_| "testnet".into());
+    let genesis_prev = format!("{:x}", Sha256::digest(
+        format!("stone-genesis-v2-{}", network).as_bytes()
+    ));
+
     // ── Memorial-Dokument für Dennis ──────────────────────────────────
     let memorial_content = "\
 in loving memory of my best friend Dennis
@@ -1660,7 +1673,7 @@ Because Dennis died of cancer and nobody could do anything.
         timestamp: 0,
         merkle_root,
         data_size: 0,
-        previous_hash: "0".repeat(64),
+        previous_hash: genesis_prev,
         hash: String::new(),
         signer: "genesis".to_string(),
         signature: String::new(),

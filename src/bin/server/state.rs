@@ -18,8 +18,10 @@ use stone::{
     master::{MasterNodeState, PeerInfo, TrustEntry, TrustVote},
     network::NetworkHandle,
     organization::Organization,
+    pop_mining::PopMiningState,
     storage::{ChunkStore, StoneStore},
     updater::UpdateManager,
+    watchdog::WatchdogState,
 };
 
 use super::rate_limiter::RateLimits;
@@ -78,6 +80,10 @@ pub struct AppState {
     pub action_store: ActionStore,
     /// Proof-of-Play Drop-Tracker (Caps + Cooldowns pro Spiel/Spieler)
     pub play_drops: PlayDropTracker,
+    /// Proof-of-Client-Hash Watchdog (verifiziert Plugin-Integrität)
+    pub watchdog: WatchdogState,
+    /// Proof-of-Play Mining (VRF-basiertes Gameplay-Mining)
+    pub pop_mining: PopMiningState,
 }
 
 // ─── Mobile Action Store ─────────────────────────────────────────────────────

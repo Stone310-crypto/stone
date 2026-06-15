@@ -283,6 +283,11 @@ pub async fn start_network(
         bootstrap_peer_ids.len(),
     );
 
+    // Stage1 (Soft-Reset: Buffer leeren + ChainInfo neu anfragen) und Stage2
+    // (Peer-Switch) sind sanfte, selbstheilende Recovery-Schritte → standardmäßig AN.
+    // Stage3 (ALLE Peers trennen + Rebuild) und Stage4 (Snapshot-/Reboot-Eskalation)
+    // sind disruptive Last-Resort-Pfade → standardmäßig AUS (per ENV opt-in).
+    // Greift nur bei aktivem Sync-Stall > sync_stall_timeout_secs.
     let sync_recovery_stage1_enabled = std::env::var("STONE_SYNC_RECOVERY_STAGE1")
         .map(|v| v != "0")
         .unwrap_or(true);
@@ -291,14 +296,14 @@ pub async fn start_network(
         .unwrap_or(true);
     let sync_recovery_stage3_enabled = std::env::var("STONE_SYNC_RECOVERY_STAGE3")
         .map(|v| v != "0")
-        .unwrap_or(true);
+        .unwrap_or(false);
     let sync_recovery_stage4_enabled = std::env::var("STONE_SYNC_RECOVERY_STAGE4")
         .map(|v| v != "0")
-        .unwrap_or(true);
+        .unwrap_or(false);
     let sync_stall_timeout_secs = std::env::var("STONE_SYNC_STALL_TIMEOUT_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
-        .unwrap_or(45);
+        .unwrap_or(120);
     let sync_recovery_cooldown_secs = std::env::var("STONE_SYNC_RECOVERY_COOLDOWN_SECS")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
@@ -364,6 +369,7 @@ pub async fn start_network(
         sync_snapshot_escalation_cooldown_secs,
         local_stake_level: 0,
         reconnect_backoff: HashMap::new(),
+        peer_connected_since: HashMap::new(),
         bootstrap_peer_ids,
         bootstrap_peer_scores: HashMap::new(),
         reconnect_jitter_max_secs,

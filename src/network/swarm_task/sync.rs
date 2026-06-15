@@ -24,9 +24,9 @@ impl SwarmTask {
     }
 
     fn sync_session_active(&self) -> bool {
-        self.sync_target_peer.is_some()
-            || !self.sync_buffer.is_empty()
-            || !self.pending_chain_info.is_empty()
+        // Only consider sync "active" if we're actually behind a peer OR have blocks to process.
+        // pending_chain_info is NOT a sync indicator — it's just I/O-in-flight tracking.
+        self.sync_target_peer.is_some() || !self.sync_buffer.is_empty()
     }
 
     fn connected_peer_count(&self) -> usize {
@@ -108,7 +108,7 @@ impl SwarmTask {
             Some(FailureClass::SyncDivergence)
         } else if connected == 0 {
             Some(FailureClass::DiscoveryFailure)
-        } else if !self.bootstrap_peer_ids.is_empty() && bootstrap_connected == 0 {
+        } else if !self.bootstrap_peer_ids.is_empty() && bootstrap_connected == 0 && connected == 0 {
             Some(FailureClass::BootstrapFailure)
         } else if poisoning_signal {
             Some(FailureClass::PeerPoisoning)

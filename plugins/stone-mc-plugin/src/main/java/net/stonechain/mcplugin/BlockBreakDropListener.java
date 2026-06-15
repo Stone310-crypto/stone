@@ -25,13 +25,15 @@ public final class BlockBreakDropListener implements Listener {
     private final ScoreboardManager scoreboard;
     private final Map<String, Double> tiers;
     private final ConcurrentHashMap<UUID, Long> lastDropMs = new ConcurrentHashMap<>();
+    private final ClientViolationDetector violationDetector;
 
     public BlockBreakDropListener(
         StoneMcPlugin plugin,
         StoneMcPlugin.DropConfig cfg,
         NodeClient node,
         PlayerWalletStore wallets,
-        ScoreboardManager scoreboard
+        ScoreboardManager scoreboard,
+        ClientViolationDetector violationDetector
     ) {
         this.plugin = plugin;
         this.cfg    = cfg;
@@ -39,12 +41,20 @@ public final class BlockBreakDropListener implements Listener {
         this.wallets = wallets;
         this.scoreboard = scoreboard;
         this.tiers  = cfg.tiers();
+        this.violationDetector = violationDetector;
     }
 
     @EventHandler(priority = EventPriority.MONITOR, ignoreCancelled = true)
     public void onBreak(BlockBreakEvent event) {
         Player player = event.getPlayer();
         if (player.getGameMode().name().equals("CREATIVE")) return;
+
+        // Verhaltensdaten an Detektor melden (X-ray + Auto-Clicker)
+        violationDetector.trackBlockBreak(player, event.getBlock().getType());
+        violationDetector.trackClick(player);
+
+        // PoP Mining: every block break counts as gameplay activity
+        if (plugin.popMiner() != null) plugin.popMiner().onPlayerActivity(player);
 
         String type = event.getBlock().getType().name();
         Double tierAmount = tiers.get(type);

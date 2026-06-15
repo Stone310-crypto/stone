@@ -214,15 +214,16 @@ pub async fn handle_set_validator_active(
 
 /// GET /api/v1/validators/self
 pub async fn handle_validator_self(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
 ) -> impl IntoResponse {
     let sk = load_or_create_validator_key();
     let pk = local_validator_pubkey_hex(&sk);
     (
         StatusCode::OK,
         axum::Json(json!({
+            "node_id": state.node.node_id,
             "public_key_hex": pk,
-            "note": "Diesen Public Key verwenden um diese Node als Validator zu registrieren",
+            "note": "node_id + public_key_hex per POST /api/v1/validators auf ALLEN Nodes registrieren (kein Auto-Sync)",
         })),
     )
 }

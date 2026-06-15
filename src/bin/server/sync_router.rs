@@ -344,6 +344,19 @@ struct SyncUser {
     wallet_address: String,
 }
 
+/// GET /game-economy – Game-Economy-Daten für Peer-Sync
+async fn sync_game_economy(State(state): State<AppState>) -> impl IntoResponse {
+    let store = state.node.game_economy.read().unwrap_or_else(|e| e.into_inner());
+    let json = serde_json::to_value(&*store).unwrap_or(serde_json::json!({}));
+    (
+        StatusCode::OK,
+        axum::Json(json!({
+            "ok": true,
+            "game_economy": json,
+        })),
+    )
+}
+
 /// GET /chunk/{hash} – Chunk-Daten für Peer-Sync
 async fn sync_chunk(
     Path(hash): Path<String>,
@@ -396,6 +409,7 @@ pub fn build_sync_router(state: AppState) -> Router {
         .route("/blocks", get(sync_blocks))
         .route("/blocks/{index}", get(sync_block))
         .route("/sync-users", post(sync_receive_users))
+        .route("/game-economy", get(sync_game_economy))
         .route("/chunk/{hash}", get(sync_chunk))
         .layer(cors)
         .with_state(state)

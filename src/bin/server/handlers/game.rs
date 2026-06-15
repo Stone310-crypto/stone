@@ -76,39 +76,41 @@ fn validate_sdk_key(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
+    validate_sdk_key_for_watchdog(state, headers)
+        .map_err(|e| (StatusCode::UNAUTHORIZED, err_json(&e)))
+}
+
+/// Gleiche Logik wie validate_sdk_key, aber mit String-Fehler (für den Watchdog-Handler).
+pub fn validate_sdk_key_for_watchdog(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<String, String> {
     let store = read_game_store(state);
 
-    // 1) Hash-basierte Auth (Security-Fix: kein Klartext-Key über die Leitung)
+    // 1) Hash-basierte Auth
     if let Some(key_hash) = headers
         .get("X-SDK-Key-Hash")
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
         .filter(|v| !v.is_empty())
     {
-        return match store.validate_api_key_hash(key_hash) {
-            Ok(game) => Ok(game.game_id.clone()),
-            Err(e) => Err((StatusCode::FORBIDDEN, err_json(&e.to_string()))),
-        };
+        return store.validate_api_key_hash(key_hash)
+            .map(|g| g.game_id.clone())
+            .map_err(|e| e.to_string());
     }
 
-    // 2) Legacy: Klartext-Key (deprecated, wird in Zukunft entfernt)
+    // 2) Legacy: Klartext-Key
     let key = headers
         .get("X-SDK-Key")
         .or_else(|| headers.get("X-API-Key"))
         .and_then(|v| v.to_str().ok())
         .map(str::trim)
         .filter(|v| !v.is_empty())
-        .ok_or_else(|| {
-            (
-                StatusCode::UNAUTHORIZED,
-                err_json("SDK-Key Header fehlt (erwartet: X-SDK-Key-Hash, X-SDK-Key oder X-API-Key)"),
-            )
-        })?;
+        .ok_or_else(|| "SDK-Key Header fehlt (X-SDK-Key-Hash oder X-SDK-Key)".to_string())?;
 
-    match store.validate_api_key(key) {
-        Ok(game) => Ok(game.game_id.clone()),
-        Err(e) => Err((StatusCode::FORBIDDEN, err_json(&e.to_string()))),
-    }
+    store.validate_api_key(key)
+        .map(|g| g.game_id.clone())
+        .map_err(|e| e.to_string())
 }
 
 /// Leitet die Wallet-Adresse eines Spielers ab — entweder aus signaturbasiertem
@@ -4600,11 +4602,67 @@ pub async fn handle_sdk_play_drop(
     let foundation_addr = std::env::var("STONE_FOUNDATION_TREASURY_ADDR")
         .unwrap_or_else(|_| "pool:treasury".to_string());
 
-    // 5) 3 Transfer-TXs sequentiell mit aufeinanderfolgenden Nonces signieren
+    // 5) TX-Gebühr vom Auszahlungsbetrag abziehen (nicht on-top)
+    let fee_per_tx = stone::token::FeeTier::Standard.fee();
+    let net_player_amount = (player_amount - fee_per_tx).max(Decimal::ZERO);
+    let net_owner_amount = (owner_amount - fee_per_tx).max(Decimal::ZERO);
+    let net_foundation_amount = (foundation_amount - fee_per_tx).max(Decimal::ZERO);
+
+    // 6) Balance-Check: Pool-Wallet muss genug Guthaben haben
+    let total_pool_cost = net_player_amount + net_owner_amount + net_foundation_amount
+        + (if net_player_amount > Decimal::ZERO { fee_per_tx } else { Decimal::ZERO })
+        + (if net_owner_amount > Decimal::ZERO { fee_per_tx } else { Decimal::ZERO })
+        + (if net_foundation_amount > Decimal::ZERO { fee_per_tx } else { Decimal::ZERO });
+    let pool_addr = pool_wallet.address();
+    {
+        let pool_balance = {
+            let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
+            ledger.balance(&pool_addr)
+        };
+        if pool_balance < total_pool_cost {
+            // Auto-Fund: ziehe benötigten Betrag aus pool:gaming (System-Operation).
+            // Im Gegensatz zu unlock_gaming_pool_to_foundation (beim Startup)
+            // verzichten wir hier auf persist() — die In-Memory-Änderung
+            // wird beim nächsten Block-Commit automatisch persistiert.
+            // Ein sync persist() im HTTP-Pfad würde den Tokio-Runtime-Thread
+            // blockieren (RocksDB I/O) → Nodes erscheinen unerreichbar.
+            let needed = total_pool_cost - pool_balance;
+            let balance_from_pool = {
+                let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
+                ledger.balance("pool:gaming")
+            };
+            if balance_from_pool >= needed {
+                let mut ledger = state.node.token_ledger.write().unwrap_or_else(|e| e.into_inner());
+                match ledger.system_pool_transfer("pool:gaming", &pool_addr, needed) {
+                    Ok(()) => {
+                        println!(
+                            "[play-drop] 💰 Auto-Fund: {} STONE von pool:gaming → {}",
+                            needed, &pool_addr[..16.min(pool_addr.len())]
+                        );
+                    }
+                    Err(e) => {
+                        return (StatusCode::PAYMENT_REQUIRED,
+                            err_json(&format!(
+                                "Gaming-Pool Auto-Fund fehlgeschlagen: {e}"
+                            ))).into_response();
+                    }
+                }
+            } else {
+                return (StatusCode::PAYMENT_REQUIRED,
+                    err_json(&format!(
+                        "Gaming-Pool hat nicht genug Guthaben: benötigt {total_pool_cost}, \
+                         pool:gaming={}, pool-wallet={}",
+                        needed, balance_from_pool
+                    ))).into_response();
+            }
+        }
+    }
+
+    // 7) 3 Transfer-TXs sequentiell mit aufeinanderfolgenden Nonces signieren
     let base_nonce = {
         let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
-        ledger.nonce(&pool_wallet.address())
-            + state.node.mempool.sender_pending_count(&pool_wallet.address())
+        ledger.nonce(&pool_addr)
+            + state.node.mempool.sender_pending_count(&pool_addr)
     };
 
     let drop_id = req.drop_id.clone().unwrap_or_else(|| "auto".into());
@@ -4613,9 +4671,9 @@ pub async fn handle_sdk_play_drop(
 
     let mut txs: Vec<stone::token::TokenTx> = Vec::with_capacity(3);
     let recipients: Vec<(String, Decimal, &str)> = vec![
-        (req.player_wallet.clone(), player_amount, "player"),
-        (game_owner_addr.clone(),    owner_amount,  "owner"),
-        (foundation_addr.clone(),    foundation_amount, "foundation"),
+        (req.player_wallet.clone(), net_player_amount, "player"),
+        (game_owner_addr.clone(),    net_owner_amount,  "owner"),
+        (foundation_addr.clone(),    net_foundation_amount, "foundation"),
     ];
     for (i, (to, amt, tag)) in recipients.iter().enumerate() {
         if *amt <= Decimal::ZERO { continue; }
@@ -4661,6 +4719,13 @@ pub async fn handle_sdk_play_drop(
                     "owner": owner_amount.to_string(),
                     "foundation": foundation_amount.to_string(),
                 },
+                "net_split": {
+                    "player": net_player_amount.to_string(),
+                    "owner": net_owner_amount.to_string(),
+                    "foundation": net_foundation_amount.to_string(),
+                },
+                "fee_per_tx": fee_per_tx.to_string(),
+                "total_pool_cost": total_pool_cost.to_string(),
                 "drop_id": req.drop_id,
             }), true);
         store.touch_owner_heartbeat(&req.game_id, &game_owner_addr);
@@ -4679,6 +4744,13 @@ pub async fn handle_sdk_play_drop(
             "owner":  owner_amount.to_string(),
             "foundation": foundation_amount.to_string(),
         },
+        "net_split": {
+            "player": net_player_amount.to_string(),
+            "owner":  net_owner_amount.to_string(),
+            "foundation": net_foundation_amount.to_string(),
+        },
+        "fee_per_tx": fee_per_tx.to_string(),
+        "total_pool_cost": total_pool_cost.to_string(),
         "drop_id": req.drop_id,
         "game_total_today": game_total,
     })).into_response()
@@ -4762,15 +4834,38 @@ pub async fn handle_sdk_play_sell(
             err_json(&format!("Pool Mnemonic: {e}"))).into_response(),
     };
 
-    // Balance-Check
+    // Balance-Check mit Auto-Fund
     let pool_addr = pool_wallet.address();
-    let pool_balance = {
-        let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
-        ledger.balance(&pool_addr)
-    };
-    if pool_balance < stone_payout {
-        return (StatusCode::SERVICE_UNAVAILABLE,
-            err_json(&format!("Gaming-Pool hat nicht genug STONE: benötigt {stone_payout}, verfügbar {pool_balance}"))).into_response();
+    {
+        let pool_balance = {
+            let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
+            ledger.balance(&pool_addr)
+        };
+        if pool_balance < stone_payout {
+            let gaming_pool_balance = {
+                let ledger = state.node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
+                ledger.balance("pool:gaming")
+            };
+            let needed = stone_payout - pool_balance;
+            if gaming_pool_balance >= needed {
+                let mut ledger = state.node.token_ledger.write().unwrap_or_else(|e| e.into_inner());
+                match ledger.system_pool_transfer("pool:gaming", &pool_addr, needed) {
+                    Ok(()) => {
+                        println!(
+                            "[play-sell] 💰 Auto-Fund: {} STONE von pool:gaming → {}",
+                            needed, &pool_addr[..16.min(pool_addr.len())]
+                        );
+                    }
+                    Err(e) => {
+                        return (StatusCode::PAYMENT_REQUIRED,
+                            err_json(&format!("Gaming-Pool Auto-Fund fehlgeschlagen: {e}"))).into_response();
+                    }
+                }
+            } else {
+                return (StatusCode::SERVICE_UNAVAILABLE,
+                    err_json(&format!("Gaming-Pool hat nicht genug STONE: benötigt {stone_payout}, pool:gaming={}", gaming_pool_balance))).into_response();
+            }
+        }
     }
 
     // 70/20/10 STONE-Split
@@ -5286,6 +5381,97 @@ pub async fn handle_game_config_read(
     }
 }
 
+/// POST /api/v1/sdk/game/heartbeat
+///
+/// Plugin sendet alle 60s Status: online, player_count, uptime.
+/// Verifizierte Server werden in mempool.verified_games aufgenommen.
+#[derive(Deserialize)]
+pub struct GameHeartbeatReq {
+    pub game_id: String,
+    /// Aktuelle Spielerzahl (wird vom Plugin ermittelt)
+    pub player_count: u32,
+    /// true = Server ist online
+    pub online: bool,
+    /// Server-Typ: "minecraft", "unity", "unreal", etc.
+    #[serde(default)]
+    pub game_type: Option<String>,
+    /// Server-IP (vom Plugin)
+    #[serde(default)]
+    pub ip: Option<String>,
+    /// Server-Port
+    #[serde(default)]
+    pub port: Option<u16>,
+}
+
+pub async fn handle_sdk_game_heartbeat(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<GameHeartbeatReq>,
+) -> impl IntoResponse {
+    let game_id = match validate_sdk_key(&state, &headers) {
+        Ok(gid) => gid,
+        Err(resp) => return resp.into_response(),
+    };
+    if game_id != req.game_id {
+        return (StatusCode::FORBIDDEN, err_json("game_id mismatch")).into_response();
+    }
+
+    // In verified_games aufnehmen
+    state.node.mempool.add_verified_game(&req.game_id);
+    
+    // Speichere Heartbeat-Daten im Game-Economy-Store
+    with_game_store_mut(&state, |store| {
+        if let Some(ref ip) = req.ip {
+            store.record_server_heartbeat(
+                &req.game_id, ip,
+                req.port.unwrap_or(25565),
+                req.player_count,
+                req.player_count.max(20),
+                req.game_type.as_deref().unwrap_or("unknown"),
+            );
+        }
+    });
+
+    Json(serde_json::json!({
+        "ok": true,
+        "game_id": req.game_id,
+        "verified": true,
+        "player_count": req.player_count,
+        "online": req.online,
+        "game_type": req.game_type.unwrap_or_else(|| "unknown".to_string()),
+    })).into_response()
+}
+
+/// GET /api/v1/sdk/game/verified-servers
+///
+/// Öffentlich: Liste aller verifizierten Game-Server mit Details.
+pub async fn handle_sdk_verified_servers(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let game_ids = state.node.mempool.verified_games_list();
+    let store = read_game_store(&state);
+    
+    let servers: Vec<serde_json::Value> = game_ids.iter().filter_map(|gid| {
+        let hb = store.get_server_heartbeat(gid)?;
+        Some(serde_json::json!({
+            "game_id": gid,
+            "online": true,
+            "ip": hb.ip,
+            "port": hb.port,
+            "player_count": hb.player_count,
+            "max_players": hb.max_players,
+            "game_type": hb.motd, // motd field stores game_type
+            "last_heartbeat": hb.last_heartbeat,
+        }))
+    }).collect();
+    
+    Json(serde_json::json!({
+        "ok": true,
+        "count": servers.len(),
+        "servers": servers,
+    })).into_response()
+}
+
 /// GET /api/v1/games/{game_id}/config/history
 ///
 /// Öffentlich: Gibt die Config-Historie zurück (letzte 10 Versionen).
@@ -5301,4 +5487,72 @@ pub async fn handle_game_config_history(
         "count": history.len(),
         "history": history,
     })).into_response()
+}
+
+// ── Server Heartbeat (Live-Status vom Minecraft-Plugin) ──────────────────────
+
+#[derive(Deserialize)]
+pub struct ServerHeartbeatRequest {
+    pub game_id: String,
+    pub ip: String,
+    pub port: u16,
+    pub player_count: u32,
+    pub max_players: u32,
+    pub motd: String,
+}
+
+/// POST /api/v1/sdk/game/server/heartbeat
+///
+/// Empfängt Live-Server-Infos vom Minecraft-Plugin (alle 30s).
+/// Auth via X-SDK-Key-Hash/X-SDK-Key.
+pub async fn handle_sdk_server_heartbeat(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<ServerHeartbeatRequest>,
+) -> impl IntoResponse {
+    if let Err(resp) = validate_sdk_key(&state, &headers) {
+        return resp.into_response();
+    }
+
+    with_game_store_mut(&state, |store| {
+        store.record_server_heartbeat(
+            &req.game_id,
+            &req.ip,
+            req.port,
+            req.player_count,
+            req.max_players,
+            &req.motd,
+        );
+    });
+
+    Json(serde_json::json!({ "ok": true })).into_response()
+}
+
+/// GET /api/v1/games/{game_id}/live
+///
+/// Öffentlich: Gibt Live-Server-Status zurück (Spieleranzahl, IP, MOTD).
+/// Server ohne Heartbeat > 120s gelten als offline.
+pub async fn handle_game_live_info(
+    State(state): State<AppState>,
+    Path(game_id): Path<String>,
+) -> impl IntoResponse {
+    let store = read_game_store(&state);
+    match store.get_server_heartbeat(&game_id) {
+        Some(hb) => Json(serde_json::json!({
+            "ok": true,
+            "game_id": game_id,
+            "online": true,
+            "ip": hb.ip,
+            "port": hb.port,
+            "player_count": hb.player_count,
+            "max_players": hb.max_players,
+            "motd": hb.motd,
+            "last_heartbeat": hb.last_heartbeat,
+        })).into_response(),
+        None => Json(serde_json::json!({
+            "ok": true,
+            "game_id": game_id,
+            "online": false,
+        })).into_response(),
+    }
 }

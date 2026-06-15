@@ -397,7 +397,8 @@ async fn start_full_node(state: SetupState) {
     // Auto-Block-Timer: produziert nach auto_timeout_secs einen Block, wenn
     // kein externer Miner aktiv ist (Liveness-Garantie für stilles Netz).
     MasterNodeState::start_heartbeat(node.clone(), HEARTBEAT_INTERVAL);
-    MasterNodeState::start_block_timer(node.clone());
+    let pop_mining_shared = stone::pop_mining::PopMiningState::new();
+    MasterNodeState::start_block_timer(node.clone(), pop_mining_shared.clone());
     spawn_auto_sync_task(node.clone(), api_key.clone(), users.clone());
 
     // Peer-Discovery: Bei Bootstrap-Nodes registrieren & Health-Check starten
@@ -740,6 +741,8 @@ async fn start_full_node(state: SetupState) {
         fcm_client: Arc::new(stone::push::FcmClient::new()),
         action_store: server::state::ActionStore::new(),
         play_drops: server::state::PlayDropTracker::new(server::state::PlayDropConfig::from_env()),
+        watchdog: stone::watchdog::WatchdogState::new(),
+        pop_mining: pop_mining_shared,
     };
 
     *state.node_state.write().await = Some(node_app_state.clone());

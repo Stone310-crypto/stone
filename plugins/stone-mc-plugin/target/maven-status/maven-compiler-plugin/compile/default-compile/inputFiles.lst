@@ -1,6 +1,7 @@
 /Users/leon/stone-1/plugins/stone-mc-plugin/src/main/java/net/stonechain/mcplugin/BlockBreakDropListener.java
 /Users/leon/stone-1/plugins/stone-mc-plugin/src/main/java/net/stonechain/mcplugin/ClaimManager.java
 /Users/leon/stone-1/plugins/stone-mc-plugin/src/main/java/net/stonechain/mcplugin/ClaimStore.java
+/Users/leon/stone-1/plugins/stone-mc-plugin/src/main/java/net/stonechain/mcplugin/ClientViolationDetector.java
 /Users/leon/stone-1/plugins/stone-mc-plugin/src/main/java/net/stonechain/mcplugin/EmbeddedNode.java
 /Users/leon/stone-1/plugins/stone-mc-plugin/src/main/java/net/stonechain/mcplugin/LightP2pNode.java
 /Users/leon/stone-1/plugins/stone-mc-plugin/src/main/java/net/stonechain/mcplugin/MobKillDropListener.java
@@ -9,6 +10,8 @@
 /Users/leon/stone-1/plugins/stone-mc-plugin/src/main/java/net/stonechain/mcplugin/PersonalVault.java
 /Users/leon/stone-1/plugins/stone-mc-plugin/src/main/java/net/stonechain/mcplugin/PersonalVaultStore.java
 /Users/leon/stone-1/plugins/stone-mc-plugin/src/main/java/net/stonechain/mcplugin/PlayerWalletStore.java
+/Users/leon/stone-1/plugins/stone-mc-plugin/src/main/java/net/stonechain/mcplugin/PopMiner.java
+/Users/leon/stone-1/plugins/stone-mc-plugin/src/main/java/net/stonechain/mcplugin/ProofOfClientHash.java
 /Users/leon/stone-1/plugins/stone-mc-plugin/src/main/java/net/stonechain/mcplugin/RareBlock.java
 /Users/leon/stone-1/plugins/stone-mc-plugin/src/main/java/net/stonechain/mcplugin/RareBlockListener.java
 /Users/leon/stone-1/plugins/stone-mc-plugin/src/main/java/net/stonechain/mcplugin/RareBlockStore.java

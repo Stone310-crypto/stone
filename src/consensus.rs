@@ -2235,6 +2235,15 @@ pub fn should_prefer_peer_chain_with_hashes(
     local_fork_hash: &str,
     peer_fork_hash: &str,
 ) -> (bool, &'static str) {
+    let diff = if peer_len > local_len { peer_len - local_len } else { local_len - peer_len };
+
+    // Peak-Advance: Wenn Peer signifikant weiter ist (>10 Blöcke), bevorzuge
+    // immer den längeren Chain-Tip — der Node mit weniger Blöcken hat vermutlich
+    // einen Fork und sollte sich angleichen.
+    if diff > 10 && peer_len > local_len {
+        return (true, "Peak-Advance: Peer-Chain signifikant länger");
+    }
+
     let (prefer, reason) = should_prefer_peer_chain(
         local_len, peer_len, local_cumulative_stake, peer_cumulative_stake,
     );

@@ -485,7 +485,7 @@ pub struct AutoMiningConfig {
 impl Default for AutoMiningConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             auto_timeout_secs: 120,
             heartbeat_timeout_secs: 30,
             heartbeat_partial_delta: DEFAULT_PARTIAL_DELTA,
@@ -507,6 +507,11 @@ impl AutoMiningConfig {
                 if let Some(v) = json.get("auto_mining_enabled").and_then(|x| x.as_bool()) {
                     cfg.enabled = v;
                 }
+                // Wenn auto_mining_enabled nicht in der Config steht, bleibt der Default (false).
+                // Kein implizites Auto-Enable mehr — das muss explizit gesetzt werden.
+                // Sonst minen alle Nodes parallel Blöcke ohne Miner → Fork-Kaskade.
+                // Zum Aktivieren: "auto_mining_enabled": true in node_config.json
+                // oder STONE_AUTO_MINING_ENABLED=1
                 if let Some(v) = json.get("auto_mining_timeout_secs").and_then(|x| x.as_u64()) {
                     cfg.auto_timeout_secs = v.max(5);
                 }
@@ -543,6 +548,38 @@ impl AutoMiningConfig {
             }
         }
         cfg
+    }
+
+    /// Schreibt `auto_mining_enabled` zurück in die `node_config.json`.
+    /// Überschreibt den Wert nur wenn die Datei bereits existiert und
+    /// gültiges JSON enthält.
+    fn patch_config_enabled(enabled: bool) {
+        let path = "node_config.json";
+        let raw = match std::fs::read_to_string(path) {
+            Ok(s) => s,
+            Err(_) => {
+                let mut map = serde_json::Map::new();
+                map.insert("auto_mining_enabled".into(), serde_json::Value::Bool(enabled));
+                let cfg = serde_json::Value::Object(map);
+                if let Ok(json) = serde_json::to_string_pretty(&cfg) {
+                    let _ = std::fs::write(path, json);
+                }
+                return;
+            }
+        };
+        let mut val: serde_json::Value = match serde_json::from_str(&raw) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+        if let Some(obj) = val.as_object_mut() {
+            obj.insert(
+                "auto_mining_enabled".into(),
+                serde_json::Value::Bool(enabled),
+            );
+            if let Ok(json) = serde_json::to_string_pretty(&val) {
+                let _ = std::fs::write(path, json);
+            }
+        }
     }
 }
 
