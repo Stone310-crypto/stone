@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use tauri::AppHandle;
+use tauri::{AppHandle, Manager};
 
 const GITHUB_API: &str = "https://api.github.com/repos/Stone310-crypto/stone/releases/latest";
 const BINARY_NAMES: &[&str] = &["stone-app-node", "stone-master"];

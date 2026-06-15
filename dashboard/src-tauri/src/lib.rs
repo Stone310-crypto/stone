@@ -1,7 +1,7 @@
 mod file_upload;
 mod node_binary_downloader;
 mod node_manager;
-use tauri::Manager;
+use tauri::{AppHandle, Manager};
 use node_manager::{
     SharedNodeState, NodeState,
     get_local_ip,
