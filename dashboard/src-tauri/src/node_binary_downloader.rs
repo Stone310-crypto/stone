@@ -34,6 +34,39 @@ pub struct BinaryVersion {
     pub sha256: String,
 }
 
+/// Synchroner Wrapper — lädt Binaries herunter, falls keine lokal vorhanden sind.
+/// Wird von `node_start_internal` aufgerufen, bevor die Binary-Suche startet.
+pub fn ensure_binaries_available(app: &AppHandle) -> Result<(), String> {
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .map_err(|e| format!("App-Datenverzeichnis nicht verfügbar: {e}"))?;
+    let binaries_dir = data_dir.join("binaries");
+
+    // Prüfen ob mindestens eine Binary schon da ist
+    #[cfg(target_os = "windows")]
+    let node_exists = binaries_dir.join("stone-app-node.exe").exists()
+        || binaries_dir.join("stone-master.exe").exists();
+    #[cfg(not(target_os = "windows"))]
+    let node_exists = binaries_dir.join("stone-app-node").exists()
+        || binaries_dir.join("stone-master").exists();
+
+    if node_exists {
+        return Ok(()); // Schon vorhanden — nichts tun
+    }
+
+    // Keine Binary lokal → von GitHub holen (blocking im aktuellen Thread)
+    let rt = tokio::runtime::Runtime::new()
+        .map_err(|e| format!("Async-Runtime-Fehler: {e}"))?;
+
+    rt.block_on(async {
+        install_or_update_binaries(app)
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("Download fehlgeschlagen: {e}"))
+    })
+}
+
 /// Lädt die neuesten Release-Informationen von GitHub.
 async fn fetch_latest_release(client: &reqwest::Client) -> Result<GitHubRelease> {
     let resp = client

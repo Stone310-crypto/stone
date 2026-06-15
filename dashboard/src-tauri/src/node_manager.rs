@@ -460,10 +460,22 @@ pub fn node_start_internal(
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
 
+    // Auto-download node binaries from GitHub if missing locally (first run)
+    s.status = NodeStatus::Starting;
+    s.append_log("[app] Prüfe Node-Binaries…");
+    if let Err(e) = crate::node_binary_downloader::ensure_binaries_available(app) {
+        s.status = NodeStatus::Error {
+            message: format!("Binary-Download fehlgeschlagen: {e}"),
+        };
+        return Err(format!(
+            "Node-Binaries nicht verfügbar und Download fehlgeschlagen: {e}"
+        ));
+    }
+
     // Find binary (prefers stone-app-node, falls back to stone-master)
     let binary = find_binary(app, &s.config.binary_path).ok_or_else(|| {
         s.status = NodeStatus::BinaryNotFound;
-        "Node-Binary nicht gefunden. Bitte bauen: cargo build --release --bin stone-app-node".to_string()
+        "Node-Binary nicht gefunden. Kein GitHub-Release vorhanden? Erstelle einen Release mit den Binaries.".to_string()
     })?;
 
     // Automatically fix permissions and remove quarantine — the main fix
