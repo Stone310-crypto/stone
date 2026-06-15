@@ -9,18 +9,212 @@ export default function NodeView() {
     refetchInterval: 5_000,
   });
 
+  const [updateState, setUpdateState] = useState<
+    "idle" | "checking" | "downloading" | "restarting"
+  >("idle");
+  const [newVersion, setNewVersion] = useState<string | null>(null);
+  const [dlResult, setDlResult] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const checkForUpdates = async () => {
+    setError(null);
+    setUpdateState("checking");
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      const tag: string | null = await invoke("node_binary_check_updates");
+      if (tag) {
+        setNewVersion(tag);
+      }
+    } catch (e: any) {
+      setError(e?.toString() ?? "Fehler beim Update-Check");
+    } finally {
+      setUpdateState("idle");
+    }
+  };
+
+  const downloadUpdate = async () => {
+    setError(null);
+    setUpdateState("downloading");
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      const results: [string, string][] =
+        await invoke("node_binary_download_latest");
+      const lines = results.map(([name, path]) => `${name} → ${path}`);
+      setDlResult(lines.join("\n"));
+      setNewVersion(null);
+    } catch (e: any) {
+      setError(e?.toString() ?? "Download fehlgeschlagen");
+    } finally {
+      setUpdateState("idle");
+    }
+  };
+
+  const doRestart = async () => {
+    setUpdateState("restarting");
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      await invoke("node_stop");
+      await new Promise((r) => setTimeout(r, 1000));
+      await invoke("node_start");
+      setDlResult(null);
+    } catch (e: any) {
+      setError(e?.toString() ?? "Restart fehlgeschlagen");
+    } finally {
+      setUpdateState("idle");
+    }
+  };
+
   return (
-    <div className="flex-1 overflow-y-auto p-6" style={{ background: "var(--main-bg)" }}>
-      <h2 className="text-xl font-bold mb-6">Embedded Node</h2>
+    <div
+      className="flex-1 overflow-y-auto p-6"
+      style={{ background: "var(--main-bg)" }}
+    >
+      <div className="flex items-center justify-between mb-6">
+        <h2 className="text-xl font-bold">Embedded Node</h2>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={checkForUpdates}
+            disabled={updateState === "checking"}
+            className="text-xs px-3 py-1.5 rounded hover:opacity-80 disabled:opacity-50"
+            style={{
+              background: "var(--surface)",
+              color: "var(--text-muted)",
+              border: "1px solid var(--border)",
+            }}
+          >
+            {updateState === "checking" ? "Prüfe…" : "🔍 Update prüfen"}
+          </button>
+        </div>
+      </div>
+
+      {/* Update-Banner */}
+      {error && (
+        <div
+          className="mb-4 p-3 rounded-lg text-sm"
+          style={{
+            background: "rgba(239,68,68,0.1)",
+            color: "#ef4444",
+            border: "1px solid rgba(239,68,68,0.2)",
+          }}
+        >
+          {error}
+          <button
+            onClick={() => setError(null)}
+            className="ml-3 underline"
+          >
+            Ausblenden
+          </button>
+        </div>
+      )}
+
+      {newVersion && (
+        <div
+          className="mb-4 p-4 rounded-lg"
+          style={{
+            background: "rgba(250,166,26,0.1)",
+            border: "1px solid rgba(250,166,26,0.2)",
+            color: "var(--yellow)",
+          }}
+        >
+          <p className="font-semibold mb-2">
+            Neue Node-Version verfügbar: {newVersion}
+          </p>
+          <div className="flex gap-2">
+            <button
+              onClick={downloadUpdate}
+              disabled={updateState === "downloading"}
+              className="text-sm px-3 py-1 rounded font-medium hover:opacity-90 disabled:opacity-50"
+              style={{
+                background: "var(--yellow)",
+                color: "#000",
+              }}
+            >
+              {updateState === "downloading"
+                ? "Lade herunter…"
+                : "⬇ Jetzt aktualisieren"}
+            </button>
+            <button
+              onClick={() => setNewVersion(null)}
+              className="text-sm px-3 py-1 rounded"
+              style={{
+                background: "var(--surface)",
+                color: "var(--text-muted)",
+                border: "1px solid var(--border)",
+              }}
+            >
+              Später
+            </button>
+          </div>
+        </div>
+      )}
+
+      {dlResult && (
+        <div
+          className="mb-4 p-4 rounded-lg"
+          style={{
+            background: "rgba(34,197,94,0.1)",
+            border: "1px solid rgba(34,197,94,0.2)",
+            color: "#22c55e",
+          }}
+        >
+          <p className="font-semibold mb-1">
+            ✅ Binaries aktualisiert:
+          </p>
+          <pre className="text-xs font-mono opacity-80">{dlResult}</pre>
+          <p className="text-xs mt-2">
+            Starte den Node neu, um die neuen Binaries zu verwenden.
+          </p>
+          <button
+            onClick={doRestart}
+            disabled={updateState === "restarting"}
+            className="mt-2 text-sm px-3 py-1 rounded font-medium hover:opacity-90 disabled:opacity-50"
+            style={{
+              background: "#22c55e",
+              color: "#000",
+            }}
+          >
+            {updateState === "restarting"
+              ? "Starte neu…"
+              : "🔄 Node neustarten"}
+          </button>
+        </div>
+      )}
+
       {healthQ.data && (
         <div className="grid grid-cols-2 gap-3 mb-6">
-          <div className="rounded-xl p-4" style={{ background: "var(--surface)", border: "1px solid var(--border)" }}>
-            <p className="text-xs" style={{ color: "var(--text-muted)" }}>Block Height</p>
-            <p className="text-xl font-bold tabular-nums" style={{ color: "var(--text)" }}>#{healthQ.data.block_height}</p>
+          <div
+            className="rounded-xl p-4"
+            style={{
+              background: "var(--surface)",
+              border: "1px solid var(--border)",
+            }}
+          >
+            <p className="text-xs" style={{ color: "var(--text-muted)" }}>
+              Block Height
+            </p>
+            <p
+              className="text-xl font-bold tabular-nums"
+              style={{ color: "var(--text)" }}
+            >
+              #{healthQ.data.block_height}
+            </p>
           </div>
-          <div className="rounded-xl p-4" style={{ background: "var(--surface)", border: "1px solid var(--border)" }}>
-            <p className="text-xs" style={{ color: "var(--text-muted)" }}>Node ID</p>
-            <p className="text-sm font-mono" style={{ color: "var(--text)" }}>{healthQ.data.node_id.slice(0, 24)}…</p>
+          <div
+            className="rounded-xl p-4"
+            style={{
+              background: "var(--surface)",
+              border: "1px solid var(--border)",
+            }}
+          >
+            <p className="text-xs" style={{ color: "var(--text-muted)" }}>
+              Node ID
+            </p>
+            <p
+              className="text-sm font-mono"
+              style={{ color: "var(--text)" }}
+            >
+              {healthQ.data.node_id.slice(0, 24)}…
+            </p>
           </div>
         </div>
       )}

@@ -1,4 +1,5 @@
 mod file_upload;
+mod node_binary_downloader;
 mod node_manager;
 use tauri::Manager;
 use node_manager::{
@@ -87,6 +88,16 @@ pub fn run() {
             state.config = cfg;
             let shared: SharedNodeState = Arc::new(Mutex::new(state));
 
+            // Auto-download node binaries on first start (if missing)
+            let app_handle_dl = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                // Wait for UI to render
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                if let Err(e) = node_binary_downloader::install_or_update_binaries(&app_handle_dl).await {
+                    eprintln!("[binary-dl] Initialer Download fehlgeschlagen (falls lokal vorhanden, wird trotzdem gestartet): {e}");
+                }
+            });
+
             // Auto-start node if config says so (delayed by 2s to let UI render)
             if enabled {
                 let app_handle = app.handle().clone();
@@ -112,7 +123,29 @@ pub fn run() {
             validate_upload_file,
             upload_file,
             detect_file_type_cmd,
+            node_binary_check_updates,
+            node_binary_download_latest,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
+}
+
+// ── Node Binary Downloader commands ───────────────────────────────────────────
+
+#[tauri::command]
+async fn node_binary_check_updates(app: AppHandle) -> Result<Option<String>, String> {
+    node_binary_downloader::check_for_updates(&app)
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn node_binary_download_latest(app: AppHandle) -> Result<Vec<(String, String)>, String> {
+    let results = node_binary_downloader::install_or_update_binaries(&app)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(results
+        .into_iter()
+        .map(|(name, path)| (name, path.to_string_lossy().to_string()))
+        .collect())
 }
