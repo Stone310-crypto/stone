@@ -140,6 +140,14 @@ fn prepare_binary(path: &PathBuf) -> Result<(), String> {
 
 // ── Binary discovery ──────────────────────────────────────────────────────────
 
+/// Discover `stone-app-node` (preferred) or `stone-master`.
+///
+/// Priority:
+/// 1. Explicit path from config (`override_path`)
+/// 2. `<app_data>/binaries/` — dedicated folder created automatically on first launch
+/// 3. Next to our own executable (inside .app bundle on macOS / next to .exe on Windows)
+/// 4. Rust build output (`target/release/`) — developer shortcut
+/// 5. `$PATH` / `%PATH%` lookup
 fn find_binary(app: &AppHandle, override_path: &str) -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     let exe_suffix = ".exe";
@@ -148,26 +156,40 @@ fn find_binary(app: &AppHandle, override_path: &str) -> Option<PathBuf> {
 
     let exe_name = |base: &str| -> String { format!("{}{}", base, exe_suffix) };
 
+    // Ensure the dedicated binaries folder exists
+    let _ = app
+        .path()
+        .app_data_dir()
+        .map(|d| {
+            let bin_dir = d.join("binaries");
+            let _ = std::fs::create_dir_all(&bin_dir);
+            bin_dir
+        });
+
     let candidates: Vec<PathBuf> = {
         let mut v = vec![];
 
-        // 0. Explicit override
+        // 0. Explicit override from config
         if !override_path.is_empty() {
             v.push(PathBuf::from(override_path));
         }
 
-        // 1. Next to our own executable
+        // 1. Dedicated binaries folder — highest default priority
+        if let Ok(data_dir) = app.path().app_data_dir() {
+            let bin_dir = data_dir.join("binaries");
+            v.push(bin_dir.join(exe_name("stone-app-node")));
+            v.push(bin_dir.join(exe_name("stone-master")));
+            // Also check legacy location (root of app data dir)
+            v.push(data_dir.join(exe_name("stone-app-node")));
+            v.push(data_dir.join(exe_name("stone-master")));
+        }
+
+        // 2. Next to our own executable
         if let Ok(exe) = std::env::current_exe() {
             if let Some(dir) = exe.parent() {
                 v.push(dir.join(exe_name("stone-app-node")));
                 v.push(dir.join(exe_name("stone-master")));
             }
-        }
-
-        // 2. App data directory
-        if let Ok(data_dir) = app.path().app_data_dir() {
-            v.push(data_dir.join(exe_name("stone-app-node")));
-            v.push(data_dir.join(exe_name("stone-master")));
         }
 
         // 3. Project build output (developer shortcut)
