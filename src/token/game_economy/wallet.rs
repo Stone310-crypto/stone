@@ -189,7 +189,7 @@ impl GameEconomyStore {
 
         // Spiel-Status prüfen
         if let Some(game) = self.registered_games.get(&gw.game_id) {
-            if !matches!(game.status, GameStatus::Active) {
+            if !matches!(game.status, GameStatus::Active | GameStatus::Dormant { .. }) {
                 return Err(GameEconomyError::GameSuspended {
                     game_id: gw.game_id.clone(),
                     reason: "Spiel nicht aktiv".into(),

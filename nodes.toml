@@ -58,6 +58,17 @@ bins    = "stone-setup stone-master"
 network = "mainnet"
 
 [[node]]
+name    = "server1-mainnet"
+host    = "100.90.28.68"
+user    = "root"
+port    = "22"
+root    = "/home/mainnet"
+path    = "/home/mainnet"
+service = "stone-node-mainnet"
+bins    = "stone-setup stone-master"
+network = "mainnet"
+
+[[node]]
 name    = "VPS2-mainnet"
 host    = "69.48.200.255"
 user    = "root"

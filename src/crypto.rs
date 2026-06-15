@@ -263,6 +263,39 @@ pub fn verify_document_signature(
         .map_err(|_| CryptoError::SignatureMismatch)
 }
 
+/// Verifiziert eine Ed25519-Signatur über eine beliebige UTF-8-Nachricht.
+///
+/// Generischer Helper für SDK-Endpoints, die Wallet-Ownership ohne Mnemonic
+/// nachweisen müssen (Consent-Approve/Reject, Wallet-Link, Session-Create).
+///
+/// * `public_key_hex` – 64-Zeichen Hex (32 Byte Ed25519-Public-Key)
+/// * `message`        – die exakte Nachricht, die signiert wurde (UTF-8 Bytes)
+/// * `signature_hex`  – 128-Zeichen Hex (64 Byte Ed25519-Signatur)
+pub fn verify_message_signature(
+    public_key_hex: &str,
+    message: &[u8],
+    signature_hex: &str,
+) -> Result<(), CryptoError> {
+    let pub_bytes = hex::decode(public_key_hex)
+        .map_err(|_| CryptoError::InvalidKey("Public Key kein gültiges Hex".into()))?;
+    let pub_array: [u8; 32] = pub_bytes
+        .try_into()
+        .map_err(|_| CryptoError::InvalidKey("Public Key muss 32 Byte sein".into()))?;
+    let verifying_key = VerifyingKey::from_bytes(&pub_array)
+        .map_err(|e| CryptoError::InvalidKey(e.to_string()))?;
+
+    let sig_bytes = hex::decode(signature_hex)
+        .map_err(|_| CryptoError::InvalidKey("Signatur kein gültiges Hex".into()))?;
+    let sig_array: [u8; 64] = sig_bytes
+        .try_into()
+        .map_err(|_| CryptoError::InvalidKey("Signatur muss 64 Byte sein".into()))?;
+    let signature = Signature::from_bytes(&sig_array);
+
+    verifying_key
+        .verify(message, &signature)
+        .map_err(|_| CryptoError::SignatureMismatch)
+}
+
 // ─── Dokument-Verschlüsselung ─────────────────────────────────────────────────
 
 /// Verschlüsselter Blob: enthält alles was zur Entschlüsselung nötig ist.

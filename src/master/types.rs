@@ -283,6 +283,8 @@ pub struct DeleteDocumentRequest {
 pub struct AddPeerRequest {
     pub url: String,
     #[serde(default)]
+    pub peer_id: Option<String>,
+    #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
     pub ca: Option<String>,

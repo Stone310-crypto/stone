@@ -96,19 +96,55 @@ const DEFAULT_DATA_DIR_MAINNET: &str = "stone_data_mainnet";
 const P2P_KEY_FILENAME: &str = "p2p.key";
 const P2P_CONFIG_FILENAME: &str = "p2p_config.json";
 
-pub const TOPIC_BLOCKS: &str = "stone/blocks/v1";
-pub const TOPIC_PEERS: &str = "stone/peers/v1";
-pub const TOPIC_MEMPOOL: &str = "stone/mempool/v1";
-pub const TOPIC_STORAGE: &str = "stone/storage/v1";
-pub const TOPIC_CHAT: &str = "stone/chat/v1";
+// ─── Netzwerk-Tag in Wire-Identifiern ─────────────────────────────────────────
+//
+// Alle Gossipsub-Topics, libp2p-StreamProtocols und der Handshake-Version-String
+// tragen ein Netzwerk-Tag (`mainnet`/`testnet`). Dadurch scheitern Cross-Net-
+// Verbindungen bereits beim libp2p-Protocol-Negotiation, bevor irgendein
+// Datenaustausch stattfindet. Keine Kademlia-Pollution, keine Gossipsub-
+// Subscription, keine Identify-Round-Trips.
+//
+// Hinweis: `is_mainnet()` liest die Env-Var; per `LazyLock` wird das Tag genau
+// einmal beim ersten Zugriff aufgelöst und danach gecached. Eine
+// Laufzeit-Umschaltung des Netzes ist nicht möglich (auch nicht erwünscht).
+
+use std::sync::LazyLock;
+
+fn net_tag() -> &'static str {
+    if is_mainnet() { "mainnet" } else { "testnet" }
+}
+
+pub static TOPIC_BLOCKS: LazyLock<String> =
+    LazyLock::new(|| format!("stone/{}/blocks/v1", net_tag()));
+pub static TOPIC_PEERS: LazyLock<String> =
+    LazyLock::new(|| format!("stone/{}/peers/v1", net_tag()));
+pub static TOPIC_MEMPOOL: LazyLock<String> =
+    LazyLock::new(|| format!("stone/{}/mempool/v1", net_tag()));
+pub static TOPIC_STORAGE: LazyLock<String> =
+    LazyLock::new(|| format!("stone/{}/storage/v1", net_tag()));
+pub static TOPIC_CHAT: LazyLock<String> =
+    LazyLock::new(|| format!("stone/{}/chat/v1", net_tag()));
 /// Off-chain Content-Sync für DSGVO-Chat (nur encrypted_content, kein PoW nötig)
-pub const TOPIC_CHAT_CONTENT: &str = "stone/chat-content/v1";
+pub static TOPIC_CHAT_CONTENT: LazyLock<String> =
+    LazyLock::new(|| format!("stone/{}/chat-content/v1", net_tag()));
 /// Miner-Identity & Heartbeats (Auto-Block-Timer Cluster-Awareness)
-pub const TOPIC_MINERS: &str = "stone/miners/v1";
+pub static TOPIC_MINERS: LazyLock<String> =
+    LazyLock::new(|| format!("stone/{}/miners/v1", net_tag()));
 
 /// Protokoll-Version für den Sync-Handshake.
 /// Peers mit einer anderen Major-Version werden abgelehnt.
-pub const STONE_PROTOCOL_VERSION: &str = "stone/0.7";
+///
+/// **Hinweis zur Netzwerk-Isolation:** Diese Version ist netzwerk-unabhängig.
+/// Cross-Net-Verbindungen scheitern bereits eine Stufe früher, weil alle
+/// libp2p-StreamProtocols (`/stone/<tag>/kad/...`, `/stone/<tag>/id/...`,
+/// Block-/Shard-Exchange) und alle Gossipsub-Topics ein Netzwerk-Tag
+/// enthalten – ein Mainnet-Node spricht ein Testnet-Node also gar nicht erst
+/// an. Der Handshake-Versionscheck bleibt damit eine reine Major-Version-
+/// Migrationsgrenze (z.B. 0.7 ↔ 0.8 Wire-Format).
+///
+/// **0.8** — Wire-Format für Block-/TX-/SyncHandshake-Gossip auf bincode
+/// (statt JSON) umgestellt. Mischbetrieb mit 0.7-Peers ist nicht möglich.
+pub const STONE_PROTOCOL_VERSION: &str = "stone/0.8";
 
 /// Dateiname für die persistierte Ban-Liste
 const BANNED_PEERS_FILENAME: &str = "banned_peers.json";
@@ -154,20 +190,99 @@ const SEED_NODES_TESTNET: &[&str] = &[
 /// Dieselben VPS, aber auf separaten Ports → komplette Netzwerk-Isolation.
 const SEED_NODES_MAINNET: &[&str] = &[
     // ── VPS1 (212.227.54.241) – primärer Mainnet-Bootstrap + Relay ───
-    "/ip4/212.227.54.241/tcp/5001/p2p/12D3KooWNz9GTNsFks567mHaQLKR4Ai6MCiw5WUDWAgvny1ow4tJ",
-    "/ip4/212.227.54.241/udp/5001/quic-v1/p2p/12D3KooWNz9GTNsFks567mHaQLKR4Ai6MCiw5WUDWAgvny1ow4tJ",
-    "/ip6/2a02:2479:a0:fa00::1/tcp/5001/p2p/12D3KooWNz9GTNsFks567mHaQLKR4Ai6MCiw5WUDWAgvny1ow4tJ",
-    "/ip6/2a02:2479:a0:fa00::1/udp/5001/quic-v1/p2p/12D3KooWNz9GTNsFks567mHaQLKR4Ai6MCiw5WUDWAgvny1ow4tJ",
+    "/ip4/212.227.54.241/tcp/5001/p2p/12D3KooWJvLC6jmFoHr5JFbH4XFomdGMCGHnFWKGgEmMSS4KcSjN",
+    "/ip4/212.227.54.241/udp/5001/quic-v1/p2p/12D3KooWJvLC6jmFoHr5JFbH4XFomdGMCGHnFWKGgEmMSS4KcSjN",
+    "/ip6/2a02:2479:a0:fa00::1/tcp/5001/p2p/12D3KooWJvLC6jmFoHr5JFbH4XFomdGMCGHnFWKGgEmMSS4KcSjN",
+    "/ip6/2a02:2479:a0:fa00::1/udp/5001/quic-v1/p2p/12D3KooWJvLC6jmFoHr5JFbH4XFomdGMCGHnFWKGgEmMSS4KcSjN",
     // ── VPS2 (69.48.200.255) – sekundärer Mainnet-Bootstrap + Relay ───
-    "/ip4/69.48.200.255/tcp/5001/p2p/12D3KooWQ4yo42uYwihPAJx1qXm85rTVVXEbH5oWu4GHrrNMs564",
-    "/ip4/69.48.200.255/udp/5001/quic-v1/p2p/12D3KooWQ4yo42uYwihPAJx1qXm85rTVVXEbH5oWu4GHrrNMs564",
-    "/ip6/2607:f1c0:f074:4300::1/tcp/5001/p2p/12D3KooWQ4yo42uYwihPAJx1qXm85rTVVXEbH5oWu4GHrrNMs564",
-    "/ip6/2607:f1c0:f074:4300::1/udp/5001/quic-v1/p2p/12D3KooWQ4yo42uYwihPAJx1qXm85rTVVXEbH5oWu4GHrrNMs564",
+    "/ip4/69.48.200.255/tcp/5001/p2p/12D3KooWJ1VKWsboQB5mf8w4iLCSJYCB1xxGTUPySm2tAwN4Uwyz",
+    "/ip4/69.48.200.255/udp/5001/quic-v1/p2p/12D3KooWJ1VKWsboQB5mf8w4iLCSJYCB1xxGTUPySm2tAwN4Uwyz",
+    "/ip6/2607:f1c0:f074:4300::1/tcp/5001/p2p/12D3KooWJ1VKWsboQB5mf8w4iLCSJYCB1xxGTUPySm2tAwN4Uwyz",
+    "/ip6/2607:f1c0:f074:4300::1/udp/5001/quic-v1/p2p/12D3KooWJ1VKWsboQB5mf8w4iLCSJYCB1xxGTUPySm2tAwN4Uwyz",
 ];
 
 /// Gibt die Seed-Nodes für das aktive Netzwerk zurück.
 fn active_seed_nodes() -> &'static [&'static str] {
     if is_mainnet() { SEED_NODES_MAINNET } else { SEED_NODES_TESTNET }
+}
+
+/// Kompakter Bericht zur Seed-/Bootstrap-Diversität.
+#[derive(Debug, Clone, Default)]
+pub struct BootstrapDiversityReport {
+    pub total_entries: usize,
+    pub unique_peer_ids: usize,
+    pub unique_ipv4_prefixes_16: usize,
+}
+
+/// Analysiert Bootstrap-Nodes auf Identitäts-/Netzwerk-Diversität.
+pub fn analyze_bootstrap_diversity(nodes: &[String]) -> BootstrapDiversityReport {
+    let mut peer_ids: HashSet<String> = HashSet::new();
+    let mut ipv4_prefixes: HashSet<String> = HashSet::new();
+
+    for raw in nodes {
+        let Ok(addr) = raw.parse::<Multiaddr>() else { continue };
+        for p in addr.iter() {
+            match p {
+                libp2p::multiaddr::Protocol::P2p(pid) => {
+                    peer_ids.insert(pid.to_string());
+                }
+                libp2p::multiaddr::Protocol::Ip4(ip) => {
+                    let o = ip.octets();
+                    ipv4_prefixes.insert(format!("{}.{}", o[0], o[1]));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    BootstrapDiversityReport {
+        total_entries: nodes.len(),
+        unique_peer_ids: peer_ids.len(),
+        unique_ipv4_prefixes_16: ipv4_prefixes.len(),
+    }
+}
+
+fn seed_host_from_multiaddr(seed: &str) -> Option<String> {
+    let addr = seed.parse::<Multiaddr>().ok()?;
+    for p in addr.iter() {
+        match p {
+            libp2p::multiaddr::Protocol::Ip4(ip) => return Some(ip.to_string()),
+            libp2p::multiaddr::Protocol::Ip6(ip) => return Some(ip.to_string()),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Liefert die Standard-HTTP-Bootstrap-URLs (pro Host eindeutig) aus den
+/// eingebauten Seed-Nodes für das aktive Netzwerk.
+///
+/// Port-Override: `STONE_BOOTSTRAP_HTTP_PORT` (Default: 8080)
+pub fn default_bootstrap_http_urls() -> Vec<String> {
+    let port = std::env::var("STONE_BOOTSTRAP_HTTP_PORT")
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(8080);
+
+    let mut hosts: HashSet<String> = HashSet::new();
+    for seed in active_seed_nodes() {
+        if let Some(host) = seed_host_from_multiaddr(seed) {
+            hosts.insert(host);
+        }
+    }
+
+    let mut urls: Vec<String> = hosts
+        .into_iter()
+        .map(|host| {
+            if host.contains(':') {
+                format!("http://[{host}]:{port}")
+            } else {
+                format!("http://{host}:{port}")
+            }
+        })
+        .collect();
+    urls.sort();
+    urls
 }
 
 /// Gibt das aktive Daten-Verzeichnis zurück.
@@ -360,6 +475,68 @@ impl P2pConfig {
         // STONE_RELAY_SERVER=1 → diesen Node als Relay-Server aktivieren
         if std::env::var("STONE_RELAY_SERVER").as_deref() == Ok("1") {
             self.relay_server_enabled = true;
+        }
+
+        // Guardrail: exakte Duplikate entfernen.
+        {
+            let mut seen = HashSet::new();
+            self.bootstrap_nodes.retain(|addr| seen.insert(addr.clone()));
+        }
+
+        // Guardrail: mehrere Addrs mit gleicher PeerId zählen nicht als Seed-Diversität.
+        {
+            let mut preferred: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+            let mut order: Vec<String> = Vec::new();
+
+            for addr in &self.bootstrap_nodes {
+                let Ok(ma) = addr.parse::<Multiaddr>() else { continue };
+                let pid = ma.iter().find_map(|p| {
+                    if let libp2p::multiaddr::Protocol::P2p(pid) = p {
+                        Some(pid.to_string())
+                    } else {
+                        None
+                    }
+                });
+                let Some(pid) = pid else { continue };
+                let has_quic = ma.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::QuicV1));
+
+                if !preferred.contains_key(&pid) {
+                    order.push(pid.clone());
+                    preferred.insert(pid, addr.clone());
+                    continue;
+                }
+
+                let current_has_quic = preferred
+                    .get(&pid)
+                    .and_then(|current| current.parse::<Multiaddr>().ok())
+                    .map(|current| current.iter().any(|p| matches!(p, libp2p::multiaddr::Protocol::QuicV1)))
+                    .unwrap_or(false);
+
+                if has_quic && !current_has_quic {
+                    preferred.insert(pid, addr.clone());
+                }
+            }
+
+            self.bootstrap_nodes = order
+                .into_iter()
+                .filter_map(|pid| preferred.remove(&pid))
+                .collect();
+        }
+
+        let diversity = analyze_bootstrap_diversity(&self.bootstrap_nodes);
+        if diversity.total_entries > 0 {
+            println!(
+                "[p2p] Seed-Diversität: total={} unique_peer_ids={} unique_ipv4_/16={}",
+                diversity.total_entries,
+                diversity.unique_peer_ids,
+                diversity.unique_ipv4_prefixes_16,
+            );
+            if diversity.unique_peer_ids < 2 {
+                eprintln!(
+                    "[p2p] ⚠ Niedrige Seed-Diversität: nur {} eindeutige PeerId(s)",
+                    diversity.unique_peer_ids,
+                );
+            }
         }
     }
 }
@@ -576,6 +753,42 @@ pub struct NetworkStatus {
     pub metrics: NetworkMetrics,
     /// Speicher-Ankündigungen aller bekannten Peers
     pub peer_storage: Vec<StorageAnnouncement>,
+    /// Selbstheilungsstatus des Sync-Pfads (WS-C)
+    pub sync_recovery: SyncRecoveryStatus,
+    /// Zustand des deterministischen Health-Controllers
+    pub health_controller: HealthControllerStatus,
+}
+
+/// Laufzeitstatus der Sync-Selbstheilung (WS-C Stage 1/2).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SyncRecoveryStatus {
+    /// "idle", "stage1_soft_reset" oder "stage2_peer_switch"
+    pub stage: String,
+    /// Anzahl ausgeführter Recovery-Aktionen seit Start
+    pub attempts: u32,
+    /// Sekunden seit letztem messbaren Sync-Fortschritt
+    pub seconds_since_progress: u64,
+    /// Aktueller Sync-Target-Peer (falls aktiv)
+    pub target_peer: Option<String>,
+    /// Letzter Recovery-Grund (menschenlesbar)
+    pub last_reason: String,
+}
+
+/// Laufzeitstatus des deterministischen Health-Controllers.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthControllerStatus {
+    /// "healthy", "degraded", "isolated", ...
+    pub state: String,
+    /// Klassifizierte Fehlerklasse oder "none"
+    pub failure: String,
+    /// Aktuelle Recovery-Eskalation oder "none"
+    pub recovery_level: String,
+    /// Sekunden seit letzter Zustands-Transition
+    pub seconds_since_transition: u64,
+    /// Cooldown bis zur nächsten Health-Aktion
+    pub cooldown_remaining_secs: u64,
+    /// Letzter Controller-Grundtext
+    pub last_reason: String,
 }
 
 /// Netzwerk-Nutzungsmetriken (kumulativ seit Start)
@@ -910,29 +1123,65 @@ pub fn build_swarm(
     let peer_id = PeerId::from_public_key(&keypair.public());
 
     // ── Gossipsub ─────────────────────────────────────────────────────────────
+    //
+    // - `validate_messages()` aktiviert manuelle Validierung: empfangene
+    //   Nachrichten werden NICHT automatisch weitergeleitet, sondern müssen vom
+    //   Anwendungscode via `report_message_validation_result(...)` mit
+    //   Accept/Reject/Ignore quittiert werden. Reject zieht zusätzlich
+    //   PeerScore-Punkte ab (P4-Penalty), was Mesh-Pruning auslöst.
+    // - `max_transmit_size = 8 MiB` deckt bincode-kodierte Blöcke bis nahe ans
+    //   `MAX_BLOCK_SIZE`-Limit (16 MiB JSON ≈ 4-8 MiB bincode) ab, ohne den
+    //   Gossip-Pfad als DoS-Vektor zu öffnen.
     let gossipsub_config = gossipsub::ConfigBuilder::default()
         .heartbeat_interval(Duration::from_secs(10))
         .validation_mode(gossipsub::ValidationMode::Strict)
-        .max_transmit_size(4 * 1024 * 1024) // 4 MiB pro Block
+        .validate_messages()
+        .max_transmit_size(10 * 1024 * 1024)  // muss == MAX_GOSSIP_BLOCK_BYTES (10 MiB) sein
         .build()
         .map_err(|e| format!("Gossipsub-Config: {e}"))?;
 
-    let gossipsub = gossipsub::Behaviour::new(
+    let mut gossipsub = gossipsub::Behaviour::new(
         MessageAuthenticity::Signed(keypair.clone()),
         gossipsub_config,
     )
     .map_err(|e| format!("Gossipsub init: {e}"))?;
 
+    // ── Gossipsub PeerScore ──────────────────────────────────────────────────
+    //
+    // Aktiviert Mesh-Scoring mit den libp2p-Defaults. Wirkt zusätzlich zu
+    // unserem Custom-Penalty-System: Peers die invalid messages
+    // (`MessageAcceptance::Reject`) liefern bekommen P4-Penalty und werden aus
+    // dem Mesh gepruned. Verhindert dass ein einzelner böser Peer den
+    // Block-Broadcast-Pfad blockiert.
+    let score_params = gossipsub::PeerScoreParams::default();
+    let score_thresholds = gossipsub::PeerScoreThresholds::default();
+    gossipsub
+        .with_peer_score(score_params, score_thresholds)
+        .map_err(|e| format!("Gossipsub PeerScore: {e}"))?;
+
     // ── Kademlia ──────────────────────────────────────────────────────────────
+    //
+    // StreamProtocol-Name enthält Netzwerk-Tag. Mainnet- und Testnet-Nodes
+    // teilen daher keine Routing-Tabellen.
+    let kad_proto: &'static str = Box::leak(
+        format!("/stone/{}/kad/1.0.0", net_tag()).into_boxed_str(),
+    );
     let mut kad_config = kad::Config::new(
-        libp2p::StreamProtocol::new("/stone/kad/1.0.0"),
+        libp2p::StreamProtocol::new(kad_proto),
     );
     kad_config.set_query_timeout(Duration::from_secs(config.connection_timeout_secs));
+    // Security Fix: DHT-Poisoning-Mitigation via S/Kademlia.
+    // FilterBoth = nur Records von Peers in der eigenen Routing-Tabelle akzeptieren.
+    kad_config.set_record_filtering(kad::StoreInserts::FilterBoth);
     let kad = kad::Behaviour::with_config(peer_id, MemoryStore::new(peer_id), kad_config);
 
     // ── Identify ──────────────────────────────────────────────────────────────
+    //
+    // Identify-Protocol-Name enthält Netzwerk-Tag (Cross-Net-Isolation).
+    // agent_version bleibt netzunabhängig – wird für Major-Version-Check
+    // genutzt.
     let identify_config = identify::Config::new(
-        "/stone/id/1.0.0".to_string(),
+        format!("/stone/{}/id/1.0.0", net_tag()),
         keypair.public(),
     ).with_agent_version(format!("stone/{}", env!("CARGO_PKG_VERSION")));
     let identify = identify::Behaviour::new(identify_config);
@@ -941,18 +1190,24 @@ pub fn build_swarm(
     let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)?;
 
     // ── Request/Response (Block-Austausch) ────────────────────────────────────
+    let block_proto: &'static str = Box::leak(
+        format!("/stone/{}/block-exchange/1.0.0", net_tag()).into_boxed_str(),
+    );
     let block_exchange = request_response::cbor::Behaviour::new(
         [(
-            libp2p::StreamProtocol::new("/stone/block-exchange/1.0.0"),
+            libp2p::StreamProtocol::new(block_proto),
             ProtocolSupport::Full,
         )],
         request_response::Config::default(),
     );
 
     // ── Request/Response (Shard-Austausch) ────────────────────────────────────
+    let shard_proto: &'static str = Box::leak(
+        format!("/stone/{}/shard-exchange/1.0.0", net_tag()).into_boxed_str(),
+    );
     let shard_exchange = request_response::cbor::Behaviour::new(
         [(
-            libp2p::StreamProtocol::new("/stone/shard-exchange/1.0.0"),
+            libp2p::StreamProtocol::new(shard_proto),
             ProtocolSupport::Full,
         )],
         request_response::Config::default(),

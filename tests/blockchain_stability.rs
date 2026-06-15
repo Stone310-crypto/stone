@@ -40,6 +40,8 @@ fn empty_block() -> Block {
         pow_nonce: 0,
         pow_hash: String::new(),
         pow_difficulty: 0,
+        effective_difficulty: 0,
+        cumulative_difficulty: 0,
     }
 }
 

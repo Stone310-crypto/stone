@@ -853,6 +853,14 @@ pub async fn handle_mining_submit(
             // Post-Block-Hooks ausführen (Staking, Slashing, Reputation, ChatPolicy)
             stone::master::MasterNodeState::run_post_block_hooks(&state.node, &block);
 
+            // Chat-Index sofort auf den neuen Block ziehen, damit confirmed
+            // nicht erst beim nächsten API-Request sichtbar wird.
+            {
+                let mut idx = state.chat_index.lock().unwrap_or_else(|e| e.into_inner());
+                idx.index_new_blocks(&[&block], Some(&state.node.message_pool));
+                stone::chat::save_chat_index(&idx);
+            }
+
             // Block via P2P-Gossipsub broadcasten
             {
                 let tx = state.node.block_broadcast_tx.lock().unwrap_or_else(|e| e.into_inner());
@@ -1050,7 +1058,7 @@ pub async fn handle_miner_connect(
         payload.extend_from_slice(&json);
         let net = net.clone();
         tokio::spawn(async move {
-            net.publish_gossip(stone::network::TOPIC_MINERS, payload).await;
+            net.publish_gossip(stone::network::TOPIC_MINERS.as_str(), payload).await;
         });
     }
 
@@ -1153,7 +1161,7 @@ pub async fn handle_miner_heartbeat(
         payload.extend_from_slice(&json);
         let net = net.clone();
         tokio::spawn(async move {
-            net.publish_gossip(stone::network::TOPIC_MINERS, payload).await;
+            net.publish_gossip(stone::network::TOPIC_MINERS.as_str(), payload).await;
         });
     }
 

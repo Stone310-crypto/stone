@@ -13,7 +13,7 @@ mod server;
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket},
     path::Path,
-    sync::Arc,
+    sync::{Arc, atomic::AtomicBool},
     time::Instant,
 };
 
@@ -57,6 +57,7 @@ use server::{
 };
 
 const CONFIG_FILE: &str = "node_config.json";
+static STAGE4_RECOVERY_RUNNING: AtomicBool = AtomicBool::new(false);
 
 // ─── Config ─────────────────────────────────────────────────────────────────
 
@@ -108,12 +109,43 @@ impl Default for NodeConfig {
 
 impl NodeConfig {
     fn load() -> Self {
-        if Path::new(CONFIG_FILE).exists() {
+        let mut cfg: Self = if Path::new(CONFIG_FILE).exists() {
             let data = std::fs::read_to_string(CONFIG_FILE).unwrap_or_default();
             serde_json::from_str(&data).unwrap_or_default()
         } else {
             Self::default()
+        };
+
+        // ── Env-Var-Override für Secrets (Phase 1.3) ────────────────────────
+        // Reihenfolge: ENV > File > leer.
+        // Wenn STONE_API_KEY / STONE_ADMIN_PASSWORD_HASH gesetzt sind,
+        // überschreiben sie File-Werte. So können Secrets aus dem JSON entfernt
+        // und über Env-Vars / .env eingespeist werden, ohne in Git zu landen.
+        if let Ok(k) = std::env::var("STONE_API_KEY") {
+            if !k.trim().is_empty() {
+                cfg.api_key = k.trim().to_string();
+            }
         }
+        if let Ok(h) = std::env::var("STONE_ADMIN_PASSWORD_HASH") {
+            if !h.trim().is_empty() {
+                cfg.password_hash = h.trim().to_string();
+            }
+        }
+
+        // Sicherheits-Warnung: Secrets stehen im File, obwohl Env-Vars verfügbar wären.
+        let file_has_secrets = Path::new(CONFIG_FILE).exists()
+            && (!cfg.api_key.is_empty() || !cfg.password_hash.is_empty());
+        let env_used = std::env::var("STONE_API_KEY").ok().filter(|v| !v.trim().is_empty()).is_some()
+            || std::env::var("STONE_ADMIN_PASSWORD_HASH").ok().filter(|v| !v.trim().is_empty()).is_some();
+        if file_has_secrets && !env_used {
+            eprintln!(
+                "[setup][WARN] Secrets stehen in {CONFIG_FILE}. \
+                 Empfehlung: STONE_API_KEY + STONE_ADMIN_PASSWORD_HASH via .env setzen \
+                 und die Felder im JSON leeren. {CONFIG_FILE} ist jetzt in .gitignore."
+            );
+        }
+
+        cfg
     }
 
     fn save(&self) -> anyhow::Result<()> {
@@ -607,7 +639,7 @@ async fn start_full_node(state: SetupState) {
                 };
 
                 if let Ok(json) = serde_json::to_vec(&announcement) {
-                    storage_net.publish_gossip(TOPIC_STORAGE, json).await;
+                    storage_net.publish_gossip(TOPIC_STORAGE.as_str(), json).await;
                 }
             }
         });
@@ -706,6 +738,8 @@ async fn start_full_node(state: SetupState) {
         audio_rooms: server::handlers::audio_relay::new_audio_rooms(),
         push_tokens: Arc::new(std::sync::Mutex::new(stone::push::load_push_tokens())),
         fcm_client: Arc::new(stone::push::FcmClient::new()),
+        action_store: server::state::ActionStore::new(),
+        play_drops: server::state::PlayDropTracker::new(server::state::PlayDropConfig::from_env()),
     };
 
     *state.node_state.write().await = Some(node_app_state.clone());
@@ -911,8 +945,13 @@ async fn handle_p2p_event(
                     let vs = node.validator_set.read().unwrap_or_else(|e| e.into_inner());
                     // Kein sinnvolles PoA möglich wenn ValidatorSet leer ist
                     // oder nur den eigenen Validator enthält
-                    if vs.validators.is_empty() || vs.active_count() <= 1 { None }
-                    else {
+                    if vs.validators.is_empty() {
+                        // SECURITY: Nach initial_sync mit leerem ValidatorSet ablehnen.
+                        Some(false)
+                    } else if vs.active_count() <= 1 {
+                        // Single-Node-Betrieb: PoA-Check überspringen
+                        None
+                    } else {
                         let (prev_hash, last_block_ts) = {
                             let chain = node.chain.lock().unwrap_or_else(|e| e.into_inner());
                             let ph = chain.blocks.last().map(|b| b.hash.clone()).unwrap_or_else(|| "genesis".into());
@@ -952,8 +991,9 @@ async fn handle_p2p_event(
                     let idx = block.index;
                     let txs = block.transactions.clone();
                     let chat_batches = block.chat_batches.clone();
-                    let block_signer = block.signer.clone();
-                    let block_validator_pk = block.validator_pub_key.clone();
+                    let block_for_chat = block.clone();
+                    let _block_signer = block.signer.clone();
+                    let _block_validator_pk = block.validator_pub_key.clone();
 
                     // Equivocation-Check vor Block-Akzeptanz
                     {
@@ -972,7 +1012,11 @@ async fn handle_p2p_event(
                         }
                     }
 
-                    match chain.accept_peer_block(*block, poa_ok) {
+                    match chain.accept_peer_block(
+                        *block,
+                        poa_ok,
+                        Some(&*node.checkpoint_store.read().unwrap_or_else(|e| e.into_inner())),
+                    ) {
                         Ok(_) => {
                             // Orphan-TX-Recovery
                             let orphaned = std::mem::take(&mut chain.orphaned_blocks);
@@ -1016,32 +1060,13 @@ async fn handle_p2p_event(
                                     );
                                 }
                             }
-                            // Validator Auto-Discovery: Nur für LIVE Blöcke
-                            // (nicht während Initial-Sync, dort kommen historische
-                            // Blöcke die tote Nodes registrieren würden)
-                            let sync_done = node.metrics.initial_sync_done.load(
-                                std::sync::atomic::Ordering::Relaxed
-                            );
-                            if sync_done
-                                && !block_signer.is_empty()
-                                && !block_validator_pk.is_empty()
-                                && block_signer != node.node_id
                             {
-                                let mut vs = node.validator_set.write().unwrap_or_else(|e| e.into_inner());
-                                if vs.get(&block_signer).is_none() {
-                                    // Auto-Discovery: als pending registrieren (active=false)
-                                    let info = stone::consensus::ValidatorInfo::new_pending(
-                                        block_signer.clone(),
-                                        block_validator_pk.clone(),
-                                    );
-                                    vs.add(info);
-                                    println!(
-                                        "[consensus] 🔗 Validator '{}' auto-discovered (pending) via Block #{} (Wallet: {}…)",
-                                        &block_signer, idx,
-                                        &block_validator_pk[..16.min(block_validator_pk.len())]
-                                    );
-                                }
+                                let mut chat_idx = chat_index_rc.lock().unwrap_or_else(|e| e.into_inner());
+                                chat_idx.index_new_blocks(&[&block_for_chat], Some(&node.message_pool));
+                                stone::chat::save_chat_index(&chat_idx);
                             }
+                            // SECURITY P0: Auto-Discovery deaktiviert.
+                            // ValidatorSet darf nicht implizit durch Netzwerk-Traffic wachsen.
                             BlockResult::Accepted(chain.blocks.len() as u64)
                         }
                         Err(ref e) if e.starts_with("Stale:") => BlockResult::Stale,
@@ -1194,7 +1219,11 @@ async fn handle_p2p_event(
                             }
                         }
 
-                        match chain.accept_peer_block(block, None) {
+                        match chain.accept_peer_block(
+                            block,
+                            None,
+                            Some(&*node.checkpoint_store.read().unwrap_or_else(|e| e.into_inner())),
+                        ) {
                             Ok(_) => {
                                 applied += 1;
                                 if !txs.is_empty() {
@@ -1509,12 +1538,20 @@ async fn handle_p2p_event(
 
         // ── Chat-Pool-Nachricht von Peer empfangen → in lokalen Pool ──────
         NetworkEvent::ChatMessageReceived { message, from_peer } => {
+            let msg_clone = message.clone();
             match node.message_pool.add_message(message) {
-                Ok(seq) => println!(
-                    "[p2p] 💬 Chat-Nachricht von {} (seq: {}, pool={})",
-                    &from_peer[..12.min(from_peer.len())], seq,
-                    node.message_pool.pending_count(),
-                ),
+                Ok(seq) => {
+                    println!(
+                        "[p2p] 💬 Chat-Nachricht von {} (seq: {}, pool={})",
+                        &from_peer[..12.min(from_peer.len())], seq,
+                        node.message_pool.pending_count(),
+                    );
+                    // Sofort in ChatIndex aufnehmen für instant delivery beim Empfänger.
+                    let mut idx = chat_index_rc.lock().unwrap_or_else(|e| e.into_inner());
+                    if idx.upsert_pool_message(&msg_clone) {
+                        stone::chat::save_chat_index(&idx);
+                    }
+                }
                 Err(e) => {
                     if !format!("{e}").contains("bereits bekannt") {
                         eprintln!("[p2p] Chat-Nachricht abgelehnt: {e}");
@@ -1564,7 +1601,76 @@ async fn handle_p2p_event(
             }
         }
 
+        // ── WS-C Stage4: Snapshot-Eskalation ───────────────────────────
+        NetworkEvent::Error { message } => {
+            if message.contains("WS-C Stage4") || message.contains("Snapshot-Eskalation") {
+                maybe_run_stage4_snapshot_recovery(node, api_key, &message).await;
+            } else {
+                eprintln!("[p2p] Fehler: {message}");
+            }
+        }
+
         _ => {} // PeerDisconnected, Listening etc.
+    }
+}
+
+async fn maybe_run_stage4_snapshot_recovery(
+    node: &Arc<MasterNodeState>,
+    api_key: &Arc<String>,
+    reason: &str,
+) {
+    let auto_enabled = std::env::var("STONE_SYNC_AUTO_SNAPSHOT_RECOVERY")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+
+    if !auto_enabled {
+        eprintln!(
+            "[snapshot] ⚠ WS-C Stage4 erkannt, Auto-Recovery aus (STONE_SYNC_AUTO_SNAPSHOT_RECOVERY=1 zum Aktivieren): {reason}"
+        );
+        return;
+    }
+
+    if STAGE4_RECOVERY_RUNNING
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_err()
+    {
+        eprintln!("[snapshot] ℹ Stage4-Recovery läuft bereits");
+        return;
+    }
+
+    let (chain_height, local_genesis) = {
+        let chain = node.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let h = chain.blocks.len() as u64;
+        let g = chain.blocks.first().map(|b| b.hash.clone()).unwrap_or_default();
+        (h, g)
+    };
+
+    eprintln!(
+        "[snapshot] 🚨 Starte WS-C Stage4 Auto-Recovery (height={}, reason={})",
+        chain_height,
+        reason,
+    );
+
+    match stone::snapshot::verified_download_snapshot(&local_genesis, chain_height).await {
+        Ok(meta) => {
+            eprintln!(
+                "[snapshot] ✅ WS-C Stage4 Recovery erfolgreich: Block #{}, {:.1} MB",
+                meta.block_height,
+                meta.archive_size as f64 / 1_048_576.0,
+            );
+            eprintln!("[snapshot] 🔄 Beende Prozess für sauberen Neustart...");
+            let _ = api_key;
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("[snapshot] ❌ WS-C Stage4 Recovery fehlgeschlagen: {e}");
+            STAGE4_RECOVERY_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
     }
 }
 

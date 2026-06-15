@@ -17,6 +17,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::json;
+use stone::consensus::{load_or_create_validator_key, local_validator_pubkey_hex};
 use stone::master::TrustStatus;
 
 use super::super::auth_middleware::require_admin;
@@ -36,10 +37,7 @@ pub struct TrustRequestBody {
 }
 
 #[derive(Debug, Deserialize)]
-pub struct TrustVoteBody {
-    /// The peer_id of the voting node (must match authenticated node)
-    pub voter_peer_id: String,
-}
+pub struct TrustVoteBody {}
 
 // ─── Handlers ─────────────────────────────────────────────────────────────────
 
@@ -124,11 +122,22 @@ pub async fn handle_trust_approve(
     headers: HeaderMap,
     Path(peer_id): Path<String>,
     State(state): State<AppState>,
-    axum::Json(body): axum::Json<TrustVoteBody>,
+    axum::Json(_body): axum::Json<TrustVoteBody>,
 ) -> Result<impl IntoResponse, Response> {
     require_admin(&headers, &state)?;
 
-    match state.node.trust_vote(&body.voter_peer_id, &peer_id, true) {
+    // SECURITY: voter_id niemals aus Client-Input übernehmen.
+    // Die Stimme ist an die lokale, authentisierte Node-Identität gebunden.
+    let voter_peer_id = state.node.node_id.clone();
+    let voter_pubkey_hex = {
+        let sk = load_or_create_validator_key();
+        local_validator_pubkey_hex(&sk)
+    };
+
+    match state
+        .node
+        .trust_vote(&voter_peer_id, &voter_pubkey_hex, &peer_id, true)
+    {
         Ok(new_status) => {
             save_trust(&state);
             let status_str = match new_status {
@@ -142,7 +151,7 @@ pub async fn handle_trust_approve(
                     "ok": true,
                     "peer_id": peer_id,
                     "status": status_str,
-                    "voter": body.voter_peer_id,
+                    "voter": voter_peer_id,
                 })),
             ))
         }
@@ -162,11 +171,22 @@ pub async fn handle_trust_revoke(
     headers: HeaderMap,
     Path(peer_id): Path<String>,
     State(state): State<AppState>,
-    axum::Json(body): axum::Json<TrustVoteBody>,
+    axum::Json(_body): axum::Json<TrustVoteBody>,
 ) -> Result<impl IntoResponse, Response> {
     require_admin(&headers, &state)?;
 
-    match state.node.trust_vote(&body.voter_peer_id, &peer_id, false) {
+    // SECURITY: voter_id niemals aus Client-Input übernehmen.
+    // Die Stimme ist an die lokale, authentisierte Node-Identität gebunden.
+    let voter_peer_id = state.node.node_id.clone();
+    let voter_pubkey_hex = {
+        let sk = load_or_create_validator_key();
+        local_validator_pubkey_hex(&sk)
+    };
+
+    match state
+        .node
+        .trust_vote(&voter_peer_id, &voter_pubkey_hex, &peer_id, false)
+    {
         Ok(new_status) => {
             save_trust(&state);
             let status_str = match new_status {
@@ -180,7 +200,7 @@ pub async fn handle_trust_revoke(
                     "ok": true,
                     "peer_id": peer_id,
                     "status": status_str,
-                    "voter": body.voter_peer_id,
+                    "voter": voter_peer_id,
                     "message": if new_status == TrustStatus::Revoked {
                         "Node has been revoked by majority vote."
                     } else {

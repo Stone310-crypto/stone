@@ -91,6 +91,7 @@ impl MasterNodeState {
             memo: format!("Block #{block_index} {memo_suffix}"),
             chain_id,
             fee_tier: crate::token::FeeTier::Priority,
+            signed_by: None,
         };
         tx.tx_id = compute_tx_id(&tx);
         tx
@@ -1033,7 +1034,7 @@ impl MasterNodeState {
                 block.hash = crate::blockchain::calculate_hash(&block);
                 block.signature = crate::blockchain::sign_hash(&self.cluster_key, &block.hash);
                 block.validator_signature = sign_block(&signing_key, &block.hash);
-            } else if is_pow_fallback {
+            } else if is_pow_fallback && crate::consensus::BLOCK_POW_ENABLED {
                 // Lite-PoW nur wenn Argon2id nicht aktiv ist
                 use crate::consensus::{solve_lite_pow, BLOCK_POW_DIFFICULTY};
                 let pow_nonce = solve_lite_pow(
@@ -1049,6 +1050,12 @@ impl MasterNodeState {
                 println!(
                     "[mining] 🔨 Lite-PoW gelöst für Block #{}: nonce={pow_nonce} (difficulty={})",
                     block.index, BLOCK_POW_DIFFICULTY
+                );
+            } else if is_pow_fallback {
+                // PoA-Fallback ohne PoW: Round-Robin-Übernahme nach Timeout, kein Puzzle.
+                println!(
+                    "[mining] ⚡ PoA-Fallback Block #{}: primärer Validator hat Slot verpasst – Übernahme ohne PoW",
+                    block.index
                 );
             }
         }
@@ -1453,11 +1460,13 @@ impl MasterNodeState {
                     continue;
                 }
 
-                // Gate: Nur Auto-Blöcke produzieren wenn auch User-TXs warten.
-                // Verhindert Block-Flood durch leere Reward-only Blöcke.
+                // Gate: Auto-Blöcke nur wenn echte Nutzlast anliegt.
+                // Nutzlast ist entweder mindestens eine User-TX ODER ein fälliger
+                // Chat-Batch (MessagePool threshold/timeout erreicht).
                 let pending = state.mempool.pending_count();
-                if pending == 0 {
-                    // Timer NICHT zurücksetzen — sobald TXs kommen soll sofort
+                let chat_batch_ready = state.message_pool.batch_ready();
+                if pending == 0 && !chat_batch_ready {
+                    // Timer NICHT zurücksetzen — sobald Nutzlast kommt soll sofort
                     // gemined werden, ohne erneut auto_timeout_secs zu warten.
                     continue;
                 }
@@ -1469,9 +1478,10 @@ impl MasterNodeState {
                 match state.mint_auto_block() {
                     Ok(block) => {
                         println!(
-                            "[auto-mining] ⛏️  Auto-Block #{} produziert ({} User-TXs, kein Miner aktiv seit {}s)",
+                            "[auto-mining] ⛏️  Auto-Block #{} produziert ({} User-TXs, chat_batch_ready={}, kein Miner aktiv seit {}s)",
                             block.index,
                             pending,
+                            chat_batch_ready,
                             state.block_timer.lock().map(|t| t.elapsed_secs()).unwrap_or(0)
                         );
                         // Broadcast + reset

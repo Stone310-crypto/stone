@@ -8,6 +8,8 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 use stone::master::{AddPeerRequest, PeerInfo, PeerStatus};
+use std::time::{Duration, Instant};
+use tokio::task::JoinSet;
 
 use super::super::auth_middleware::require_admin;
 use super::super::state::{save_peers, AppState};
@@ -17,7 +19,98 @@ use super::super::sync::pull_from_peer;
 pub async fn handle_list_peers(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    (StatusCode::OK, axum::Json(state.node.get_peers()))
+    let mut peers = state.node.get_peers();
+    if peers.is_empty() {
+        return (StatusCode::OK, axum::Json(peers));
+    }
+
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(4))
+        .danger_accept_invalid_certs(
+            std::env::var("STONE_INSECURE_SSL").map(|v| v == "1").unwrap_or(false),
+        )
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return (StatusCode::OK, axum::Json(peers)),
+    };
+
+    let now = chrono::Utc::now().timestamp();
+    let mut changed = false;
+
+    let mut checks = JoinSet::new();
+    for peer in &peers {
+        let peer_url = peer.url.clone();
+        let health_url = format!("{}/api/v1/health", peer_url.trim_end_matches('/'));
+        let client = client.clone();
+        checks.spawn(async move {
+            let started = Instant::now();
+            let is_healthy = match client.get(&health_url).send().await {
+                Ok(resp) => resp.status().is_success(),
+                Err(_) => false,
+            };
+
+            let discovered_peer_id = if is_healthy {
+                let info_url = format!("{}/api/v1/p2p/info", peer_url.trim_end_matches('/'));
+                match client.get(&info_url).send().await {
+                    Ok(resp) if resp.status().is_success() => resp
+                        .json::<serde_json::Value>()
+                        .await
+                        .ok()
+                        .and_then(|v| v.get("peer_id").and_then(|p| p.as_str()).map(|s| s.to_string()))
+                        .filter(|pid| pid.parse::<libp2p::PeerId>().is_ok()),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+            (peer_url, is_healthy, started.elapsed().as_millis(), discovered_peer_id)
+        });
+    }
+
+    while let Some(result) = checks.join_next().await {
+        let Ok((peer_url, is_healthy, latency, discovered_peer_id)) = result else {
+            continue;
+        };
+        let Some(peer) = peers.iter_mut().find(|p| p.url == peer_url) else {
+            continue;
+        };
+
+        if is_healthy {
+            if peer.status != PeerStatus::Healthy {
+                peer.status = PeerStatus::Healthy;
+                changed = true;
+            }
+            if peer.last_seen == 0 || now - peer.last_seen > 5 {
+                peer.last_seen = now;
+                changed = true;
+            }
+            if peer.latency_ms != Some(latency) {
+                peer.latency_ms = Some(latency);
+                changed = true;
+            }
+            if peer.sync_failures != 0 {
+                peer.sync_failures = 0;
+                changed = true;
+            }
+            if discovered_peer_id.is_some() && peer.peer_id != discovered_peer_id {
+                peer.peer_id = discovered_peer_id;
+                changed = true;
+            }
+        } else if peer.status == PeerStatus::Healthy {
+            peer.status = PeerStatus::Unreachable;
+            peer.sync_failures = peer.sync_failures.saturating_add(1);
+            changed = true;
+        }
+    }
+
+    if changed {
+        state.node.replace_peers(peers.clone());
+        save_peers(&peers);
+    }
+
+    (StatusCode::OK, axum::Json(peers))
 }
 
 /// POST /api/v1/peers
@@ -30,6 +123,7 @@ pub async fn handle_add_peer(
 
     let peer = PeerInfo {
         url: req.url.clone(),
+        peer_id: req.peer_id.clone(),
         name: req.name,
         ca: req.ca,
         status: PeerStatus::Unreachable,
@@ -89,7 +183,35 @@ pub async fn handle_remove_peer(
 pub struct RegisterPeerRequest {
     pub url: String,
     #[serde(default)]
+    pub peer_id: Option<String>,
+    #[serde(default)]
     pub name: Option<String>,
+}
+
+fn normalize_peer_url_for_network(raw_url: &str) -> String {
+    let url = raw_url.trim().trim_end_matches('/').to_string();
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return url;
+    };
+    let host_port = rest.split('/').next().unwrap_or(rest);
+    let host = host_port.split(':').next().unwrap_or(host_port).trim();
+    let port = host_port
+        .split(':')
+        .nth(1)
+        .and_then(|p| p.parse::<u16>().ok())
+        .unwrap_or(0);
+    if host.is_empty() {
+        return url;
+    }
+
+    let default_http = if stone::network::is_mainnet() { 3180 } else { 3080 };
+    let normalized_port = if port == 8080 { default_http } else { port };
+
+    if normalized_port == 0 {
+        format!("{}://{}", scheme, host)
+    } else {
+        format!("{}://{}:{}", scheme, host, normalized_port)
+    }
 }
 
 /// POST /api/v1/peers/register — Öffentlich: Node meldet sich bei uns an.
@@ -100,7 +222,17 @@ pub async fn handle_register_peer(
     State(state): State<AppState>,
     axum::Json(req): axum::Json<RegisterPeerRequest>,
 ) -> impl IntoResponse {
-    let url = req.url.trim().trim_end_matches('/').to_string();
+    let url = normalize_peer_url_for_network(&req.url);
+
+    // Optionales PeerId-Feld auf gültiges Format prüfen.
+    if let Some(ref peer_id) = req.peer_id {
+        if peer_id.parse::<libp2p::PeerId>().is_err() {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(json!({"error": "peer_id ist ungültig"})),
+            );
+        }
+    }
 
     // Validierung: URL muss ein gültiges Schema haben
     if !url.starts_with("http://") && !url.starts_with("https://") {
@@ -127,6 +259,26 @@ pub async fn handle_register_peer(
     {
         let mut peers = state.node.peers.write().unwrap_or_else(|e| e.into_inner());
         if let Some(existing) = peers.iter_mut().find(|p| p.url == url) {
+            if let (Some(existing_pid), Some(incoming_pid)) = (&existing.peer_id, &req.peer_id) {
+                if existing_pid.parse::<libp2p::PeerId>().is_ok() {
+                    if existing_pid != incoming_pid {
+                        return (
+                            StatusCode::CONFLICT,
+                            axum::Json(json!({
+                                "error": "URL ist bereits mit einer anderen peer_id verknüpft",
+                                "existing_peer_id": existing_pid,
+                            })),
+                        );
+                    }
+                } else {
+                    // Altbestand bereinigen: früher gespeicherte ungültige peer_id (z.B. URL)
+                    // durch eine jetzt gültig gelieferte PeerId ersetzen.
+                    existing.peer_id = Some(incoming_pid.clone());
+                }
+            }
+            if existing.peer_id.is_none() && req.peer_id.is_some() {
+                existing.peer_id = req.peer_id.clone();
+            }
             existing.last_seen = chrono::Utc::now().timestamp();
             existing.name = req.name.or_else(|| existing.name.clone());
             let total = peers.len();
@@ -148,6 +300,7 @@ pub async fn handle_register_peer(
     // Neuen Peer anlegen
     let peer = PeerInfo {
         url: url.clone(),
+        peer_id: req.peer_id,
         name: req.name,
         ca: None,
         status: PeerStatus::Healthy, // Optimistisch: wenn er uns erreicht, ist er erreichbar

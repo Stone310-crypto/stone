@@ -910,6 +910,22 @@ pub const MAX_POW_DIFFICULTY: u32 = 32;
 /// 0 = PoW von Genesis an (Competitive Mining ab Start).
 pub const ARGON2_POW_ACTIVATION_BLOCK: u64 = 0;
 
+/// Master-Schalter: Block-Level Proof-of-Work an/aus.
+///
+/// `false` = reines PoA (Round-Robin Validator-Rotation + Ed25519-Signaturen +
+/// ⌊2/3⌋+1 Voting). Keine Argon2id- oder Lite-PoW-Puzzle für Block-Produktion.
+/// Schützt nicht gegen Sybil (das macht der Validator-Whitelist + Stake);
+/// schützt nicht gegen Spam (das macht Mempool-Caps + Message-PoW separat).
+///
+/// `true` = Hybrid PoA+PoW (Legacy). Reaktiviert die gesamte PoW-Schiene
+/// (Difficulty-Adjustment, Argon2id-Verifikation in `accept_peer_block`,
+/// Gossip-Pre-Checks, Heartbeat-Partials, Lite-PoW-Fallback bei verpasstem Slot).
+///
+/// **Wichtig:** Message-PoW (`MESSAGE_POW_DIFFICULTY`, `solve_message_pow`,
+/// `verify_message_pow`) für Chat-Anti-Spam ist davon **nicht** betroffen und
+/// bleibt immer aktiv.
+pub const BLOCK_POW_ENABLED: bool = false;
+
 // ─── PoS/PoW Hybrid Konstanten ──────────────────────────────────────────────
 
 /// Maximaler Difficulty-Bonus durch Staking (Anzahl Bits).
@@ -1130,6 +1146,10 @@ pub fn calculate_next_difficulty(
 /// Am Activation-Block: ARGON2_POW_INITIAL_DIFFICULTY.
 /// Danach: Aus der Chain berechnet (letzter Block mit pow_difficulty > 0).
 pub fn get_current_pow_difficulty(blocks: &[Block], next_block_index: u64) -> u32 {
+    // Pure-PoA Modus: keine Block-Difficulty mehr (Validator-Rotation übernimmt).
+    if !BLOCK_POW_ENABLED {
+        return 0;
+    }
     if next_block_index < ARGON2_POW_ACTIVATION_BLOCK {
         return 0; // Legacy-Block, kein Argon2id-PoW
     }
@@ -1211,13 +1231,33 @@ impl BlockProposal {
         }
     }
 
-    /// Signatur des Proposers gegen seinen Public Key prüfen
-    pub fn verify_proposer(&self, validator_set: &ValidatorSet) -> bool {
-        matches!(
-            validator_set.verify_block(&self.block.hash, &self.proposer_id, &self.proposer_signature),
-            BlockVerifyResult::Valid | BlockVerifyResult::NoValidatorsConfigured
-        )
+    /// Signatur des Proposers gegen seinen Public Key prüfen.
+    ///
+    /// Standard ist strikt: `NoValidatorsConfigured` wird NICHT akzeptiert.
+    /// Ein Bootstrap-Fenster muss explizit über die Policy erlaubt werden.
+    pub fn verify_proposer(
+        &self,
+        validator_set: &ValidatorSet,
+        policy: ProposerVerificationPolicy,
+    ) -> bool {
+        match validator_set.verify_block(
+            &self.block.hash,
+            &self.proposer_id,
+            &self.proposer_signature,
+        ) {
+            BlockVerifyResult::Valid => true,
+            BlockVerifyResult::NoValidatorsConfigured => {
+                matches!(policy, ProposerVerificationPolicy::AllowNoValidatorsConfigured)
+            }
+            _ => false,
+        }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProposerVerificationPolicy {
+    Strict,
+    AllowNoValidatorsConfigured,
 }
 
 // ─── 2-Phase BFT Voting ───────────────────────────────────────────────────────
@@ -1407,6 +1447,12 @@ impl VotingRound {
         if vote.phase != VotePhase::PreVote {
             return Err(format!("Erwartete PreVote, erhielt {:?}", vote.phase));
         }
+        if !validator_set.is_active_validator(&vote.voter_id) {
+            return Err(format!(
+                "Voter '{}' ist kein aktiver Validator",
+                vote.voter_id
+            ));
+        }
         if !vote.verify(validator_set) {
             return Err("Ungültige PreVote-Signatur".into());
         }
@@ -1429,6 +1475,12 @@ impl VotingRound {
         }
         if vote.phase != VotePhase::PreCommit {
             return Err(format!("Erwartete PreCommit, erhielt {:?}", vote.phase));
+        }
+        if !validator_set.is_active_validator(&vote.voter_id) {
+            return Err(format!(
+                "Voter '{}' ist kein aktiver Validator",
+                vote.voter_id
+            ));
         }
         if !vote.verify(validator_set) {
             return Err("Ungültige PreCommit-Signatur".into());

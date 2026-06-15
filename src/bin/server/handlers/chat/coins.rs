@@ -54,6 +54,12 @@ pub async fn handle_chat_send_coins(
     headers: HeaderMap,
     axum::Json(req): axum::Json<ChatSendCoinsRequest>,
 ) -> impl IntoResponse {
+    if !crate::server::auth_middleware::mnemonic_auth_enabled() {
+        return (axum::http::StatusCode::GONE, axum::Json(
+            crate::server::auth_middleware::mnemonic_killswitch_body("handle_chat_send_coins")
+        )).into_response();
+    }
+    crate::server::auth_middleware::log_mnemonic_call("handle_chat_send_coins");
     let user = match require_user(&headers, &state) {
         Ok(u) => u,
         Err(e) => return e.into_response(),
@@ -230,7 +236,7 @@ pub async fn handle_chat_send_coins(
 
     // Push-Benachrichtigung (Fire & Forget)
     {
-        let push_store = state.push_tokens.lock().unwrap().clone();
+        let push_store = state.push_tokens.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let fcm = state.fcm_client.clone();
         let sender_name = user.name.clone();
         let recipient = to_wallet.clone();
@@ -271,6 +277,12 @@ pub async fn handle_chat_request_coins(
     headers: HeaderMap,
     axum::Json(req): axum::Json<ChatRequestCoinsRequest>,
 ) -> impl IntoResponse {
+    if !crate::server::auth_middleware::mnemonic_auth_enabled() {
+        return (axum::http::StatusCode::GONE, axum::Json(
+            crate::server::auth_middleware::mnemonic_killswitch_body("handle_chat_request_coins")
+        )).into_response();
+    }
+    crate::server::auth_middleware::log_mnemonic_call("handle_chat_request_coins");
     let user = match require_user(&headers, &state) {
         Ok(u) => u,
         Err(e) => return e.into_response(),
@@ -377,7 +389,7 @@ pub async fn handle_chat_request_coins(
 
             // Push-Benachrichtigung (Fire & Forget)
             {
-                let push_store = state.push_tokens.lock().unwrap().clone();
+                let push_store = state.push_tokens.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 let fcm = state.fcm_client.clone();
                 let sender_name = user.name.clone();
                 let recipient = from_wallet.clone();

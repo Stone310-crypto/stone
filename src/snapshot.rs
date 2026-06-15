@@ -76,10 +76,42 @@ pub struct SnapshotMeta {
 // ─── Pfade ───────────────────────────────────────────────────────────────────
 
 /// Verzeichnis für Snapshots: `stone_data/snapshots/`
+///
+/// **Panic:** Schlägt fehl wenn das Verzeichnis nicht angelegt werden kann
+/// (z.B. Permission-Denied). Ein laufender Node ohne Snapshot-Dir ist
+/// nicht sinnvoll betreibbar → früher Crash mit klarer Meldung ist besser
+/// als kryptische Folgefehler in `save_snapshot`/`load_snapshot` (S6).
 pub fn snapshot_dir() -> PathBuf {
     let dir = PathBuf::from(data_dir()).join("snapshots");
-    fs::create_dir_all(&dir).unwrap_or(());
+    fs::create_dir_all(&dir).unwrap_or_else(|e| {
+        panic!("[snapshot] Verzeichnis {} konnte nicht angelegt werden: {e}", dir.display())
+    });
     dir
+}
+
+/// **Sicherheits-Helper (S5)**: TLS-Validierung darf nur in Debug-Builds
+/// per `STONE_INSECURE_SSL=1` deaktiviert werden. Release-Builds ignorieren
+/// die Env-Var → kein MITM-Angriffsvektor in produktiven Builds.
+fn insecure_ssl_allowed() -> bool {
+    #[cfg(debug_assertions)]
+    {
+        std::env::var("STONE_INSECURE_SSL").as_deref() == Ok("1")
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        false
+    }
+}
+
+/// Mainnet-Policy: Sicherheits-Bypasses sind dort nicht erlaubt.
+fn is_mainnet_network() -> bool {
+    matches!(
+        std::env::var("STONE_NETWORK")
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .as_str(),
+        "mainnet" | "main"
+    )
 }
 
 /// Pfad zur aktuellen Snapshot-Metadatei.
@@ -334,8 +366,9 @@ fn create_rocksdb_checkpoint(db_path: &str, dst_path: &Path) -> Result<(), Snaps
 
     // Read-Only Open: kein Lock-Konflikt mit dem laufenden Node-Prozess
     let db = if db_path.ends_with("chain_db") {
-        // chain_db hat 3 CFs + default
-        DB::open_cf_for_read_only(&opts, db_path, ["default", "blocks", "meta", "index"], false)
+        // SECURITY (S4): CF-Liste aus zentraler Konstante — verhindert dass neue CFs
+        // stillschweigend aus Snapshots fallen.
+        DB::open_cf_for_read_only(&opts, db_path, crate::storage::CHAIN_DB_CF_NAMES.iter().copied(), false)
     } else {
         DB::open_for_read_only(&opts, db_path, false)
     }.map_err(|e| SnapshotError::Io(std::io::Error::new(
@@ -466,12 +499,21 @@ pub fn restore_snapshot(
 
 /// Versucht einen Snapshot von einem HTTP-Peer herunterzuladen.
 ///
+/// **DEPRECATED (S2):** Single-source-of-trust — kein Bootstrap-Konsens, keine
+/// Attestation-Prüfung. Nutze stattdessen `verified_download_snapshot`.
+/// Behalten nur für Tools und manuelle Debug-Zwecke. Wird in einer zukünftigen
+/// Version entfernt.
+///
 /// # Ablauf
 /// 1. GET /api/v1/snapshot/meta — Metadaten holen
 /// 2. Genesis-Hash vergleichen
 /// 3. GET /api/v1/snapshot/download — Archiv herunterladen
 /// 4. Hash verifizieren
 /// 5. Wiederherstellen
+#[deprecated(
+    since = "0.7.7",
+    note = "Single-source-of-trust ohne Konsens — nutze verified_download_snapshot."
+)]
 pub async fn download_snapshot_from_peer(
     peer_url: &str,
     local_genesis_hash: &str,
@@ -480,11 +522,7 @@ pub async fn download_snapshot_from_peer(
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300)) // 5 Min Timeout für große Snapshots
         .connect_timeout(std::time::Duration::from_secs(5)) // Schneller Connect-Timeout
-        .danger_accept_invalid_certs(
-            std::env::var("STONE_INSECURE_SSL")
-                .map(|v| v == "1")
-                .unwrap_or(false),
-        )
+        .danger_accept_invalid_certs(insecure_ssl_allowed())
         .build()
         .map_err(|e| SnapshotError::Network(format!("HTTP-Client: {e}")))?;
 
@@ -492,11 +530,7 @@ pub async fn download_snapshot_from_peer(
     let meta_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
         .connect_timeout(std::time::Duration::from_secs(5))
-        .danger_accept_invalid_certs(
-            std::env::var("STONE_INSECURE_SSL")
-                .map(|v| v == "1")
-                .unwrap_or(false),
-        )
+        .danger_accept_invalid_certs(insecure_ssl_allowed())
         .build()
         .map_err(|e| SnapshotError::Network(format!("HTTP-Client: {e}")))?;
 
@@ -671,9 +705,7 @@ pub async fn verified_download_snapshot(
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .connect_timeout(std::time::Duration::from_secs(5))
-        .danger_accept_invalid_certs(
-            std::env::var("STONE_INSECURE_SSL").as_deref() == Ok("1"),
-        )
+        .danger_accept_invalid_certs(insecure_ssl_allowed())
         .build()
         .map_err(|e| SnapshotError::Network(format!("HTTP-Client: {e}")))?;
 
@@ -798,13 +830,28 @@ pub async fn verified_download_snapshot(
             let first = &roots_at_height[0];
             let agrees = roots_at_height.iter().filter(|sr| *sr == first).count();
             if agrees < roots_at_height.len() {
-                // State-Roots stimmen nicht überein — aber Block-Höhe und Chain-Hashes
-                // passen (gleiche Chain). Ledger-Divergenz ist ein bekanntes Problem.
-                // Wir akzeptieren den Snapshot trotzdem, die Post-Restore-Verifikation
-                // (Schritt 7) prüft die interne Konsistenz des heruntergeladenen Snapshots.
+                // SECURITY (S3): State-Root Divergenz ist kritisch — bedeutet, dass
+                // mindestens ein Bootstrap-Node einen abweichenden Ledger-State sieht.
+                // Default: harter Abort. Operator kann via STONE_ALLOW_STATEROOT_DIVERGENCE=1
+                // den Snapshot trotzdem akzeptieren (z.B. wenn ein Bootstrap-Node nachweislich
+                // out-of-sync ist).
+                let allow_divergence = if is_mainnet_network() {
+                    false
+                } else {
+                    std::env::var("STONE_ALLOW_STATEROOT_DIVERGENCE")
+                        .map(|v| v == "1")
+                        .unwrap_or(false)
+                };
+                if !allow_divergence {
+                    return Err(SnapshotError::ConsensusFailure {
+                        agrees,
+                        required: roots_at_height.len(),
+                        total: total_nodes,
+                    });
+                }
                 eprintln!(
                     "[snapshot] ⚠️  State-Root Divergenz bei Block #{}: {}/{} übereinstimmend. \
-                     Snapshot wird trotzdem verwendet (Post-Restore-Verifikation aktiv).",
+                     STONE_ALLOW_STATEROOT_DIVERGENCE=1 → Snapshot wird akzeptiert.",
                     best_height, agrees, roots_at_height.len()
                 );
             } else {
@@ -847,9 +894,7 @@ pub async fn verified_download_snapshot(
     let dl_client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
         .connect_timeout(std::time::Duration::from_secs(5))
-        .danger_accept_invalid_certs(
-            std::env::var("STONE_INSECURE_SSL").as_deref() == Ok("1"),
-        )
+        .danger_accept_invalid_certs(insecure_ssl_allowed())
         .build()
         .map_err(|e| SnapshotError::Network(format!("HTTP-Client: {e}")))?;
 
@@ -907,8 +952,43 @@ pub async fn verified_download_snapshot(
 
     eprintln!("[snapshot] ✅ Archiv-Hash verifiziert");
 
+    // ── Schritt 5b: Attestations kryptographisch verifizieren (S1) ──────
+    // Pre-Restore: jede vorhandene Attestation MUSS eine gültige Ed25519-Signatur
+    // haben, sonst wurde der Snapshot manipuliert.
+    // Nach dem Restore wird zusätzlich gegen den lokalen Ledger gequert.
+    let attestation_summary = verify_attestation_signatures(best_meta)?;
+    if attestation_summary.valid_count == 0 {
+        if is_mainnet_network() || std::env::var("STONE_REQUIRE_ATTESTATIONS").as_deref() == Ok("1") {
+            return Err(SnapshotError::Network(
+                "Keine gültigen Snapshot-Attestations (Mainnet-Policy oder STONE_REQUIRE_ATTESTATIONS=1)".into(),
+            ));
+        }
+        eprintln!(
+            "[snapshot] ⚠️  Snapshot ohne Attestations — Vertrauen nur via Bootstrap-Konsens \
+             (setze STONE_REQUIRE_ATTESTATIONS=1 um abzubrechen)"
+        );
+    } else {
+        eprintln!(
+            "[snapshot] ✅ {} gültige Attestation(s) verifiziert (claimed stake: {})",
+            attestation_summary.valid_count, attestation_summary.claimed_stake
+        );
+    }
+
     // ── Schritt 6: Wiederherstellen ─────────────────────────────────────
     restore_snapshot(&archive_path, best_meta)?;
+
+    // ── Schritt 6b: Attestation-Quorum gegen restored Ledger (S1) ───────
+    if attestation_summary.valid_count > 0 {
+        if let Err(e) = verify_attestation_quorum_against_ledger(best_meta) {
+            eprintln!("[snapshot] ❌ Attestation-Quorum-Check fehlgeschlagen: {e}");
+            return Err(SnapshotError::ConsensusFailure {
+                agrees: attestation_summary.valid_count,
+                required: 1,
+                total: best_meta.attestations.len(),
+            });
+        }
+        eprintln!("[snapshot] ✅ Attestation-Quorum (≥⅔ Guardian-Stake) erreicht");
+    }
 
     // ── Schritt 7: Lokalen State-Root nach Restore verifizieren ─────────
     // Ledger aus der wiederhergestellten token_db laden und state_root berechnen.
@@ -943,6 +1023,138 @@ fn compute_restored_state_root() -> String {
     use crate::token::TokenLedger;
     let ledger = TokenLedger::load();
     ledger.state_root()
+}
+
+// ─── Attestation-Verifikation (S1) ───────────────────────────────────────────
+
+/// Ergebnis der kryptographischen Verifikation der Snapshot-Attestations.
+struct AttestationCheck {
+    valid_count: usize,
+    /// Selbst-deklarierter Stake der Signer (noch nicht gegen Ledger geprüft).
+    claimed_stake: Decimal,
+}
+
+/// Prüft jede Attestation kryptographisch:
+/// - Wallet → Pubkey decodieren (Bech32m oder Hex)
+/// - Ed25519-Signatur gegen `"snapshot:{height}:{archive_hash}:{state_root}"` prüfen
+/// - block_height + archive_hash + state_root müssen zum Meta passen
+///
+/// Bei ungültiger Signatur → harter Abort (Manipulation).
+/// Duplikat-Signer werden verworfen.
+fn verify_attestation_signatures(meta: &SnapshotMeta) -> Result<AttestationCheck, SnapshotError> {
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+    let mut seen_signers: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut valid_count = 0usize;
+    let mut claimed_stake = Decimal::ZERO;
+
+    let message = format!(
+        "snapshot:{}:{}:{}",
+        meta.block_height, meta.archive_hash, meta.state_root
+    );
+
+    for att in &meta.attestations {
+        // Cross-Field: Attestation muss zum Snapshot passen
+        if att.block_height != meta.block_height
+            || att.archive_hash != meta.archive_hash
+            || att.state_root != meta.state_root
+        {
+            return Err(SnapshotError::Network(format!(
+                "Attestation Cross-Field-Mismatch von {}: erwartet h={}/{}, bekommen h={}/{}",
+                &att.signer_wallet[..12.min(att.signer_wallet.len())],
+                meta.block_height,
+                &meta.archive_hash[..12.min(meta.archive_hash.len())],
+                att.block_height,
+                &att.archive_hash[..12.min(att.archive_hash.len())],
+            )));
+        }
+
+        // Wallet → 32-Byte Pubkey
+        let pubkey_bytes: [u8; 32] = if att.signer_wallet.to_lowercase().starts_with("stone1") {
+            match crate::token::address::decode(&att.signer_wallet) {
+                Some(b) => b,
+                None => return Err(SnapshotError::Network(format!(
+                    "Ungültige Wallet-Adresse in Attestation: {}",
+                    &att.signer_wallet[..16.min(att.signer_wallet.len())]
+                ))),
+            }
+        } else if att.signer_wallet.len() == 64 {
+            let bytes = hex::decode(&att.signer_wallet).map_err(|_| {
+                SnapshotError::Network(format!(
+                    "Ungültiger Hex-Wallet in Attestation: {}",
+                    &att.signer_wallet[..16.min(att.signer_wallet.len())]
+                ))
+            })?;
+            bytes.try_into().map_err(|_| {
+                SnapshotError::Network("Wallet-Hex falsche Länge".to_string())
+            })?
+        } else {
+            return Err(SnapshotError::Network(format!(
+                "Nicht-Pubkey Wallet in Attestation: {}",
+                &att.signer_wallet[..16.min(att.signer_wallet.len())]
+            )));
+        };
+
+        let verifying_key = VerifyingKey::from_bytes(&pubkey_bytes).map_err(|e| {
+            SnapshotError::Network(format!("Ungültiger Ed25519-Key in Attestation: {e}"))
+        })?;
+
+        let sig_bytes = hex::decode(&att.signature_hex).map_err(|e| {
+            SnapshotError::Network(format!("Signatur-Hex-Decode: {e}"))
+        })?;
+        if sig_bytes.len() != 64 {
+            return Err(SnapshotError::Network(
+                "Attestation-Signatur muss 64 Bytes sein".into(),
+            ));
+        }
+        let sig_array: [u8; 64] = sig_bytes.try_into().unwrap();
+        let signature = Signature::from_bytes(&sig_array);
+
+        verifying_key.verify(message.as_bytes(), &signature).map_err(|e| {
+            SnapshotError::Network(format!(
+                "Attestation-Signatur ungültig von {}: {e}",
+                &att.signer_wallet[..12.min(att.signer_wallet.len())]
+            ))
+        })?;
+
+        // Duplikate verwerfen (gleicher Signer mehrfach)
+        if seen_signers.insert(att.signer_wallet.clone()) {
+            valid_count += 1;
+            claimed_stake += att.signer_stake;
+        }
+    }
+
+    Ok(AttestationCheck { valid_count, claimed_stake })
+}
+
+/// Post-Restore: Prüft das Attestation-Quorum gegen den realen Ledger.
+///
+/// Nutzt `StakingPool::load()` und delegiert die volle Verifikation an
+/// `verify_snapshot_attestations`, das Signatur-Validität, Eligibility (Guardian+)
+/// und Quorum (≥⅔ des stake-gewichteten Voting-Powers) prüft.
+fn verify_attestation_quorum_against_ledger(meta: &SnapshotMeta) -> Result<(), String> {
+    use crate::token::staking::StakingPool;
+    let pool = StakingPool::load();
+    let trust = pool.verify_snapshot_attestations(
+        &meta.attestations,
+        meta.block_height,
+        &meta.archive_hash,
+        &meta.state_root,
+    );
+
+    if trust.total_eligible_stake == Decimal::ZERO {
+        // Frühe Chain — kein Guardian-Set existiert. Akzeptieren.
+        eprintln!("[snapshot] ℹ️  Kein Guardian-Stake im Ledger — Quorum-Check übersprungen");
+        return Ok(());
+    }
+
+    if !trust.quorum_reached {
+        return Err(format!(
+            "Quorum nicht erreicht: {} gültige Sigs, attested_stake={}, total_eligible={}",
+            trust.valid_signatures, trust.attested_stake, trust.total_eligible_stake
+        ));
+    }
+    Ok(())
 }
 
 /// Prüft ob ein Snapshot erstellt werden soll (alle SNAPSHOT_INTERVAL Blöcke).

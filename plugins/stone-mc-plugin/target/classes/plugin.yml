@@ -1,0 +1,77 @@
+name: StoneMC
+main: net.stonechain.mcplugin.StoneMcPlugin
+version: 0.1.0-SNAPSHOT
+api-version: "1.21"
+author: Stonechain
+description: Proof-of-Play bridge for Stonechain (random STONE drops, /redeem command).
+
+commands:
+  stoneredeem:
+    description: Redeem collected Stone Coins to your on-chain wallet.
+    usage: /<command> <stone1...address>
+    aliases: [redeem, sredeem]
+  stonebalance:
+    description: Show local pending Stone Coins (un-redeemed) for the player.
+    usage: /<command>
+    aliases: [sbalance, stonestats]
+  stonerates:
+    description: Show active Minecraft fairness parameters (drop rates, shards, limits).
+    usage: /<command>
+    aliases: [srate]
+  stonelink:
+    description: Link your Minecraft account to a Stonechain wallet (one-time).
+    usage: /<command> <stone1...address>
+  stoneunlink:
+    description: Remove linked Stonechain wallet from your Minecraft account.
+    usage: /<command>
+    aliases: [sunlink]
+  stoneboard:
+    description: Toggle the Stone-Coins sidebar on/off.
+    usage: /<command>
+    aliases: [sboard]
+  stonemenu:
+    description: Open the Stone-Coins menu (GUI).
+    usage: /<command> [item]
+    aliases: [smenu]
+  stonevault:
+    description: Open your personal Stone Vault (only you can access it).
+    usage: /<command>
+    aliases: [svault]
+  stoneclaim:
+    description: Claim areas or chunks and manage trusted players.
+    usage: /<command> <gui|map|visual [all|claim]|list|info|trust|accept|untrust|transfer|remove|<gruppe|all> <spieler>>
+    aliases: [sclaim]
+    permission: stone.claim
+  stonerareblock:
+    description: Admin – give rare Stone Core blocks.
+    usage: /<command> [amount]
+    aliases: [srare]
+    permission: stone.admin
+  stoneshop:
+    description: Server-Shop öffnen (kaufen mit Shards).
+    usage: /<command>
+    aliases: [shop, sshop]
+  stoneshopadmin:
+    description: Admin – Shop-Items verwalten.
+    usage: /<command> <add <preis>|remove <id>|list>
+    permission: stone.admin
+  shopwithdraw:
+    description: Deprecated (no shop treasury in fee-free mode).
+    usage: /<command>
+    permission: stone.admin
+  stonedeathprotect:
+    description: Admin – death protection for shards/coins toggles.
+    usage: /<command> <status|coins|shards> <on|off>
+    aliases: [sdp]
+    permission: stone.admin
+
+permissions:
+  stone.redeem:
+    description: Allow players to redeem Stone Coins.
+    default: true
+  stone.admin:
+    description: Admin commands.
+    default: op
+  stone.claim:
+    description: Use personal claim commands.
+    default: true

@@ -20,6 +20,7 @@ impl GameEconomyStore {
         developer_wallet: &str,
         max_wallet_limit: Decimal,
         permissions: Vec<GamePermission>,
+        genres: Vec<GameGenre>,
     ) -> Result<(RegisteredGame, String), GameEconomyError> {
         if self.registered_games.contains_key(game_id) {
             return Err(GameEconomyError::AlreadyExists {
@@ -39,6 +40,8 @@ impl GameEconomyStore {
             });
         }
 
+        validate_genres(&genres)?;
+
         let (api_key, api_key_hash) = generate_api_key(game_id, developer_wallet);
         let now = Utc::now().timestamp();
 
@@ -47,34 +50,74 @@ impl GameEconomyStore {
             name: name.to_string(),
             description: description.to_string(),
             website: website.to_string(),
+            genres,
             developer_wallet: developer_wallet.to_string(),
             api_key_hash,
             max_wallet_limit,
             permissions,
+            authorized_servers: Vec::new(),
             status: GameStatus::Active,
             created_at: now,
             updated_at: now,
+            last_owner_heartbeat: now,
+            inherited_game_ids: Vec::new(),
+            successor_of: None,
         };
 
         self.registered_games.insert(game_id.to_string(), game.clone());
         self.audit(game_id, developer_wallet, "register_game", serde_json::json!({
-            "name": name, "permissions_count": game.permissions.len(),
+            "name": name,
+            "permissions_count": game.permissions.len(),
+            "genres": game.genres.iter().map(|g| g.to_string()).collect::<Vec<_>>(),
         }), true);
 
         Ok((game, api_key))
     }
 
-    /// Validiert einen API-Key und gibt das zugehörige Spiel zurück.
+    pub fn update_game_genres(
+    &mut self,
+    game_id: &str,
+    caller_wallet: &str,
+    new_genres: Vec<GameGenre>,
+) -> Result<(), GameEconomyError> {
+    let game = self.registered_games.get_mut(game_id)
+        .ok_or_else(|| GameEconomyError::NotFound { what: format!("Spiel '{game_id}'") })?;
+
+    if game.developer_wallet != caller_wallet {
+        return Err(GameEconomyError::Unauthorized {
+            reason: "Nur der Owner darf Genres updaten".into(),
+        });
+    }
+
+    validate_genres(&new_genres)?;
+
+    game.genres = new_genres.clone();
+    game.updated_at = Utc::now().timestamp();
+    
+    self.audit(game_id, caller_wallet, "update_genres", serde_json::json!({
+        "genres": new_genres.iter().map(|g| g.to_string()).collect::<Vec<_>>(),
+    }), true);
+
+    Ok(())
+}
+    /// Validiert einen API-Key (Klartext) und gibt das zugehörige Spiel zurück.
     pub fn validate_api_key(&self, api_key: &str) -> Result<&RegisteredGame, GameEconomyError> {
         let hash = hash_api_key(api_key);
+        self.validate_api_key_hash(&hash)
+    }
+
+    /// Validiert einen bereits gehashten API-Key-Hash (ohne Re-Hash).
+    /// Security: Der Client hasht den Key lokal und sendet nur den Hash.
+    /// Kein API-Key-Klartext über die Leitung.
+    pub fn validate_api_key_hash(&self, key_hash: &str) -> Result<&RegisteredGame, GameEconomyError> {
         let game = self.registered_games.values()
-            .find(|g| g.api_key_hash == hash)
+            .find(|g| g.api_key_hash == key_hash)
             .ok_or_else(|| GameEconomyError::Unauthorized {
                 reason: "Ungültiger API-Key".into(),
             })?;
 
         match &game.status {
-            GameStatus::Active => Ok(game),
+            GameStatus::Active | GameStatus::Dormant { .. } => Ok(game),
             GameStatus::Suspended { reason, .. } => Err(GameEconomyError::GameSuspended {
                 game_id: game.game_id.clone(),
                 reason: reason.clone(),
@@ -82,6 +125,14 @@ impl GameEconomyStore {
             GameStatus::Blacklisted { reason } => Err(GameEconomyError::GameBlacklisted {
                 game_id: game.game_id.clone(),
                 reason: reason.clone(),
+            }),
+            GameStatus::Abandoned { .. } => Err(GameEconomyError::GameSuspended {
+                game_id: game.game_id.clone(),
+                reason: "Spiel ist als verlassen markiert – Community-Fork möglich".into(),
+            }),
+            GameStatus::Forked { successor, .. } => Err(GameEconomyError::GameAlreadyForked {
+                game_id: game.game_id.clone(),
+                successor: successor.clone(),
             }),
         }
     }
@@ -96,6 +147,47 @@ impl GameEconomyStore {
         self.registered_games.get(game_id)
             .map(|g| g.permissions.contains(&perm))
             .unwrap_or(false)
+    }
+
+    /// Rotiert den API-Key eines Spiels. Gibt den neuen Klartext-Key zurück.
+    /// Der alte Key wird sofort ungültig. Caller-seitige Authentifizierung
+    /// (Owner-Signatur o.ä.) muss VOR diesem Aufruf erfolgt sein.
+    pub fn rotate_api_key(&mut self, game_id: &str) -> Result<String, GameEconomyError> {
+        let (api_key, api_key_hash, owner) = {
+            let game = self.registered_games.get_mut(game_id)
+                .ok_or_else(|| GameEconomyError::NotFound { what: format!("Spiel '{game_id}'") })?;
+            let (api_key, api_key_hash) = generate_api_key(game_id, &game.developer_wallet);
+            game.api_key_hash = api_key_hash.clone();
+            game.updated_at = Utc::now().timestamp();
+            (api_key, api_key_hash, game.developer_wallet.clone())
+        };
+        let _ = api_key_hash;
+        self.audit(game_id, &owner, "rotate_api_key", serde_json::json!({}), true);
+        Ok(api_key)
+    }
+
+    /// TOTP-Secret für Owner-2FA setzen/rotieren.
+    /// Das Secret wird als Base32 gespeichert und nie über öffentliche APIs ausgegeben.
+    pub fn set_owner_totp_secret(
+        &mut self,
+        game_id: &str,
+        secret_b32: &str,
+    ) -> Result<(), GameEconomyError> {
+        let owner = {
+            let game = self.registered_games.get_mut(game_id)
+                .ok_or_else(|| GameEconomyError::NotFound { what: format!("Spiel '{game_id}'") })?;
+            game.updated_at = Utc::now().timestamp();
+            game.developer_wallet.clone()
+        };
+        self.owner_totp_secrets
+            .insert(game_id.to_string(), secret_b32.to_string());
+        self.audit(game_id, &owner, "set_owner_totp_secret", serde_json::json!({}), true);
+        Ok(())
+    }
+
+    /// TOTP-Secret für ein Spiel lesen (falls eingerichtet).
+    pub fn owner_totp_secret(&self, game_id: &str) -> Option<&str> {
+        self.owner_totp_secrets.get(game_id).map(|s| s.as_str())
     }
 
     /// Spiel suspendieren (Admin).
@@ -142,11 +234,112 @@ impl GameEconomyStore {
         Ok(())
     }
 
-    /// Prüft ob das Wallet der registrierte Game-Server ist.
+    /// Prüft ob das Wallet als Game-Server agieren darf:
+    /// - der eingetragene Owner (`developer_wallet`) **oder**
+    /// - ein aktiver, nicht-revozierter `authorized_servers`-Eintrag.
     pub fn is_game_server(&self, game_id: &str, wallet: &str) -> bool {
+        let Some(g) = self.registered_games.get(game_id) else { return false; };
+        if g.developer_wallet == wallet { return true; }
+        g.authorized_servers.iter().any(|s| s.pubkey == wallet && s.revoked_at.is_none())
+    }
+
+    /// Prüft, ob das Wallet eine bestimmte Permission im Spiel ausüben darf.
+    /// Owner: alle Spiel-Permissions. Server-Key: Schnittmenge aus Spiel-Permissions
+    /// und (falls gesetzt) der Sub-Scope-Liste des Keys.
+    pub fn server_can(&self, game_id: &str, wallet: &str, perm: GamePermission) -> bool {
+        let Some(g) = self.registered_games.get(game_id) else { return false; };
+        if !g.permissions.contains(&perm) { return false; }
+        if g.developer_wallet == wallet { return true; }
+        g.authorized_servers.iter().any(|s| {
+            s.pubkey == wallet
+                && s.revoked_at.is_none()
+                && (s.permissions.is_empty() || s.permissions.contains(&perm))
+        })
+    }
+
+    // ── Server-Key-Management ───────────────────────────────────────────
+
+    /// Fügt einen neuen Server-Key zu einem Spiel hinzu. Nur der Owner darf das.
+    /// Idempotent: ist der Key bereits aktiv eingetragen, wird ein Fehler
+    /// zurückgegeben (vermeidet stilles Überschreiben des Labels).
+    pub fn add_server_key(
+        &mut self,
+        game_id: &str,
+        caller_wallet: &str,
+        new_server_pubkey: &str,
+        label: &str,
+        permissions: Vec<GamePermission>,
+    ) -> Result<ServerKey, GameEconomyError> {
+        let game = self.registered_games.get_mut(game_id)
+            .ok_or_else(|| GameEconomyError::NotFound { what: format!("Spiel '{game_id}'") })?;
+        if game.developer_wallet != caller_wallet {
+            return Err(GameEconomyError::Unauthorized {
+                reason: "Nur der Owner darf Server-Keys verwalten".into(),
+            });
+        }
+        if new_server_pubkey.is_empty() {
+            return Err(GameEconomyError::InvalidInput { reason: "Server-Pubkey fehlt".into() });
+        }
+        if new_server_pubkey == game.developer_wallet {
+            return Err(GameEconomyError::InvalidInput {
+                reason: "Owner-Key ist bereits implizit autorisiert".into(),
+            });
+        }
+        if game.authorized_servers.iter().any(|s| s.pubkey == new_server_pubkey && s.revoked_at.is_none()) {
+            return Err(GameEconomyError::AlreadyExists {
+                what: format!("Server-Key {new_server_pubkey} (aktiv)"),
+            });
+        }
+        let now = Utc::now().timestamp();
+        let entry = ServerKey {
+            pubkey: new_server_pubkey.to_string(),
+            label: label.to_string(),
+            permissions,
+            added_at: now,
+            revoked_at: None,
+        };
+        game.authorized_servers.push(entry.clone());
+        game.updated_at = now;
+        self.audit(game_id, caller_wallet, "add_server_key", serde_json::json!({
+            "pubkey": new_server_pubkey, "label": label,
+        }), true);
+        Ok(entry)
+    }
+
+    /// Revoziert einen Server-Key. Nur Owner. Markiert revoked_at statt zu löschen,
+    /// damit der Audit-Trail erhalten bleibt.
+    pub fn revoke_server_key(
+        &mut self,
+        game_id: &str,
+        caller_wallet: &str,
+        server_pubkey: &str,
+    ) -> Result<(), GameEconomyError> {
+        let game = self.registered_games.get_mut(game_id)
+            .ok_or_else(|| GameEconomyError::NotFound { what: format!("Spiel '{game_id}'") })?;
+        if game.developer_wallet != caller_wallet {
+            return Err(GameEconomyError::Unauthorized {
+                reason: "Nur der Owner darf Server-Keys verwalten".into(),
+            });
+        }
+        let now = Utc::now().timestamp();
+        let entry = game.authorized_servers.iter_mut()
+            .find(|s| s.pubkey == server_pubkey && s.revoked_at.is_none())
+            .ok_or_else(|| GameEconomyError::NotFound {
+                what: format!("aktiver Server-Key {server_pubkey}"),
+            })?;
+        entry.revoked_at = Some(now);
+        game.updated_at = now;
+        self.audit(game_id, caller_wallet, "revoke_server_key", serde_json::json!({
+            "pubkey": server_pubkey,
+        }), true);
+        Ok(())
+    }
+
+    /// Liste aller (auch revozierten) Server-Keys eines Spiels.
+    pub fn list_server_keys(&self, game_id: &str) -> Vec<ServerKey> {
         self.registered_games.get(game_id)
-            .map(|g| g.developer_wallet == wallet)
-            .unwrap_or(false)
+            .map(|g| g.authorized_servers.clone())
+            .unwrap_or_default()
     }
 
     // ═════════════════════════════════════════════════════════════════════

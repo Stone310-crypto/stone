@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Custom Dashboard Smoke Test</title>
+  <style>
+    :root { --bg: #0b1220; --panel: #121c30; --line: #2b3e66; --ink: #dbe7ff; --muted: #93a9d8; --ok: #3ddc97; }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif; background: radial-gradient(circle at 20% 0%, #1a2a4d 0%, #0b1220 55%, #090f1d 100%); color: var(--ink); }
+    .wrap { max-width: 980px; margin: 0 auto; padding: 22px; }
+    .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 14px; margin: 0 0 12px 0; }
+    .row { display: flex; gap: 8px; flex-wrap: wrap; }
+    input { flex: 1; min-width: 260px; background: #0d1728; color: var(--ink); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+    button { border: 1px solid #325ca8; background: linear-gradient(135deg, #376bd4, #4ea5ff); color: #fff; border-radius: 10px; padding: 10px 14px; font-weight: 700; cursor: pointer; }
+    .muted { color: var(--muted); font-size: 13px; }
+    .ok { color: var(--ok); }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(270px, 1fr)); gap: 10px; }
+    .w { border: 1px solid #315189; border-radius: 12px; background: #0f1b30; padding: 10px; }
+    .w h3 { margin: 0 0 6px 0; font-size: 15px; }
+    .m { color: var(--muted); font-size: 12px; word-break: break-all; }
+    pre { margin: 0; white-space: pre-wrap; word-break: break-word; color: #b8cdfa; font-size: 12px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h2 style="margin:0 0 8px 0">Custom Dashboard Smoke Test</h2>
+      <div class="row">
+        <input id="apiBase" placeholder="API base, e.g. http://127.0.0.1:3180" value="http://127.0.0.1:3180">
+        <input id="appId" placeholder="app_id, e.g. com.leon.custom-dashboard" value="com.leon.custom-dashboard">
+      </div>
+      <div class="row" style="margin-top:8px">
+        <input id="tokenOrKey" placeholder="Paste sd2 token OR x-api-key">
+        <button onclick="runSmoke()">Run Smoke Test</button>
+      </div>
+      <p id="status" class="muted">Status: idle</p>
+    </div>
+
+    <div class="card">
+      <h3 style="margin:0 0 8px 0">Capabilities</h3>
+      <pre id="capabilities">-</pre>
+    </div>
+
+    <div class="card">
+      <h3 style="margin:0 0 8px 0">Widgets</h3>
+      <div id="widgets" class="grid"></div>
+    </div>
+  </div>
+
+  <script>
+    function authHeaders(secret) {
+      const h = {};
+      if (!secret) return h;
+      if (secret.startsWith('sd2.')) h['authorization'] = 'Bearer ' + secret;
+      else h['x-api-key'] = secret;
+      return h;
+    }
+
+    async function getJson(url, headers) {
+      const r = await fetch(url, { headers });
+      const text = await r.text();
+      let body;
+      try { body = JSON.parse(text); } catch (_) { body = { raw: text }; }
+      return { ok: r.ok, status: r.status, body };
+    }
+
+    async function runSmoke() {
+      const base = document.getElementById('apiBase').value.trim().replace(/\/$/, '');
+      const appId = document.getElementById('appId').value.trim();
+      const secret = document.getElementById('tokenOrKey').value.trim();
+      const headers = authHeaders(secret);
+      const status = document.getElementById('status');
+      const cap = document.getElementById('capabilities');
+      const widgets = document.getElementById('widgets');
+
+      status.textContent = 'Status: loading';
+      widgets.innerHTML = '';
+
+      const c = await getJson(base + '/api/v2/dashboard/capabilities?app_id=' + encodeURIComponent(appId), headers);
+      cap.textContent = JSON.stringify(c.body, null, 2);
+      if (!c.ok) {
+        status.textContent = 'Status: error capabilities ' + c.status;
+        return;
+      }
+
+      const w = await getJson(base + '/api/v2/dashboard/widgets?app_id=' + encodeURIComponent(appId), headers);
+      if (!w.ok) {
+        status.textContent = 'Status: error widgets ' + w.status;
+        return;
+      }
+
+      const list = (w.body && w.body.widgets) ? w.body.widgets : [];
+      for (const item of list) {
+        const card = document.createElement('div');
+        card.className = 'w';
+        card.innerHTML = '<h3>' + (item.manifest && item.manifest.name ? item.manifest.name : item.app_id) + '</h3>' +
+          '<div class="m">app_id: ' + item.app_id + '</div>' +
+          '<div class="m">entry_url: ' + (item.manifest ? item.manifest.entry_url : '-') + '</div>' +
+          '<div class="m">granted_scopes: ' + JSON.stringify(item.granted_scopes || []) + '</div>';
+        widgets.appendChild(card);
+      }
+
+      status.innerHTML = 'Status: <span class="ok">ok</span> (widgets: ' + list.length + ')';
+    }
+  </script>
+</body>
+</html>

@@ -2,10 +2,21 @@
 //
 // handle_gossip_block(): Validierung + Weiterleitung eingehender Blöcke
 // handle_gossip_tx():    Validierung + Weiterleitung eingehender Transaktionen
+//
+// Beide Funktionen geben `gossipsub::MessageAcceptance` zurück. Der Dispatcher
+// in `events.rs` ruft anschließend
+// `gossipsub.report_message_validation_result(msg_id, source, acceptance)` auf:
+//   - `Accept`  → Nachricht ans Mesh weiterleiten, Peer positiv scoren
+//   - `Reject`  → NICHT weiterleiten + P4-Penalty (Mesh-Pruning)
+//   - `Ignore`  → NICHT weiterleiten, kein Score-Effekt
+//
+// Wire-Format ist seit Protokoll v0.8 bincode (vorher JSON). Peers mit alter
+// Version werden über den Major-Version-Check in `events.rs` / `sync.rs`
+// getrennt, bevor sie überhaupt Block-Gossip bekommen.
 
 use crate::blockchain::Block;
 use crate::consensus::verify_block_signature_standalone;
-use libp2p::PeerId;
+use libp2p::{PeerId, gossipsub::MessageAcceptance};
 use std::time::Instant;
 
 use super::*;
@@ -14,10 +25,14 @@ use super::super::*;
 impl SwarmTask {
     // ── Gossip Block verarbeiten ──────────────────────────────────────────────
 
-    pub(super) fn handle_gossip_block(&mut self, data: Vec<u8>, source: PeerId) {
+    pub(super) fn handle_gossip_block(
+        &mut self,
+        data: Vec<u8>,
+        source: PeerId,
+    ) -> MessageAcceptance {
         // Gebannte Peers ignorieren
         if self.is_peer_banned(&source) {
-            return;
+            return MessageAcceptance::Ignore;
         }
 
         // ── Rate-Limit: Gossip-Blocks ─────────────────────────────────────────
@@ -27,7 +42,7 @@ impl SwarmTask {
         if !limiter.gossip_blocks.try_consume() {
             eprintln!("[p2p] ⚠ Rate-Limit für Gossip-Blocks von {source} erreicht – ignoriert");
             self.add_peer_penalty(&source, 15, "gossip block rate limit");
-            return;
+            return MessageAcceptance::Ignore;
         }
 
         // ── Größenlimit: Blöcke > 10 MiB sind verdächtig ──────────────────────
@@ -38,14 +53,14 @@ impl SwarmTask {
                 data.len()
             );
             self.add_peer_penalty(&source, 50, "oversized block");
-            return;
+            return MessageAcceptance::Reject;
         }
 
-        match serde_json::from_slice::<Block>(&data) {
+        match super::decode_gossip::<Block>(&data) {
             Ok(block) => {
                 // ── Duplicate-Filter ──────────────────────────────────────────
                 if self.is_duplicate(&block.hash) {
-                    return;
+                    return MessageAcceptance::Ignore;
                 }
 
                 // ── Hash-Integrität ───────────────────────────────────────────
@@ -56,7 +71,7 @@ impl SwarmTask {
                         block.index
                     );
                     self.add_peer_penalty(&source, 100, "invalid hash");
-                    return;
+                    return MessageAcceptance::Reject;
                 }
 
                 // ── Merkle-Root-Verifikation ──────────────────────────────────
@@ -71,7 +86,7 @@ impl SwarmTask {
                         block.index
                     );
                     self.add_peer_penalty(&source, 100, "invalid merkle root");
-                    return;
+                    return MessageAcceptance::Reject;
                 }
 
                 // ── Timestamp-Drift-Check ─────────────────────────────────────
@@ -88,7 +103,7 @@ impl SwarmTask {
                             block.timestamp - now,
                         );
                         self.add_peer_penalty(&source, 30, "future timestamp");
-                        return;
+                        return MessageAcceptance::Reject;
                     }
                     if block.timestamp < now - max_past {
                         eprintln!(
@@ -97,7 +112,7 @@ impl SwarmTask {
                             (now - block.timestamp) / 3600,
                         );
                         self.add_peer_penalty(&source, 10, "stale timestamp");
-                        return;
+                        return MessageAcceptance::Reject;
                     }
                 }
 
@@ -108,7 +123,7 @@ impl SwarmTask {
                         block.index
                     );
                     self.add_peer_penalty(&source, 50, "missing signer");
-                    return;
+                    return MessageAcceptance::Reject;
                 }
 
                 // ── Ed25519-Validator-Signatur prüfen ─────────────────────────
@@ -119,7 +134,7 @@ impl SwarmTask {
                             block.index
                         );
                         self.add_peer_penalty(&source, 100, "missing validator signature");
-                        return;
+                        return MessageAcceptance::Reject;
                     }
                     if !verify_block_signature_standalone(
                         &block.hash,
@@ -131,7 +146,7 @@ impl SwarmTask {
                             block.index
                         );
                         self.add_peer_penalty(&source, 200, "invalid validator signature");
-                        return;
+                        return MessageAcceptance::Reject;
                     }
                 }
 
@@ -143,11 +158,11 @@ impl SwarmTask {
                         block.index
                     );
                     self.add_peer_penalty(&source, 30, "data_size mismatch");
-                    return;
+                    return MessageAcceptance::Reject;
                 }
 
-                // ── Argon2id-PoW Schnellprüfung ──────────────────────────────
-                {
+                // ── Argon2id-PoW Schnellprüfung (nur wenn BLOCK_POW_ENABLED) ─
+                if crate::consensus::BLOCK_POW_ENABLED {
                     use crate::consensus::{
                         ARGON2_POW_ACTIVATION_BLOCK, MIN_EFFECTIVE_POW_DIFFICULTY,
                         MAX_STAKE_DIFFICULTY_BONUS,
@@ -159,7 +174,7 @@ impl SwarmTask {
                                 block.index
                             );
                             self.add_peer_penalty(&source, 100, "missing pow");
-                            return;
+                            return MessageAcceptance::Reject;
                         }
                         // PoS/PoW Hybrid: effective_difficulty Plausibilität prüfen
                         if block.effective_difficulty > 0 {
@@ -169,7 +184,7 @@ impl SwarmTask {
                                     block.index, block.effective_difficulty, block.pow_difficulty,
                                 );
                                 self.add_peer_penalty(&source, 100, "invalid effective_difficulty");
-                                return;
+                                return MessageAcceptance::Reject;
                             }
                             if block.effective_difficulty < MIN_EFFECTIVE_POW_DIFFICULTY {
                                 eprintln!(
@@ -177,7 +192,7 @@ impl SwarmTask {
                                     block.index, block.effective_difficulty, MIN_EFFECTIVE_POW_DIFFICULTY,
                                 );
                                 self.add_peer_penalty(&source, 100, "effective_difficulty below min");
-                                return;
+                                return MessageAcceptance::Reject;
                             }
                             let bonus = block.pow_difficulty - block.effective_difficulty;
                             if bonus > MAX_STAKE_DIFFICULTY_BONUS {
@@ -186,7 +201,7 @@ impl SwarmTask {
                                     block.index, bonus, MAX_STAKE_DIFFICULTY_BONUS,
                                 );
                                 self.add_peer_penalty(&source, 100, "stake bonus too high");
-                                return;
+                                return MessageAcceptance::Reject;
                             }
                         }
                         // PoW gegen effektive Difficulty verifizieren
@@ -208,7 +223,7 @@ impl SwarmTask {
                                 block.index, verify_difficulty,
                             );
                             self.add_peer_penalty(&source, 200, "invalid argon2id pow");
-                            return;
+                            return MessageAcceptance::Reject;
                         }
                     }
                 }
@@ -226,10 +241,9 @@ impl SwarmTask {
                 }
                 self.net_metrics.blocks_received += 1;
 
-                // Aktuelle Chain-Höhe lesen um zu entscheiden ob gebuffert werden muss
-                let actual_local = self.chain_ref.as_ref()
-                    .and_then(|arc| arc.lock().ok().map(|c| c.blocks.len() as u64))
-                    .unwrap_or(self.local_chain_count);
+                // Aktuelle Chain-Höhe ohne Lock (über `local_chain_count`,
+                // wird vom Master-Pfad via `SetLocalChainCount` aktualisiert).
+                let actual_local = self.local_chain_count;
 
                 if block.index < actual_local {
                     // ── Fork-Erkennung: Competing Block innerhalb Reorg-Tiefe ──
@@ -243,9 +257,13 @@ impl SwarmTask {
                             block: Box::new(block),
                             from_peer: source.to_string(),
                         });
+                        // Competing-Block ist gültig signiert → ans Mesh weiterreichen,
+                        // damit andere Peers das Reorg-Voting sehen.
+                        return MessageAcceptance::Accept;
                     }
-                    // Blöcke jenseits MAX_REORG_DEPTH → wirklich veraltet
-                    return;
+                    // Blöcke jenseits MAX_REORG_DEPTH → wirklich veraltet,
+                    // nicht weiterleiten aber kein Score-Penalty.
+                    return MessageAcceptance::Ignore;
                 }
 
                 // Block ist voraus ODER Sync-Buffer ist aktiv → puffern
@@ -260,20 +278,26 @@ impl SwarmTask {
                         from_peer: source.to_string(),
                     });
                 }
+                MessageAcceptance::Accept
             }
             Err(e) => {
                 eprintln!("[p2p] Gossip Block-Dekodierung fehlgeschlagen von {source}: {e}");
                 self.add_peer_penalty(&source, 20, "malformed block");
+                MessageAcceptance::Reject
             }
         }
     }
 
     // ── Gossipsub: Token-TX empfangen ─────────────────────────────────────────
 
-    pub(super) fn handle_gossip_tx(&mut self, data: Vec<u8>, source: PeerId) {
+    pub(super) fn handle_gossip_tx(
+        &mut self,
+        data: Vec<u8>,
+        source: PeerId,
+    ) -> MessageAcceptance {
         // Gebannte Peers ignorieren
         if self.is_peer_banned(&source) {
-            return;
+            return MessageAcceptance::Ignore;
         }
 
         // ── Rate-Limit: Gossip-TXs ────────────────────────────────────────────
@@ -283,7 +307,7 @@ impl SwarmTask {
         if !limiter.gossip_txs.try_consume() {
             eprintln!("[p2p] ⚠ Rate-Limit für Gossip-TXs von {source} erreicht – ignoriert");
             self.add_peer_penalty(&source, 10, "gossip tx rate limit");
-            return;
+            return MessageAcceptance::Ignore;
         }
 
         // Größenlimit: TXs > 64 KiB sind verdächtig
@@ -294,10 +318,10 @@ impl SwarmTask {
                 data.len()
             );
             self.add_peer_penalty(&source, 20, "oversized tx");
-            return;
+            return MessageAcceptance::Reject;
         }
 
-        match serde_json::from_slice::<crate::token::TokenTx>(&data) {
+        match super::decode_gossip::<crate::token::TokenTx>(&data) {
             Ok(tx) => {
                 // Stake/Unstake-TXs dürfen nur lokal über authentifizierte
                 // API-Handler erstellt werden – via P2P ablehnen.
@@ -309,13 +333,13 @@ impl SwarmTask {
                         tx.tx_type, &tx.tx_id[..12.min(tx.tx_id.len())]
                     );
                     self.add_peer_penalty(&source, 50, "unauthorized stake/unstake via gossip");
-                    return;
+                    return MessageAcceptance::Reject;
                 }
 
                 // Duplikat-Filter (tx_id basiert)
                 let key = format!("tx:{}", tx.tx_id);
                 if self.is_duplicate(&key) {
-                    return;
+                    return MessageAcceptance::Ignore;
                 }
 
                 // Signatur prüfen
@@ -325,7 +349,7 @@ impl SwarmTask {
                         tx.tx_id
                     );
                     self.add_peer_penalty(&source, 30, "invalid tx signature");
-                    return;
+                    return MessageAcceptance::Reject;
                 }
 
                 println!("[p2p] 💸 TX {} von {source} empfangen", &tx.tx_id[..12.min(tx.tx_id.len())]);
@@ -336,10 +360,12 @@ impl SwarmTask {
                     tx: Box::new(tx),
                     from_peer: source.to_string(),
                 });
+                MessageAcceptance::Accept
             }
             Err(e) => {
                 eprintln!("[p2p] Gossip TX-Dekodierung fehlgeschlagen von {source}: {e}");
                 self.add_peer_penalty(&source, 10, "malformed tx");
+                MessageAcceptance::Reject
             }
         }
     }

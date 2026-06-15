@@ -36,6 +36,12 @@ pub struct User {
     /// Rolle innerhalb der Organisation (leer, "owner", "admin", "member", "viewer")
     #[serde(default)]
     pub org_role: String,
+    /// Discord-User-ID (leer = kein Discord-Account verknüpft)
+    #[serde(default)]
+    pub discord_id: String,
+    /// Discord-Benutzername (z.B. "leon#1234" oder neu: "leon")
+    #[serde(default)]
+    pub discord_username: String,
 }
 
 pub fn default_account_type() -> String { "private".to_string() }
@@ -103,6 +109,8 @@ pub fn create_user_with_phrase(name: &str) -> (User, String) {
         account_type: default_account_type(),
         org_id: String::new(),
         org_role: String::new(),
+        discord_id: String::new(),
+        discord_username: String::new(),
     };
     (user, phrase_str)
 }
@@ -174,17 +182,48 @@ pub fn rebuild_users_from_ledger(
 
         // ID: Versuche aus bestehenden Usern zu übernehmen, sonst generieren
         let existing_id = existing_users.iter()
-            .find(|u| u.wallet_address == *wallet || u.api_key == api_key_hash)
+            .find(|u| {
+                u.wallet_address == *wallet
+                    || (!api_key_hash.is_empty() && u.api_key == api_key_hash)
+            })
             .map(|u| u.id.clone());
         let id = existing_id.unwrap_or_else(|| {
             format!("u-{}", uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("0000"))
         });
 
+        // Metadaten aus bestehendem User übernehmen (falls vorhanden), damit
+        // Rebuilds keine Discord-/Org-Verknüpfungen verlieren.
+        let existing_meta = existing_users.iter()
+            .find(|u| {
+                u.wallet_address == *wallet
+                    || (!api_key_hash.is_empty() && u.api_key == api_key_hash)
+            });
+
         // Quota: aus bestehendem User übernehmen oder Default
-        let quota = existing_users.iter()
-            .find(|u| u.wallet_address == *wallet || u.api_key == api_key_hash)
+        let quota = existing_meta
             .map(|u| u.quota_bytes)
             .unwrap_or_else(default_quota_bytes);
+
+        let account_type = existing_meta
+            .map(|u| u.account_type.clone())
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(default_account_type);
+
+        let org_id = existing_meta
+            .map(|u| u.org_id.clone())
+            .unwrap_or_default();
+
+        let org_role = existing_meta
+            .map(|u| u.org_role.clone())
+            .unwrap_or_default();
+
+        let discord_id = existing_meta
+            .map(|u| u.discord_id.clone())
+            .unwrap_or_default();
+
+        let discord_username = existing_meta
+            .map(|u| u.discord_username.clone())
+            .unwrap_or_default();
 
         chain_wallets.insert(wallet.clone());
         if !api_key_hash.is_empty() {
@@ -198,9 +237,11 @@ pub fn rebuild_users_from_ledger(
             phrase_hash: api_key_hash,
             quota_bytes: quota,
             wallet_address: wallet.clone(),
-            account_type: default_account_type(),
-            org_id: String::new(),
-            org_role: String::new(),
+            account_type,
+            org_id,
+            org_role,
+            discord_id,
+            discord_username,
         });
     }
 
@@ -217,6 +258,21 @@ pub fn rebuild_users_from_ledger(
 }
 
 // ─── Lokale Token-Generierung (kein Auth-Server nötig) ───────────────────────
+
+/// Constant-Time-Byte-Vergleich — verhindert Timing-Seitenkanal bei HMAC-Checks.
+/// Ein normaler `==`-Vergleich bricht beim ersten ungleichen Byte ab und gibt
+/// damit einem Angreifer die Möglichkeit, per Timing-Analyse Byte für Byte
+/// die korrekte Signatur zu erraten.
+#[inline]
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter()
+        .zip(b.iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+        == 0
+}
 
 /// Claims für einen lokal generierten HMAC-Token.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -290,7 +346,11 @@ pub fn validate_local_token(token: &str, cluster_key: &str) -> Option<LocalToken
     mac.update(claims_b64.as_bytes());
     let expected_sig = mac.finalize().into_bytes();
     let expected_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(expected_sig);
-    if expected_b64 != sig_b64 {
+
+    // Security Fix: Constant-Time-Vergleich verhindert Timing-Seitenkanal.
+    // Ein Angreifer kann sonst durch Messung der Antwortzeit Byte für Byte
+    // die korrekte HMAC-Signatur rekonstruieren und Tokens fälschen.
+    if !constant_time_eq(expected_b64.as_bytes(), sig_b64.as_bytes()) {
         return None;
     }
 
@@ -513,7 +573,9 @@ pub fn validate_session_token(token: &str, cluster_key: &str) -> Option<SessionC
     mac.update(claims_b64.as_bytes());
     let expected_sig = mac.finalize().into_bytes();
     let expected_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(expected_sig);
-    if expected_b64 != sig_b64 {
+
+    // Security Fix: Constant-Time-Vergleich (siehe validate_local_token)
+    if !constant_time_eq(expected_b64.as_bytes(), sig_b64.as_bytes()) {
         return None;
     }
 
@@ -574,6 +636,8 @@ pub struct QrLoginSession {
     pub approved_user_name: Option<String>,
     pub approved_wallet: Option<String>,
     pub approved_account_type: Option<String>,
+    pub approved_discord_id: Option<String>,
+    pub approved_discord_username: Option<String>,
     /// Mnemonic-Phrase (wird nach Genehmigung gesetzt, nur für QR-Login Chat)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approved_phrase: Option<String>,
@@ -623,6 +687,8 @@ impl QrLoginStore {
             approved_user_name: None,
             approved_wallet: None,
             approved_account_type: None,
+            approved_discord_id: None,
+            approved_discord_username: None,
             approved_phrase: None,
         };
 
@@ -662,6 +728,8 @@ impl QrLoginStore {
             session.approved_user_name = Some(user.name.clone());
             session.approved_wallet = Some(user.wallet_address.clone());
             session.approved_account_type = Some(user.account_type.clone());
+            session.approved_discord_id = Some(user.discord_id.clone());
+            session.approved_discord_username = Some(user.discord_username.clone());
             session.approved_phrase = phrase;
             true
         } else {

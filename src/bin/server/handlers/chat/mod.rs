@@ -156,6 +156,16 @@ pub(super) fn index_new_blocks_if_needed(state: &AppState) {
         }
     }
 
+    // ── Self-Heal: alte faelschlich pending Nachrichten nachziehen ──────
+    // Historischer Bug: Batch-confirmed Nachrichten konnten mit block_index=0
+    // im ChatIndex verbleiben. Das wird hier opportunistisch gegen die Chain
+    // abgeglichen, damit Clients wieder "confirmed" sehen.
+    let healed = reconcile_stale_pending_entries(&chain, &mut idx, &state.node.message_pool);
+    if healed > 0 {
+        println!("[chat-index] ✅ Self-Heal: {healed} pending Nachrichten auf confirmed aktualisiert");
+        let _ = stone::chat::save_chat_index(&idx);
+    }
+
     // ── Self-Destruct GC: Abgelaufene Nachrichten-Content löschen ─────────
     {
         let mut policy = state.node.chat_policy.write().unwrap_or_else(|e| e.into_inner());
@@ -165,6 +175,93 @@ pub(super) fn index_new_blocks_if_needed(state: &AppState) {
             let _ = policy.persist();
         }
     }
+}
+
+/// Aktualisiert fälschlich pending markierte ChatIndex-Einträge (block_index=0),
+/// wenn deren msg_id bereits on-chain nachweisbar ist.
+fn reconcile_stale_pending_entries(
+    chain: &stone::blockchain::StoneChain,
+    idx: &mut stone::chat::ChatIndex,
+    pool: &stone::message_pool::MessagePool,
+) -> usize {
+    let mut pending_ids: std::collections::HashSet<String> = idx
+        .conversations
+        .values()
+        .flat_map(|entries| entries.iter())
+        .filter(|e| e.block_index == 0 && !e.msg_id.is_empty())
+        .map(|e| e.msg_id.clone())
+        .collect();
+
+    if pending_ids.is_empty() {
+        return 0;
+    }
+
+    let mut found: std::collections::HashMap<String, (u64, String)> = std::collections::HashMap::new();
+
+    for block in chain.blocks.iter().rev() {
+        if pending_ids.is_empty() {
+            break;
+        }
+
+        // Backward-compat: klassische ChatMessage-TXs
+        for tx in &block.transactions {
+            if tx.tx_type != stone::token::TxType::ChatMessage {
+                continue;
+            }
+            if let Ok(data) = serde_json::from_str::<serde_json::Value>(&tx.memo) {
+                if let Some(mid) = data.get("msg_id").and_then(|v| v.as_str()) {
+                    if pending_ids.remove(mid) {
+                        found.insert(mid.to_string(), (block.index, tx.tx_id.clone()));
+                    }
+                }
+            }
+        }
+
+        // Neuer Pfad: Chat-Batches
+        for batch in &block.chat_batches {
+            if pending_ids.is_empty() {
+                break;
+            }
+
+            if !batch.messages.is_empty() {
+                for m in &batch.messages {
+                    if pending_ids.remove(&m.msg_id) {
+                        found.insert(m.msg_id.clone(), (block.index, String::new()));
+                    }
+                }
+                continue;
+            }
+
+            // Fallback: persistierter Batch-Record (wenn Anchor keine Messages trägt)
+            for m in pool.load_batch_messages(&batch.merkle_root) {
+                if pending_ids.remove(&m.msg_id) {
+                    found.insert(m.msg_id.clone(), (block.index, String::new()));
+                }
+            }
+        }
+    }
+
+    if found.is_empty() {
+        return 0;
+    }
+
+    let mut healed = 0usize;
+    for entries in idx.conversations.values_mut() {
+        for e in entries.iter_mut() {
+            if e.block_index != 0 {
+                continue;
+            }
+            if let Some((block_idx, tx_id)) = found.get(&e.msg_id) {
+                e.block_index = *block_idx;
+                if e.tx_id.is_empty() && !tx_id.is_empty() {
+                    e.tx_id = tx_id.clone();
+                }
+                healed += 1;
+            }
+        }
+    }
+
+    healed
 }
 
 /// Lokale Suche: state.users + on-chain account_names.

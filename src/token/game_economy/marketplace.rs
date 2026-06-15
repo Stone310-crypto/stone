@@ -120,12 +120,19 @@ impl GameEconomyStore {
     //  §5 Marktplatz
     // ═════════════════════════════════════════════════════════════════════
 
+    /// Item listen — voller Modus mit `PriceMode` (Stone oder USD).
+    ///
+    /// Bei `PriceMode::Usd` wird der Oracle befragt, um den **Snapshot-STONE-Betrag**
+    /// für `listing.price` zu berechnen (Anzeige/Floor-Preis). Maßgeblich beim Kauf
+    /// ist später aber `listing.price_mode` — der USD-Wert wird beim `buy_item()`
+    /// erneut über den dann aktuellen Oracle-Kurs konvertiert.
     pub fn list_item(
         &mut self,
         seller: &str,
         item_id: &str,
-        price: Decimal,
+        price_mode: PriceMode,
         expires_at: Option<i64>,
+        oracle: &dyn PriceOracle,
     ) -> Result<MarketListing, GameEconomyError> {
         let item = self.items.get(item_id)
             .ok_or_else(|| GameEconomyError::NotFound { what: format!("Item {item_id}") })?;
@@ -142,9 +149,18 @@ impl GameEconomyStore {
             return Err(GameEconomyError::NotTransferable { item_id: item_id.to_string() });
         }
 
-        if price <= Decimal::ZERO {
+        // Snapshot-STONE-Preis berechnen (für Anzeige/Floor).
+        let snapshot = resolve_price_stone(&Some(price_mode.clone()), Decimal::ZERO, oracle)?;
+        if snapshot.stone <= Decimal::ZERO {
             return Err(GameEconomyError::InvalidAmount { reason: "Preis muss positiv sein".into() });
         }
+
+        // Rarity-Plausibilität (USD-basiert).
+        let price_usd_now = match &price_mode {
+            PriceMode::Usd { amount } => *amount,
+            PriceMode::Stone { amount } => *amount * oracle.usd_per_stone(),
+        };
+        let warning = self.rarity_guard.check(&item.rarity, price_usd_now)?;
 
         let already_listed = self.listings.values()
             .any(|l| l.item_id == item_id && l.status == ListingStatus::Active);
@@ -168,14 +184,30 @@ impl GameEconomyStore {
             listing_id: listing_id.clone(),
             item_id: item_id.to_string(),
             seller: seller.to_string(),
-            price,
+            price: snapshot.stone,
             status: ListingStatus::Active,
             created_at: now,
             expires_at,
+            price_mode: Some(price_mode),
+            warnings: warning.into_iter().collect(),
         };
 
         self.listings.insert(listing_id, listing.clone());
         Ok(listing)
+    }
+
+    /// Convenience: Item mit festem STONE-Preis listen (klassisches Verhalten).
+    /// Ruft intern `list_item` mit `PriceMode::Stone` auf. Oracle wird **nicht**
+    /// konsultiert (`FixedOracle(1)` als Dummy, da Stone-Mode keinen Kurs braucht).
+    pub fn list_item_stone(
+        &mut self,
+        seller: &str,
+        item_id: &str,
+        price: Decimal,
+        expires_at: Option<i64>,
+    ) -> Result<MarketListing, GameEconomyError> {
+        let oracle = FixedOracle(Decimal::ONE);
+        self.list_item(seller, item_id, PriceMode::Stone { amount: price }, expires_at, &oracle)
     }
 
     pub fn delist_item(&mut self, listing_id: &str, seller: &str) -> Result<(), GameEconomyError> {
@@ -201,10 +233,17 @@ impl GameEconomyStore {
     }
 
     /// Item kaufen. Gibt (fee, seller_amount, seller_wallet) zurück.
+    ///
+    /// Der Oracle wird bei USD-Listings konsultiert, um den **aktuellen** STONE-Betrag
+    /// zu berechnen. Bei Stone-Listings (oder Legacy ohne `price_mode`) wird der
+    /// Oracle ignoriert und `listing.price` direkt verwendet.
+    ///
+    /// Fee bleibt 2.5 % des resolved STONE-Betrags.
     pub fn buy_item(
         &mut self,
         listing_id: &str,
         buyer: &str,
+        oracle: &dyn PriceOracle,
     ) -> Result<(Decimal, Decimal, String), GameEconomyError> {
         let listing = self.listings.get(listing_id).cloned()
             .ok_or_else(|| GameEconomyError::NotFound { what: format!("Listing {listing_id}") })?;
@@ -225,8 +264,16 @@ impl GameEconomyStore {
             }
         }
 
-        let fee = (listing.price * Decimal::from(MARKETPLACE_FEE_PCT) / Decimal::from(MARKETPLACE_FEE_BASE)).round_dp(8);
-        let seller_amount = listing.price - fee;
+        // Preis live über Oracle auflösen (nur bei USD-Mode relevant).
+        let resolved = resolve_price_stone(&listing.price_mode, listing.price, oracle)?;
+        if resolved.stone <= Decimal::ZERO {
+            return Err(GameEconomyError::InvalidAmount {
+                reason: format!("Resolved STONE-Betrag <= 0 (Oracle: {})", oracle.source()),
+            });
+        }
+
+        let fee = (resolved.stone * Decimal::from(MARKETPLACE_FEE_PCT) / Decimal::from(MARKETPLACE_FEE_BASE)).round_dp(8);
+        let seller_amount = resolved.stone - fee;
 
         self.transfer_item(&listing.item_id, &listing.seller, buyer)?;
 
@@ -238,10 +285,12 @@ impl GameEconomyStore {
 
         self.price_history.entry(listing.item_id.clone()).or_default().push(PriceHistoryEntry {
             item_id: listing.item_id.clone(),
-            price: listing.price,
+            price: resolved.stone,
             seller: listing.seller.clone(),
             buyer: buyer.to_string(),
             timestamp: Utc::now().timestamp(),
+            price_usd_at_sale: resolved.usd,
+            oracle_source: resolved.oracle_source,
         });
 
         Ok((fee, seller_amount, listing.seller.clone()))

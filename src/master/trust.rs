@@ -29,14 +29,44 @@ impl MasterNodeState {
         Ok(())
     }
 
-    /// Abstimmung: approve=true → Zustimmung, false → Ablehnung
-    /// Gibt (neue_status, quorum_erreicht) zurück.
+    /// Abstimmung: approve=true → Zustimmung, false → Ablehnung.
+    ///
+    /// SECURITY:
+    /// - Stimme ist nur gültig wenn `voter_peer_id` ein aktiver Validator ist.
+    /// - Zusätzlich muss der übergebene `voter_pubkey_hex` zur Validator-Identität passen.
+    /// - Gezählt wird per kanonischer Konsensidentität (validator public_key_hex),
+    ///   nicht per freiem node_id-String.
     pub fn trust_vote(
         &self,
         voter_peer_id: &str,
+        voter_pubkey_hex: &str,
         target_peer_id: &str,
         approve: bool,
     ) -> Result<TrustStatus, String> {
+        if voter_pubkey_hex.trim().is_empty() {
+            return Err("voter_pubkey_hex fehlt".to_string());
+        }
+
+        // Nur aktive Validatoren mit passender Konsensidentität dürfen voten.
+        let canonical_voter_id = {
+            let vs = self.validator_set.read().unwrap_or_else(|e| e.into_inner());
+            let v = vs
+                .validators
+                .iter()
+                .find(|v| v.node_id == voter_peer_id)
+                .ok_or_else(|| format!("voter '{}' ist kein bekannter Validator", voter_peer_id))?;
+            if !v.active {
+                return Err(format!("voter '{}' ist kein aktiver Validator", voter_peer_id));
+            }
+            if v.public_key_hex != voter_pubkey_hex {
+                return Err(format!(
+                    "voter '{}' PubKey passt nicht zur Validator-Identität",
+                    voter_peer_id
+                ));
+            }
+            v.public_key_hex.clone()
+        };
+
         // Abstimmung ins History-Log schreiben
         {
             let mut history = self.trust_history.lock().unwrap_or_else(|e| e.into_inner());
@@ -59,14 +89,15 @@ impl MasterNodeState {
             return Ok(TrustStatus::Active);
         }
 
-        // Doppelabstimmung desselben Voters verhindern
-        entry.votes_approve.retain(|v| v != voter_peer_id);
-        entry.votes_reject.retain(|v| v != voter_peer_id);
+        // Doppelabstimmung derselben Konsensidentität verhindern.
+        // Legacy-Kompatibilität: alte node_id-basierte Votes ebenfalls entfernen.
+        entry.votes_approve.retain(|v| v != voter_peer_id && v != &canonical_voter_id);
+        entry.votes_reject.retain(|v| v != voter_peer_id && v != &canonical_voter_id);
 
         if approve {
-            entry.votes_approve.push(voter_peer_id.to_string());
+            entry.votes_approve.push(canonical_voter_id);
         } else {
-            entry.votes_reject.push(voter_peer_id.to_string());
+            entry.votes_reject.push(canonical_voter_id);
         }
 
         // Quorum: Anzahl aktiver Validators als Referenz (min 1)

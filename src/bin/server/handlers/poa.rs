@@ -20,6 +20,24 @@ use stone::{
 use super::super::auth_middleware::require_admin;
 use super::super::state::AppState;
 
+fn validator_mutations_enabled() -> bool {
+    matches!(
+        std::env::var("STONE_ENABLE_VALIDATORSET_MUTATIONS").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    )
+}
+
+fn validator_mutation_lock_response() -> Response {
+    (
+        StatusCode::LOCKED,
+        axum::Json(json!({
+            "error": "ValidatorSet-Mutationen sind gesperrt (P0.5 Governance-Lock aktiv)",
+            "hint": "Setze STONE_ENABLE_VALIDATORSET_MUTATIONS=1 nur fuer kontrollierte Wartungsfenster",
+        })),
+    )
+        .into_response()
+}
+
 #[derive(Deserialize)]
 pub struct AddValidatorRequest {
     pub node_id: String,
@@ -62,6 +80,10 @@ pub async fn handle_add_validator(
     axum::Json(req): axum::Json<AddValidatorRequest>,
 ) -> Result<impl IntoResponse, Response> {
     require_admin(&headers, &state)?;
+
+    if !validator_mutations_enabled() {
+        return Err(validator_mutation_lock_response());
+    }
 
     if req.node_id.trim().is_empty() || req.public_key_hex.trim().is_empty() {
         return Err((
@@ -115,6 +137,10 @@ pub async fn handle_remove_validator(
 ) -> Result<impl IntoResponse, Response> {
     require_admin(&headers, &state)?;
 
+    if !validator_mutations_enabled() {
+        return Err(validator_mutation_lock_response());
+    }
+
     let removed = {
         let mut vs = state.node.validator_set.write().unwrap_or_else(|e| e.into_inner());
         vs.remove(&node_id)
@@ -149,6 +175,10 @@ pub async fn handle_set_validator_active(
     axum::Json(body): axum::Json<serde_json::Value>,
 ) -> Result<impl IntoResponse, Response> {
     require_admin(&headers, &state)?;
+
+    if !validator_mutations_enabled() {
+        return Err(validator_mutation_lock_response());
+    }
 
     let active = body.get("active").and_then(|v| v.as_bool()).unwrap_or(true);
 
@@ -286,11 +316,40 @@ pub async fn handle_cast_vote(
 
     let voter_id = {
         let vs = state.node.validator_set.read().unwrap_or_else(|e| e.into_inner());
-        vs.validators
+        if !vs.validators.is_empty() {
+            let Some(v) = vs
+                .validators
+                .iter()
+                .find(|v| v.public_key_hex == pk_hex)
+            else {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    axum::Json(json!({
+                        "error": "Lokaler Validator-Key ist nicht im ValidatorSet registriert",
+                    })),
+                )
+                    .into_response());
+            };
+            if !v.active {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    axum::Json(json!({
+                        "error": format!(
+                            "Validator '{}' ist inaktiv und darf nicht voten",
+                            v.node_id
+                        ),
+                    })),
+                )
+                    .into_response());
+            }
+            v.node_id.clone()
+        } else {
+            vs.validators
             .iter()
             .find(|v| v.public_key_hex == pk_hex)
             .map(|v| v.node_id.clone())
             .unwrap_or_else(|| state.node.node_id.clone())
+        }
     };
 
     let vote = VoteMessage::new(
@@ -466,11 +525,39 @@ pub async fn handle_receive_checkpoint(
 
     match local_hash {
         Some(hash) if hash == incoming.block_hash => {
+            // ── Phase 1.5: Validator-Mitzeichnen + Re-Broadcast ──────────────
+            // Wenn ich selbst noch nicht für diesen Checkpoint signiert habe,
+            // signiere lokal nach und propagiere den ergänzten Checkpoint weiter.
+            // So sammeln sich Validator-Signaturen organisch über das Netzwerk.
+            let node_id = state.node.node_id.clone();
+            let already_signed_by_me = incoming.signatures.contains_key(&node_id);
+
+            let mut merged = incoming.clone();
+            if !already_signed_by_me {
+                let sk = load_or_create_validator_key();
+                merged.sign(&node_id, &sk);
+            }
+
             // Signaturen mergen
-            let mut store = state.node.checkpoint_store.write().unwrap_or_else(|e| e.into_inner());
-            let was_finalized_before = store.latest_finalized().map(|c| c.block_index);
-            store.add_or_update(incoming.clone());
-            let is_now_finalized = store.latest_finalized().map(|c| c.block_index);
+            let (was_finalized_before, sigs_grew) = {
+                let mut store = state.node.checkpoint_store.write().unwrap_or_else(|e| e.into_inner());
+                let before_finalized = store.latest_finalized().map(|c| c.block_index);
+                let before_sig_count = store
+                    .get(merged.block_index)
+                    .map(|c| c.signatures.len())
+                    .unwrap_or(0);
+                store.add_or_update(merged.clone());
+                let after_sig_count = store
+                    .get(merged.block_index)
+                    .map(|c| c.signatures.len())
+                    .unwrap_or(0);
+                (before_finalized, after_sig_count > before_sig_count)
+            };
+
+            let is_now_finalized = {
+                let store = state.node.checkpoint_store.read().unwrap_or_else(|e| e.into_inner());
+                store.latest_finalized().map(|c| c.block_index)
+            };
 
             let newly_finalized = is_now_finalized != was_finalized_before
                 && is_now_finalized == Some(incoming.block_index);
@@ -482,12 +569,49 @@ pub async fn handle_receive_checkpoint(
                 );
             }
 
+            // Re-Broadcast: nur wenn neue Signaturen dazukamen (verhindert Storm)
+            // und der Checkpoint noch nicht finalisiert ist.
+            let should_rebroadcast = sigs_grew && !merged.is_finalized();
+            if should_rebroadcast {
+                let peer_urls: Vec<String> = {
+                    let peers = state.node.peers.read().unwrap_or_else(|e| e.into_inner());
+                    peers.iter()
+                        .filter(|p| p.is_healthy())
+                        .map(|p| p.url.clone())
+                        .collect()
+                };
+                if !peer_urls.is_empty() {
+                    let cp_json = serde_json::to_vec(&merged).unwrap_or_default();
+                    tokio::spawn(async move {
+                        let client = match reqwest::Client::builder()
+                            .timeout(std::time::Duration::from_secs(5))
+                            .danger_accept_invalid_certs(true)
+                            .build()
+                        {
+                            Ok(c) => c,
+                            Err(_) => return,
+                        };
+                        for peer in &peer_urls {
+                            let url = format!("{}/api/v1/checkpoint", peer.trim_end_matches('/'));
+                            let _ = client
+                                .post(&url)
+                                .header("Content-Type", "application/json")
+                                .body(cp_json.clone())
+                                .send()
+                                .await;
+                        }
+                    });
+                }
+            }
+
             (
                 StatusCode::OK,
                 axum::Json(json!({
                     "ok": true,
                     "block_index": incoming.block_index,
                     "finalized": newly_finalized,
+                    "signed_locally": !already_signed_by_me,
+                    "rebroadcast": should_rebroadcast,
                 })),
             )
         }

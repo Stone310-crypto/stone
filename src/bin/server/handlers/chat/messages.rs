@@ -168,20 +168,14 @@ pub async fn handle_chat_send(
         ).into_response();
     }
 
-    // ── Stake-Gate: Mindest-Stake prüfen ────────────────────────────────
-    let staked_amount = {
-        let pool = state.node.staking_pool.read().unwrap_or_else(|e| e.into_inner());
-        pool.stakers.get(&wallet.address())
-            .map(|e| e.staked_amount)
-            .unwrap_or(rust_decimal::Decimal::ZERO)
-    };
-    if let Err(msg) = stone::chat_policy::ChatPolicyStore::check_stake_gate(staked_amount) {
-        return (
-            StatusCode::FORBIDDEN,
-            axum::Json(json!({"ok": false, "error": msg, "stake_required": true})),
-        )
-            .into_response();
-    }
+    // ── Spam-Schutz / Message-Fee: derzeit DEAKTIVIERT ────────────────
+    // Hintergrund: Es gab Inkonsistenzen zwischen UI-Balance und Ledger-Balance
+    // (UI zeigt 0 obwohl 100 STONE vorhanden). Solange das nicht behoben ist
+    // werden Nachrichten ohne Fee/Stake-Check zugestellt. Lite-PoW
+    // (MESSAGE_POW_DIFFICULTY) bleibt als Basis-Spam-Schutz aktiv.
+    //
+    // Reaktivierung später: Balance prüfen + ledger.burn(addr, MESSAGE_FEE_STONE)
+    // siehe Git-History dieser Datei für den ursprünglichen Code.
 
     // ── MessagePool: Nachricht bauen, signieren, in Pool einfügen ──────
     let now = chrono::Utc::now().timestamp();
@@ -280,14 +274,14 @@ pub async fn handle_chat_send(
         if let Ok(data) = serde_json::to_vec(&pool_msg) {
             let net = net.clone();
             tokio::spawn(async move {
-                net.publish_gossip(stone::network::TOPIC_CHAT, data).await;
+                net.publish_gossip(stone::network::TOPIC_CHAT.as_str(), data).await;
             });
         }
     }
 
     // Push-Benachrichtigung an Empfänger senden (Fire & Forget)
     {
-        let push_store = state.push_tokens.lock().unwrap().clone();
+        let push_store = state.push_tokens.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let fcm = state.fcm_client.clone();
         let sender_name = user.name.clone();
         let recipient = to_wallet.clone();
@@ -349,66 +343,9 @@ pub async fn handle_chat_conversations(
         .map(|c| c.peer_wallet.clone()).collect();
     drop(idx);
 
-    // Pending ChatMessage TXs als Konversationen ergänzen (noch nicht gemined)
-    let pending_txs = state.node.mempool.pending_txs();
-    let mut pending_convos: std::collections::HashMap<String, (String, String, i64, String, String)> = std::collections::HashMap::new();
-    for tx in &pending_txs {
-        if tx.tx_type != TxType::ChatMessage {
-            continue;
-        }
-        let (is_mine, peer) = if tx.from == user.wallet_address {
-            (true, tx.to.clone())
-        } else if tx.to == user.wallet_address {
-            (false, tx.from.clone())
-        } else {
-            continue;
-        };
-        let entry = pending_convos.entry(peer.clone()).or_insert_with(|| {
-            let memo_data = serde_json::from_str::<serde_json::Value>(&tx.memo).unwrap_or_default();
-            let msg_id = memo_data["msg_id"].as_str().unwrap_or("").to_string();
-            let encrypted = memo_data["encrypted"].as_str().unwrap_or("").to_string();
-            (msg_id, encrypted, tx.timestamp, tx.from.clone(), peer.clone())
-        });
-        if tx.timestamp > entry.2 {
-            let memo_data = serde_json::from_str::<serde_json::Value>(&tx.memo).unwrap_or_default();
-            *entry = (
-                memo_data["msg_id"].as_str().unwrap_or("").to_string(),
-                memo_data["encrypted"].as_str().unwrap_or("").to_string(),
-                tx.timestamp,
-                tx.from.clone(),
-                if is_mine { tx.to.clone() } else { tx.from.clone() },
-            );
-        }
-    }
-    for (peer, (msg_id, encrypted, ts, from_wallet, _)) in pending_convos {
-        if existing_peers.contains(&peer) {
-            if let Some(c) = convos.iter_mut().find(|c| c.peer_wallet == peer) {
-                if ts > c.last_timestamp {
-                    c.last_timestamp = ts;
-                    c.last_msg_id = msg_id;
-                    c.last_message_preview = encrypted;
-                    c.last_from_wallet = from_wallet;
-                }
-            }
-        } else {
-            let (peer_user_id, peer_name) = users_map
-                .iter()
-                .find(|u| u.wallet_address == peer)
-                .map(|u| (u.id.clone(), u.name.clone()))
-                .unwrap_or_else(|| (String::new(), format!("{}…", &peer[..8.min(peer.len())])));
-            convos.push(stone::chat::ConversationSummary {
-                peer_wallet: peer.clone(),
-                peer_user_id,
-                peer_name,
-                last_message_preview: encrypted,
-                last_timestamp: ts,
-                last_msg_id: msg_id,
-                last_from_wallet: from_wallet,
-                unread_count: 1,
-                total_messages: 1,
-            });
-        }
-    }
+    // Keine Mempool-ChatTXs in die normale Konversationsansicht mischen:
+    // Chat laeuft primar ueber MessagePool/ChatIndex (off-chain + Batch-Anchor).
+    let _ = existing_peers;
     convos.sort_by(|a, b| b.last_timestamp.cmp(&a.last_timestamp));
 
     (
@@ -447,52 +384,11 @@ pub async fn handle_chat_messages(
     let idx = state.chat_index.lock().unwrap_or_else(|e| e.into_inner());
     let confirmed: Vec<stone::chat::ChatEntry> = idx.messages_between(&user.wallet_address, &peer_wallet, query.limit, query.offset)
         .into_iter().cloned().collect();
-    let confirmed_msg_ids: std::collections::HashSet<String> = confirmed.iter()
+    let _confirmed_msg_ids: std::collections::HashSet<String> = confirmed.iter()
         .map(|m| m.msg_id.clone()).collect();
     drop(idx);
 
-    // Pending ChatMessage TXs aus dem Mempool als ChatEntry anhängen
-    let pending_entries: Vec<stone::chat::ChatEntry> = state.node.mempool.pending_txs()
-        .into_iter()
-        .filter(|tx| {
-            tx.tx_type == TxType::ChatMessage && (
-                (tx.from == user.wallet_address && tx.to == peer_wallet)
-                || (tx.from == peer_wallet && tx.to == user.wallet_address)
-            )
-        })
-        .filter_map(|tx| {
-            serde_json::from_str::<serde_json::Value>(&tx.memo).ok().map(|data| {
-                let msg_id = data["msg_id"].as_str().unwrap_or("").to_string();
-                (msg_id, tx, data)
-            })
-        })
-        .filter(|(msg_id, _, _)| !msg_id.is_empty() && !confirmed_msg_ids.contains(msg_id))
-        .map(|(msg_id, tx, data)| {
-            let enc = data["encrypted"].as_str().unwrap_or("").to_string();
-            let nc = data["nonce"].as_str().unwrap_or("").to_string();
-            let ch = if !enc.is_empty() {
-                stone::chat::compute_content_hash(&enc, &nc)
-            } else {
-                data["content_hash"].as_str().unwrap_or("").to_string()
-            };
-            stone::chat::ChatEntry {
-                msg_id,
-                from_wallet: tx.from,
-                to_wallet: tx.to,
-                from_user_id: data["from_user_id"].as_str().unwrap_or("").to_string(),
-                from_name: data["from_name"].as_str().unwrap_or("").to_string(),
-                encrypted_content: enc,
-                nonce: nc,
-                content_hash: ch,
-                timestamp: tx.timestamp,
-                block_index: 0,
-                tx_id: tx.tx_id,
-            }
-        })
-        .collect();
-
     let mut messages = confirmed;
-    messages.extend(pending_entries);
     messages.sort_by_key(|m| m.timestamp);
 
     let block_height = state.node.chain.lock().unwrap_or_else(|e| e.into_inner()).blocks.len() as u64;

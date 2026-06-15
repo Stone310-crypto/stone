@@ -139,6 +139,8 @@ impl Default for PeerStatus {
 pub struct PeerInfo {
     pub url: String,
     #[serde(default)]
+    pub peer_id: Option<String>,
+    #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
     pub ca: Option<String>,
@@ -160,6 +162,7 @@ impl PeerInfo {
     pub fn new(url: impl Into<String>) -> Self {
         Self {
             url: url.into(),
+            peer_id: None,
             name: None,
             ca: None,
             status: PeerStatus::Unreachable,
@@ -449,6 +452,14 @@ impl MasterNodeState {
                 Err(e) => eprintln!("[token] ⚠️  Genesis-Fehler: {e}"),
             }
         }
+        // Idempotente Migration: Gaming-Pool (45M) für bestehende Chains.
+        if let Err(e) = crate::token::migrate_pool_gaming(&mut ledger) {
+            eprintln!("[token] ⚠️  Gaming-Pool Migration fehlgeschlagen: {e}");
+        }
+        // Idempotenter Unlock: Gaming-Pool → Foundation-Wallet (falls Mnemonic gesetzt).
+        if let Err(e) = crate::token::unlock_gaming_pool_to_foundation(&mut ledger) {
+            eprintln!("[token] ⚠️  Gaming-Pool Unlock fehlgeschlagen: {e}");
+        }
 
         let started_at = Utc::now().timestamp();
         let mut staking_pool = crate::token::StakingPool::load();
@@ -665,39 +676,8 @@ impl MasterNodeState {
             }
         }
 
-        // ── Validator Auto-Discovery aus bestehender Chain ───────────────
-        // Beim Start: Nur aus den LETZTEN 20 Block-Signern Validatoren
-        // registrieren. Verhindert dass tote Nodes aus alten Blöcken
-        // die Validator-Rotation stören.
-        {
-            let chain = state.chain.lock().unwrap_or_else(|e| e.into_inner());
-            let mut vs = state.validator_set.write().unwrap_or_else(|e| e.into_inner());
-            let mut discovered = 0u32;
-            let start = chain.blocks.len().saturating_sub(20);
-            for block in &chain.blocks[start..] {
-                if !block.signer.is_empty()
-                    && !block.validator_pub_key.is_empty()
-                    && block.signer != node_id
-                    && vs.get(&block.signer).is_none()
-                {
-                    use crate::consensus::ValidatorInfo;
-                    // Auto-discovered Nodes starten als pending –
-                    // sie müssen ihre Aktivität erst beweisen.
-                    let info = ValidatorInfo::new_pending(
-                        block.signer.clone(),
-                        block.validator_pub_key.clone(),
-                    );
-                    vs.add(info);
-                    discovered += 1;
-                }
-            }
-            if discovered > 0 {
-                println!(
-                    "[consensus] 🔗 {} Validator(en) aus letzten {} Blöcken auto-discovered (gesamt: {})",
-                    discovered, chain.blocks.len().min(20), vs.active_count()
-                );
-            }
-        }
+        // SECURITY P0: Keine implizite Validator-Admission aus historischer Chain.
+        // ValidatorSet-Mutationen müssen explizit über Governance/Admin erfolgen.
 
         state
     }
@@ -719,10 +699,30 @@ impl MasterNodeState {
                 .collect()
         };
 
-        // Jailed aus SlashingStore
-        let jailed: std::collections::HashSet<String> = {
+        // Jailed aus SlashingStore:
+        // Slashing kann kanonisch per PubKey oder legacy per node_id gespeichert sein.
+        // Für Konsens-Checks wird auf node_id normalisiert.
+        let jailed_raw: std::collections::HashSet<String> = {
             let ss = self.slashing_store.read().unwrap_or_else(|e| e.into_inner());
             ss.jailed.keys().cloned().collect()
+        };
+
+        let jailed: std::collections::HashSet<String> = {
+            let vs = self.validator_set.read().unwrap_or_else(|e| e.into_inner());
+            let mut out = std::collections::HashSet::new();
+
+            // Legacy: node_id-basierte Jails direkt übernehmen.
+            for id in &jailed_raw {
+                out.insert(id.clone());
+            }
+
+            // Canonical: PubKey-basierte Jails auf node_id zurückführen.
+            for v in &vs.validators {
+                if jailed_raw.contains(&v.public_key_hex) || jailed_raw.contains(&v.node_id) {
+                    out.insert(v.node_id.clone());
+                }
+            }
+            out
         };
 
         // Wallet-Map: Alle bekannten Validatoren → public_key_hex als Wallet

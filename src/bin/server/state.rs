@@ -5,6 +5,7 @@ use std::{
     sync::{Arc, Mutex, RwLock},
     time::{Duration, Instant},
 };
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use stone::{
     auth::{User, ChallengeStore, QrLoginStore},
@@ -73,6 +74,345 @@ pub struct AppState {
     pub push_tokens: Arc<Mutex<PushTokenStore>>,
     /// FCM-Client (Google Service Account basiert)
     pub fcm_client: Arc<FcmClient>,
+    /// Pending Mobile-Actions (z. B. Marketplace-Käufe mit App-Bestätigung)
+    pub action_store: ActionStore,
+    /// Proof-of-Play Drop-Tracker (Caps + Cooldowns pro Spiel/Spieler)
+    pub play_drops: PlayDropTracker,
+}
+
+// ─── Mobile Action Store ─────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum MobileActionStatus {
+    Pending,
+    Approved,
+    Rejected,
+    Expired,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MobileAction {
+    pub id: String,
+    pub action_type: String,
+    pub wallet: String,
+    pub listing_id: Option<String>,
+    pub item_id: Option<String>,
+    pub game_id: Option<String>,
+    pub amount: Option<String>,
+    pub memo: Option<String>,
+    pub buyer_discord_id: Option<String>,
+    pub item_name: Option<String>,
+    pub status: MobileActionStatus,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub resolved_at: Option<u64>,
+    pub tx_id: Option<String>,
+    pub reject_reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct CreateMobileAction {
+    pub action_type: String,
+    pub wallet: String,
+    pub listing_id: Option<String>,
+    pub item_id: Option<String>,
+    pub game_id: Option<String>,
+    pub amount: Option<String>,
+    pub memo: Option<String>,
+    pub buyer_discord_id: Option<String>,
+    pub item_name: Option<String>,
+    pub ttl_seconds: u64,
+}
+
+#[derive(Clone)]
+pub struct ActionStore {
+    inner: Arc<Mutex<HashMap<String, MobileAction>>>,
+}
+
+impl ActionStore {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    fn now_unix() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    fn cleanup_expired_locked(map: &mut HashMap<String, MobileAction>, now: u64) {
+        for action in map.values_mut() {
+            if action.status == MobileActionStatus::Pending && now > action.expires_at {
+                action.status = MobileActionStatus::Expired;
+                action.resolved_at = Some(now);
+            }
+        }
+        // Alte finale Actions nach 24h entfernen.
+        map.retain(|_, action| {
+            if action.status == MobileActionStatus::Pending {
+                return true;
+            }
+            now.saturating_sub(action.resolved_at.unwrap_or(now)) <= 24 * 60 * 60
+        });
+    }
+
+    pub fn create(&self, req: CreateMobileAction) -> MobileAction {
+        let now = Self::now_unix();
+        let ttl = req.ttl_seconds.clamp(30, 900);
+        let mut token_bytes = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut token_bytes);
+        let id = format!("act_{}", hex::encode(token_bytes));
+
+        let action = MobileAction {
+            id: id.clone(),
+            action_type: req.action_type,
+            wallet: req.wallet,
+            listing_id: req.listing_id,
+            item_id: req.item_id,
+            game_id: req.game_id,
+            amount: req.amount,
+            memo: req.memo,
+            buyer_discord_id: req.buyer_discord_id,
+            item_name: req.item_name,
+            status: MobileActionStatus::Pending,
+            created_at: now,
+            expires_at: now + ttl,
+            resolved_at: None,
+            tx_id: None,
+            reject_reason: None,
+        };
+
+        let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        Self::cleanup_expired_locked(&mut map, now);
+        map.insert(id, action.clone());
+        action
+    }
+
+    pub fn pending_for_wallet(&self, wallet: &str) -> Vec<MobileAction> {
+        let now = Self::now_unix();
+        let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        Self::cleanup_expired_locked(&mut map, now);
+        map.values()
+            .filter(|a| a.status == MobileActionStatus::Pending && a.wallet == wallet)
+            .cloned()
+            .collect()
+    }
+
+    pub fn get(&self, action_id: &str) -> Option<MobileAction> {
+        let now = Self::now_unix();
+        let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        Self::cleanup_expired_locked(&mut map, now);
+        map.get(action_id).cloned()
+    }
+
+    pub fn approve(&self, action_id: &str, tx_id: String) -> Option<MobileAction> {
+        let now = Self::now_unix();
+        let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        Self::cleanup_expired_locked(&mut map, now);
+        let action = map.get_mut(action_id)?;
+        if action.status != MobileActionStatus::Pending {
+            return None;
+        }
+        action.status = MobileActionStatus::Approved;
+        action.tx_id = Some(tx_id);
+        action.resolved_at = Some(now);
+        Some(action.clone())
+    }
+
+    pub fn reject(&self, action_id: &str, reason: Option<String>) -> Option<MobileAction> {
+        let now = Self::now_unix();
+        let mut map = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        Self::cleanup_expired_locked(&mut map, now);
+        let action = map.get_mut(action_id)?;
+        if action.status != MobileActionStatus::Pending {
+            return None;
+        }
+        action.status = MobileActionStatus::Rejected;
+        action.reject_reason = reason;
+        action.resolved_at = Some(now);
+        Some(action.clone())
+    }
+}
+
+impl Default for ActionStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ─── Proof-of-Play Drop Tracker ──────────────────────────────────────────────
+
+/// Konfiguration pro Spiel: tägliches Emissions-Budget + Pro-Spieler-Limits.
+#[derive(Debug, Clone)]
+pub struct PlayDropConfig {
+    /// Maximale Token-Menge pro Spiel pro UTC-Tag (in STONE).
+    pub daily_game_cap: f64,
+    /// Maximale Token-Menge pro Spieler pro UTC-Tag (in STONE).
+    pub daily_player_cap: f64,
+    /// Mindest-Abstand zwischen zwei Drops desselben Spielers (Sekunden).
+    pub player_cooldown_secs: u64,
+    /// Maximale Token-Menge pro Einzeldrop (Anti-Bug-Cap).
+    pub max_drop_amount: f64,
+}
+
+impl PlayDropConfig {
+    pub fn from_env() -> Self {
+        fn f(env: &str, def: f64) -> f64 {
+            std::env::var(env)
+                .ok()
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .filter(|v| v.is_finite() && *v >= 0.0)
+                .unwrap_or(def)
+        }
+        fn u(env: &str, def: u64) -> u64 {
+            std::env::var(env).ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(def)
+        }
+        Self {
+            daily_game_cap: f("STONE_PLAY_DAILY_GAME_CAP", 1000.0),
+            daily_player_cap: f("STONE_PLAY_DAILY_PLAYER_CAP", 50.0),
+            player_cooldown_secs: u("STONE_PLAY_PLAYER_COOLDOWN_SECS", 30),
+            max_drop_amount: f("STONE_PLAY_MAX_DROP", 5.0),
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone)]
+struct PlayDropDay {
+    epoch_day: i64,
+    game_total: f64,
+    per_player: HashMap<String, f64>,
+}
+
+#[derive(Default)]
+struct PlayDropInner {
+    days: HashMap<String, PlayDropDay>,           // key: game_id
+    last_drop: HashMap<(String, String), u64>,    // (game_id, player) -> ts
+}
+
+#[derive(Clone)]
+pub struct PlayDropTracker {
+    cfg: Arc<PlayDropConfig>,
+    inner: Arc<Mutex<PlayDropInner>>,
+}
+
+#[derive(Debug)]
+pub enum PlayDropError {
+    InvalidAmount,
+    Cooldown { remaining_secs: u64 },
+    PlayerCapExceeded { used: f64, cap: f64 },
+    GameCapExceeded { used: f64, cap: f64 },
+    DropTooLarge { max: f64 },
+}
+
+impl std::fmt::Display for PlayDropError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidAmount => write!(f, "Ungültiger Betrag"),
+            Self::Cooldown { remaining_secs } => write!(f, "Cooldown aktiv: noch {remaining_secs}s"),
+            Self::PlayerCapExceeded { used, cap } =>
+                write!(f, "Spieler-Tageslimit erreicht: {used:.4}/{cap:.4}"),
+            Self::GameCapExceeded { used, cap } =>
+                write!(f, "Spiel-Tagesbudget erschöpft: {used:.4}/{cap:.4}"),
+            Self::DropTooLarge { max } => write!(f, "Drop überschreitet Maximum ({max:.4})"),
+        }
+    }
+}
+
+impl PlayDropTracker {
+    pub fn new(cfg: PlayDropConfig) -> Self {
+        Self {
+            cfg: Arc::new(cfg),
+            inner: Arc::new(Mutex::new(PlayDropInner::default())),
+        }
+    }
+
+    pub fn config(&self) -> &PlayDropConfig {
+        &self.cfg
+    }
+
+    fn now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs()
+    }
+
+    fn epoch_day(now: u64) -> i64 {
+        (now / 86_400) as i64
+    }
+
+    /// Prüft alle Limits und reserviert den Betrag bei Erfolg.
+    /// Bei Fehler wird nichts verändert.
+    pub fn try_consume(
+        &self,
+        game_id: &str,
+        player: &str,
+        amount: f64,
+    ) -> Result<(), PlayDropError> {
+        if !amount.is_finite() || amount <= 0.0 {
+            return Err(PlayDropError::InvalidAmount);
+        }
+        if amount > self.cfg.max_drop_amount {
+            return Err(PlayDropError::DropTooLarge { max: self.cfg.max_drop_amount });
+        }
+
+        let now = Self::now();
+        let today = Self::epoch_day(now);
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+
+        let day = inner.days.entry(game_id.to_string()).or_default();
+        if day.epoch_day != today {
+            day.epoch_day = today;
+            day.game_total = 0.0;
+            day.per_player.clear();
+        }
+
+        let cooldown_key = (game_id.to_string(), player.to_string());
+        if let Some(last_ts) = inner.last_drop.get(&cooldown_key).copied() {
+            let elapsed = now.saturating_sub(last_ts);
+            if elapsed < self.cfg.player_cooldown_secs {
+                return Err(PlayDropError::Cooldown {
+                    remaining_secs: self.cfg.player_cooldown_secs - elapsed,
+                });
+            }
+        }
+
+        let day = inner.days.get_mut(game_id).unwrap();
+        let player_used = day.per_player.get(player).copied().unwrap_or(0.0);
+        if player_used + amount > self.cfg.daily_player_cap {
+            return Err(PlayDropError::PlayerCapExceeded {
+                used: player_used,
+                cap: self.cfg.daily_player_cap,
+            });
+        }
+        if day.game_total + amount > self.cfg.daily_game_cap {
+            return Err(PlayDropError::GameCapExceeded {
+                used: day.game_total,
+                cap: self.cfg.daily_game_cap,
+            });
+        }
+
+        day.game_total += amount;
+        *day.per_player.entry(player.to_string()).or_insert(0.0) += amount;
+        inner.last_drop.insert(cooldown_key, now);
+
+        Ok(())
+    }
+
+    pub fn snapshot(&self, game_id: &str) -> (f64, HashMap<String, f64>) {
+        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let today = Self::epoch_day(Self::now());
+        if let Some(day) = inner.days.get(game_id) {
+            if day.epoch_day == today {
+                return (day.game_total, day.per_player.clone());
+            }
+        }
+        (0.0, HashMap::new())
+    }
 }
 
 // ─── Miner Status Relay Store ────────────────────────────────────────────────

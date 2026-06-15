@@ -193,7 +193,7 @@ pub async fn handle_hub_register(
         .unwrap_or_default()
         .as_secs_f64();
 
-    let mut store = hub_user_store().lock().unwrap();
+    let mut store = hub_user_store().lock().unwrap_or_else(|e| e.into_inner());
     // Upsert: gleicher user_id → Update (egal von welchem Node)
     if let Some(idx) = store.iter().position(|u| u.user_id == user_id) {
         store[idx].name = name.clone();
@@ -273,7 +273,7 @@ pub async fn handle_hub_report(
             .into_response();
     }
 
-    let mut store = hub_report_store().lock().unwrap();
+    let mut store = hub_report_store().lock().unwrap_or_else(|e| e.into_inner());
     // Upsert: existierender Report → aktualisieren
     if let Some(idx) = store.iter().position(|r| r.report_id == report_id) {
         store[idx].description = description.clone();
@@ -332,7 +332,7 @@ pub async fn handle_hub_users(
         return e;
     }
 
-    let store = hub_user_store().lock().unwrap();
+    let store = hub_user_store().lock().unwrap_or_else(|e| e.into_inner());
     // Nur "Test-Net" User anzeigen (echte Testnet-Accounts)
     let filtered: Vec<_> = store.iter()
         .filter(|u| u.name.starts_with("Test-Net"))
@@ -369,12 +369,12 @@ pub async fn handle_hub_bug_reports(
         return e;
     }
 
-    let store = hub_report_store().lock().unwrap();
+    let store = hub_report_store().lock().unwrap_or_else(|e| e.into_inner());
 
     // Wenn nach user_id gefiltert wird, auch nach wallet_address matchen
     // (Bug-Reports werden oft vom Wallet-Account eingereicht, nicht vom Test-Net Account)
     let wallet_prefix = if let Some(ref uid) = query.user_id {
-        let users = hub_user_store().lock().unwrap();
+        let users = hub_user_store().lock().unwrap_or_else(|e| e.into_inner());
         users.iter()
             .find(|u| u.user_id == *uid)
             .map(|u| u.wallet_address.clone())
@@ -458,7 +458,7 @@ pub async fn handle_hub_bulk_sync(
         .unwrap_or_default()
         .as_secs_f64();
 
-    let mut store = hub_user_store().lock().unwrap();
+    let mut store = hub_user_store().lock().unwrap_or_else(|e| e.into_inner());
     let mut added = 0u32;
     let mut updated = 0u32;
 
@@ -535,7 +535,7 @@ pub async fn handle_hub_send_coins(
 
     // User im Hub finden → wallet + node_url
     let (wallet, node_url) = {
-        let store = hub_user_store().lock().unwrap();
+        let store = hub_user_store().lock().unwrap_or_else(|e| e.into_inner());
         match store.iter().find(|u| u.user_id == user_id) {
             Some(u) => (u.wallet_address.clone(), u.node_url.clone()),
             None => return (
@@ -644,7 +644,7 @@ pub async fn handle_hub_send_message(
 
     // User finden → node_url ermitteln
     let node_url = {
-        let store = hub_user_store().lock().unwrap();
+        let store = hub_user_store().lock().unwrap_or_else(|e| e.into_inner());
         store.iter()
             .find(|u| u.user_id == user_id)
             .map(|u| u.node_url.clone())

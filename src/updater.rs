@@ -49,8 +49,13 @@ use std::{
 /// Chunk-Größe für Update-Binaries (1 MiB)
 pub const UPDATE_CHUNK_SIZE: usize = 1024 * 1024;
 
-/// Gossipsub-Topic für Update-Manifeste
-pub const TOPIC_UPDATES: &str = "stone/updates/v1";
+/// Gossipsub-Topic für Update-Manifeste (inkl. Netzwerk-Tag).
+/// Mainnet- und Testnet-Updates werden \u00fcber getrennte Topics propagiert.
+pub static TOPIC_UPDATES: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| format!(
+        "stone/{}/updates/v1",
+        if crate::network::is_mainnet() { "mainnet" } else { "testnet" },
+    ));
 
 /// Verzeichnis für heruntergeladene Updates relativ zu data_dir
 const UPDATES_DIR: &str = "updates";
@@ -234,6 +239,9 @@ impl UpdateManager {
             return Ok(false);
         }
 
+        // 1c. SECURITY (U5): Cross-Field-Sanity-Check
+        validate_manifest_sanity(&manifest)?;
+
         // 2. Signatur prüfen
         self.verify_signature(&manifest)?;
 
@@ -278,7 +286,9 @@ impl UpdateManager {
         if key_bytes.len() != 32 {
             return Err("Signer-Key muss 32 Bytes sein".into());
         }
-        let key_array: [u8; 32] = key_bytes.try_into().unwrap();
+        let key_array: [u8; 32] = key_bytes
+            .try_into()
+            .expect("key_bytes length 32 checked above");
         let verifying_key = VerifyingKey::from_bytes(&key_array)
             .map_err(|e| format!("Ungültiger Ed25519 Public Key: {e}"))?;
 
@@ -296,7 +306,9 @@ impl UpdateManager {
         if sig_bytes.len() != 64 {
             return Err("Signatur muss 64 Bytes sein".into());
         }
-        let sig_array: [u8; 64] = sig_bytes.try_into().unwrap();
+        let sig_array: [u8; 64] = sig_bytes
+            .try_into()
+            .expect("sig_bytes length 64 checked above");
         let signature = Signature::from_bytes(&sig_array);
 
         // Kanonische Nachricht bauen (gleiche Felder wie beim Signieren)
@@ -466,6 +478,14 @@ impl UpdateManager {
             return Err(format!("Update nicht bereit (Status: {:?})", self.state));
         }
 
+        // SECURITY (U2): Manifest-Signatur direkt vor dem Binary-Swap erneut prüfen.
+        // Schützt vor Disk-Tampering oder Race-Conditions zwischen receive_manifest und install.
+        // Klont, damit der mutable borrow auf self frei wird.
+        let manifest_clone = manifest.clone();
+        self.verify_signature(&manifest_clone)
+            .map_err(|e| format!("Pre-Install-Signatur-Check fehlgeschlagen: {e}"))?;
+        let manifest = self.manifest.as_ref().unwrap();
+
         // Werte klonen die wir nach dem Löschen des Manifests noch brauchen
         let version = manifest.version.clone();
         let binary_name = manifest.binary_name.clone();
@@ -579,6 +599,9 @@ impl UpdateManager {
         manifest: UpdateManifest,
         chunk_data: Vec<(usize, Vec<u8>)>,
     ) -> Result<(), String> {
+        // SECURITY (U5): Cross-Field-Sanity-Check zuerst
+        validate_manifest_sanity(&manifest)?;
+
         // Signatur prüfen
         self.verify_signature(&manifest)?;
 
@@ -801,26 +824,115 @@ impl UpdateManager {
 
 // ─── Hilfsfunktionen (public) ─────────────────────────────────────────────────
 
+/// SECURITY (U5): Cross-Field-Sanity-Check für ein Manifest.
+///
+/// Prüft:
+/// - `chunk_size` muss exakt `UPDATE_CHUNK_SIZE` sein
+/// - Anzahl der Chunks muss zur `binary_size` passen (`ceil(binary_size / chunk_size)`)
+/// - `binary_size` muss zwischen 1 Byte und `MAX_BINARY_SIZE` sein
+/// - `chunk_hashes` darf nicht leer sein und nicht > 100k Einträge enthalten
+/// - `version`, `target`, `binary_name` dürfen nicht leer sein
+/// - `signer_key` und `signature` müssen das richtige Hex-Format haben
+pub fn validate_manifest_sanity(manifest: &UpdateManifest) -> Result<(), String> {
+    if manifest.chunk_size != UPDATE_CHUNK_SIZE {
+        return Err(format!(
+            "chunk_size {} != erwartet {}",
+            manifest.chunk_size, UPDATE_CHUNK_SIZE
+        ));
+    }
+    if manifest.binary_size == 0 || manifest.binary_size > MAX_BINARY_SIZE {
+        return Err(format!(
+            "binary_size {} außerhalb [1, {}]",
+            manifest.binary_size, MAX_BINARY_SIZE
+        ));
+    }
+    let expected_chunks = manifest.binary_size.div_ceil(manifest.chunk_size as u64);
+    if manifest.chunk_hashes.is_empty() {
+        return Err("chunk_hashes leer".into());
+    }
+    if manifest.chunk_hashes.len() as u64 != expected_chunks {
+        return Err(format!(
+            "chunk_hashes.len() {} passt nicht zu binary_size {} (erwartet {} Chunks à {})",
+            manifest.chunk_hashes.len(),
+            manifest.binary_size,
+            expected_chunks,
+            manifest.chunk_size
+        ));
+    }
+    // Jeder Chunk-Hash: 64 Hex-Zeichen
+    for (i, h) in manifest.chunk_hashes.iter().enumerate() {
+        if h.len() != 64 || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!("chunk_hashes[{i}] kein gültiger 32-Byte SHA-256 Hex"));
+        }
+    }
+    if manifest.binary_hash.len() != 64
+        || !manifest.binary_hash.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        return Err("binary_hash kein gültiger 32-Byte SHA-256 Hex".into());
+    }
+    if manifest.version.is_empty() || manifest.version.len() > 64 {
+        return Err("version-Feld ungültig".into());
+    }
+    if manifest.target.is_empty() || manifest.target.len() > 128 {
+        return Err("target-Feld ungültig".into());
+    }
+    if manifest.binary_name.is_empty() || manifest.binary_name.len() > 128 {
+        return Err("binary_name ungültig".into());
+    }
+    // Pfad-Traversal-Schutz im binary_name (wird als Dateiname benutzt)
+    if manifest.binary_name.contains('/')
+        || manifest.binary_name.contains('\\')
+        || manifest.binary_name.contains("..")
+    {
+        return Err("binary_name darf keine Pfad-Zeichen enthalten".into());
+    }
+    if manifest.signer_key.len() != 64 {
+        return Err("signer_key muss 64 Hex-Zeichen sein".into());
+    }
+    if manifest.signature.len() != 128 {
+        return Err("signature muss 128 Hex-Zeichen sein".into());
+    }
+    // Sanity-Bound published_at: nicht in ferner Zukunft (>1 Jahr)
+    let now = Utc::now();
+    let one_year = chrono::Duration::days(366);
+    if manifest.published_at > now + one_year {
+        return Err("published_at liegt zu weit in der Zukunft".into());
+    }
+    // Changelog-Größe begrenzen
+    if manifest.changelog.len() > 64 * 1024 {
+        return Err("changelog > 64 KiB".into());
+    }
+    Ok(())
+}
+
 /// Erzeugt die kanonische Byte-Repräsentation eines Manifests für die Signierung.
 /// Enthält NICHT die Signatur selbst.
+///
+/// SECURITY (U4): `published_at` und `changelog` sind Teil der signierten Nachricht,
+/// damit Angreifer mit Zugriff auf ein altes Manifest weder den Zeitstempel noch
+/// die Release-Notes manipulieren können (Changelog-Spoofing-Schutz).
 pub fn canonical_manifest_bytes(manifest: &UpdateManifest) -> Vec<u8> {
-    let mut buf = Vec::new();
-    buf.extend_from_slice(manifest.version.as_bytes());
-    buf.push(0);
-    buf.extend_from_slice(manifest.binary_hash.as_bytes());
-    buf.push(0);
-    buf.extend_from_slice(&manifest.binary_size.to_le_bytes());
-    buf.push(0);
-    buf.extend_from_slice(manifest.target.as_bytes());
-    buf.push(0);
-    buf.extend_from_slice(manifest.binary_name.as_bytes());
-    buf.push(0);
-    for h in &manifest.chunk_hashes {
-        buf.extend_from_slice(h.as_bytes());
-        buf.push(b',');
+    fn push_field(buf: &mut Vec<u8>, bytes: &[u8]) {
+        buf.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+        buf.extend_from_slice(bytes);
     }
-    buf.push(0);
+
+    let mut buf = Vec::new();
+    // Versions-Tag der kanonischen Repräsentation (für zukünftige Schema-Änderungen)
+    buf.extend_from_slice(b"stone-manifest-v2\0");
+    push_field(&mut buf, manifest.version.as_bytes());
+    push_field(&mut buf, manifest.binary_hash.as_bytes());
+    buf.extend_from_slice(&manifest.binary_size.to_le_bytes());
+    push_field(&mut buf, manifest.target.as_bytes());
+    push_field(&mut buf, manifest.binary_name.as_bytes());
+    buf.extend_from_slice(&(manifest.chunk_hashes.len() as u64).to_le_bytes());
+    for h in &manifest.chunk_hashes {
+        push_field(&mut buf, h.as_bytes());
+    }
     buf.extend_from_slice(&(manifest.chunk_size as u64).to_le_bytes());
+    // U4: published_at + changelog mitsignieren
+    push_field(&mut buf, manifest.published_at.to_rfc3339().as_bytes());
+    push_field(&mut buf, manifest.changelog.as_bytes());
     buf
 }
 
@@ -833,18 +945,31 @@ pub fn sha256_hex(data: &[u8]) -> String {
 
 /// Vergleicht zwei Semantic-Versioning-Strings.
 /// Gibt `true` zurück wenn `new_ver` neuer als `current` ist.
+///
+/// SECURITY (U7): Strict parsing — Pre-Release-Suffixe (z.B. `0.3.0-rc1`,
+/// `0.3.0+build1`) werden **abgelehnt** (gibt `false`). Erlaubt nur exakt
+/// `MAJOR.MINOR.PATCH` mit ASCII-Digits und optionalem `v`-Prefix.
 pub fn is_newer_version(new_ver: &str, current: &str) -> bool {
-    let parse = |v: &str| -> (u32, u32, u32) {
-        let parts: Vec<&str> = v.trim_start_matches('v').split('.').collect();
-        (
-            parts.first().and_then(|s| s.parse().ok()).unwrap_or(0),
-            parts.get(1).and_then(|s| s.parse().ok()).unwrap_or(0),
-            parts.get(2).and_then(|s| s.parse().ok()).unwrap_or(0),
-        )
-    };
-    let new = parse(new_ver);
-    let cur = parse(current);
-    new > cur
+    fn parse_strict(v: &str) -> Option<(u32, u32, u32)> {
+        let v = v.trim().trim_start_matches('v');
+        let parts: Vec<&str> = v.split('.').collect();
+        if parts.len() != 3 {
+            return None;
+        }
+        // Jede Komponente: nur ASCII-Digits, kein Suffix
+        let mut out = [0u32; 3];
+        for (i, p) in parts.iter().enumerate() {
+            if p.is_empty() || !p.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+            out[i] = p.parse().ok()?;
+        }
+        Some((out[0], out[1], out[2]))
+    }
+    match (parse_strict(new_ver), parse_strict(current)) {
+        (Some(new), Some(cur)) => new > cur,
+        _ => false, // Ungültige Versionsstrings → niemals als "neuer" akzeptieren
+    }
 }
 
 /// Signiert ein Manifest mit einem Ed25519-Signing-Key.
@@ -869,7 +994,9 @@ pub fn load_signing_key(path: &Path) -> Result<SigningKey, String> {
         return Err(format!("Key muss 32 Bytes sein, hat aber {} Bytes", bytes.len()));
     }
 
-    let key_bytes: [u8; 32] = bytes.try_into().unwrap();
+    let key_bytes: [u8; 32] = bytes
+        .try_into()
+        .expect("bytes length 32 checked above");
     Ok(SigningKey::from_bytes(&key_bytes))
 }
 
@@ -950,6 +1077,13 @@ pub fn check_post_update_rollback(data_dir: &str) -> bool {
 /// Bestätigt ein erfolgreiches Update (Marker + Backup löschen).
 /// Sollte aufgerufen werden nachdem der Node erfolgreich gestartet ist
 /// (z.B. nach 60 Sekunden gesundem Betrieb).
+///
+/// **Hinweis (U9):** Die Rollback-Schwelle in `check_post_update_rollback`
+/// ist `attempt >= 3`. Bei normalen, gewollten Restarts in dichter Folge
+/// (z.B. Debug-Sessions mit Ctrl-C-Cycle) können ungewollt Rollbacks
+/// ausgelöst werden, solange `confirm_update_success` nicht aufgerufen
+/// wurde. Im produktiven Betrieb wird dieser Helper nach ~60s gesundem
+/// Betrieb getriggert → dann ist die Schwelle robust.
 pub fn confirm_update_success(data_dir: &str) {
     let marker_path = PathBuf::from(data_dir).join(ROLLBACK_MARKER);
     if marker_path.exists() {

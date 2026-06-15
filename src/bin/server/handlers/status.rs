@@ -466,9 +466,9 @@ pub async fn handle_shard_health(
 
 /// Hardcodierte öffentliche Nodes – wird als Basis für die Node-Liste verwendet.
 /// Clients (iOS-App, Web) bekommen diese immer zurück + dynamisch entdeckte Peers.
-const PUBLIC_BOOTSTRAP_NODES: &[(&str, &str)] = &[
-    ("http://212.227.54.241:8080", "VPS1-EU"),
-    ("http://69.48.200.255:8080",  "VPS2-US"),
+const PUBLIC_BOOTSTRAP_HOSTS: &[(&str, &str)] = &[
+    ("212.227.54.241", "VPS1-EU"),
+    ("69.48.200.255", "VPS2-US"),
 ];
 
 /// GET /api/v1/nodes — Öffentliche Node-Liste für Client-Discovery (kein Auth)
@@ -487,19 +487,26 @@ pub async fn handle_node_list(
     let summary = state.node.chain_summary();
     let uptime = (chrono::Utc::now().timestamp() - state.node.started_at) as u64;
 
+    let default_http = if stone::network::is_mainnet() { 3180 } else { 3080 };
+    let configured_port: u16 = std::env::var("STONE_HTTP_PORT")
+        .or_else(|_| std::env::var("STONE_PORT"))
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(default_http);
+    let preferred_port = if configured_port == 8080 { default_http } else { configured_port };
+
     // Diesen Node selbst (mit public_ip wenn bekannt)
     let self_url = std::env::var("STONE_PUBLIC_URL").ok()
         .or_else(|| std::env::var("STONE_PUBLIC_IP").ok().map(|ip| {
-            let port = std::env::var("STONE_PORT").unwrap_or_else(|_| "8080".into());
-            format!("http://{}:{}", ip, port)
+            format!("http://{}:{}", ip, preferred_port)
         }));
 
     let mut nodes: Vec<serde_json::Value> = Vec::new();
 
     // 1) Hardcoded Bootstrap-Nodes
-    for (url, name) in PUBLIC_BOOTSTRAP_NODES {
+    for (host, name) in PUBLIC_BOOTSTRAP_HOSTS {
         nodes.push(json!({
-            "url":  url,
+            "url":  format!("http://{}:{}", host, preferred_port),
             "name": name,
             "type": "bootstrap",
         }));

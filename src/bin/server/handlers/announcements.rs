@@ -63,7 +63,7 @@ pub async fn handle_list_announcements(
     State(state): State<AppState>,
     Query(params): Query<AnnouncementPagination>,
 ) -> impl IntoResponse {
-    let store = state.announcements.lock().unwrap();
+    let store = state.announcements.lock().unwrap_or_else(|e| e.into_inner());
     let limit = params.limit.unwrap_or(50).min(100);
     let offset = params.offset.unwrap_or(0);
 
@@ -89,7 +89,7 @@ pub async fn handle_get_announcement(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let store = state.announcements.lock().unwrap();
+    let store = state.announcements.lock().unwrap_or_else(|e| e.into_inner());
     match store.find(&id) {
         Some(a) => (StatusCode::OK, axum::Json(json!({
             "ok": true,
@@ -127,7 +127,7 @@ pub async fn handle_create_announcement(
 
     // Pubkey-Autorisierung prüfen
     {
-        let store = state.announcements.lock().unwrap();
+        let store = state.announcements.lock().unwrap_or_else(|e| e.into_inner());
         if !store.is_founder(&req.author_pubkey) {
             return (StatusCode::FORBIDDEN, axum::Json(json!({
                 "ok": false, "error": "Pubkey ist nicht als Gründer autorisiert",
@@ -224,13 +224,13 @@ pub async fn handle_create_announcement(
         deadline: req.deadline,
     };
 
-    let mut store = state.announcements.lock().unwrap();
+    let mut store = state.announcements.lock().unwrap_or_else(|e| e.into_inner());
     store.announcements.push(announcement.clone());
     save_announcements(&store);
 
     // Push-Benachrichtigung an alle registrierten Geräte senden (Fire & Forget)
     {
-        let push_store = state.push_tokens.lock().unwrap().clone();
+        let push_store = state.push_tokens.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let fcm = state.fcm_client.clone();
         tokio::spawn(async move {
             let sent = fcm.broadcast(&push_store, &stone::push::PushType::Announcement).await;
@@ -258,7 +258,7 @@ pub async fn handle_delete_announcement(
         return e;
     }
 
-    let mut store = state.announcements.lock().unwrap();
+    let mut store = state.announcements.lock().unwrap_or_else(|e| e.into_inner());
     let before = store.announcements.len();
     store.announcements.retain(|a| a.id != id);
     if store.announcements.len() == before {
@@ -295,7 +295,7 @@ pub async fn handle_react(
         .into_response();
     }
 
-    let mut store = state.announcements.lock().unwrap();
+    let mut store = state.announcements.lock().unwrap_or_else(|e| e.into_inner());
     let announcement = match store.find_mut(&id) {
         Some(a) => a,
         None => return (StatusCode::NOT_FOUND, axum::Json(json!({
@@ -335,7 +335,7 @@ pub async fn handle_vote(
         .into_response();
     }
 
-    let mut store = state.announcements.lock().unwrap();
+    let mut store = state.announcements.lock().unwrap_or_else(|e| e.into_inner());
     let announcement = match store.find_mut(&id) {
         Some(a) => a,
         None => return (StatusCode::NOT_FOUND, axum::Json(json!({

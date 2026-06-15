@@ -429,6 +429,7 @@ pub async fn handle_token_faucet(
         memo: "Testnet Faucet".to_string(),
         chain_id: default_chain_id(),
         fee_tier: stone::token::FeeTier::Priority,
+        signed_by: None,
     };
     tx.tx_id = compute_tx_id(&tx);
 
@@ -734,6 +735,12 @@ pub async fn handle_token_send(
     State(state): State<AppState>,
     Json(req): Json<SendRequest>,
 ) -> impl IntoResponse {
+    if !crate::server::auth_middleware::mnemonic_auth_enabled() {
+        return (axum::http::StatusCode::GONE, axum::Json(
+            crate::server::auth_middleware::mnemonic_killswitch_body("handle_token_send")
+        ));
+    }
+    crate::server::auth_middleware::log_mnemonic_call("handle_token_send");
     use stone::token::Wallet;
 
     // Mnemonic prüfen
@@ -938,6 +945,12 @@ pub async fn handle_token_send_authenticated(
     State(state): State<AppState>,
     Json(req): Json<SendAuthenticatedRequest>,
 ) -> impl IntoResponse {
+    if !crate::server::auth_middleware::mnemonic_auth_enabled() {
+        return (axum::http::StatusCode::GONE, axum::Json(
+            crate::server::auth_middleware::mnemonic_killswitch_body("handle_token_send_authenticated")
+        ));
+    }
+    crate::server::auth_middleware::log_mnemonic_call("handle_token_send_authenticated");
     use stone::token::Wallet;
 
     // Mnemonic prüfen (wird vom Flask-Proxy injiziert)
@@ -1337,6 +1350,7 @@ pub async fn handle_admin_airdrop(
         memo,
         chain_id: default_chain_id(),
         fee_tier: stone::token::FeeTier::Standard,
+        signed_by: None,
     };
     tx.tx_id = compute_tx_id(&tx);
 
@@ -1526,6 +1540,7 @@ pub async fn handle_market_buy(
         memo: format!("Market Buy: {} STONE @ {:.6} TC$", stone_amount, price),
         chain_id: default_chain_id(),
         fee_tier: stone::token::FeeTier::Standard,
+        signed_by: None,
     };
     tx.tx_id = compute_tx_id(&tx);
     let tx_id = tx.tx_id.clone();
@@ -1645,6 +1660,7 @@ pub async fn handle_market_sell(
         memo: format!("Market Sell: {} STONE @ {:.6} TC$", stone_amount, price),
         chain_id: default_chain_id(),
         fee_tier: stone::token::FeeTier::Standard,
+        signed_by: None,
     };
     tx.tx_id = compute_tx_id(&tx);
     let tx_id = tx.tx_id.clone();
@@ -1882,6 +1898,7 @@ pub async fn handle_htlc_create(
         memo,
         chain_id: default_chain_id(),
         fee_tier: stone::token::FeeTier::Standard,
+        signed_by: None,
     };
     tx.tx_id = compute_tx_id(&tx);
     let tx_id = tx.tx_id.clone();
@@ -2002,6 +2019,7 @@ pub async fn handle_htlc_claim(
         memo,
         chain_id: default_chain_id(),
         fee_tier: stone::token::FeeTier::Standard,
+        signed_by: None,
     };
     tx.tx_id = compute_tx_id(&tx);
     let tx_id = tx.tx_id.clone();
@@ -2087,6 +2105,7 @@ pub async fn handle_htlc_refund(
         memo,
         chain_id: default_chain_id(),
         fee_tier: stone::token::FeeTier::Standard,
+        signed_by: None,
     };
     tx.tx_id = compute_tx_id(&tx);
     let tx_id = tx.tx_id.clone();
@@ -2223,6 +2242,7 @@ pub async fn handle_htlc_buy(
         memo,
         chain_id: default_chain_id(),
         fee_tier: stone::token::FeeTier::Standard,
+        signed_by: None,
     };
     tx.tx_id = compute_tx_id(&tx);
     let tx_id = tx.tx_id.clone();
@@ -2603,6 +2623,12 @@ pub async fn handle_bridge_withdraw(
     State(state): State<AppState>,
     Json(req): Json<BridgeWithdrawRequest>,
 ) -> impl IntoResponse {
+    if !crate::server::auth_middleware::mnemonic_auth_enabled() {
+        return (axum::http::StatusCode::GONE, axum::Json(
+            crate::server::auth_middleware::mnemonic_killswitch_body("handle_bridge_withdraw")
+        )).into_response();
+    }
+    crate::server::auth_middleware::log_mnemonic_call("handle_bridge_withdraw");
     let address = match stone::token::normalize_address(&req.address) {
         Some(h) if h.len() == 64 && !h.starts_with("pool:") => h,
         _ => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({

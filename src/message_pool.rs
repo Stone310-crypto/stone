@@ -38,10 +38,36 @@ use crate::blockchain::data_dir;
 // ─── Konstanten ──────────────────────────────────────────────────────────────
 
 /// Mindestanzahl an Nachrichten für einen Batch
-pub const BATCH_MIN_MESSAGES: usize = 50;
+pub const BATCH_MIN_MESSAGES_DEFAULT: usize = 20;
 
 /// Maximale Wartezeit in Sekunden bevor ein Batch erzwungen wird (auch mit weniger Nachrichten)
-pub const BATCH_MAX_WAIT_SECS: i64 = 30;
+pub const BATCH_MAX_WAIT_SECS_DEFAULT: i64 = 10;
+
+/// Hard-Bounds fuer Laufzeit-Tuning (DoS- und Fehlkonfig-Schutz).
+const BATCH_MIN_MESSAGES_LOWER: usize = 5;
+const BATCH_MIN_MESSAGES_UPPER: usize = 200;
+const BATCH_MAX_WAIT_SECS_LOWER: i64 = 3;
+const BATCH_MAX_WAIT_SECS_UPPER: i64 = 60;
+
+/// Aktiver Batch-Schwellenwert (env-uebersteuerbar, bounded).
+/// Env: STONE_CHAT_BATCH_MIN_MESSAGES
+pub fn batch_min_messages() -> usize {
+    std::env::var("STONE_CHAT_BATCH_MIN_MESSAGES")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .map(|v| v.clamp(BATCH_MIN_MESSAGES_LOWER, BATCH_MIN_MESSAGES_UPPER))
+        .unwrap_or(BATCH_MIN_MESSAGES_DEFAULT)
+}
+
+/// Aktive maximale Batch-Wartezeit in Sekunden (env-uebersteuerbar, bounded).
+/// Env: STONE_CHAT_BATCH_MAX_WAIT_SECS
+pub fn batch_max_wait_secs() -> i64 {
+    std::env::var("STONE_CHAT_BATCH_MAX_WAIT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .map(|v| v.clamp(BATCH_MAX_WAIT_SECS_LOWER, BATCH_MAX_WAIT_SECS_UPPER))
+        .unwrap_or(BATCH_MAX_WAIT_SECS_DEFAULT)
+}
 
 /// Maximale Nachrichten im Pool bevor neue abgelehnt werden
 pub const MAX_POOL_SIZE: usize = 50_000;
@@ -413,14 +439,16 @@ impl MessagePool {
     pub fn batch_ready(&self) -> bool {
         let inner = self.inner.read().unwrap_or_else(|e| e.into_inner());
         let pending = inner.queue.len();
+        let min_messages = batch_min_messages();
+        let max_wait_secs = batch_max_wait_secs();
         if pending == 0 {
             return false;
         }
-        if pending >= BATCH_MIN_MESSAGES {
+        if pending >= min_messages {
             return true;
         }
         let now = Utc::now().timestamp();
-        now - inner.last_batch_time >= BATCH_MAX_WAIT_SECS
+        now - inner.last_batch_time >= max_wait_secs
     }
 
     /// Entnimmt alle pending Nachrichten für einen neuen Batch.
@@ -903,7 +931,7 @@ mod tests {
 
         assert!(!pool.batch_ready());
 
-        for _ in 0..BATCH_MIN_MESSAGES {
+        for _ in 0..BATCH_MIN_MESSAGES_DEFAULT {
             let msg = make_test_message(&key, &to);
             pool.add_message(msg).unwrap();
         }

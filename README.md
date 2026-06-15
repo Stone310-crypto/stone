@@ -214,6 +214,36 @@ Seed-Nodes können per `STONE_NO_SEED=1` deaktiviert werden (für private Netzwe
 | `STONE_SEED_PEERS` | libp2p-Multiaddrs (kommagetrennt) |
 | `STONE_RELAY_NODES` | Relay-Server für NAT-Traversal |
 | `STONE_RELAY_SERVER` | `1` = dieser Node als Relay aktivieren |
+| `STONE_ALLOW_SINGLE_SEED` | `1` = Mainnet-Failfast bei <2 eindeutigen Seed-PeerIds übersteuern (nur Notfall) |
+
+### Chaos Guardrail Tests
+
+Für Resilience-Tests gibt es den Driver [scripts/chaos_guardrail_driver.sh](scripts/chaos_guardrail_driver.sh).
+
+Szenarien:
+- `soft` — Soft-Offense-Sturm: soll **kein** Hard-Ban erzeugen
+- `strong` — Strong-Evidence-Offenses: soll Hard-Ban erzeugen
+- `seed` — Seed-Diversität prüfen (unique PeerIds)
+- `all` — alle Szenarien nacheinander
+
+Beispiele:
+
+```bash
+# Nur Seed-Diversität lokal prüfen
+./scripts/chaos_guardrail_driver.sh seed
+
+# API-basierte Chaos-Penalty-Tests (Admin-Key + laufender Node)
+BASE_URL=http://127.0.0.1:8080 \
+API_KEY=<admin-key> \
+./scripts/chaos_guardrail_driver.sh soft
+```
+
+Für API-basierte Chaos-Injektion muss der Node explizit opt-in sein:
+
+| Variable | Beschreibung |
+|---|---|
+| `STONE_ENABLE_CHAOS_API` | `1` = aktiviert `/api/v1/p2p/chaos/penalty` (Admin-only) |
+| `STONE_CHAOS_API_ALLOW_MAINNET` | `1` = erlaubt Chaos-API auf Mainnet (sonst blockiert) |
 
 ### Docker
 

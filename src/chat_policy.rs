@@ -52,6 +52,12 @@ pub const REDACTED_CONTENT: &str = "[REDACTED — self-destruct or reported]";
 /// Platzhalter fuer DSGVO-geloeschten Content (Art. 17)
 pub const GDPR_REDACTED: &str = "[GDPR-DELETED — account removed]";
 
+/// Gebühr für eine Chat-Nachricht in STONE (0.001 STONE pro Message).
+///
+/// Wird beim Senden direkt vom Sender-Konto abgezogen (kein Mindest-Stake mehr).
+/// Jeder neue User erhält 100 STONE Startguthaben → ~100.000 Nachrichten frei.
+pub const MESSAGE_FEE_STONE: &str = "0.001";
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // DSGVO Art. 17 — Loeschprotokoll
 // ═══════════════════════════════════════════════════════════════════════════════

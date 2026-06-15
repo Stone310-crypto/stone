@@ -1,0 +1,24 @@
+{
+  "setup_complete": false,
+  "_comment_secrets": "password_hash + api_key NICHT hier eintragen. Stattdessen via Env-Vars setzen: STONE_API_KEY, STONE_ADMIN_PASSWORD_HASH (oder in .env, .gitignored). Wird beim Load gemerged.",
+  "password_hash": "",
+  "node_name": "MeineNode1",
+  "wallet_address": "",
+  "mnemonic_once": "",
+  "seed_peers": [
+    "/ip4/100.90.28.68/tcp/4001/p2p/12D3KooWLqikBBCRhCZ2MgSYG3R579BNUgrN5E6dZnYSEYdmAKTd"
+  ],
+  "http_port": 8080,
+  "p2p_port": 4001,
+  "data_dir": "./stone_data",
+  "api_key": "",
+  "created_at": "",
+  "storage_offered_gb": 100,
+  "reward_per_day": 0.0,
+  "public_ip": "",
+  "wallet_balance": 0.0,
+  "auto_mining_enabled": true,
+  "auto_mining_timeout_secs": 120,
+  "miner_heartbeat_timeout_secs": 30,
+  "miner_heartbeat_partial_delta": 6
+}

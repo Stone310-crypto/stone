@@ -392,6 +392,157 @@ mod tests {
     use super::*;
     use crate::token::transaction::validate_tx;
 
+    /// Dumps deterministic test vectors for the Kotlin client implementation.
+    /// Run with: `cargo test --lib token::wallet::tests::dump_kotlin_vectors -- --nocapture --ignored`
+    #[test]
+    #[ignore]
+    fn dump_kotlin_vectors() {
+        use crate::token::transaction::{create_signed_tx, TxType, FeeTier, compute_tx_id};
+        use rust_decimal::Decimal;
+
+        // Force testnet chain_id for reproducibility
+        std::env::set_var("STONE_NETWORK", "testnet");
+
+        let phrase12 = "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about";
+        let phrase24 = "legal winner thank year wave sausage worth useful legal winner thank year wave sausage worth useful legal winner thank year wave sausage worth title";
+
+        for (label, phrase) in [("PHRASE_12", phrase12), ("PHRASE_24", phrase24)] {
+            let w = Wallet::from_mnemonic(phrase).unwrap();
+            eprintln!("=== {label} ===");
+            eprintln!("phrase: {phrase}");
+            eprintln!("address_hex: {}", w.address());
+            eprintln!("address_stone1: {}", w.display_address());
+        }
+
+        // Build a deterministic Transfer TX with explicit timestamp
+        let w = Wallet::from_mnemonic(phrase12).unwrap();
+        let to_wallet = "1111111111111111111111111111111111111111111111111111111111111111".to_string();
+        // create_signed_tx uses chrono::Utc::now() for timestamp — instead build manually:
+        let mut tx = crate::token::transaction::TokenTx {
+            tx_id: String::new(),
+            tx_type: TxType::Transfer,
+            from: w.address(),
+            to: to_wallet,
+            amount: Decimal::new(15, 1), // 1.5
+            fee: Decimal::new(1, 4),     // 0.0001
+            nonce: 7,
+            timestamp: 1_700_000_000,
+            signature: String::new(),
+            memo: "hello world".into(),
+            chain_id: "stone-testnet".into(),
+            fee_tier: FeeTier::Standard,
+            signed_by: None,
+        };
+        tx.tx_id = compute_tx_id(&tx);
+        let sign_input_bytes = {
+            // re-compute exactly what sign_input produces
+            let mut buf = Vec::new();
+            buf.extend_from_slice(tx.tx_type.to_string().as_bytes());
+            buf.push(b'|');
+            buf.extend_from_slice(tx.from.as_bytes());
+            buf.push(b'|');
+            buf.extend_from_slice(tx.to.as_bytes());
+            buf.push(b'|');
+            buf.extend_from_slice(tx.amount.normalize().to_string().as_bytes());
+            buf.push(b'|');
+            buf.extend_from_slice(tx.fee.normalize().to_string().as_bytes());
+            buf.push(b'|');
+            buf.extend_from_slice(&tx.nonce.to_le_bytes());
+            buf.push(b'|');
+            buf.extend_from_slice(&tx.timestamp.to_le_bytes());
+            buf.push(b'|');
+            buf.extend_from_slice(tx.chain_id.as_bytes());
+            buf.push(b'|');
+            buf.extend_from_slice(tx.memo.as_bytes());
+            buf.push(b'|');
+            buf.extend_from_slice(tx.fee_tier.to_string().as_bytes());
+            buf
+        };
+        use ed25519_dalek::Signer;
+        // Production signs SHA-256(sign_input), not sign_input directly.
+        let sig_digest = Sha256::digest(&sign_input_bytes);
+        let sig = w.signing_key.sign(&sig_digest);
+        let sig_hex = hex::encode(sig.to_bytes());
+        eprintln!("=== TX_TRANSFER ===");
+        eprintln!("tx_id: {}", tx.tx_id);
+        eprintln!("sign_input_hex: {}", hex::encode(&sign_input_bytes));
+        eprintln!("sign_input_len: {}", sign_input_bytes.len());
+        eprintln!("signature: {sig_hex}");
+
+        // GameCoinMint with subkey
+        let owner = Wallet::from_mnemonic(phrase12).unwrap();
+        let sub = Wallet::from_mnemonic(phrase24).unwrap();
+        let mint_memo = serde_json::json!({
+            "game_id":"stone-dungeon",
+            "to": owner.address(),
+            "amount":"100"
+        }).to_string();
+        let mut tx2 = crate::token::transaction::TokenTx {
+            tx_id: String::new(),
+            tx_type: TxType::GameCoinMint,
+            from: owner.address(),
+            to: owner.address(),
+            amount: Decimal::ZERO,
+            fee: Decimal::ZERO,
+            nonce: 3,
+            timestamp: 1_700_000_500,
+            signature: String::new(),
+            memo: mint_memo,
+            chain_id: "stone-testnet".into(),
+            fee_tier: FeeTier::Standard,
+            signed_by: Some(sub.address()),
+        };
+        tx2.tx_id = compute_tx_id(&tx2);
+        let sign_input2 = {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(tx2.tx_type.to_string().as_bytes());
+            buf.push(b'|');
+            buf.extend_from_slice(tx2.from.as_bytes());
+            buf.push(b'|');
+            buf.extend_from_slice(tx2.to.as_bytes());
+            buf.push(b'|');
+            buf.extend_from_slice(tx2.amount.normalize().to_string().as_bytes());
+            buf.push(b'|');
+            buf.extend_from_slice(tx2.fee.normalize().to_string().as_bytes());
+            buf.push(b'|');
+            buf.extend_from_slice(&tx2.nonce.to_le_bytes());
+            buf.push(b'|');
+            buf.extend_from_slice(&tx2.timestamp.to_le_bytes());
+            buf.push(b'|');
+            buf.extend_from_slice(tx2.chain_id.as_bytes());
+            buf.push(b'|');
+            buf.extend_from_slice(tx2.memo.as_bytes());
+            buf.push(b'|');
+            buf.extend_from_slice(tx2.fee_tier.to_string().as_bytes());
+            buf.push(b'|');
+            buf.extend_from_slice(b"signed_by:");
+            buf.extend_from_slice(tx2.signed_by.as_ref().unwrap().as_bytes());
+            buf
+        };
+        let sig2_digest = Sha256::digest(&sign_input2);
+        let sig2 = sub.signing_key.sign(&sig2_digest);
+        eprintln!("=== TX_SUBKEY_MINT ===");
+        eprintln!("owner_addr: {}", owner.address());
+        eprintln!("sub_addr: {}", sub.address());
+        eprintln!("tx_id: {}", tx2.tx_id);
+        eprintln!("memo_json: {}", tx2.memo);
+        eprintln!("sign_input_hex: {}", hex::encode(&sign_input2));
+        eprintln!("signature: {}", hex::encode(sig2.to_bytes()));
+
+        // Also test Decimal canonical
+        for (raw_amt, expected_label) in [
+            (Decimal::new(0, 0),   "zero"),
+            (Decimal::new(15, 1),  "1.5"),
+            (Decimal::new(100, 0), "100"),
+            (Decimal::new(12345678, 8), "0.12345678"),
+            (Decimal::new(15000, 4), "1.5000 -> normalized"),
+        ] {
+            eprintln!("decimal_{expected_label}: '{}'", raw_amt.normalize());
+        }
+
+        let _ = validate_tx; // ensure import is alive
+    }
+
     #[test]
     fn test_generate_and_address() {
         let wallet = Wallet::generate().unwrap();

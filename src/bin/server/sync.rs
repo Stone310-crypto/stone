@@ -237,7 +237,14 @@ pub async fn pull_from_peer(node: &Arc<MasterNodeState>, peer_url: &str, api_key
         }
 
         let did_rollback = if let Some(fork_idx) = fork_at {
-            let peer_len = blocks.len() as u64;
+            // `blocks` may only contain a paginated subset (e.g. first 500 items),
+            // so using `blocks.len()` can under-report peer chain length and bias
+            // fork-choice toward "local chain is longer".
+            let peer_len = blocks
+                .iter()
+                .map(|b| b.index.saturating_add(1))
+                .max()
+                .unwrap_or(peer_height);
 
             // ── Stake-gewichtete Fork-Choice mit Hash-Tiebreaker ──
             let (stakes, _jailed, wallet_map) = node.build_selection_context();
@@ -403,9 +410,29 @@ pub async fn pull_from_peer(node: &Arc<MasterNodeState>, peer_url: &str, api_key
                 }
             }
 
+            // PoA-Membership im HTTP-Sync strikt prüfen (kein Bypass).
+            let poa_ok = if block.index == 0 {
+                Some(true)
+            } else {
+                let vs = node.validator_set.read().unwrap_or_else(|e| e.into_inner());
+                if vs.validators.is_empty() {
+                    Some(false)
+                } else {
+                    let known_active = vs.validators.iter().any(|v| {
+                        v.active
+                            && v.node_id == block.signer
+                            && v.public_key_hex == block.validator_pub_key
+                    });
+                    Some(known_active)
+                }
+            };
+
             // accept_peer_block: Hash, Merkle, Memorial, Storage-Proof, Timestamp etc.
-            // poa_ok = None → kein PoA-Check (HTTP-Sync hat keinen Validator-Set-Kontext)
-            match chain.accept_peer_block(block, None) {
+            match chain.accept_peer_block(
+                block,
+                poa_ok,
+                Some(&*node.checkpoint_store.read().unwrap_or_else(|e| e.into_inner())),
+            ) {
                 Ok(_) => {
                     // Token-TXs im Ledger verarbeiten
                     // HTTP-Sync-Blöcke sind bereits vom Netzwerk validiert →
@@ -797,6 +824,8 @@ pub async fn pull_users_from_peer(
             account_type: stone::auth::default_account_type(),
             org_id: String::new(),
             org_role: String::new(),
+            discord_id: String::new(),
+            discord_username: String::new(),
         });
         added += 1;
     }
@@ -860,6 +889,8 @@ pub fn sync_chain_accounts_to_users(
             account_type: stone::auth::default_account_type(),
             org_id: String::new(),
             org_role: String::new(),
+            discord_id: String::new(),
+            discord_username: String::new(),
         });
         added += 1;
     }
@@ -872,11 +903,68 @@ pub fn sync_chain_accounts_to_users(
 
 // ─── Peer Discovery: Bootstrap Announce & Health Check ───────────────────────
 
-/// Hardcoded Bootstrap-Nodes für Peer-Registrierung.
-const BOOTSTRAP_URLS: &[&str] = &[
-    "http://212.227.54.241:8080",
-    "http://69.48.200.255:8080",
-];
+fn configured_bootstrap_urls() -> Vec<String> {
+    if let Ok(raw) = std::env::var("STONE_BOOTSTRAP_HTTP_URLS") {
+        let urls: Vec<String> = raw
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.trim_end_matches('/').to_string())
+            .collect();
+        if !urls.is_empty() {
+            return urls;
+        }
+    }
+    stone::network::default_bootstrap_http_urls()
+}
+
+fn host_from_url(url: &str) -> Option<&str> {
+    let without_scheme = url.split("://").nth(1).unwrap_or(url);
+    let host_port = without_scheme.split('/').next().unwrap_or(without_scheme);
+    let host = host_port.split(':').next().unwrap_or(host_port).trim();
+    if host.is_empty() { None } else { Some(host) }
+}
+
+fn same_host_url(a: &str, b: &str) -> bool {
+    match (host_from_url(a), host_from_url(b)) {
+        (Some(ha), Some(hb)) => ha.eq_ignore_ascii_case(hb),
+        _ => false,
+    }
+}
+
+fn endpoint_from_url(url: &str) -> Option<(String, u16)> {
+    let without_scheme = url.split("://").nth(1).unwrap_or(url);
+    let host_port = without_scheme.split('/').next().unwrap_or(without_scheme);
+    let host = host_port.split(':').next().unwrap_or(host_port).trim().to_ascii_lowercase();
+    if host.is_empty() {
+        return None;
+    }
+    let port = host_port
+        .split(':')
+        .nth(1)
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(80);
+    Some((host, port))
+}
+
+fn same_endpoint_url(a: &str, b: &str) -> bool {
+    match (endpoint_from_url(a), endpoint_from_url(b)) {
+        (Some(ea), Some(eb)) => ea == eb,
+        _ => false,
+    }
+}
+
+fn is_bootstrap_url(url: &str) -> bool {
+    let configured = configured_bootstrap_urls();
+    configured.iter().any(|b| same_endpoint_url(url, b))
+}
+
+fn effective_bootstrap_urls(self_url: &str) -> Vec<String> {
+    configured_bootstrap_urls()
+        .into_iter()
+        .filter(|b| !same_host_url(self_url, b))
+        .collect()
+}
 
 /// Registriert diesen Node bei allen Bootstrap-Nodes via POST /api/v1/peers/register.
 /// Wird einmalig beim Start aufgerufen. Fehler werden still ignoriert.
@@ -902,14 +990,11 @@ pub async fn bootstrap_announce(node: &Arc<MasterNodeState>) {
 
     let body = serde_json::json!({
         "url": self_url,
+        "peer_id": stone::network::read_peer_id(),
         "name": node.node_id.clone(),
     });
 
-    for bootstrap_url in BOOTSTRAP_URLS {
-        // Nicht bei sich selbst registrieren
-        if self_url.contains(bootstrap_url.trim_start_matches("http://").split(':').next().unwrap_or("")) {
-            continue;
-        }
+    for bootstrap_url in effective_bootstrap_urls(&self_url) {
         let url = format!("{}/api/v1/peers/register", bootstrap_url);
         match client.post(&url).json(&body).send().await {
             Ok(resp) if resp.status().is_success() => {
@@ -932,6 +1017,8 @@ pub async fn bootstrap_announce(node: &Arc<MasterNodeState>) {
 /// 4. Peers die >1h nicht gesehen wurden, entfernt (Cleanup)
 pub fn spawn_peer_health_task(node: Arc<MasterNodeState>) {
     use super::state::save_peers;
+
+    let self_url = resolve_self_url();
 
     tokio::spawn(async move {
         // Erst 2 Minuten warten bis Node vollständig gestartet ist
@@ -961,6 +1048,12 @@ pub fn spawn_peer_health_task(node: Arc<MasterNodeState>) {
             let mut changed = false;
 
             for peer in &peers {
+                if let Some(ref me) = self_url {
+                    if same_host_url(&peer.url, me) {
+                        continue;
+                    }
+                }
+
                 let health_url = format!("{}/api/v1/health", peer.url);
                 let start = Instant::now();
 
@@ -975,6 +1068,21 @@ pub fn spawn_peer_health_task(node: Arc<MasterNodeState>) {
                     _ => (false, 0),
                 };
 
+                let discovered_peer_id = if is_healthy {
+                    let info_url = format!("{}/api/v1/p2p/info", peer.url.trim_end_matches('/'));
+                    match client.get(&info_url).send().await {
+                        Ok(resp) if resp.status().is_success() => resp
+                            .json::<serde_json::Value>()
+                            .await
+                            .ok()
+                            .and_then(|v| v.get("peer_id").and_then(|p| p.as_str()).map(|s| s.to_string()))
+                            .filter(|pid| pid.parse::<libp2p::PeerId>().is_ok()),
+                        _ => None,
+                    }
+                } else {
+                    None
+                };
+
                 let latency = start.elapsed().as_millis();
 
                 // Peer-Status aktualisieren
@@ -987,6 +1095,9 @@ pub fn spawn_peer_health_task(node: Arc<MasterNodeState>) {
                             p.latency_ms = Some(latency);
                             p.block_height = block_height;
                             p.sync_failures = 0;
+                            if discovered_peer_id.is_some() && p.peer_id != discovered_peer_id {
+                                p.peer_id = discovered_peer_id.clone();
+                            }
                         } else {
                             p.status = PeerStatus::Unreachable;
                             p.sync_failures = p.sync_failures.saturating_add(1);
@@ -1002,13 +1113,22 @@ pub fn spawn_peer_health_task(node: Arc<MasterNodeState>) {
                 let mut all = node.peers.write().unwrap_or_else(|e| e.into_inner());
                 let before = all.len();
                 all.retain(|p| {
+                    // Self-Peer nie persistieren
+                    if let Some(ref me) = self_url {
+                        if same_host_url(&p.url, me) {
+                            return false;
+                        }
+                    }
+
                     // Bootstrap-Nodes immer behalten
-                    if BOOTSTRAP_URLS.iter().any(|b| p.url.contains(b.trim_start_matches("http://").split(':').next().unwrap_or(""))) {
+                    if is_bootstrap_url(&p.url) {
                         return true;
                     }
                     // Nie gesehene Peers (last_seen == 0) 30 min Gnadenfrist
                     if p.last_seen == 0 {
-                        return true; // Wird beim nächsten Health-Check geprüft
+                        // Alte Ghost-Einträge (z.B. Legacy-Port) nach mehreren
+                        // Fehlversuchen entfernen.
+                        return p.sync_failures < 3;
                     }
                     // >1h nicht gesehen → entfernen
                     now - p.last_seen < 3600
@@ -1034,13 +1154,19 @@ fn resolve_self_url() -> Option<String> {
     if let Ok(url) = std::env::var("STONE_PUBLIC_URL") {
         let url = url.trim().to_string();
         if !url.is_empty() {
-            return Some(url);
+            return Some(url.trim_end_matches('/').to_string());
         }
     }
     if let Ok(ip) = std::env::var("STONE_PUBLIC_IP") {
         let ip = ip.trim().to_string();
         if !ip.is_empty() {
-            let port = std::env::var("STONE_PORT").unwrap_or_else(|_| "8080".into());
+            let default_http = if stone::network::is_mainnet() { 3180 } else { 3080 };
+            let configured_port = std::env::var("STONE_HTTP_PORT")
+                .or_else(|_| std::env::var("STONE_PORT"))
+                .ok()
+                .and_then(|v| v.parse::<u16>().ok())
+                .unwrap_or(default_http);
+            let port = if configured_port == 8080 { default_http } else { configured_port };
             return Some(format!("http://{}:{}", ip, port));
         }
     }

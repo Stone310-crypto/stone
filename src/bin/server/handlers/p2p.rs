@@ -5,13 +5,24 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
+use serde::Deserialize;
 use serde_json::json;
 use stone::consensus::{
-    BlockProposal, PreCommitRequest, VoteMessage, VotePhase, load_or_create_validator_key,
+    BlockProposal, PreCommitRequest, ProposerVerificationPolicy, VoteMessage,
+    VotePhase, load_or_create_validator_key,
 };
 
 use super::super::auth_middleware::require_admin;
 use super::super::state::AppState;
+
+#[derive(Debug, Deserialize)]
+pub struct ChaosPenaltyRequest {
+    pub peer_id: String,
+    pub points: u32,
+    pub reason: String,
+    #[serde(default)]
+    pub repeat: u32,
+}
 
 /// GET /api/v1/p2p/peers (öffentlich)
 pub async fn handle_p2p_peers(
@@ -120,6 +131,23 @@ pub async fn handle_p2p_status(State(state): State<AppState>) -> impl IntoRespon
         }))
         .into_response();
     };
+    let (registry_total, registry_bound, registry_invalid) = {
+        let peers = state.node.peers.read().unwrap_or_else(|e| e.into_inner());
+        let total = peers.len();
+        let mut bound = 0usize;
+        let mut invalid = 0usize;
+        for p in peers.iter() {
+            if let Some(pid) = &p.peer_id {
+                if pid.parse::<libp2p::PeerId>().is_ok() {
+                    bound += 1;
+                } else {
+                    invalid += 1;
+                }
+            }
+        }
+        (total, bound, invalid)
+    };
+
     match net.get_status().await {
         Some(s) => axum::Json(json!({
             "local_peer_id":       s.local_peer_id,
@@ -127,6 +155,28 @@ pub async fn handle_p2p_status(State(state): State<AppState>) -> impl IntoRespon
             "total_known_peers":   s.total_known_peers,
             "gossipsub_mesh_size": s.gossipsub_mesh_size,
             "chain_block_count":   s.chain_block_count,
+            "health_controller": {
+                "state": s.health_controller.state,
+                "failure": s.health_controller.failure,
+                "recovery_level": s.health_controller.recovery_level,
+                "seconds_since_transition": s.health_controller.seconds_since_transition,
+                "cooldown_remaining_secs": s.health_controller.cooldown_remaining_secs,
+                "last_reason": s.health_controller.last_reason,
+            },
+            "discovery_binding": {
+                "registry_peers_total": registry_total,
+                "registry_peers_with_valid_peer_id": registry_bound,
+                "registry_peers_with_invalid_peer_id": registry_invalid,
+                "registry_peer_id_binding_coverage_pct":
+                    if registry_total > 0 { (registry_bound as f64 / registry_total as f64) * 100.0 } else { 100.0 },
+            },
+            "sync_recovery": {
+                "stage": s.sync_recovery.stage,
+                "attempts": s.sync_recovery.attempts,
+                "seconds_since_progress": s.sync_recovery.seconds_since_progress,
+                "target_peer": s.sync_recovery.target_peer,
+                "last_reason": s.sync_recovery.last_reason,
+            },
             "peers": s.peers.iter().map(|p| json!({
                 "peer_id":         p.peer_id,
                 "addresses":       p.addresses,
@@ -190,6 +240,65 @@ pub async fn handle_p2p_ping(
     ))
 }
 
+/// POST /api/v1/p2p/chaos/penalty
+///
+/// Test-Hook: injiziert Penalties gegen einen Peer.
+/// Nur für Chaos-Tests, daher hart opt-in via STONE_ENABLE_CHAOS_API=1.
+pub async fn handle_p2p_chaos_penalty(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    axum::Json(body): axum::Json<ChaosPenaltyRequest>,
+) -> Result<impl IntoResponse, Response> {
+    require_admin(&headers, &state)?;
+
+    if std::env::var("STONE_ENABLE_CHAOS_API").as_deref() != Ok("1") {
+        return Err((
+            StatusCode::FORBIDDEN,
+            axum::Json(json!({
+                "error": "Chaos API deaktiviert (setze STONE_ENABLE_CHAOS_API=1)"
+            })),
+        )
+            .into_response());
+    }
+
+    // Mainnet-Schutz: Chaos-Hook standardmäßig blockiert.
+    if stone::network::is_mainnet()
+        && std::env::var("STONE_CHAOS_API_ALLOW_MAINNET").as_deref() != Ok("1")
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            axum::Json(json!({
+                "error": "Chaos API auf Mainnet blockiert (STONE_CHAOS_API_ALLOW_MAINNET=1 für expliziten Override)"
+            })),
+        )
+            .into_response());
+    }
+
+    let net = state.network.as_ref().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(json!({"error": "P2P nicht aktiv"})),
+        )
+            .into_response()
+    })?;
+
+    let repeat = body.repeat.clamp(1, 32);
+    for _ in 0..repeat {
+        net.report_penalty(&body.peer_id, body.points, &body.reason).await;
+    }
+
+    Ok((
+        StatusCode::OK,
+        axum::Json(json!({
+            "ok": true,
+            "peer_id": body.peer_id,
+            "points": body.points,
+            "reason": body.reason,
+            "repeat": repeat,
+        })),
+    ))
+}
+
 /// POST /api/v1/p2p/proposal
 ///
 /// Empfängt einen Block-Proposal von einem Peer-Validator.
@@ -201,25 +310,7 @@ pub async fn handle_p2p_proposal(
     // 1. Validator-Set laden
     let vs = state.node.validator_set.read().unwrap_or_else(|e| e.into_inner()).clone();
 
-    // 2. Proposer-Signatur prüfen
-    if !proposal.verify_proposer(&vs) {
-        let signing_key = load_or_create_validator_key();
-        let vote = VoteMessage::new(
-            proposal.round,
-            proposal.block.hash.clone(),
-            state.node.node_id.clone(),
-            false,
-            &signing_key,
-            "Ungültige Proposer-Signatur".into(),
-        );
-        return (StatusCode::OK, axum::Json(json!({
-            "ok": false,
-            "error": "Ungültige Proposer-Signatur",
-            "vote": vote,
-        })));
-    }
-
-    // 3. Prüfen ob der Proposer der ausgewählte Validator für diesen Slot ist
+    // Lokalen Chain-Stand früh laden, damit Bootstrap-Fenster sicher begrenzt ist.
     let (prev_hash, expected_index) = {
         let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
         let ph = chain.blocks.last()
@@ -228,6 +319,65 @@ pub async fn handle_p2p_proposal(
         let idx = chain.blocks.len() as u64;
         (ph, idx)
     };
+
+    // 2. Proposer-Signatur strikt prüfen (kein Bootstrap-Bypass).
+    let proposer_policy = ProposerVerificationPolicy::Strict;
+
+    if !proposal.verify_proposer(&vs, proposer_policy) {
+        let signing_key = load_or_create_validator_key();
+        let reason = if vs.validators.is_empty() {
+            "Kein ValidatorSet konfiguriert (Bootstrapfenster geschlossen)"
+        } else {
+            "Ungültige Proposer-Signatur"
+        };
+        let vote = VoteMessage::new(
+            proposal.round,
+            proposal.block.hash.clone(),
+            state.node.node_id.clone(),
+            false,
+            &signing_key,
+            reason.into(),
+        );
+        return (StatusCode::OK, axum::Json(json!({
+            "ok": false,
+            "error": reason,
+            "vote": vote,
+        })));
+    }
+
+    // 2c. Nur aktive Validatoren dürfen Votings signieren.
+    if !vs.validators.is_empty() && !vs.is_active_validator(&state.node.node_id) {
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(json!({
+                "ok": false,
+                "error": format!(
+                    "Node '{}' ist kein aktiver Validator und darf nicht voten",
+                    state.node.node_id
+                ),
+            })),
+        );
+    }
+
+    // 2b. Admission-Guard: Unbekannte Proposer strikt ablehnen.
+    if !vs.validators.is_empty() && vs.get(&proposal.proposer_id).is_none() {
+        let signing_key = load_or_create_validator_key();
+        let vote = VoteMessage::new(
+            proposal.round,
+            proposal.block.hash.clone(),
+            state.node.node_id.clone(),
+            false,
+            &signing_key,
+            format!("Unbekannter Validator '{}'", proposal.proposer_id),
+        );
+        return (StatusCode::OK, axum::Json(json!({
+            "ok": false,
+            "error": "Unbekannter Validator",
+            "vote": vote,
+        })));
+    }
+
+    // 3. Prüfen ob der Proposer der ausgewählte Validator für diesen Slot ist
 
     // Block-Index muss zum lokalen Chain-Stand passen
     if proposal.block.index != expected_index {
@@ -273,15 +423,20 @@ pub async fn handle_p2p_proposal(
     ) || vs.is_round_robin_turn(&proposal.proposer_id, proposal.block.index, &jailed);
 
     if !is_primary {
-        // Nicht der primäre Validator → prüfe PoW-Fallback
-        let pow_valid = proposal.block.pow_nonce > 0
-            && stone::consensus::verify_lite_pow(
-                &prev_hash,
-                proposal.block.index,
-                &proposal.proposer_id,
-                proposal.block.pow_nonce,
-                stone::consensus::BLOCK_POW_DIFFICULTY,
-            );
+        // Nicht der primäre Validator → prüfe Fallback-Bedingung.
+        // Mit BLOCK_POW_ENABLED=false reicht reines Timeout (keine PoW-Lösung nötig).
+        let pow_valid = if stone::consensus::BLOCK_POW_ENABLED {
+            proposal.block.pow_nonce > 0
+                && stone::consensus::verify_lite_pow(
+                    &prev_hash,
+                    proposal.block.index,
+                    &proposal.proposer_id,
+                    proposal.block.pow_nonce,
+                    stone::consensus::BLOCK_POW_DIFFICULTY,
+                )
+        } else {
+            true
+        };
 
         let last_block_age = {
             let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
@@ -349,24 +504,7 @@ pub async fn handle_p2p_proposal(
         proposal.block.index, proposal.proposer_id,
     );
 
-    // 6. Auto-Registrierung: Proposer als Validator hinzufügen falls unbekannt
-    {
-        let mut vs_w = state.node.validator_set.write().unwrap_or_else(|e| e.into_inner());
-        if vs_w.get(&proposal.proposer_id).is_none() {
-            let pub_key_hex = proposal.block.validator_pub_key.clone();
-            let mut vi = stone::consensus::ValidatorInfo::new(
-                proposal.proposer_id.clone(),
-                pub_key_hex,
-            );
-            vi.name = format!("Auto-discovered (Block #{})", proposal.block.index);
-            vi.active = true;
-            vs_w.add(vi);
-            println!(
-                "[consensus] 🔗 Peer '{}' automatisch als Validator registriert",
-                proposal.proposer_id,
-            );
-        }
-    }
+    // SECURITY P0: Kein implizites Validator Auto-Discovery im Proposal-Pfad.
 
     (StatusCode::OK, axum::Json(json!({
         "ok": true,
@@ -384,6 +522,20 @@ pub async fn handle_p2p_precommit(
     axum::Json(pcr): axum::Json<PreCommitRequest>,
 ) -> impl IntoResponse {
     let vs = state.node.validator_set.read().unwrap_or_else(|e| e.into_inner()).clone();
+
+    if !vs.validators.is_empty() && !vs.is_active_validator(&state.node.node_id) {
+        return (
+            StatusCode::FORBIDDEN,
+            axum::Json(json!({
+                "ok": false,
+                "error": format!(
+                    "Node '{}' ist kein aktiver Validator und darf kein PreCommit signieren",
+                    state.node.node_id
+                ),
+            })),
+        );
+    }
+
     let signing_key = load_or_create_validator_key();
 
     // 1. Pre-Votes verifizieren: jede Signatur muss gültig sein

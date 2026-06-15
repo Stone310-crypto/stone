@@ -68,6 +68,12 @@ pub async fn handle_chat_policy_status(
             "min_stake_required": "0",
             "description": "Kein Mindest-Stake erforderlich",
         },
+        "message_fee": {
+            "fee_per_message": "0",
+            "currency": "STONE",
+            "enabled": false,
+            "description": "Spam-Schutz per Fee derzeit deaktiviert (nur Lite-PoW aktiv).",
+        },
     })))
 }
 

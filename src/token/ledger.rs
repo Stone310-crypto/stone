@@ -30,7 +30,7 @@ use super::transaction::{TokenTx, TxError, TxType, validate_tx};
 // ─── Konstanten ──────────────────────────────────────────────────────────────
 
 /// Maximales Token-Supply: 55.000.000 STONE (Mainnet)
-pub const MAX_SUPPLY: &str = "55000000";
+pub const MAX_SUPPLY: &str = "100000000";
 /// Testnet Max-Supply: 550.000.000 STONE (10x Mainnet, damit Faucet nicht blockiert)
 pub const MAX_SUPPLY_TESTNET: &str = "550000000";
 
@@ -205,6 +205,20 @@ pub struct TokenLedger {
     /// Wallet-Adresse → API-Key-Hash (SHA-256 der Phrase).
     /// Dient als Authentifizierungsbeweis, wird aus AccountRegister-TX memo gelesen.
     account_api_keys: HashMap<String, String>,
+    // ── On-Chain Game-Registry (Phase A) ────────────────────────────
+    /// Owner-Wallet → CompanyProfile. Wird aus `CompanyRegister`-TXs aufgebaut.
+    companies: HashMap<String, super::game_chain::CompanyProfile>,
+    /// Game-ID → OnChainGame. Wird aus `GameRegister`-TXs aufgebaut.
+    games: HashMap<String, super::game_chain::OnChainGame>,
+    /// Owner-Wallet → Liste der Sub-Keys (Rollen).
+    sub_keys: HashMap<String, Vec<super::game_chain::SubKey>>,
+    /// Founder-Pubkey-Set für Verify-TXs. Wird beim ersten Bedarf lazy initialisiert.
+    founder_pubkeys: std::collections::HashSet<String>,
+    /// **Phase D**: Game-Coin-Salden. `game_id → wallet → balance`.
+    game_coins: HashMap<String, HashMap<String, Decimal>>,
+    /// **Phase D**: Sub-Key Daily-Usage. `sub_wallet → (day_index_utc, used_stone)`.
+    /// Wird beim Tageswechsel automatisch zurückgesetzt.
+    sub_key_daily_usage: HashMap<String, (i64, Decimal)>,
     /// Vesting-Schedules: pool-Adresse → VestingSchedule
     /// Verhindert Auszahlungen über den freigegebenen Betrag hinaus.
     vesting_schedules: HashMap<String, VestingSchedule>,
@@ -234,6 +248,12 @@ impl TokenLedger {
             key_rotation_history: HashMap::new(),
             account_names: HashMap::new(),
             account_api_keys: HashMap::new(),
+            companies: HashMap::new(),
+            games: HashMap::new(),
+            sub_keys: HashMap::new(),
+            founder_pubkeys: super::game_chain::load_founder_pubkeys(),
+            game_coins: HashMap::new(),
+            sub_key_daily_usage: HashMap::new(),
             vesting_schedules: HashMap::new(),
             total_fees_burned: Decimal::ZERO,
             current_block_validator: None,
@@ -328,6 +348,79 @@ impl TokenLedger {
         let fees_str = self.total_fees_burned.to_string();
         hasher.update((fees_str.len() as u32).to_le_bytes());
         hasher.update(fees_str.as_bytes());
+
+        // ── Game-Registry-Beitrag (Phase A) ─────────────────────────────
+        // Nur einbeziehen wenn vorhanden — erhält Backward-Compat zur Pre-A-Chain.
+        if !self.companies.is_empty() {
+            hasher.update(b"||companies||");
+            hasher.update((self.companies.len() as u32).to_le_bytes());
+            let mut wallets: Vec<&String> = self.companies.keys().collect();
+            wallets.sort();
+            for w in wallets {
+                let c = &self.companies[w];
+                let json = serde_json::to_string(c).unwrap_or_default();
+                hasher.update((w.len() as u32).to_le_bytes());
+                hasher.update(w.as_bytes());
+                hasher.update((json.len() as u32).to_le_bytes());
+                hasher.update(json.as_bytes());
+            }
+        }
+        if !self.games.is_empty() {
+            hasher.update(b"||games||");
+            hasher.update((self.games.len() as u32).to_le_bytes());
+            let mut ids: Vec<&String> = self.games.keys().collect();
+            ids.sort();
+            for id in ids {
+                let g = &self.games[id];
+                let json = serde_json::to_string(g).unwrap_or_default();
+                hasher.update((id.len() as u32).to_le_bytes());
+                hasher.update(id.as_bytes());
+                hasher.update((json.len() as u32).to_le_bytes());
+                hasher.update(json.as_bytes());
+            }
+        }
+        if !self.sub_keys.is_empty() {
+            hasher.update(b"||subkeys||");
+            let mut owners: Vec<&String> = self.sub_keys.keys()
+                .filter(|k| !self.sub_keys[*k].is_empty()).collect();
+            owners.sort();
+            hasher.update((owners.len() as u32).to_le_bytes());
+            for w in owners {
+                let keys = &self.sub_keys[w];
+                let json = serde_json::to_string(keys).unwrap_or_default();
+                hasher.update((w.len() as u32).to_le_bytes());
+                hasher.update(w.as_bytes());
+                hasher.update((json.len() as u32).to_le_bytes());
+                hasher.update(json.as_bytes());
+            }
+        }
+        // **Phase D**: Game-Coin-Salden
+        if !self.game_coins.is_empty() {
+            // Flat-Liste (game_id, wallet, balance) sortiert
+            let mut entries: Vec<(&String, &String, &Decimal)> = Vec::new();
+            for (gid, bals) in &self.game_coins {
+                for (w, b) in bals {
+                    if !b.is_zero() {
+                        entries.push((gid, w, b));
+                    }
+                }
+            }
+            if !entries.is_empty() {
+                entries.sort_by(|a, b| a.0.cmp(b.0).then(a.1.cmp(b.1)));
+                hasher.update(b"||gcoins||");
+                hasher.update((entries.len() as u32).to_le_bytes());
+                for (gid, w, b) in entries {
+                    let bs = b.to_string();
+                    hasher.update((gid.len() as u32).to_le_bytes());
+                    hasher.update(gid.as_bytes());
+                    hasher.update((w.len() as u32).to_le_bytes());
+                    hasher.update(w.as_bytes());
+                    hasher.update((bs.len() as u32).to_le_bytes());
+                    hasher.update(bs.as_bytes());
+                }
+            }
+        }
+
         hex::encode(hasher.finalize())
     }
 
@@ -365,6 +458,109 @@ impl TokenLedger {
         self.account_names.len()
     }
 
+    // ── On-Chain Game-Registry Abfragen (Phase A) ─────────────────────────
+
+    /// Gibt das Firmenprofil für eine Owner-Wallet zurück (falls registriert).
+    pub fn company(&self, owner_wallet: &str) -> Option<&super::game_chain::CompanyProfile> {
+        self.companies.get(owner_wallet)
+    }
+
+    /// Prüft, ob eine Wallet als Firma registriert ist.
+    pub fn is_company(&self, owner_wallet: &str) -> bool {
+        self.companies.contains_key(owner_wallet)
+    }
+
+    /// Account-Typ-Klassifikation einer Wallet (Personal oder Company).
+    pub fn account_type(&self, wallet: &str) -> super::game_chain::AccountType {
+        if self.companies.contains_key(wallet) {
+            super::game_chain::AccountType::Company
+        } else {
+            super::game_chain::AccountType::Personal
+        }
+    }
+
+    /// Gibt den On-Chain-Eintrag eines Spiels zurück.
+    pub fn game(&self, game_id: &str) -> Option<&super::game_chain::OnChainGame> {
+        self.games.get(game_id)
+    }
+
+    /// Alle Spiele einer Firma (Owner-Wallet).
+    pub fn games_of_company(&self, owner_wallet: &str) -> Vec<&super::game_chain::OnChainGame> {
+        self.games.values().filter(|g| g.owner_company == owner_wallet).collect()
+    }
+
+    /// Iteriert alle registrierten Firmen (Owner-Wallet → Profil).
+    pub fn all_companies(&self) -> &HashMap<String, super::game_chain::CompanyProfile> {
+        &self.companies
+    }
+
+    /// Iteriert alle registrierten Spiele (Game-ID → Eintrag).
+    pub fn all_games(&self) -> &HashMap<String, super::game_chain::OnChainGame> {
+        &self.games
+    }
+
+    /// Anzahl registrierter Firmen.
+    pub fn company_count(&self) -> usize {
+        self.companies.len()
+    }
+
+    /// Anzahl registrierter Spiele.
+    pub fn game_count(&self) -> usize {
+        self.games.len()
+    }
+
+    /// Sub-Keys einer Firma (leerer Slice wenn keine).
+    pub fn sub_keys_of(&self, owner_wallet: &str) -> &[super::game_chain::SubKey] {
+        self.sub_keys.get(owner_wallet).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
+    /// Prüft, ob eine Wallet ein Founder ist.
+    pub fn is_founder(&self, wallet: &str) -> bool {
+        self.founder_pubkeys.contains(&wallet.to_lowercase())
+    }
+
+    /// Anzahl Founder-Pubkeys.
+    pub fn founder_count(&self) -> usize {
+        self.founder_pubkeys.len()
+    }
+
+    /// **Phase D**: Game-Coin-Balance einer Wallet für ein bestimmtes Spiel.
+    pub fn game_coin_balance(&self, game_id: &str, wallet: &str) -> Decimal {
+        self.game_coins.get(game_id)
+            .and_then(|m| m.get(wallet))
+            .copied()
+            .unwrap_or(Decimal::ZERO)
+    }
+
+    /// **Phase D**: Gesamt-Supply eines Game-Coins (Summe aller Halter).
+    pub fn game_coin_supply(&self, game_id: &str) -> Decimal {
+        self.game_coins.get(game_id)
+            .map(|m| m.values().sum())
+            .unwrap_or(Decimal::ZERO)
+    }
+
+    /// **Phase D**: Anzahl Halter eines Game-Coins.
+    pub fn game_coin_holder_count(&self, game_id: &str) -> usize {
+        self.game_coins.get(game_id)
+            .map(|m| m.values().filter(|v| !v.is_zero()).count())
+            .unwrap_or(0)
+    }
+
+    /// **Phase D**: Alle Salden eines Game-Coins (für Read-Endpoints).
+    pub fn game_coin_balances(&self, game_id: &str) -> Option<&HashMap<String, Decimal>> {
+        self.game_coins.get(game_id)
+    }
+
+    #[cfg(test)]
+    pub fn add_founder_for_test(&mut self, pubkey_hex: &str) {
+        self.founder_pubkeys.insert(pubkey_hex.to_lowercase());
+    }
+
+    #[cfg(test)]
+    pub fn clear_founders_for_test(&mut self) {
+        self.founder_pubkeys.clear();
+    }
+
     // ── Schreiboperationen ────────────────────────────────────────────────
 
     /// Neue Token minten (nur für System: Genesis, Rewards).
@@ -393,6 +589,41 @@ impl TokenLedger {
             "[token] 🪙 Mint: {} STONE → {} (Supply: {}/{})",
             amount, &to[..12.min(to.len())], self.total_supply, self.max_supply
         );
+        Ok(())
+    }
+
+    /// System-Operation: Direkter Pool-zu-Adresse Transfer **außerhalb** der
+    /// normalen TX-Pipeline. Wird ausschließlich von Migrations-Routinen beim
+    /// Node-Start verwendet (z.B. Gaming-Pool-Unlock). Verändert das
+    /// `total_supply` nicht – verschiebt nur Balances.
+    ///
+    /// Quelle MUSS eine `pool:`-Adresse sein.
+    pub fn system_pool_transfer(
+        &mut self,
+        from_pool: &str,
+        to: &str,
+        amount: Decimal,
+    ) -> Result<(), LedgerError> {
+        if !from_pool.starts_with("pool:") {
+            return Err(LedgerError::TxValidation(TxError::MissingField(
+                format!("system_pool_transfer: from='{from_pool}' ist kein Pool")
+            )));
+        }
+        if amount <= Decimal::ZERO {
+            return Err(LedgerError::TxValidation(TxError::InvalidAmount(
+                "system_pool_transfer Betrag muss positiv sein".into()
+            )));
+        }
+        let pool_balance = self.balance(from_pool);
+        if pool_balance < amount {
+            return Err(LedgerError::InsufficientBalance {
+                account: from_pool.to_string(),
+                available: pool_balance,
+                required: amount,
+            });
+        }
+        *self.balances.entry(from_pool.to_string()).or_insert(Decimal::ZERO) -= amount;
+        *self.balances.entry(to.to_string()).or_insert(Decimal::ZERO) += amount;
         Ok(())
     }
 
@@ -658,6 +889,11 @@ impl TokenLedger {
                 | TxType::AccountRegister | TxType::AccountUpdate
                 | TxType::Stake | TxType::Unstake
                 | TxType::HtlcCreate
+                | TxType::CompanyRegister | TxType::GameRegister
+                | TxType::CompanyUpdate | TxType::GameUpdate | TxType::GameDeprecate
+                | TxType::CompanyVerify | TxType::GameVerify
+                | TxType::RoleGrant | TxType::RoleRevoke
+                | TxType::GameCoinMint | TxType::GameCoinTransfer | TxType::GameCoinBurn
             );
             if needs_nonce {
                 let expected = pending_nonces
@@ -733,6 +969,62 @@ impl TokenLedger {
             validate_tx(tx)?;
         }
 
+        // 1b. **Phase D — Sub-Key-Autorisierung**: Wenn `signed_by` gesetzt, muss
+        // `from` eine Firma sein, der Sub-Key in der Rollen-Liste existieren,
+        // die Rolle den TxType freigeben und (bei Transfer) das Daily-Limit
+        // eingehalten werden. Im Replay-Modus überspringen.
+        if !self.replay_mode {
+            if let Some(sub_pub) = tx.signed_by.clone() {
+                if !self.companies.contains_key(&tx.from) {
+                    return Err(LedgerError::TxValidation(TxError::InvalidKey(
+                        "signed_by gesetzt, aber `from` ist keine Firma".into()
+                    )));
+                }
+                let role = self.sub_keys.get(&tx.from)
+                    .and_then(|keys| keys.iter().find(|s| s.wallet == sub_pub).map(|s| s.role.clone()))
+                    .ok_or_else(|| LedgerError::TxValidation(TxError::InvalidKey(
+                        format!("Sub-Key {} ist nicht für Firma {} berechtigt",
+                            &sub_pub[..12.min(sub_pub.len())],
+                            &tx.from[..12.min(tx.from.len())])
+                    )))?;
+                if !role.allows(&tx.tx_type) {
+                    return Err(LedgerError::TxValidation(TxError::InvalidKey(
+                        format!("Rolle {} darf TxType {} nicht ausführen",
+                            role.as_str(), tx.tx_type)
+                    )));
+                }
+                // Daily-Limit-Check (nur für STONE-Transfer, nicht Game-Coin-TXs)
+                if tx.tx_type == TxType::Transfer {
+                    let limit_str = self.sub_keys.get(&tx.from)
+                        .and_then(|keys| keys.iter().find(|s| s.wallet == sub_pub))
+                        .map(|s| s.daily_limit_stone.clone())
+                        .unwrap_or_default();
+                    if !limit_str.is_empty() {
+                        let limit = limit_str.parse::<Decimal>().unwrap_or(Decimal::ZERO);
+                        if limit > Decimal::ZERO {
+                            let today = chrono::Utc::now().timestamp() / 86400;
+                            let entry = self.sub_key_daily_usage.entry(sub_pub.clone())
+                                .or_insert((today, Decimal::ZERO));
+                            if entry.0 != today {
+                                *entry = (today, Decimal::ZERO);
+                            }
+                            let new_used = entry.1 + tx.amount;
+                            if new_used > limit {
+                                return Err(LedgerError::TxValidation(TxError::InvalidAmount(
+                                    format!("Daily-Limit überschritten: {limit} STONE/Tag (bereits {} genutzt)",
+                                        entry.1)
+                                )));
+                            }
+                            // Nur reservieren — apply geschieht später beim Transfer-Branch.
+                            // Wir tracken hier vorab und akzeptieren leichte Inkonsistenz
+                            // bei Fehlschlag im Transfer (akzeptabel, da Limit konservativ).
+                            entry.1 = new_used;
+                        }
+                    }
+                }
+            }
+        }
+
         // 2. Duplikat-Prüfung (Memorial-TXs sind in jedem Block identisch → überspringen)
         if tx.tx_type != TxType::Memorial && self.processed_txs.contains(&tx.tx_id) {
             return Err(LedgerError::TxValidation(TxError::Replay(
@@ -747,7 +1039,14 @@ impl TokenLedger {
             || tx.tx_type == TxType::AccountRegister || tx.tx_type == TxType::AccountUpdate
             || tx.tx_type == TxType::Stake || tx.tx_type == TxType::Unstake
             || tx.tx_type == TxType::Delegate || tx.tx_type == TxType::Undelegate
-            || tx.tx_type == TxType::HtlcCreate)
+            || tx.tx_type == TxType::HtlcCreate
+            || tx.tx_type == TxType::CompanyRegister || tx.tx_type == TxType::GameRegister
+            || tx.tx_type == TxType::CompanyUpdate
+            || tx.tx_type == TxType::GameUpdate || tx.tx_type == TxType::GameDeprecate
+            || tx.tx_type == TxType::CompanyVerify || tx.tx_type == TxType::GameVerify
+            || tx.tx_type == TxType::RoleGrant || tx.tx_type == TxType::RoleRevoke
+            || tx.tx_type == TxType::GameCoinMint || tx.tx_type == TxType::GameCoinTransfer
+            || tx.tx_type == TxType::GameCoinBurn)
         {
             // Prüfen ob der Key durch Rotation invalidiert wurde
             if let Some(active) = self.resolve_active_key(&tx.from) {
@@ -1036,6 +1335,401 @@ impl TokenLedger {
                     tx.amount, &tx.to[..12.min(tx.to.len())], &tx.tx_id[..12]
                 );
             }
+            TxType::ForkBondRefund => {
+                // from = pool:fork:<predecessor>:<new_game_id> (Escrow),
+                // to   = Empfänger (Sieger oder Verlierer oder Veto-Refund-Empfänger),
+                // amount = Bond-Anteil. Privileged System-TX: keine User-Signatur,
+                // Validierung erfolgt im Sweeper-Handler gegen GameEconomyStore.
+                if !tx.from.starts_with("pool:fork:") {
+                    return Err(LedgerError::TxValidation(TxError::MissingField(
+                        format!("ForkBondRefund: 'from' muss pool:fork:* sein (war {})", tx.from)
+                    )));
+                }
+                let pool_balance = self.balance(&tx.from);
+                if pool_balance < tx.amount {
+                    return Err(LedgerError::InsufficientBalance {
+                        account: tx.from.clone(),
+                        available: pool_balance,
+                        required: tx.amount,
+                    });
+                }
+                *self.balances.entry(tx.from.clone()).or_insert(Decimal::ZERO) -= tx.amount;
+                *self.balances.entry(tx.to.clone()).or_insert(Decimal::ZERO) += tx.amount;
+                println!(
+                    "[token] 🏆 Fork-Bond-Refund: {} STONE {} → {} (TX: {})",
+                    tx.amount, &tx.from[..24.min(tx.from.len())],
+                    &tx.to[..12.min(tx.to.len())], &tx.tx_id[..12]
+                );
+            }
+            TxType::CompanyRegister => {
+                // from == to == Owner-Wallet. memo = JSON CompanyRegisterMemo.
+                if tx.from != tx.to {
+                    return Err(LedgerError::TxValidation(TxError::MissingField(
+                        "CompanyRegister: from == to erwartet".into()
+                    )));
+                }
+                if self.companies.contains_key(&tx.from) {
+                    return Err(LedgerError::TxValidation(TxError::Replay(
+                        format!("Firma {} bereits registriert", &tx.from[..12.min(tx.from.len())])
+                    )));
+                }
+                let memo = super::game_chain::CompanyRegisterMemo::parse(&tx.memo)
+                    .map_err(|e| LedgerError::TxValidation(TxError::MissingField(
+                        format!("CompanyRegister memo: {e}")
+                    )))?;
+                // Optionale Fee burnen / splitten
+                if tx.fee > Decimal::ZERO {
+                    let balance = self.balance(&tx.from);
+                    if balance < tx.fee {
+                        return Err(LedgerError::InsufficientBalance {
+                            account: tx.from.clone(),
+                            available: balance,
+                            required: tx.fee,
+                        });
+                    }
+                    *self.balances.entry(tx.from.clone()).or_insert(Decimal::ZERO) -= tx.fee;
+                    self.apply_fee_split(tx.fee);
+                }
+                let company = super::game_chain::build_company(&memo, &tx.from, block_index);
+                println!(
+                    "[token] 🏢 CompanyRegister: '{}' Owner {} Block {}",
+                    company.name, &tx.from[..12.min(tx.from.len())], block_index
+                );
+                self.companies.insert(tx.from.clone(), company);
+                self.advance_nonce(&tx.from, tx.nonce);
+            }
+            TxType::GameRegister => {
+                // from == to == Owner-Wallet einer registrierten Firma.
+                if tx.from != tx.to {
+                    return Err(LedgerError::TxValidation(TxError::MissingField(
+                        "GameRegister: from == to erwartet".into()
+                    )));
+                }
+                if !self.companies.contains_key(&tx.from) {
+                    return Err(LedgerError::TxValidation(TxError::MissingField(
+                        format!("GameRegister: Owner {} ist keine Firma", &tx.from[..12.min(tx.from.len())])
+                    )));
+                }
+                let memo = super::game_chain::GameRegisterMemo::parse(&tx.memo)
+                    .map_err(|e| LedgerError::TxValidation(TxError::MissingField(
+                        format!("GameRegister memo: {e}")
+                    )))?;
+                if self.games.contains_key(&memo.game_id) {
+                    return Err(LedgerError::TxValidation(TxError::Replay(
+                        format!("Game-ID '{}' bereits vergeben", memo.game_id)
+                    )));
+                }
+                if tx.fee > Decimal::ZERO {
+                    let balance = self.balance(&tx.from);
+                    if balance < tx.fee {
+                        return Err(LedgerError::InsufficientBalance {
+                            account: tx.from.clone(),
+                            available: balance,
+                            required: tx.fee,
+                        });
+                    }
+                    *self.balances.entry(tx.from.clone()).or_insert(Decimal::ZERO) -= tx.fee;
+                    self.apply_fee_split(tx.fee);
+                }
+                let game = super::game_chain::build_game(&memo, &tx.from, block_index);
+                println!(
+                    "[token] 🎮 GameRegister: '{}' (id={}) Owner {} Block {}",
+                    game.name, game.game_id, &tx.from[..12.min(tx.from.len())], block_index
+                );
+                self.games.insert(memo.game_id.clone(), game);
+                self.advance_nonce(&tx.from, tx.nonce);
+            }
+            TxType::CompanyUpdate => {
+                if tx.from != tx.to {
+                    return Err(LedgerError::TxValidation(TxError::MissingField(
+                        "CompanyUpdate: from == to erwartet".into()
+                    )));
+                }
+                let memo = super::game_chain::CompanyUpdateMemo::parse(&tx.memo)
+                    .map_err(|e| LedgerError::TxValidation(TxError::MissingField(
+                        format!("CompanyUpdate memo: {e}")
+                    )))?;
+                let company = self.companies.get_mut(&tx.from).ok_or_else(||
+                    LedgerError::TxValidation(TxError::MissingField(
+                        format!("CompanyUpdate: Firma {} nicht registriert",
+                            &tx.from[..12.min(tx.from.len())])
+                    )))?;
+                if let Some(c) = memo.country { company.country = c; }
+                if let Some(w) = memo.website { company.website = w; }
+                if tx.fee > Decimal::ZERO {
+                    let balance = self.balance(&tx.from);
+                    if balance < tx.fee {
+                        return Err(LedgerError::InsufficientBalance {
+                            account: tx.from.clone(), available: balance, required: tx.fee,
+                        });
+                    }
+                    *self.balances.entry(tx.from.clone()).or_insert(Decimal::ZERO) -= tx.fee;
+                    self.apply_fee_split(tx.fee);
+                }
+                self.advance_nonce(&tx.from, tx.nonce);
+            }
+            TxType::GameUpdate => {
+                if tx.from != tx.to {
+                    return Err(LedgerError::TxValidation(TxError::MissingField(
+                        "GameUpdate: from == to erwartet".into()
+                    )));
+                }
+                let memo = super::game_chain::GameUpdateMemo::parse(&tx.memo)
+                    .map_err(|e| LedgerError::TxValidation(TxError::MissingField(
+                        format!("GameUpdate memo: {e}")
+                    )))?;
+                let game = self.games.get_mut(&memo.game_id).ok_or_else(||
+                    LedgerError::TxValidation(TxError::MissingField(
+                        format!("GameUpdate: Spiel '{}' nicht registriert", memo.game_id)
+                    )))?;
+                if game.owner_company != tx.from {
+                    return Err(LedgerError::TxValidation(TxError::InvalidKey(
+                        format!("GameUpdate: {} ist nicht Owner von '{}'",
+                            &tx.from[..12.min(tx.from.len())], memo.game_id)
+                    )));
+                }
+                if let Some(v) = memo.version { game.version = v; }
+                if let Some(u) = memo.icon_uri { game.icon_uri = u; }
+                if let Some(c) = memo.coin_address { game.coin_address = c; }
+                if let Some(g) = memo.genres { game.genres = g; }
+                if tx.fee > Decimal::ZERO {
+                    let balance = self.balance(&tx.from);
+                    if balance < tx.fee {
+                        return Err(LedgerError::InsufficientBalance {
+                            account: tx.from.clone(), available: balance, required: tx.fee,
+                        });
+                    }
+                    *self.balances.entry(tx.from.clone()).or_insert(Decimal::ZERO) -= tx.fee;
+                    self.apply_fee_split(tx.fee);
+                }
+                self.advance_nonce(&tx.from, tx.nonce);
+            }
+            TxType::GameDeprecate => {
+                if tx.from != tx.to {
+                    return Err(LedgerError::TxValidation(TxError::MissingField(
+                        "GameDeprecate: from == to erwartet".into()
+                    )));
+                }
+                let memo = super::game_chain::GameDeprecateMemo::parse(&tx.memo)
+                    .map_err(|e| LedgerError::TxValidation(TxError::MissingField(
+                        format!("GameDeprecate memo: {e}")
+                    )))?;
+                let game = self.games.get_mut(&memo.game_id).ok_or_else(||
+                    LedgerError::TxValidation(TxError::MissingField(
+                        format!("GameDeprecate: Spiel '{}' nicht registriert", memo.game_id)
+                    )))?;
+                if game.owner_company != tx.from {
+                    return Err(LedgerError::TxValidation(TxError::InvalidKey(
+                        format!("GameDeprecate: {} ist nicht Owner von '{}'",
+                            &tx.from[..12.min(tx.from.len())], memo.game_id)
+                    )));
+                }
+                game.status = super::game_chain::GameStatus::Deprecated;
+                self.advance_nonce(&tx.from, tx.nonce);
+            }
+            TxType::CompanyVerify => {
+                if tx.from != tx.to {
+                    return Err(LedgerError::TxValidation(TxError::MissingField(
+                        "CompanyVerify: from == to erwartet".into()
+                    )));
+                }
+                if !self.founder_pubkeys.contains(&tx.from.to_lowercase()) {
+                    return Err(LedgerError::TxValidation(TxError::InvalidKey(
+                        "CompanyVerify: nur Founder erlaubt".into()
+                    )));
+                }
+                let memo = super::game_chain::VerifyMemo::parse_company(&tx.memo)
+                    .map_err(|e| LedgerError::TxValidation(TxError::MissingField(
+                        format!("CompanyVerify memo: {e}")
+                    )))?;
+                let company = self.companies.get_mut(&memo.target).ok_or_else(||
+                    LedgerError::TxValidation(TxError::MissingField(
+                        format!("CompanyVerify: Firma {} nicht registriert",
+                            &memo.target[..12.min(memo.target.len())])
+                    )))?;
+                company.verified = true;
+                println!(
+                    "[token] ✅ CompanyVerify: '{}' verified by founder {}",
+                    company.name, &tx.from[..12.min(tx.from.len())]
+                );
+                self.advance_nonce(&tx.from, tx.nonce);
+            }
+            TxType::GameVerify => {
+                if tx.from != tx.to {
+                    return Err(LedgerError::TxValidation(TxError::MissingField(
+                        "GameVerify: from == to erwartet".into()
+                    )));
+                }
+                if !self.founder_pubkeys.contains(&tx.from.to_lowercase()) {
+                    return Err(LedgerError::TxValidation(TxError::InvalidKey(
+                        "GameVerify: nur Founder erlaubt".into()
+                    )));
+                }
+                let memo = super::game_chain::VerifyMemo::parse_game(&tx.memo)
+                    .map_err(|e| LedgerError::TxValidation(TxError::MissingField(
+                        format!("GameVerify memo: {e}")
+                    )))?;
+                let game = self.games.get_mut(&memo.target).ok_or_else(||
+                    LedgerError::TxValidation(TxError::MissingField(
+                        format!("GameVerify: Spiel '{}' nicht registriert", memo.target)
+                    )))?;
+                game.verified = true;
+                println!(
+                    "[token] ✅ GameVerify: '{}' verified by founder {}",
+                    memo.target, &tx.from[..12.min(tx.from.len())]
+                );
+                self.advance_nonce(&tx.from, tx.nonce);
+            }
+            TxType::RoleGrant => {
+                if tx.from != tx.to {
+                    return Err(LedgerError::TxValidation(TxError::MissingField(
+                        "RoleGrant: from == to erwartet".into()
+                    )));
+                }
+                if !self.companies.contains_key(&tx.from) {
+                    return Err(LedgerError::TxValidation(TxError::MissingField(
+                        format!("RoleGrant: {} ist keine Firma",
+                            &tx.from[..12.min(tx.from.len())])
+                    )));
+                }
+                let memo = super::game_chain::RoleGrantMemo::parse(&tx.memo)
+                    .map_err(|e| LedgerError::TxValidation(TxError::MissingField(
+                        format!("RoleGrant memo: {e}")
+                    )))?;
+                if memo.sub_wallet == tx.from {
+                    return Err(LedgerError::TxValidation(TxError::InvalidKey(
+                        "RoleGrant: Owner kann sich nicht selbst rollen".into()
+                    )));
+                }
+                let entry = self.sub_keys.entry(tx.from.clone()).or_default();
+                // Duplikat: gleiche sub_wallet wird ersetzt
+                entry.retain(|s| s.wallet != memo.sub_wallet);
+                entry.push(super::game_chain::SubKey {
+                    wallet: memo.sub_wallet.clone(),
+                    role: memo.role,
+                    granted_at: chrono::Utc::now().timestamp(),
+                    granted_at_block: block_index,
+                    daily_limit_stone: memo.daily_limit_stone,
+                });
+                println!(
+                    "[token] 👥 RoleGrant: {} → {} role={:?}",
+                    &tx.from[..12.min(tx.from.len())],
+                    &memo.sub_wallet[..12.min(memo.sub_wallet.len())],
+                    memo.role
+                );
+                self.advance_nonce(&tx.from, tx.nonce);
+            }
+            TxType::RoleRevoke => {
+                if tx.from != tx.to {
+                    return Err(LedgerError::TxValidation(TxError::MissingField(
+                        "RoleRevoke: from == to erwartet".into()
+                    )));
+                }
+                let memo = super::game_chain::RoleRevokeMemo::parse(&tx.memo)
+                    .map_err(|e| LedgerError::TxValidation(TxError::MissingField(
+                        format!("RoleRevoke memo: {e}")
+                    )))?;
+                let entry = self.sub_keys.entry(tx.from.clone()).or_default();
+                let before = entry.len();
+                entry.retain(|s| s.wallet != memo.sub_wallet);
+                if entry.len() == before {
+                    return Err(LedgerError::TxValidation(TxError::MissingField(
+                        format!("RoleRevoke: Sub-Key {} nicht gefunden",
+                            &memo.sub_wallet[..12.min(memo.sub_wallet.len())])
+                    )));
+                }
+                self.advance_nonce(&tx.from, tx.nonce);
+            }
+            TxType::GameCoinMint => {
+                if tx.from != tx.to {
+                    return Err(LedgerError::TxValidation(TxError::MissingField(
+                        "GameCoinMint: from == to erwartet".into()
+                    )));
+                }
+                let memo = super::game_chain::GameCoinMintMemo::parse(&tx.memo)
+                    .map_err(|e| LedgerError::TxValidation(TxError::MissingField(
+                        format!("GameCoinMint memo: {e}")
+                    )))?;
+                let game = self.games.get(&memo.game_id).ok_or_else(||
+                    LedgerError::TxValidation(TxError::MissingField(
+                        format!("GameCoinMint: Spiel '{}' nicht registriert", memo.game_id)
+                    )))?;
+                if game.owner_company != tx.from {
+                    return Err(LedgerError::TxValidation(TxError::InvalidKey(
+                        "GameCoinMint: nur Owner-Firma darf für ihre Spiele minten".into()
+                    )));
+                }
+                let amount = super::game_chain::parse_positive_amount(&memo.amount)
+                    .map_err(|e| LedgerError::TxValidation(TxError::MissingField(e.to_string())))?;
+                let game_balances = self.game_coins.entry(memo.game_id.clone()).or_default();
+                let bal = game_balances.entry(memo.to.clone()).or_insert(Decimal::ZERO);
+                *bal += amount;
+                println!(
+                    "[token] 🪙 GameCoinMint: {} {} → {} (game={})",
+                    amount, &memo.game_id, &memo.to[..12.min(memo.to.len())], memo.game_id
+                );
+                self.advance_nonce(&tx.from, tx.nonce);
+            }
+            TxType::GameCoinTransfer => {
+                let memo = super::game_chain::GameCoinTransferMemo::parse(&tx.memo)
+                    .map_err(|e| LedgerError::TxValidation(TxError::MissingField(
+                        format!("GameCoinTransfer memo: {e}")
+                    )))?;
+                if !self.games.contains_key(&memo.game_id) {
+                    return Err(LedgerError::TxValidation(TxError::MissingField(
+                        format!("GameCoinTransfer: Spiel '{}' nicht registriert", memo.game_id)
+                    )));
+                }
+                let amount = super::game_chain::parse_positive_amount(&memo.amount)
+                    .map_err(|e| LedgerError::TxValidation(TxError::MissingField(e.to_string())))?;
+                let game_balances = self.game_coins.entry(memo.game_id.clone()).or_default();
+                let from_bal = game_balances.get(&tx.from).copied().unwrap_or(Decimal::ZERO);
+                if from_bal < amount {
+                    return Err(LedgerError::InsufficientBalance {
+                        account: tx.from[..12.min(tx.from.len())].to_string(),
+                        available: from_bal,
+                        required: amount,
+                    });
+                }
+                game_balances.insert(tx.from.clone(), from_bal - amount);
+                let to_bal = game_balances.entry(tx.to.clone()).or_insert(Decimal::ZERO);
+                *to_bal += amount;
+                self.advance_nonce(&tx.from, tx.nonce);
+            }
+            TxType::GameCoinBurn => {
+                if tx.from != tx.to {
+                    return Err(LedgerError::TxValidation(TxError::MissingField(
+                        "GameCoinBurn: from == to erwartet".into()
+                    )));
+                }
+                let memo = super::game_chain::GameCoinBurnMemo::parse(&tx.memo)
+                    .map_err(|e| LedgerError::TxValidation(TxError::MissingField(
+                        format!("GameCoinBurn memo: {e}")
+                    )))?;
+                if !self.games.contains_key(&memo.game_id) {
+                    return Err(LedgerError::TxValidation(TxError::MissingField(
+                        format!("GameCoinBurn: Spiel '{}' nicht registriert", memo.game_id)
+                    )));
+                }
+                let amount = super::game_chain::parse_positive_amount(&memo.amount)
+                    .map_err(|e| LedgerError::TxValidation(TxError::MissingField(e.to_string())))?;
+                let game_balances = self.game_coins.entry(memo.game_id.clone()).or_default();
+                let from_bal = game_balances.get(&tx.from).copied().unwrap_or(Decimal::ZERO);
+                if from_bal < amount {
+                    return Err(LedgerError::InsufficientBalance {
+                        account: tx.from[..12.min(tx.from.len())].to_string(),
+                        available: from_bal,
+                        required: amount,
+                    });
+                }
+                let new_bal = from_bal - amount;
+                if new_bal.is_zero() {
+                    game_balances.remove(&tx.from);
+                } else {
+                    game_balances.insert(tx.from.clone(), new_bal);
+                }
+                self.advance_nonce(&tx.from, tx.nonce);
+            }
         }
 
         // TX als verarbeitet markieren
@@ -1129,6 +1823,44 @@ impl TokenLedger {
             let key = format!("acct_key/{}", wallet);
             db.put(key.as_bytes(), hash.as_bytes())
                 .map_err(|e| LedgerError::Persistence(format!("put acct_key: {e}")))?;
+        }
+
+        // Game-Registry: Companies (Owner-Wallet → JSON)
+        for (wallet, company) in &self.companies {
+            let key = format!("company/{}", wallet);
+            let json = serde_json::to_string(company)
+                .map_err(|e| LedgerError::Persistence(format!("company JSON: {e}")))?;
+            db.put(key.as_bytes(), json.as_bytes())
+                .map_err(|e| LedgerError::Persistence(format!("put company: {e}")))?;
+        }
+
+        // Game-Registry: Games (Game-ID → JSON)
+        for (game_id, game) in &self.games {
+            let key = format!("game/{}", game_id);
+            let json = serde_json::to_string(game)
+                .map_err(|e| LedgerError::Persistence(format!("game JSON: {e}")))?;
+            db.put(key.as_bytes(), json.as_bytes())
+                .map_err(|e| LedgerError::Persistence(format!("put game: {e}")))?;
+        }
+
+        // Game-Registry: Sub-Keys (Owner-Wallet → JSON-Liste)
+        for (wallet, keys) in &self.sub_keys {
+            if keys.is_empty() { continue; }
+            let key = format!("subkeys/{}", wallet);
+            let json = serde_json::to_string(keys)
+                .map_err(|e| LedgerError::Persistence(format!("subkeys JSON: {e}")))?;
+            db.put(key.as_bytes(), json.as_bytes())
+                .map_err(|e| LedgerError::Persistence(format!("put subkeys: {e}")))?;
+        }
+
+        // Phase D: Game-Coin-Salden (game_id, wallet → Decimal-String)
+        for (game_id, balances) in &self.game_coins {
+            for (wallet, bal) in balances {
+                if bal.is_zero() { continue; }
+                let key = format!("gcoin/{}/{}", game_id, wallet);
+                db.put(key.as_bytes(), bal.to_string().as_bytes())
+                    .map_err(|e| LedgerError::Persistence(format!("put gcoin: {e}")))?;
+            }
         }
 
         // Vesting-Schedules
@@ -1286,6 +2018,79 @@ impl TokenLedger {
                 let hash = String::from_utf8_lossy(&value).to_string();
                 if !wallet.is_empty() && !hash.is_empty() {
                     ledger.account_api_keys.insert(wallet, hash);
+                }
+            }
+        }
+
+        // Game-Registry: Companies laden
+        let iter = db.prefix_iterator(b"company/");
+        for item in iter {
+            if let Ok((key, value)) = item {
+                let key_str = String::from_utf8_lossy(&key);
+                if !key_str.starts_with("company/") {
+                    break;
+                }
+                let wallet = key_str.strip_prefix("company/").unwrap_or("").to_string();
+                if let Ok(c) = serde_json::from_slice::<super::game_chain::CompanyProfile>(&value) {
+                    if !wallet.is_empty() {
+                        ledger.companies.insert(wallet, c);
+                    }
+                }
+            }
+        }
+
+        // Game-Registry: Games laden
+        let iter = db.prefix_iterator(b"game/");
+        for item in iter {
+            if let Ok((key, value)) = item {
+                let key_str = String::from_utf8_lossy(&key);
+                if !key_str.starts_with("game/") {
+                    break;
+                }
+                let game_id = key_str.strip_prefix("game/").unwrap_or("").to_string();
+                if let Ok(g) = serde_json::from_slice::<super::game_chain::OnChainGame>(&value) {
+                    if !game_id.is_empty() {
+                        ledger.games.insert(game_id, g);
+                    }
+                }
+            }
+        }
+
+        // Game-Registry: Sub-Keys laden
+        let iter = db.prefix_iterator(b"subkeys/");
+        for item in iter {
+            if let Ok((key, value)) = item {
+                let key_str = String::from_utf8_lossy(&key);
+                if !key_str.starts_with("subkeys/") {
+                    break;
+                }
+                let wallet = key_str.strip_prefix("subkeys/").unwrap_or("").to_string();
+                if let Ok(keys) = serde_json::from_slice::<Vec<super::game_chain::SubKey>>(&value) {
+                    if !wallet.is_empty() {
+                        ledger.sub_keys.insert(wallet, keys);
+                    }
+                }
+            }
+        }
+
+        // Phase D: Game-Coin-Salden laden
+        let iter = db.prefix_iterator(b"gcoin/");
+        for item in iter {
+            if let Ok((key, value)) = item {
+                let key_str = String::from_utf8_lossy(&key);
+                if !key_str.starts_with("gcoin/") {
+                    break;
+                }
+                let rest = key_str.strip_prefix("gcoin/").unwrap_or("");
+                if let Some(slash) = rest.find('/') {
+                    let game_id = rest[..slash].to_string();
+                    let wallet = rest[slash+1..].to_string();
+                    let s = String::from_utf8_lossy(&value);
+                    if let Ok(bal) = s.parse::<Decimal>() {
+                        if !game_id.is_empty() && !wallet.is_empty() {
+                            ledger.game_coins.entry(game_id).or_default().insert(wallet, bal);
+                        }
+                    }
                 }
             }
         }

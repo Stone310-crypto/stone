@@ -619,8 +619,13 @@ async fn handle_p2p_event(
                 if syncing { None }
                 else {
                     let vs = node.validator_set.read().unwrap_or_else(|e| e.into_inner());
-                    if vs.validators.is_empty() || vs.active_count() <= 1 { None }
-                    else {
+                    if vs.validators.is_empty() {
+                        // SECURITY: Nach initial_sync mit leerem ValidatorSet ablehnen.
+                        Some(false)
+                    } else if vs.active_count() <= 1 {
+                        // Single-Node-Betrieb: PoA-Check überspringen
+                        None
+                    } else {
                         let (prev_hash, last_block_ts) = {
                             let chain = node.chain.lock().unwrap_or_else(|e| e.into_inner());
                             let ph = chain.blocks.last().map(|b| b.hash.clone()).unwrap_or("genesis".into());
@@ -650,9 +655,10 @@ async fn handle_p2p_event(
                 } else {
                     let txs = block.transactions.clone();
                     let chat_batches = block.chat_batches.clone();
+                    let block_for_chat = block.clone();
                     let idx = block.index;
-                    let block_signer = block.signer.clone();
-                    let block_validator_pk = block.validator_pub_key.clone();
+                    let _block_signer = block.signer.clone();
+                    let _block_validator_pk = block.validator_pub_key.clone();
 
                     // Equivocation-Check vor Block-Akzeptanz
                     {
@@ -674,7 +680,11 @@ async fn handle_p2p_event(
                         }
                     }
 
-                    match chain.accept_peer_block(*block, poa_ok) {
+                    match chain.accept_peer_block(
+                        *block,
+                        poa_ok,
+                        Some(&*node.checkpoint_store.read().unwrap_or_else(|e| e.into_inner())),
+                    ) {
                         Ok(_) => {
                             // Orphan-TX-Recovery: User-TXs aus verwaisten Blöcken zurück in Mempool
                             let orphaned = std::mem::take(&mut chain.orphaned_blocks);
@@ -720,43 +730,13 @@ async fn handle_p2p_event(
                                     );
                                 }
                             }
-                            // Validator Auto-Discovery: Nur nach Initial-Sync
-                            // SECURITY: Nur Signer mit ausreichend Stake werden aufgenommen
-                            let sync_done = node.metrics.initial_sync_done.load(
-                                std::sync::atomic::Ordering::Relaxed
-                            );
-                            if sync_done
-                                && !block_signer.is_empty()
-                                && !block_validator_pk.is_empty()
-                                && block_signer != node.node_id
                             {
-                                let mut vs = node.validator_set.write().unwrap_or_else(|e| e.into_inner());
-                                if vs.get(&block_signer).is_none() {
-                                    // Stake-Check: Signer muss mindestens VALIDATOR_MIN_STAKE haben
-                                    let has_stake = {
-                                        let pool = node.staking_pool.read().unwrap_or_else(|e| e.into_inner());
-                                        let min_stake: rust_decimal::Decimal = stone::token::staking::VALIDATOR_MIN_STAKE.parse().unwrap();
-                                        pool.stakers.values().any(|entry| entry.staked_amount >= min_stake)
-                                            || pool.total_staked >= min_stake
-                                    };
-                                    if has_stake {
-                                        let info = stone::consensus::ValidatorInfo::new_pending(
-                                            block_signer.clone(),
-                                            block_validator_pk.clone(),
-                                        );
-                                        vs.add(info);
-                                        println!(
-                                            "[consensus] 🔗 Validator '{}' auto-discovered (pending) via Block #{}",
-                                            &block_signer, idx,
-                                        );
-                                    } else {
-                                        eprintln!(
-                                            "[consensus] ⚠ Validator '{}' auto-discovery abgelehnt – kein ausreichender Stake im Pool",
-                                            &block_signer,
-                                        );
-                                    }
-                                }
+                                let mut chat_idx = chat_index_rc.lock().unwrap_or_else(|e| e.into_inner());
+                                chat_idx.index_new_blocks(&[&block_for_chat], Some(&node.message_pool));
+                                stone::chat::save_chat_index(&chat_idx);
                             }
+                            // SECURITY P0: Auto-Discovery deaktiviert.
+                            // ValidatorSet darf nicht implizit durch Netzwerk-Traffic wachsen.
                             BlockResult::Accepted(chain.blocks.len() as u64)
                         }
                         Err(ref e) if e.starts_with("Stale:") => BlockResult::Stale,
@@ -871,6 +851,7 @@ async fn handle_p2p_event(
                     for block in contiguous {
                         let idx = block.index;
                         let txs = block.transactions.clone();
+                        let block_for_chat = block.clone();
                         let _block_signer = block.signer.clone();
                         let _block_validator_pk = block.validator_pub_key.clone();
 
@@ -927,7 +908,11 @@ async fn handle_p2p_event(
                             }
                         }
 
-                        match chain.accept_peer_block(block, None) {
+                        match chain.accept_peer_block(
+                            block,
+                            None,
+                            Some(&*node.checkpoint_store.read().unwrap_or_else(|e| e.into_inner())),
+                        ) {
                             Ok(_) => {
                                 applied += 1;
                                 if !txs.is_empty() {
@@ -945,6 +930,11 @@ async fn handle_p2p_event(
                                 }
                                 // HTLC-TXs verarbeiten (RangeSync-Pfad)
                                 MasterNodeState::process_htlc_txs(&node, &txs, idx);
+                                {
+                                    let mut chat_idx = chat_index_rc.lock().unwrap_or_else(|e| e.into_inner());
+                                    chat_idx.index_new_blocks(&[&block_for_chat], Some(&node.message_pool));
+                                    stone::chat::save_chat_index(&chat_idx);
+                                }
                             }
                             Err(e) => {
                                 eprintln!("[sync] ✗ Reorg Block #{idx} fehlgeschlagen: {e}");
@@ -1052,11 +1042,20 @@ async fn handle_p2p_event(
         }
 
         NetworkEvent::ChatMessageReceived { message, from_peer } => {
+            let msg_clone = message.clone();
             match node.message_pool.add_message(message) {
-                Ok(seq) => eprintln!(
-                    "[p2p] 💬 Chat von {} (seq: {})",
-                    &from_peer[..12.min(from_peer.len())], seq,
-                ),
+                Ok(seq) => {
+                    eprintln!(
+                        "[p2p] 💬 Chat von {} (seq: {})",
+                        &from_peer[..12.min(from_peer.len())], seq,
+                    );
+                    // Sofort in lokalen ChatIndex aufnehmen, damit der Empfänger
+                    // die Nachricht über /api/v1/chat/messages/:peer sieht.
+                    let mut idx = chat_index_rc.lock().unwrap_or_else(|e| e.into_inner());
+                    if idx.upsert_pool_message(&msg_clone) {
+                        stone::chat::save_chat_index(&idx);
+                    }
+                }
                 Err(_) => {}
             }
         }
@@ -1986,7 +1985,7 @@ fn spawn_miner_heartbeat_task(
             let mut payload = Vec::with_capacity(json.len() + 1);
             payload.push(stone::master::mining::MINER_GOSSIP_KIND_CONNECT);
             payload.extend_from_slice(&json);
-            net.publish_gossip(stone::network::TOPIC_MINERS, payload).await;
+            net.publish_gossip(stone::network::TOPIC_MINERS.as_str(), payload).await;
         }
         // HTTP-Fallback: direkt an bekannte Master melden (falls P2P-Gossip
         // zwischen Miner und Master nicht zuverlässig zustande kommt).
@@ -2128,7 +2127,7 @@ fn spawn_miner_heartbeat_task(
                 let mut payload = Vec::with_capacity(json.len() + 1);
                 payload.push(stone::master::mining::MINER_GOSSIP_KIND_HEARTBEAT);
                 payload.extend_from_slice(&json);
-                net.publish_gossip(stone::network::TOPIC_MINERS, payload).await;
+                net.publish_gossip(stone::network::TOPIC_MINERS.as_str(), payload).await;
             }
             // HTTP-Fallback zusätzlich pushen, damit Master den Miner auch ohne
             // direkte Gossip-Pfade als aktiv erkennen.
@@ -2692,6 +2691,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
     }
 
+    // Game-Economy Dormancy-Tick: Spiele ohne Owner-Heartbeat schalten nach
+    // 30 d auf Dormant, nach 90 d auf Abandoned (Fork-fähig). Einmal pro
+    // Stunde reicht – die Schwellen sind tagebasiert.
+    {
+        let ne = node.clone();
+        tokio::spawn(async move {
+            let mut iv = tokio::time::interval(Duration::from_secs(3600));
+            let mut ticks: u64 = 0;
+            loop {
+                iv.tick().await;
+                let now = chrono::Utc::now().timestamp();
+                {
+                    let mut store = ne.game_economy.write().unwrap_or_else(|e| e.into_inner());
+                    store.tick_dormancy(now);
+                }
+                ticks += 1;
+                // Alle 24 Ticks (~1 d) persistieren, damit Transitions
+                // einen Restart überleben.
+                if ticks % 24 == 0 {
+                    let store = ne.game_economy.read().unwrap_or_else(|e| e.into_inner()).clone();
+                    if let Err(e) = store.persist() {
+                        eprintln!("[game_economy] persist nach dormancy-tick fehlgeschlagen: {e}");
+                    }
+                }
+            }
+        });
+    }
+
     // P2P starten – Miner verwendet eigene Ports pro Netzwerk
     // (Testnet: 4002, Mainnet: 5002), damit kein Konflikt mit stone-setup.
     let miner_p2p_port = p2p_port_arg
@@ -2906,6 +2933,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         audio_rooms: server::handlers::audio_relay::new_audio_rooms(),
         push_tokens: Arc::new(std::sync::Mutex::new(stone::push::load_push_tokens())),
         fcm_client: Arc::new(stone::push::FcmClient::new()),
+        action_store: server::state::ActionStore::new(),
+        play_drops: server::state::PlayDropTracker::new(server::state::PlayDropConfig::from_env()),
     };
 
     // Post-Update Erfolg bestätigen (nach 120s gesundem Betrieb)

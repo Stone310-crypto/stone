@@ -32,6 +32,8 @@ services:
       STONE_SEED_PEERS: "/ip4/212.227.54.241/tcp/4001/p2p/12D3KooWNz9GTNsFks567mHaQLKR4Ai6MCiw5WUDWAgvny1ow4tJ,/ip4/212.227.54.241/udp/4001/quic-v1/p2p/12D3KooWNz9GTNsFks567mHaQLKR4Ai6MCiw5WUDWAgvny1ow4tJ"
       NOMAD_URL: "https://chain.unrooted.dev"
       NODE_SECRET: "${NODE_SECRET:-}"
+      DISCORD_CLIENT_ID: "${DISCORD_CLIENT_ID:-}"
+      DISCORD_CLIENT_SECRET: "${DISCORD_CLIENT_SECRET:-}"
     volumes:
       - testnet_data:/opt/stone-node/stone_data
     networks:
@@ -59,6 +61,8 @@ services:
       STONE_SEED_PEERS: "/ip4/212.227.54.241/tcp/5001/p2p/12D3KooWNz9GTNsFks567mHaQLKR4Ai6MCiw5WUDWAgvny1ow4tJ,/ip4/212.227.54.241/udp/5001/quic-v1/p2p/12D3KooWNz9GTNsFks567mHaQLKR4Ai6MCiw5WUDWAgvny1ow4tJ"
       NOMAD_URL: "https://chain.unrooted.dev"
       NODE_SECRET: "${NODE_SECRET:-}"
+      DISCORD_CLIENT_ID: "${DISCORD_CLIENT_ID:-}"
+      DISCORD_CLIENT_SECRET: "${DISCORD_CLIENT_SECRET:-}"
     volumes:
       - mainnet_data:/opt/stone-node/stone_data_mainnet
     networks:

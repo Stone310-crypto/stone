@@ -24,6 +24,19 @@ fn constant_time_eq(a: &str, b: &str) -> bool {
     result == 0
 }
 
+/// Vergleicht einen Kandidaten-Key gegen ZWEI Referenz-Keys in konstanter Zeit.
+///
+/// Im Gegensatz zu `a || b` (Short-Circuit) wird hier IMMER beide Vergleiche
+/// ausgeführt, sodass ein Angreifer nicht aus der Antwortzeit ableiten kann,
+/// welcher der beiden Keys getroffen wurde (oder ob überhaupt einer matched
+/// und nur durch Zufall die Längen passten).
+fn constant_time_eq_any(key: &str, a: &str, b: &str) -> bool {
+    // bitor statt logischem OR → kein Short-Circuit auf bool-Ebene
+    let m1 = constant_time_eq(key, a) as u8;
+    let m2 = constant_time_eq(key, b) as u8;
+    (m1 | m2) != 0
+}
+
 pub fn extract_api_key(headers: &HeaderMap) -> Option<String> {
     // Akzeptiere sowohl "x-api-key" (Legacy) als auch "X-Admin-Key" (Mac App)
     headers
@@ -49,8 +62,11 @@ pub fn resolve_user_by_key(
     api_key: &str,
     admin_key: &str,
 ) -> Option<User> {
-    // Prüfe ob der Key dem API-Key ODER dem Admin-Key entspricht
-    if constant_time_eq(key, api_key) || constant_time_eq(key, admin_key) {
+    // Prüfe ob der Key dem API-Key ODER dem Admin-Key entspricht.
+    // `constant_time_eq_any` führt beide Vergleiche immer aus → kein Timing-Leak,
+    // der verrät, welcher Key matched (oder ob nur einer der beiden überhaupt
+    // die korrekte Länge hat).
+    if constant_time_eq_any(key, api_key, admin_key) {
         return Some(User {
             id: "admin".into(),
             name: "admin".into(),
@@ -61,6 +77,8 @@ pub fn resolve_user_by_key(
             account_type: "private".into(),
             org_id: String::new(),
             org_role: String::new(),
+            discord_id: String::new(),
+            discord_username: String::new(),
         });
     }
     let guard = users.lock().unwrap_or_else(|e| e.into_inner());
@@ -133,4 +151,56 @@ pub fn require_admin(headers: &HeaderMap, state: &AppState) -> Result<(), Respon
         )
             .into_response())
     }
+}
+
+// ─── Mnemonic-Auth Killswitch ────────────────────────────────────────────────
+//
+// 23 SDK-Endpoints akzeptieren den User-Mnemonic im Request-Body. Das ist
+// fundamental unsicher (Mnemonic landet in HTTP-Logs, Proxies, Browser-DevTools).
+// Migrationspfad: `/api/v1/sdk/tx/submit` für TXs + signaturbasierter Consent.
+//
+// Bis alle Clients migriert sind, kann der Operator über die Env-Variable
+//   STONE_DISABLE_MNEMONIC_AUTH=1
+// alle Mnemonic-akzeptierenden Endpoints in Produktion abschalten.
+
+/// Prüft, ob Mnemonic-basierte Auth aktuell erlaubt ist.
+///
+/// Operator-Schalter: `STONE_DISABLE_MNEMONIC_AUTH=1` setzt globalen Killswitch.
+/// Default = aktiviert (für Testnet/CLI). Operatoren MÜSSEN das in Produktion
+/// auf `1` setzen.
+pub fn mnemonic_auth_enabled() -> bool {
+    !matches!(
+        std::env::var("STONE_DISABLE_MNEMONIC_AUTH").as_deref(),
+        Ok("1") | Ok("true") | Ok("yes")
+    )
+}
+
+/// Liefert den 410-Gone-Body für einen abgeschalteten Mnemonic-Endpoint.
+///
+/// Aufrufer kombinieren das mit `StatusCode::GONE` zu einer Response in der
+/// Form, die ihre Handler-Signatur ohnehin nutzt:
+/// ```ignore
+/// if !mnemonic_auth_enabled() {
+///     return (StatusCode::GONE, Json(mnemonic_killswitch_body("op"))).into_response();
+/// }
+/// log_mnemonic_call("op");
+/// ```
+pub fn mnemonic_killswitch_body(operation: &str) -> serde_json::Value {
+    json!({
+        "ok": false,
+        "error": "Mnemonic-basierte HTTP-Auth ist auf diesem Node deaktiviert. \
+                  Migriere auf Client-Side-Signing: \
+                  POST /api/v1/sdk/tx/submit mit signierter TokenTx.",
+        "migration": "https://chain.unrooted.dev/sdk#client-side-signing",
+        "deprecated_operation": operation,
+    })
+}
+
+/// Loggt einen Deprecation-Hinweis für einen Mnemonic-Aufruf.
+/// Erzeugt operativen Druck Richtung Migration.
+pub fn log_mnemonic_call(operation: &str) {
+    eprintln!(
+        "[deprecation] {operation}: Mnemonic-Auth via HTTP. Killswitch: \
+         STONE_DISABLE_MNEMONIC_AUTH=1"
+    );
 }

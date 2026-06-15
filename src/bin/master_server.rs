@@ -30,7 +30,12 @@
 #[path = "server/mod.rs"]
 mod server;
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    net::SocketAddr,
+    sync::{Arc, atomic::AtomicBool},
+};
+
+use chrono::Timelike;
 
 use stone::{
     auth::load_users,
@@ -44,9 +49,69 @@ use server::{
     router::build_router,
     sync_router::build_sync_router,
     rate_limiter::RateLimits,
-    state::{load_api_key, load_admin_key, load_peers_from_disk, load_trust_from_disk, AppState, HEARTBEAT_INTERVAL},
+    state::{load_api_key, load_admin_key, load_peers_from_disk, load_trust_from_disk, save_peers, AppState, HEARTBEAT_INTERVAL},
     sync::{bootstrap_announce, fetch_missing_chunks, pull_from_peer, spawn_auto_sync_task, spawn_peer_health_task},
 };
+
+static STAGE4_RECOVERY_RUNNING: AtomicBool = AtomicBool::new(false);
+
+async fn maybe_run_stage4_snapshot_recovery(
+    node: &Arc<MasterNodeState>,
+    reason: &str,
+) {
+    let auto_enabled = std::env::var("STONE_SYNC_AUTO_SNAPSHOT_RECOVERY")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+
+    if !auto_enabled {
+        eprintln!(
+            "[snapshot] ⚠ WS-C Stage4 erkannt, Auto-Recovery aus (STONE_SYNC_AUTO_SNAPSHOT_RECOVERY=1 zum Aktivieren): {reason}"
+        );
+        return;
+    }
+
+    if STAGE4_RECOVERY_RUNNING
+        .compare_exchange(
+            false,
+            true,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        )
+        .is_err()
+    {
+        eprintln!("[snapshot] ℹ Stage4-Recovery läuft bereits");
+        return;
+    }
+
+    let (chain_height, local_genesis) = {
+        let chain = node.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let h = chain.blocks.len() as u64;
+        let g = chain.blocks.first().map(|b| b.hash.clone()).unwrap_or_default();
+        (h, g)
+    };
+
+    eprintln!(
+        "[snapshot] 🚨 Starte WS-C Stage4 Auto-Recovery (height={}, reason={})",
+        chain_height,
+        reason,
+    );
+
+    match stone::snapshot::verified_download_snapshot(&local_genesis, chain_height).await {
+        Ok(meta) => {
+            eprintln!(
+                "[snapshot] ✅ WS-C Stage4 Recovery erfolgreich: Block #{}, {:.1} MB",
+                meta.block_height,
+                meta.archive_size as f64 / 1_048_576.0,
+            );
+            eprintln!("[snapshot] 🔄 Beende Prozess für sauberen Neustart...");
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("[snapshot] ❌ WS-C Stage4 Recovery fehlgeschlagen: {e}");
+            STAGE4_RECOVERY_RUNNING.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
 
 #[tokio::main]
 async fn main() {
@@ -122,9 +187,37 @@ async fn main() {
 
     // Master Node State initialisieren
     let node = MasterNodeState::new(node_id.clone(), api_key.as_ref().clone(), NodeRole::Master);
+    let updater = Arc::new(std::sync::RwLock::new({
+        let mut um = stone::updater::UpdateManager::new(&stone::blockchain::data_dir());
+        um.load_persisted_update();
+        um
+    }));
 
     // Gespeicherte Peers laden
-    let saved_peers = load_peers_from_disk();
+    let mut saved_peers = load_peers_from_disk();
+    if !saved_peers.is_empty() {
+        let default_http = if stone::network::is_mainnet() { 3180 } else { 3080 };
+        for p in &mut saved_peers {
+            if let Some((scheme, rest)) = p.url.split_once("://") {
+                let host_port = rest.split('/').next().unwrap_or(rest);
+                let host = host_port.split(':').next().unwrap_or(host_port).trim();
+                let port = host_port
+                    .split(':')
+                    .nth(1)
+                    .and_then(|v| v.parse::<u16>().ok())
+                    .unwrap_or(0);
+                if !host.is_empty() && port == 8080 {
+                    p.url = format!("{}://{}:{}", scheme, host, default_http);
+                }
+            }
+            if let Some(pid) = &p.peer_id {
+                if pid.parse::<libp2p::PeerId>().is_err() {
+                    p.peer_id = None;
+                }
+            }
+        }
+        save_peers(&saved_peers);
+    }
     if !saved_peers.is_empty() {
         println!("[master] {} Peer(s) aus Datei geladen", saved_peers.len());
         node.replace_peers(saved_peers);
@@ -138,10 +231,70 @@ async fn main() {
     {
         let mut bootstrap: Vec<String> = Vec::new();
 
+        let self_url = {
+            if let Ok(url) = std::env::var("STONE_PUBLIC_URL") {
+                let trimmed = url.trim().to_string();
+                if !trimmed.is_empty() {
+                    Some(trimmed)
+                } else {
+                    None
+                }
+            } else if let Ok(ip) = std::env::var("STONE_PUBLIC_IP") {
+                let ip = ip.trim().to_string();
+                if ip.is_empty() {
+                    None
+                } else {
+                    let default_http = if stone::network::is_mainnet() { 3180 } else { 3080 };
+                    let configured_port = std::env::var("STONE_HTTP_PORT")
+                        .or_else(|_| std::env::var("STONE_PORT"))
+                        .ok()
+                        .and_then(|v| v.parse::<u16>().ok())
+                        .unwrap_or(default_http);
+                    let port = if configured_port == 8080 { default_http } else { configured_port }
+                        .to_string();
+                    Some(format!("http://{}:{}", ip, port))
+                }
+            } else {
+                None
+            }
+        };
+
+        let same_host = |a: &str, b: &str| {
+            let host = |url: &str| {
+                let without_scheme = url.split("://").nth(1).unwrap_or(url);
+                let host_port = without_scheme.split('/').next().unwrap_or(without_scheme);
+                host_port.split(':').next().unwrap_or(host_port).trim().to_ascii_lowercase()
+            };
+            let ha = host(a);
+            let hb = host(b);
+            !ha.is_empty() && ha == hb
+        };
+
+        let normalize_bootstrap_url = |raw: &str| {
+            let base = raw.trim().trim_end_matches('/');
+            let default_http = if stone::network::is_mainnet() { 3180 } else { 3080 };
+            let Some((scheme, rest)) = base.split_once("://") else {
+                return base.to_string();
+            };
+            let host_port = rest.split('/').next().unwrap_or(rest);
+            let host = host_port.split(':').next().unwrap_or(host_port).trim();
+            let port = host_port
+                .split(':')
+                .nth(1)
+                .and_then(|v| v.parse::<u16>().ok())
+                .unwrap_or(default_http);
+            let normalized_port = if port == 8080 { default_http } else { port };
+            if host.is_empty() {
+                base.to_string()
+            } else {
+                format!("{}://{}:{}", scheme, host, normalized_port)
+            }
+        };
+
         // Aus Env
         if let Ok(env_val) = std::env::var("STONE_BOOTSTRAP_NODES") {
             for url in env_val.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
-                bootstrap.push(url);
+                bootstrap.push(normalize_bootstrap_url(&url));
             }
         }
 
@@ -155,7 +308,7 @@ async fn main() {
                         if let Some(nodes) = cfg.get("bootstrap_nodes").and_then(|v| v.as_array()) {
                             for n in nodes {
                                 if let Some(url) = n.as_str() {
-                                    bootstrap.push(url.to_string());
+                                    bootstrap.push(normalize_bootstrap_url(url));
                                 }
                             }
                         }
@@ -163,6 +316,18 @@ async fn main() {
                     break;
                 }
             }
+        }
+
+        // Fallback: zentrale Default-Bootstrap-URLs aus der Netzwerk-Schicht
+        if bootstrap.is_empty() {
+            bootstrap = stone::network::default_bootstrap_http_urls()
+                .into_iter()
+                .map(|u| normalize_bootstrap_url(&u))
+                .collect();
+        }
+
+        if let Some(ref me) = self_url {
+            bootstrap.retain(|url| !same_host(url, me));
         }
 
         if !bootstrap.is_empty() {
@@ -174,7 +339,9 @@ async fn main() {
 
             let mut added = 0;
             for url in &bootstrap {
-                if !existing_urls.contains(url) {
+                if !existing_urls.contains(url)
+                    && !existing_urls.iter().any(|u| same_host(u, url))
+                {
                     let peer = stone::master::PeerInfo::new(url);
                     node.upsert_peer(peer);
                     added += 1;
@@ -240,6 +407,30 @@ async fn main() {
                 // known_ids GC alle 5 Minuten
                 if gc_counter % 5 == 0 {
                     node_evict.mempool.gc_known_ids();
+                }
+            }
+        });
+    }
+
+    // Game-Economy Dormancy-Tick (Active → Dormant → Abandoned).
+    {
+        let ne = node.clone();
+        tokio::spawn(async move {
+            let mut iv = tokio::time::interval(std::time::Duration::from_secs(3600));
+            let mut ticks: u64 = 0;
+            loop {
+                iv.tick().await;
+                let now = chrono::Utc::now().timestamp();
+                {
+                    let mut store = ne.game_economy.write().unwrap_or_else(|e| e.into_inner());
+                    store.tick_dormancy(now);
+                }
+                ticks += 1;
+                if ticks % 24 == 0 {
+                    let store = ne.game_economy.read().unwrap_or_else(|e| e.into_inner()).clone();
+                    if let Err(e) = store.persist() {
+                        eprintln!("[game_economy] persist nach dormancy-tick fehlgeschlagen: {e}");
+                    }
                 }
             }
         });
@@ -355,6 +546,7 @@ async fn main() {
                         let handle_bg = handle.clone();
                         let api_key_bg = api_key.clone();
                         let chat_idx_bg = chat_index_arc.clone();
+                        let updater_bg = updater.clone();
                         tokio::spawn(async move {
                             loop {
                                 let event = match event_rx.recv().await {
@@ -390,7 +582,9 @@ async fn main() {
                                         } else {
                                             let vs = node_bg.validator_set.read().unwrap_or_else(|e| e.into_inner());
                                             if vs.validators.is_empty() {
-                                                None
+                                                // SECURITY: Nach initial_sync ist ein leeres ValidatorSet
+                                                // nicht mehr erlaubt – kein PoA-Bypass.
+                                                Some(false)
                                             } else {
                                                 let (prev_hash, last_block_ts) = {
                                                     let chain = node_bg.chain.lock().unwrap_or_else(|e| e.into_inner());
@@ -422,14 +616,16 @@ async fn main() {
                                         }
                                     };
 
+                                    let block_for_chat = block.clone();
+
                                     // Block-Akzeptanz in eigenem Scope (Lock vor await droppen)
                                     enum BlockResult {
                                         Accepted(u64),
                                         Stale,
                                         NeedsResync { idx: u64, from: String, err: String },
-                                        Rejected,
                                         AlreadyKnown,
                                         Fork,
+                                        Rejected,
                                     }
 
                                     let result = {
@@ -464,7 +660,11 @@ async fn main() {
                                                 }
                                             }
 
-                                            match chain.accept_peer_block(*block, poa_ok) {
+                                            match chain.accept_peer_block(
+                                                *block,
+                                                poa_ok,
+                                                Some(&*node_bg.checkpoint_store.read().unwrap_or_else(|e| e.into_inner())),
+                                            ) {
                                                 Ok(_) => {
                                                     // Orphan-TX-Recovery
                                                     let orphaned = std::mem::take(&mut chain.orphaned_blocks);
@@ -506,6 +706,11 @@ async fn main() {
                                                                 &batch.merkle_root, &batch.messages, idx,
                                                             );
                                                         }
+                                                    }
+                                                    {
+                                                        let mut chat_idx = chat_idx_bg.lock().unwrap_or_else(|e| e.into_inner());
+                                                        chat_idx.index_new_blocks(&[&block_for_chat], Some(&node_bg.message_pool));
+                                                        stone::chat::save_chat_index(&chat_idx);
                                                     }
                                                     BlockResult::Accepted(chain.blocks.len() as u64)
                                                 }
@@ -730,12 +935,62 @@ async fn main() {
                                 NetworkEvent::UpdateManifestReceived { manifest_json, from_peer } => {
                                     match serde_json::from_slice::<stone::updater::UpdateManifest>(&manifest_json) {
                                         Ok(manifest) => {
-                                            println!(
-                                                "[updater] 🆕 Update v{} von Peer {} empfangen",
-                                                manifest.version,
-                                                &from_peer[..12.min(from_peer.len())]
-                                            );
-                                            // TODO: integrate with state.updater when available
+                                            let mut um = updater_bg.write().unwrap_or_else(|e| e.into_inner());
+                                            match um.receive_manifest(manifest.clone()) {
+                                                Ok(true) => {
+                                                    println!(
+                                                        "[updater] 🆕 Update v{} von Peer {} empfangen",
+                                                        manifest.version,
+                                                        &from_peer[..12.min(from_peer.len())]
+                                                    );
+                                                    if um.config.auto_download {
+                                                        let peer_urls: Vec<String> = node_bg.get_peers()
+                                                            .iter()
+                                                            .map(|p| p.url.clone())
+                                                            .collect();
+                                                        let missing = um.missing_chunks();
+                                                        drop(um);
+
+                                                        if !missing.is_empty() {
+                                                            let updater_clone = updater_bg.clone();
+                                                            tokio::spawn(async move {
+                                                                let client = reqwest::Client::builder()
+                                                                    .danger_accept_invalid_certs(true)
+                                                                    .timeout(std::time::Duration::from_secs(30))
+                                                                    .build()
+                                                                    .unwrap();
+                                                                for idx in missing {
+                                                                    for url in &peer_urls {
+                                                                        let chunk_url = format!(
+                                                                            "{}/api/v1/updates/chunk/{}",
+                                                                            url.trim_end_matches('/'), idx
+                                                                        );
+                                                                        if let Ok(resp) = client.get(&chunk_url).send().await {
+                                                                            if resp.status().is_success() {
+                                                                                if let Ok(data) = resp.bytes().await {
+                                                                                    let mut um = updater_clone.write().unwrap_or_else(|e| e.into_inner());
+                                                                                    if um.store_chunk(idx, data.to_vec()).is_ok() {
+                                                                                        println!("[updater] ✓ Chunk {idx} heruntergeladen");
+                                                                                        break;
+                                                                                    }
+                                                                                }
+                                                                            }
+                                                                        }
+                                                                    }
+                                                                }
+                                                                let mut um = updater_clone.write().unwrap_or_else(|e| e.into_inner());
+                                                                if um.missing_chunks().is_empty() {
+                                                                    if let Err(e) = um.verify_and_prepare() {
+                                                                        eprintln!("[updater] Verifizierung: {e}");
+                                                                    }
+                                                                }
+                                                            });
+                                                        }
+                                                    }
+                                                }
+                                                Ok(false) => {}
+                                                Err(e) => eprintln!("[updater] Manifest abgelehnt: {e}"),
+                                            }
                                         }
                                         Err(e) => eprintln!("[updater] Manifest-Parse: {e}"),
                                     }
@@ -824,6 +1079,14 @@ async fn main() {
                                                 "[p2p] 💬 Chat von {} (seq: {})",
                                                 &from_peer[..12.min(from_peer.len())], seq,
                                             );
+                                            // Sofort in ChatIndex aufnehmen, damit der Empfänger
+                                            // die Nachricht via /api/v1/chat/messages/:peer sieht.
+                                            {
+                                                let mut idx = chat_idx_bg.lock().unwrap_or_else(|e| e.into_inner());
+                                                if idx.upsert_pool_message(&msg_clone) {
+                                                    stone::chat::save_chat_index(&idx);
+                                                }
+                                            }
                                             // WebSocket-Push an verbundene Clients
                                             node_bg.events.publish(stone::master::NodeEvent::ChatMessageReceived {
                                                 msg_id: msg_clone.msg_id.clone(),
@@ -943,6 +1206,14 @@ async fn main() {
                                         let our_after_fork = local_len.saturating_sub(fork_at);
 
                                         if peer_new.len() > our_after_fork {
+                                            // Reorg-Schutz: finalisierter Checkpoint darf nicht verletzt werden.
+                                            {
+                                                let cps = node_bg.checkpoint_store.read().unwrap_or_else(|e| e.into_inner());
+                                                if let Err(e) = cps.check_reorg_allowed(fork_at as u64) {
+                                                    eprintln!("[sync] ❌ Range-Sync abgelehnt: {e}");
+                                                    continue;
+                                                }
+                                            }
                                             println!(
                                                 "[sync] 🔄 Range-Sync von {}: fork_at={fork_at}, lokal={local_len}, {} neue Blöcke",
                                                 &from_peer[..12.min(from_peer.len())], peer_new.len()
@@ -981,7 +1252,11 @@ async fn main() {
                                                     );
                                                 }
 
-                                                match chain.accept_peer_block(block, None) {
+                                                match chain.accept_peer_block(
+                                                    block,
+                                                    None,
+                                                    Some(&*node_bg.checkpoint_store.read().unwrap_or_else(|e| e.into_inner())),
+                                                ) {
                                                     Ok(_) => {
                                                         applied += 1;
                                                         if !txs.is_empty() {
@@ -1097,6 +1372,16 @@ async fn main() {
                                     }
                                 }
 
+                                NetworkEvent::Error { message } => {
+                                    if message.contains("WS-C Stage4")
+                                        || message.contains("Snapshot-Eskalation")
+                                    {
+                                        maybe_run_stage4_snapshot_recovery(&node_bg, &message).await;
+                                    } else {
+                                        eprintln!("[p2p] Fehler: {message}");
+                                    }
+                                }
+
                                 _ => {} // Listening etc.
                                 }
                             }
@@ -1201,11 +1486,7 @@ async fn main() {
         admin_key,
         network: network_handle,
         rate_limits,
-        updater: Arc::new(std::sync::RwLock::new({
-            let mut um = stone::updater::UpdateManager::new(&stone::blockchain::data_dir());
-            um.load_persisted_update();
-            um
-        })),
+        updater: updater.clone(),
         orgs: Arc::new(std::sync::Mutex::new(stone::organization::load_orgs())),
         chat_index: chat_index_arc.clone(),
         contacts: Arc::new(std::sync::Mutex::new(stone::chat::load_contacts())),
@@ -1219,6 +1500,8 @@ async fn main() {
         audio_rooms: server::handlers::audio_relay::new_audio_rooms(),
         push_tokens: Arc::new(std::sync::Mutex::new(stone::push::load_push_tokens())),
         fcm_client: Arc::new(stone::push::FcmClient::new()),
+        action_store: server::state::ActionStore::new(),
+        play_drops: server::state::PlayDropTracker::new(server::state::PlayDropConfig::from_env()),
     };
 
     let router = build_router(state.clone());
@@ -1231,6 +1514,69 @@ async fn main() {
         tokio::time::sleep(std::time::Duration::from_secs(120)).await;
         stone::updater::confirm_update_success(&stone::blockchain::data_dir());
     });
+
+    // ── Auto-Update Scheduler ───────────────────────────────────────────
+    // Prüft jede Minute ob ein Update bereit ist und ob die konfigurierte
+    // Stunde erreicht ist → automatische Installation + Neustart.
+    {
+        let sched_updater = updater.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            let mut last_install_date = String::new();
+            loop {
+                interval.tick().await;
+                let (should_install, version) = {
+                    let um = sched_updater.read().unwrap_or_else(|e| e.into_inner());
+                    let hour = match um.config.auto_update_hour {
+                        Some(h) => h,
+                        None => continue,
+                    };
+                    let now = chrono::Local::now();
+                    let today = now.format("%Y-%m-%d").to_string();
+                    if today == last_install_date {
+                        continue;
+                    }
+                    let current_hour = now.hour() as u8;
+                    let is_ready = matches!(um.state, stone::updater::UpdateState::Ready);
+                    let version = um.manifest.as_ref().map(|m| m.version.clone()).unwrap_or_default();
+                    (current_hour == hour && is_ready, version)
+                };
+                if should_install {
+                    println!("[updater] ⏰ Geplantes Auto-Update: v{version} wird installiert...");
+                    let now = chrono::Local::now();
+                    last_install_date = now.format("%Y-%m-%d").to_string();
+                    let install_result = {
+                        let mut um = sched_updater.write().unwrap_or_else(|e| e.into_inner());
+                        um.install()
+                    };
+                    match install_result {
+                        Ok(_path) => {
+                            println!("[updater] ✅ Auto-Update installiert → Neustart in 5 Sekunden");
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            #[cfg(unix)]
+                            {
+                                use std::os::unix::process::CommandExt;
+                                let exe = std::env::current_exe().unwrap();
+                                let args: Vec<String> = std::env::args().collect();
+                                let mut cmd = std::process::Command::new(&exe);
+                                cmd.args(&args[1..]);
+                                let err = cmd.exec();
+                                eprintln!("[updater] exec fehlgeschlagen: {err}");
+                                std::process::exit(1);
+                            }
+                            #[cfg(not(unix))]
+                            {
+                                std::process::exit(0);
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("[updater] ❌ Auto-Update fehlgeschlagen: {e}");
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     // Audio-Room GC: Idle-Rooms alle 60s aufräumen (Rooms ohne Aktivität > 5 Min)
     {

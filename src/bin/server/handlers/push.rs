@@ -59,7 +59,7 @@ pub async fn handle_push_register(
 
     let wallet_hash = hash_wallet(&wallet);
 
-    let mut store = state.push_tokens.lock().unwrap();
+    let mut store = state.push_tokens.lock().unwrap_or_else(|e| e.into_inner());
     store.register(wallet_hash.clone(), fcm.to_string(), req.platform);
     save_push_tokens(&store);
 
@@ -85,7 +85,7 @@ pub async fn handle_push_unregister(
     }
 
     let wallet_hash = hash_wallet(&wallet);
-    let mut store = state.push_tokens.lock().unwrap();
+    let mut store = state.push_tokens.lock().unwrap_or_else(|e| e.into_inner());
     let removed = store.unregister(&wallet_hash);
     save_push_tokens(&store);
 
@@ -100,7 +100,7 @@ pub async fn handle_push_unregister(
 pub async fn handle_push_status(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let store = state.push_tokens.lock().unwrap();
+    let store = state.push_tokens.lock().unwrap_or_else(|e| e.into_inner());
     let fcm_configured = state.fcm_client.is_configured();
 
     (StatusCode::OK, axum::Json(json!({
@@ -115,7 +115,7 @@ pub async fn handle_push_status(
 pub async fn handle_push_test(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    let store = state.push_tokens.lock().unwrap().clone();
+    let store = state.push_tokens.lock().unwrap_or_else(|e| e.into_inner()).clone();
     let fcm = state.fcm_client.clone();
 
     if !fcm.is_configured() {

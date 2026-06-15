@@ -76,6 +76,14 @@ pub struct ChainStore {
     db: Arc<DB>,
 }
 
+/// Column-Family-Namen der chain_db RocksDB-Instanz.
+///
+/// **WICHTIG (S4):** Diese Liste ist die SINGLE SOURCE OF TRUTH.
+/// Alle Stellen, die `chain_db` öffnen, MÜSSEN diese Konstante verwenden
+/// (insbesondere `snapshot::create_rocksdb_checkpoint`), damit neue CFs
+/// nicht stillschweigend aus Snapshots fallen.
+pub const CHAIN_DB_CF_NAMES: &[&str] = &["default", "blocks", "meta", "index"];
+
 impl ChainStore {
     /// Öffnet (oder erstellt) die RocksDB-Datenbank.
     pub fn open() -> Result<Arc<Self>, StorageError> {
@@ -86,7 +94,8 @@ impl ChainStore {
         opts.create_missing_column_families(true);
         opts.set_compression_type(rocksdb::DBCompressionType::Snappy);
 
-        // Column Families definieren
+        // Column Families definieren — Liste muss zu CHAIN_DB_CF_NAMES passen
+        // (außer "default", das implizit existiert)
         let cf_blocks = ColumnFamilyDescriptor::new("blocks", Options::default());
         let cf_meta   = ColumnFamilyDescriptor::new("meta",   Options::default());
         let cf_index  = ColumnFamilyDescriptor::new("index",  Options::default());

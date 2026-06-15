@@ -1,0 +1,2172 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Stone Dungeon — Game Economy Test</title>
+<style>
+  :root {
+    --bg: #0b0d12;
+    --bg-2: #131722;
+    --panel: #1a1f2e;
+    --line: #2a3142;
+    --txt: #e6e9f2;
+    --mut: #8b94a8;
+    --acc: #f9c74f;
+    --ok:  #43d17a;
+    --bad: #ff5d6c;
+    --warn:#ffb454;
+    --rar-common:    #c5cbd6;
+    --rar-uncommon:  #43d17a;
+    --rar-rare:      #4ea1ff;
+    --rar-epic:      #c47bff;
+    --rar-legendary: #ffb454;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+    background: radial-gradient(circle at 50% 0%, #1a2238 0%, var(--bg) 60%);
+    color: var(--txt); min-height: 100vh;
+  }
+  header {
+    display: flex; align-items: center; gap: 1rem; padding: .8rem 1.2rem;
+    border-bottom: 1px solid var(--line); background: rgba(10,12,18,.75);
+    position: sticky; top: 0; z-index: 10; backdrop-filter: blur(8px);
+  }
+  header h1 { margin: 0; font-size: 1.05rem; letter-spacing: .04em; }
+  header .acc { color: var(--acc); }
+  header .grow { flex: 1; }
+  .pill {
+    padding: .25rem .6rem; border-radius: 999px; background: var(--panel);
+    border: 1px solid var(--line); font-size: .8rem; color: var(--mut);
+  }
+  .pill.live { color: var(--ok); border-color: rgba(67,209,122,.4); }
+  .pill.dead { color: var(--bad); border-color: rgba(255,93,108,.4); }
+
+  nav {
+    display: flex; gap: .3rem; padding: .5rem 1.2rem;
+    border-bottom: 1px solid var(--line);
+  }
+  nav button {
+    background: transparent; border: 1px solid transparent; color: var(--mut);
+    padding: .45rem .9rem; border-radius: .35rem; cursor: pointer;
+    font: inherit;
+  }
+  nav button:hover { color: var(--txt); }
+  nav button.on { color: var(--txt); border-color: var(--line); background: var(--panel); }
+
+  main { padding: 1.2rem; max-width: 1180px; margin: 0 auto; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line); border-radius: .6rem;
+    padding: 1rem 1.1rem; margin-bottom: 1rem;
+  }
+  .panel h2 { margin: 0 0 .8rem; font-size: 1rem; }
+  .row { display: flex; gap: .6rem; flex-wrap: wrap; align-items: center; }
+  .row > * { flex: 0 0 auto; }
+  .grow { flex: 1 1 auto; }
+
+  label { display: block; font-size: .78rem; color: var(--mut); margin-bottom: .2rem; }
+  input, select, textarea {
+    background: var(--bg-2); color: var(--txt); border: 1px solid var(--line);
+    border-radius: .35rem; padding: .45rem .6rem; font: inherit; width: 100%;
+  }
+  textarea { resize: vertical; min-height: 3.5rem; font-family: ui-monospace, monospace; }
+  button.primary {
+    background: var(--acc); color: #1a1410; border: 0; padding: .5rem .9rem;
+    border-radius: .35rem; cursor: pointer; font-weight: 600;
+  }
+  button.primary:hover { filter: brightness(1.06); }
+  button.ghost {
+    background: transparent; color: var(--txt); border: 1px solid var(--line);
+    padding: .45rem .85rem; border-radius: .35rem; cursor: pointer;
+  }
+  button.danger {
+    background: rgba(255,93,108,.15); color: var(--bad);
+    border: 1px solid rgba(255,93,108,.3);
+    padding: .45rem .85rem; border-radius: .35rem; cursor: pointer;
+  }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+
+  .grid {
+    display: grid; gap: .8rem; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  }
+  .card {
+    background: var(--bg-2); border: 1px solid var(--line); border-radius: .5rem;
+    padding: .75rem; display: flex; flex-direction: column; gap: .35rem;
+  }
+  .card .name { font-weight: 600; }
+  .card .meta { font-size: .78rem; color: var(--mut); }
+  .card .price { color: var(--acc); font-weight: 600; }
+  .card .actions { display: flex; gap: .4rem; margin-top: auto; }
+  .card .actions button { flex: 1; font-size: .8rem; }
+  .rarity {
+    display: inline-block; padding: 0 .4rem; border-radius: .25rem;
+    font-size: .7rem; text-transform: uppercase; letter-spacing: .05em;
+    border: 1px solid currentColor;
+  }
+  .rar-common    { color: var(--rar-common); }
+  .rar-uncommon  { color: var(--rar-uncommon); }
+  .rar-rare      { color: var(--rar-rare); }
+  .rar-epic      { color: var(--rar-epic); }
+  .rar-legendary { color: var(--rar-legendary); }
+
+  .toast {
+    position: fixed; bottom: 1rem; right: 1rem; max-width: 360px;
+    background: var(--panel); border: 1px solid var(--line); border-radius: .4rem;
+    padding: .7rem .9rem; box-shadow: 0 6px 20px rgba(0,0,0,.4); z-index: 1000;
+    animation: slide .25s ease;
+  }
+  .toast.ok  { border-left: 3px solid var(--ok); }
+  .toast.bad { border-left: 3px solid var(--bad); }
+  .toast.warn{ border-left: 3px solid var(--warn); }
+  @keyframes slide { from { transform: translateX(20px); opacity: 0; } }
+
+  /* Dungeon */
+  .dungeon {
+    background: linear-gradient(180deg, #0d1320 0%, #1a2238 100%);
+    border-radius: .6rem; padding: 1.5rem; text-align: center;
+    border: 1px solid var(--line);
+  }
+  .monster { font-size: 5rem; margin: .8rem 0; user-select: none; }
+  .monster.hit { animation: shake .25s; }
+  @keyframes shake {
+    0%,100% { transform: translateX(0); }
+    25% { transform: translateX(-6px); }
+    75% { transform: translateX(6px); }
+  }
+  .hpbar {
+    height: 14px; background: var(--bg); border: 1px solid var(--line);
+    border-radius: 7px; overflow: hidden; margin: 0 auto; max-width: 320px;
+  }
+  .hpbar > div { height: 100%; background: linear-gradient(90deg, var(--bad), var(--acc)); transition: width .15s; }
+  .stats { display: flex; gap: 1.2rem; justify-content: center; margin: .8rem 0; }
+  .stat { text-align: center; }
+  .stat .v { font-size: 1.3rem; font-weight: 700; color: var(--acc); }
+  .stat .l { font-size: .75rem; color: var(--mut); text-transform: uppercase; }
+  .attack {
+    margin-top: 1rem; background: var(--acc); color: #1a1410; border: 0;
+    padding: .8rem 2rem; border-radius: .4rem; cursor: pointer;
+    font-size: 1.1rem; font-weight: 700; letter-spacing: .05em;
+  }
+  .attack:hover { filter: brightness(1.06); }
+  .attack:disabled { opacity: .5; cursor: not-allowed; }
+
+  /* Floating damage numbers */
+  .arena {
+    position: relative;
+  }
+  .dmg-float {
+    position: absolute; pointer-events: none;
+    font-weight: 800; font-size: 1.6rem;
+    color: var(--acc); text-shadow: 0 0 6px rgba(0,0,0,.6);
+    animation: dmg-rise 900ms ease-out forwards;
+    z-index: 5;
+  }
+  .dmg-float.crit { color: #ff5d6c; font-size: 2.2rem; text-shadow: 0 0 12px rgba(255,93,108,.7); }
+  .dmg-float.miss { color: var(--mut); font-size: 1.2rem; }
+  .dmg-float.heal { color: var(--ok); }
+  .dmg-float.player-hit { color: #ff5d6c; left: 50%; }
+  @keyframes dmg-rise {
+    0%   { transform: translate(-50%, 0) scale(.6); opacity: 0; }
+    20%  { transform: translate(-50%, -10px) scale(1.1); opacity: 1; }
+    100% { transform: translate(-50%, -90px) scale(1); opacity: 0; }
+  }
+
+  /* HUD */
+  .hud {
+    display: grid; gap: .8rem; grid-template-columns: 1fr 1fr;
+    margin: 0 auto 1rem; max-width: 480px;
+    text-align: left;
+  }
+  .hud .box {
+    background: rgba(10,12,18,.55); border: 1px solid var(--line);
+    border-radius: .4rem; padding: .55rem .7rem;
+  }
+  .hud .box .label { font-size: .7rem; color: var(--mut); text-transform: uppercase; letter-spacing: .05em; }
+  .hud .box .value { font-size: 1.05rem; font-weight: 700; }
+  .hud .hpbar { margin-top: .35rem; height: 8px; }
+  .hud .hpbar > div { background: linear-gradient(90deg, #ff5d6c, var(--ok)); }
+  .hud .stats-line { font-size: .82rem; color: var(--mut); margin-top: .15rem; }
+  .hud .equipped { font-size: .82rem; }
+  .hud .equipped strong { color: var(--acc); }
+
+  .stage-info { font-size: .82rem; color: var(--mut); }
+  .stage-info strong { color: var(--txt); }
+  .monster-stats {
+    font-size: .78rem; color: var(--mut); margin-top: .2rem;
+  }
+
+  .death-overlay {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    flex-direction: column; gap: 1rem;
+    background: rgba(11,13,18,.85); border-radius: .6rem; z-index: 10;
+  }
+  .death-overlay h3 { margin: 0; color: var(--bad); font-size: 2rem; }
+
+  /* Schrein-Etage: Spieler picked 1 von 3 Items */
+  .shrine-overlay {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    flex-direction: column; gap: 1rem; padding: 1rem;
+    background: rgba(11,13,18,.92); border-radius: .6rem; z-index: 10;
+  }
+  .shrine-overlay h3 { margin: 0; color: #ffd966; font-size: 1.6rem; text-align: center; }
+  .shrine-overlay .muted { text-align: center; }
+  .shrine-grid {
+    display: grid; grid-template-columns: repeat(3, 1fr); gap: .6rem;
+    width: 100%; max-width: 600px;
+  }
+  .shrine-card {
+    border: 1px solid #444; border-radius: .5rem; padding: .6rem;
+    background: rgba(255,217,102,.05); cursor: pointer;
+    transition: transform .15s, border-color .15s, background .15s;
+    display: flex; flex-direction: column; gap: .3rem; text-align: center;
+  }
+  .shrine-card:hover {
+    transform: translateY(-3px); border-color: #ffd966;
+    background: rgba(255,217,102,.15);
+  }
+  .shrine-card .em { font-size: 2.2rem; }
+  .shrine-card .nm { font-weight: 600; font-size: .9rem; }
+
+  .effect-tag {
+    display: inline-block; padding: 0 .35rem; border-radius: .25rem;
+    font-size: .7rem; font-weight: 600;
+    background: rgba(255,180,84,.15); color: var(--warn);
+    border: 1px solid rgba(255,180,84,.3); margin-right: .2rem;
+  }
+  .effect-tag.fire     { color: #ff7043; background: rgba(255,112,67,.15); border-color: rgba(255,112,67,.35); }
+  .effect-tag.poison   { color: #88c057; background: rgba(136,192,87,.15); border-color: rgba(136,192,87,.35); }
+  .effect-tag.ice      { color: #5fb3e3; background: rgba(95,179,227,.15); border-color: rgba(95,179,227,.35); }
+  .effect-tag.lifesteal{ color: #e85ab1; background: rgba(232,90,177,.15); border-color: rgba(232,90,177,.35); }
+  .effect-tag.crit     { color: #f9c74f; background: rgba(249,199,79,.15); border-color: rgba(249,199,79,.35); }
+
+  .muted { color: var(--mut); }
+  .addr { font-family: ui-monospace, monospace; font-size: .82rem; }
+  .warnings {
+    background: rgba(255,180,84,.1); border: 1px solid rgba(255,180,84,.3);
+    color: var(--warn); padding: .4rem .6rem; border-radius: .3rem;
+    font-size: .8rem; margin-top: .4rem;
+  }
+  .log {
+    max-height: 220px; overflow-y: auto;
+    font-family: ui-monospace, monospace; font-size: .78rem;
+    background: var(--bg); padding: .6rem .8rem; border-radius: .35rem;
+    border: 1px solid var(--line);
+  }
+  .log .ts { color: var(--mut); }
+  .log .ok  { color: var(--ok); }
+  .log .bad { color: var(--bad); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>⚔️ <span class="acc">Stone Dungeon</span> <span class="muted" style="font-weight:normal">— Game Economy Test</span></h1>
+  <div class="grow"></div>
+  <span id="netPill" class="pill">disconnected</span>
+  <span id="walletPill" class="pill">kein Wallet</span>
+</header>
+
+<nav>
+  <button data-tab="wallet" class="on">Wallet</button>
+  <button data-tab="dungeon">Dungeon</button>
+  <button data-tab="inventory">Inventar</button>
+  <button data-tab="market">Marketplace</button>
+  <button data-tab="dev">Developer</button>
+  <button data-tab="log">Log</button>
+</nav>
+
+<main>
+
+  <!-- ─── WALLET ──────────────────────────────────────────────────────────── -->
+  <section data-pane="wallet">
+    <div class="panel">
+      <h2>Verbindung</h2>
+      <div class="row">
+        <div>
+          <label>Server</label>
+          <select id="serverPreset">
+            <option value="http://212.227.54.241:3080">Testnet  (212.227.54.241:3080)</option>
+            <option value="http://212.227.54.241:3180">Mainnet  (212.227.54.241:3180)</option>
+            <option value="http://69.48.200.255:3080">Testnet VPS2  (69.48.200.255:3080)</option>
+            <option value="http://localhost:8080">Lokal  (localhost:8080)</option>
+            <option value="custom">Eigene URL…</option>
+          </select>
+        </div>
+        <div class="grow">
+          <label>URL</label>
+          <input id="serverUrl" value="http://212.227.54.241:3080">
+        </div>
+        <div style="align-self:flex-end">
+          <button id="btnPing" class="ghost">Ping</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Profile (Spieler-Wallets)</h2>
+      <p class="muted" style="margin-top:0">
+        Mehrere Spieler-Wallets im selben Browser. Aktives Profil wird für
+        Combat / Inventar / Marketplace-Käufe genutzt. Loot-Drops nutzen
+        immer das <em>Game-Server-Wallet</em> (unten) — Spieler darf wechseln.
+      </p>
+      <div class="row">
+        <div class="grow">
+          <label>Aktives Profil</label>
+          <select id="profileSelect"></select>
+        </div>
+        <div style="align-self:flex-end">
+          <button id="btnNewProfile" class="primary">+ Neues Test-Wallet</button>
+          <button id="btnImportProfile" class="ghost">Mnemonic importieren</button>
+          <button id="btnRenameProfile" class="ghost">Umbenennen</button>
+          <button id="btnDeleteProfile" class="danger">Löschen</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Aktives Wallet</h2>
+      <div>
+        <label>Mnemonic des aktiven Profils (read-only)</label>
+        <textarea id="mnemonic" readonly></textarea>
+      </div>
+      <div class="row" style="margin-top:.6rem">
+        <div class="grow">
+          <label>Adresse</label>
+          <div class="addr" id="addrOut">—</div>
+        </div>
+        <button id="btnForget" class="danger">Alles vergessen</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Game-Server-Wallet (Owner)</h2>
+      <p class="muted" style="margin-top:0">
+        Das ist das <code>developer_wallet</code> des registrierten Spiels.
+        Es zahlt die Anchor-Fees für jeden Loot-Drop und mintet die Items.
+        Beim Spiel-registrieren (Developer-Tab) wird das aktive Wallet automatisch
+        als Server-Wallet gespeichert.
+      </p>
+      <div class="row">
+        <div class="grow"><label>Server-Adresse</label><div class="addr" id="serverAddrOut">—</div></div>
+        <button id="btnUseActiveAsServer" class="ghost">Aktives Wallet = Server</button>
+        <button id="btnClearServer" class="danger">Server-Wallet entfernen</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>Balance</h2>
+      <div class="stats">
+        <div class="stat"><div class="v" id="balMain">—</div><div class="l">Main Wallet (STONE)</div></div>
+        <div class="stat"><div class="v" id="balGame">—</div><div class="l">Game Wallet (STONE)</div></div>
+        <div class="stat"><div class="v" id="oracleRate">—</div><div class="l">Oracle  (USD/STONE)</div></div>
+      </div>
+      <button id="btnRefreshBal" class="ghost">Aktualisieren</button>
+    </div>
+  </section>
+
+  <!-- ─── DUNGEON ─────────────────────────────────────────────────────────── -->
+  <section data-pane="dungeon" hidden>
+    <div class="panel">
+      <h2>Dungeon — Echte Combat-Mechanik</h2>
+      <p class="muted" style="margin-top:0">
+        Spieler vs. Monster mit HP/ATK/DEF/Crits. Bei jedem Kill triggert
+        <code>POST /sdk/game/drop</code> einen NFT-Loot mit gewürfelten Stats
+        (Schaden, Crit-Bonus, Element-Effekt). Höhere Stages → härtere Monster,
+        bessere Drops. Jeder Drop wird on-chain als Anchor-TX verankert.
+      </p>
+
+      <div class="dungeon arena" id="dungeonArena">
+        <div class="stage-info">Stage <strong id="stage">1</strong> · <span id="stageMonsterPool">Slime</span></div>
+
+        <!-- Monster -->
+        <div class="monster" id="monsterEmoji">👾</div>
+        <div class="muted" id="monsterName">Slime</div>
+        <div class="monster-stats">
+          HP <span id="monHpText">10/10</span> · ATK <span id="monAtk">1</span> · DEF <span id="monDef">0</span>
+        </div>
+        <div class="hpbar" style="margin-top:.4rem"><div id="monsterHp" style="width:100%"></div></div>
+
+        <!-- Power-Balance ----------------------------------------------- -->
+        <div id="powerBar" style="margin-top:.8rem;font-size:.85rem">
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:.5rem">
+            <span>Du ⚡<strong id="powerPlayer">5</strong></span>
+            <span class="muted" id="powerVerdict">ausgeglichen</span>
+            <span>Gegner ⚡<strong id="powerMonster">3</strong></span>
+          </div>
+          <div class="hpbar" style="margin-top:.3rem;background:#222">
+            <div id="powerSplit" style="width:50%;background:linear-gradient(90deg,#4ade80,#f87171)"></div>
+          </div>
+        </div>
+
+        <!-- HUD -->
+        <div class="hud" style="margin-top:1rem">
+          <div class="box">
+            <div class="label">Held · HP</div>
+            <div class="value"><span id="playerHpText">100/100</span></div>
+            <div class="hpbar"><div id="playerHpBar" style="width:100%"></div></div>
+          </div>
+          <div class="box">
+            <div class="label">Stats</div>
+            <div class="stats-line">
+              ⚔️ ATK <strong id="statAtk">5</strong> ·
+              🛡 DEF <strong id="statDef">0</strong> ·
+              💥 CRIT <strong id="statCrit">5</strong>%
+            </div>
+            <div class="equipped" id="equippedLine" style="margin-top:.25rem">
+              Ausgerüstet: <strong>—</strong>
+            </div>
+          </div>
+        </div>
+
+        <div class="stats">
+          <div class="stat"><div class="v" id="killCount">0</div><div class="l">Kills</div></div>
+          <div class="stat"><div class="v" id="lootCount">0</div><div class="l">Loot</div></div>
+          <div class="stat"><div class="v" id="stageCount">1</div><div class="l">Stage</div></div>
+        </div>
+
+        <div class="row" style="gap:.5rem;justify-content:center;margin-top:.5rem">
+          <button id="btnAttack" class="attack">⚔️ ANGRIFF</button>
+          <button id="btnQuickHeal" class="ghost" title="Besten Heiltrank aus Inventar konsumieren">🧪 Heilen <span id="potionCount" class="muted">(0)</span></button>
+          <button id="btnResetDungeon" class="ghost" title="Combat-Fortschritt für dieses Profil zurücksetzen">↻ Reset</button>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ─── INVENTORY ───────────────────────────────────────────────────────── -->
+  <section data-pane="inventory" hidden>
+    <div class="panel">
+      <h2>Mein Inventar</h2>
+      <div class="row" style="margin-bottom:.8rem">
+        <button id="btnRefreshInv" class="ghost">Aktualisieren</button>
+        <span class="muted" id="invCount">0 Items</span>
+      </div>
+      <div class="grid" id="inventoryGrid"></div>
+    </div>
+  </section>
+
+  <!-- ─── MARKET ──────────────────────────────────────────────────────────── -->
+  <section data-pane="market" hidden>
+    <div class="panel">
+      <h2>Marketplace</h2>
+      <div class="row" style="margin-bottom:.8rem">
+        <button id="btnRefreshMarket" class="ghost">Aktualisieren</button>
+        <span class="muted" id="marketCount">0 Listings</span>
+      </div>
+      <div class="grid" id="marketGrid"></div>
+    </div>
+  </section>
+
+  <!-- ─── DEVELOPER ───────────────────────────────────────────────────────── -->
+  <section data-pane="dev" hidden>
+    <div class="panel">
+      <h2>1) Game registrieren</h2>
+      <p class="muted" style="margin-top:0">Aktuelles Wallet wird zum Developer-Wallet des Spiels.</p>
+      <div class="row">
+        <div class="grow"><label>game_id</label><input id="gameId" placeholder="dungeon-test-abc"></div>
+        <div class="grow"><label>Name</label><input id="gameName" placeholder="Stone Dungeon"></div>
+        <div><label>max_wallet_limit (STONE)</label><input id="gameLimit" value="1000" style="width:8rem"></div>
+      </div>
+      <div class="row" style="margin-top:.6rem">
+        <button id="btnRegisterGame" class="primary">Game registrieren</button>
+        <button id="btnClaimGame" class="ghost" title="On-Chain registriertes Spiel (z.B. via StoneScan) übernehmen — selbe game_id, dein Wallet muss owner_company sein.">Bestehendes On-Chain-Spiel claimen</button>
+        <button id="btnLoadGame" class="ghost">Bestehendes Game laden</button>
+        <button id="btnUseApiKey" class="ghost">API-Key verbinden</button>
+        <button id="btnRotateApiKey" class="ghost" style="border-color:#a33;color:#f88" title="API-Key neu generieren. Erfordert Owner-Wallet-Signatur (2FA). Alter Key ist sofort tot.">🔄 API-Key rotieren</button>
+        <div class="grow"></div>
+        <div>
+          <label>API-Key</label>
+          <div class="addr" id="apiKeyOut">—</div>
+        </div>
+      </div>
+      <div class="row" style="margin-top:.6rem">
+        <div class="grow">
+          <label>API-Key (realistischer Test)</label>
+          <input id="apiKeyInput" placeholder="sk_...">
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>2) Server-Keys verwalten</h2>
+      <p class="muted" style="margin-top:0">
+        Mehrere Hot-Wallets dürfen im Namen des Spiels Loot droppen. Owner
+        (Developer-Wallet) ist <em>immer</em> implizit autorisiert. Hier kannst
+        du zusätzliche Server-Keys hinzufügen (z.B. das aktive Profil), damit
+        Drops auch ohne Owner-Mnemonic funktionieren.
+      </p>
+      <div class="row" style="align-items:flex-end">
+        <div class="grow">
+          <label>Server-Pubkey (Hex oder <code>stone1...</code>)</label>
+          <input id="serverKeyInput" placeholder="stone1... oder 64-Hex">
+        </div>
+        <div><label>Label</label><input id="serverKeyLabel" placeholder="dev-laptop" style="width:10rem"></div>
+        <button id="btnUseActiveAsKey" class="ghost">↳ aktives Profil</button>
+        <button id="btnAddServerKey" class="primary">+ Hinzufügen</button>
+      </div>
+      <p class="muted" style="margin:.4rem 0 0">
+        Owner-Mnemonic des Spiels muss im Wallet-Tab als aktives Profil geladen sein
+        (das Profil, mit dem du das Spiel registriert hast).
+      </p>
+      <div id="serverKeysList" style="margin-top:.8rem"></div>
+      <div class="row" style="margin-top:.5rem">
+        <button id="btnRefreshServerKeys" class="ghost">↻ Liste neu laden</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>3) Shop-Items erstellen</h2>
+      <p class="muted" style="margin-top:0">
+        Werden beim Dungeon-Kill an Spieler ausgeliefert (geminted als NFT).
+      </p>
+      <div class="row">
+        <div><label>shop_item_id</label><input id="shopId" placeholder="sword-001"></div>
+        <div class="grow"><label>Name</label><input id="shopName" placeholder="Eisenschwert"></div>
+        <div><label>Preis (STONE)</label><input id="shopPrice" value="1" style="width:6rem"></div>
+        <div>
+          <label>Rarität</label>
+          <select id="shopRarity">
+            <option>common</option><option>uncommon</option><option>rare</option>
+            <option>epic</option><option>legendary</option>
+          </select>
+        </div>
+      </div>
+      <div class="row" style="margin-top:.6rem">
+        <button id="btnCreateShop" class="primary">Shop-Item anlegen</button>
+        <button id="btnLoadShop"   class="ghost">Katalog laden</button>
+      </div>
+      <div class="grid" id="shopCatalog" style="margin-top:.8rem"></div>
+    </div>
+  </section>
+
+  <!-- ─── LOG ─────────────────────────────────────────────────────────────── -->
+  <section data-pane="log" hidden>
+    <div class="panel">
+      <h2>API-Log</h2>
+      <div class="log" id="logBox"></div>
+    </div>
+  </section>
+
+</main>
+
+<div id="toastSlot"></div>
+
+<script>
+//──────────────────────────────────────────────────────────────────────────────
+//  State + persistence
+//──────────────────────────────────────────────────────────────────────────────
+const STORE_KEY = "stone_dungeon_state_v2";
+const LEGACY_KEY = "stone_dungeon_state_v1";
+
+// Schema:
+//   profiles: { [name]: { mnemonic, address } }
+//   activeProfile: <name>
+//   serverMnemonic / serverAddress: Game-Owner-Wallet (registriert das Spiel)
+//   mnemonic / address: Spiegel des aktiven Profils (für Bestandscode)
+const defaults = {
+  serverUrl: "http://212.227.54.241:3080",
+  profiles: {},
+  activeProfile: "",
+  profileProgress: {},
+  serverMnemonic: "",
+  serverAddress: "",
+  mnemonic: "",
+  address: "",
+  ownerWallet: "",
+  gameId: "",
+  apiKey: "",
+  kills: 0,
+  loot:  0,
+  // ── Combat-State (per Profil getrennt via prefixed key) ──────
+  playerHp: 100,
+  playerHpMax: 100,
+  stage: 1,
+  // Legacy: einzelnes ausgerüstetes Item (vor Multi-Slot).
+  equippedItemId: "",
+  equippedItem: null,
+  // Multi-Slot Equipment: { slot → { item_id, name, rarity, category, metadata } }.
+  equipment: {},
+  shrineSeen: [],
+};
+let stored = {};
+try { stored = JSON.parse(localStorage.getItem(STORE_KEY) || "{}"); } catch {}
+// Migration aus v1 (einzelne Mnemonic → Default-Profil + Server-Wallet).
+if (!localStorage.getItem(STORE_KEY)) {
+  try {
+    const legacy = JSON.parse(localStorage.getItem(LEGACY_KEY) || "{}");
+    if (legacy && legacy.mnemonic) {
+      stored = { ...legacy, profiles: { "default": { mnemonic: legacy.mnemonic, address: legacy.address || "" } }, activeProfile: "default", serverMnemonic: legacy.mnemonic, serverAddress: legacy.address || "" };
+    }
+  } catch {}
+}
+const state = Object.assign({}, defaults, stored);
+
+function makeDefaultProgress() {
+  return {
+    kills: 0,
+    loot: 0,
+    playerHp: 100,
+    playerHpMax: 100,
+    stage: 1,
+    equippedItemId: "",
+    equippedItem: null,
+    equipment: {},
+    shrineSeen: [],
+  };
+}
+
+function cloneJson(v) {
+  return JSON.parse(JSON.stringify(v));
+}
+
+function profileProgressKey() {
+  return state.address || state.activeProfile || "";
+}
+
+function persistActiveProgress() {
+  const key = profileProgressKey();
+  if (!key) return;
+  state.profileProgress = state.profileProgress || {};
+  state.profileProgress[key] = {
+    kills: Number(state.kills || 0),
+    loot: Number(state.loot || 0),
+    playerHp: Number(state.playerHp || 100),
+    playerHpMax: Number(state.playerHpMax || 100),
+    stage: Number(state.stage || 1),
+    equippedItemId: state.equippedItemId || "",
+    equippedItem: state.equippedItem ? cloneJson(state.equippedItem) : null,
+    equipment: cloneJson(state.equipment || {}),
+    shrineSeen: Array.isArray(state.shrineSeen) ? [...state.shrineSeen] : [],
+  };
+}
+
+function loadActiveProgress() {
+  const key = profileProgressKey();
+  const d = makeDefaultProgress();
+  if (!key) {
+    Object.assign(state, d);
+    return;
+  }
+  state.profileProgress = state.profileProgress || {};
+  const p = state.profileProgress[key] || d;
+  state.kills = Number(p.kills || 0);
+  state.loot = Number(p.loot || 0);
+  state.playerHp = Number(p.playerHp || 100);
+  state.playerHpMax = Number(p.playerHpMax || 100);
+  state.stage = Number(p.stage || 1);
+  state.equippedItemId = p.equippedItemId || "";
+  state.equippedItem = p.equippedItem ? cloneJson(p.equippedItem) : null;
+  state.equipment = cloneJson(p.equipment || {});
+  state.shrineSeen = Array.isArray(p.shrineSeen) ? [...p.shrineSeen] : [];
+  if (!state.profileProgress[key]) {
+    state.profileProgress[key] = cloneJson(d);
+  }
+}
+// Sicherstellen dass equipment immer ein Objekt ist + Legacy-Migration.
+if (!state.equipment || typeof state.equipment !== "object") state.equipment = {};
+if (state.equippedItemId && state.equippedItem && state.equippedItem.category) {
+  const cat = state.equippedItem.category;
+  if (!state.equipment[cat]) {
+    state.equipment[cat] = {
+      item_id:  state.equippedItemId,
+      name:     state.equippedItem.name,
+      rarity:   state.equippedItem.rarity,
+      category: cat,
+      metadata: state.equippedItem.metadata || {},
+    };
+  }
+}
+const save = () => {
+  persistActiveProgress();
+  localStorage.setItem(STORE_KEY, JSON.stringify(state));
+};
+
+function syncActiveProfile() {
+  const p = state.profiles[state.activeProfile];
+  if (p) { state.mnemonic = p.mnemonic; state.address = p.address; }
+  else   { state.mnemonic = ""; state.address = ""; }
+}
+syncActiveProfile();
+loadActiveProgress();
+
+// Letzter Inventar-Snapshot für schnellen Zugriff (Quick-Heal etc.).
+// MUSS vor allen Funktionen deklariert werden, die ihn nutzen (TDZ-Vermeidung).
+var inventoryCache = [];
+
+// Equipment-Slots → ein Item pro Slot gleichzeitig tragbar.
+// MUSS vor playerStats()/refreshHud() initialisiert werden, da diese in der
+// Init-Sequenz aufgerufen werden (TDZ-Vermeidung).
+var EQUIP_SLOTS = ["weapon","armor","helmet","boots","gloves","ring","amulet","relic"];
+var SLOT_LABEL  = {
+  weapon: "Waffe", armor: "Rüstung", helmet: "Helm",
+  boots: "Stiefel", gloves: "Handschuhe",
+  ring: "Ring", amulet: "Amulett", relic: "Relikt",
+};
+var SLOT_EMOJI  = {
+  weapon:"⚔️", armor:"🛡", helmet:"⛑",
+  boots:"🥾", gloves:"🧤",
+  ring:"💍", amulet:"📿", relic:"💎",
+};
+function isEquipSlot(category) { return EQUIP_SLOTS.includes(category); }
+
+//──────────────────────────────────────────────────────────────────────────────
+//  Helpers
+//──────────────────────────────────────────────────────────────────────────────
+const $ = (s, r=document) => r.querySelector(s);
+const $$ = (s, r=document) => [...r.querySelectorAll(s)];
+
+function logLine(kind, txt) {
+  const box = $("#logBox");
+  const t = new Date().toTimeString().slice(0,8);
+  const div = document.createElement("div");
+  div.innerHTML = `<span class="ts">${t}</span> <span class="${kind}">${kind.toUpperCase()}</span> ${escapeHtml(txt)}`;
+  box.appendChild(div);
+  box.scrollTop = box.scrollHeight;
+}
+function escapeHtml(s){ return String(s).replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;"}[c])); }
+function toast(kind, msg, ttl=4000) {
+  const t = document.createElement("div");
+  t.className = `toast ${kind}`;
+  t.textContent = msg;
+  $("#toastSlot").appendChild(t);
+  setTimeout(()=>t.remove(), ttl);
+}
+async function api(path, opts={}) {
+  const url = state.serverUrl.replace(/\/$/,"") + path;
+  const init = { headers: {"Content-Type":"application/json"}, ...opts };
+  if (init.body && typeof init.body === "object") init.body = JSON.stringify(init.body);
+  logLine("ok", `${init.method||"GET"} ${path}`);
+  let res, json;
+  try {
+    res = await fetch(url, init);
+    json = await res.json().catch(()=>({}));
+  } catch (e) {
+    logLine("bad", `${path} → NET-ERR ${e.message}`);
+    throw new Error("Netzwerkfehler: " + e.message);
+  }
+  if (!res.ok || json.ok === false) {
+    const err = json.error || json.reason || res.statusText;
+    logLine("bad", `${path} → ${res.status} ${err}`);
+    throw new Error(err || `HTTP ${res.status}`);
+  }
+  return json;
+}
+
+//──────────────────────────────────────────────────────────────────────────────
+//  Tabs
+//──────────────────────────────────────────────────────────────────────────────
+$$("nav button").forEach(b => b.addEventListener("click", () => {
+  $$("nav button").forEach(x => x.classList.toggle("on", x===b));
+  $$("section[data-pane]").forEach(s => s.hidden = s.dataset.pane !== b.dataset.tab);
+  if (b.dataset.tab === "inventory") refreshInventory();
+  if (b.dataset.tab === "market")    refreshMarket();
+  if (b.dataset.tab === "dev")       refreshShopCatalog();
+}));
+
+//──────────────────────────────────────────────────────────────────────────────
+//  Wallet pane
+//──────────────────────────────────────────────────────────────────────────────
+$("#serverPreset").addEventListener("change", e => {
+  if (e.target.value === "custom") { $("#serverUrl").focus(); return; }
+  $("#serverUrl").value = e.target.value;
+  state.serverUrl = e.target.value; save(); ping();
+});
+$("#serverUrl").addEventListener("change", e => {
+  state.serverUrl = e.target.value; save(); ping();
+});
+$("#mnemonic").value = state.mnemonic || "";
+$("#serverUrl").value = state.serverUrl;
+
+$("#btnPing").addEventListener("click", ping);
+async function ping() {
+  const pill = $("#netPill");
+  pill.className = "pill"; pill.textContent = "…";
+  try {
+    const r = await fetch(state.serverUrl.replace(/\/$/,"") + "/api/v1/status");
+    if (r.ok) { pill.className = "pill live"; pill.textContent = "online"; }
+    else      { pill.className = "pill dead"; pill.textContent = "HTTP " + r.status; }
+  } catch (e) { pill.className = "pill dead"; pill.textContent = "offline"; }
+}
+
+//──────────────────────────────────────────────────────────────────────────────
+//  Profile management
+//──────────────────────────────────────────────────────────────────────────────
+function refreshProfileUi() {
+  const sel = $("#profileSelect");
+  sel.innerHTML = "";
+  const names = Object.keys(state.profiles);
+  if (names.length === 0) {
+    const opt = document.createElement("option");
+    opt.value = ""; opt.textContent = "— kein Profil —"; sel.appendChild(opt);
+  } else {
+    names.forEach(n => {
+      const opt = document.createElement("option");
+      opt.value = n;
+      opt.textContent = `${n} · ${(state.profiles[n].address||"").slice(0,10)}…`;
+      if (n === state.activeProfile) opt.selected = true;
+      sel.appendChild(opt);
+    });
+  }
+  syncActiveProfile();
+  loadActiveProgress();
+  $("#mnemonic").value = state.mnemonic || "";
+  $("#addrOut").textContent = state.address || "—";
+  $("#walletPill").textContent = state.address ? state.address.slice(0,10)+"…" : "kein Wallet";
+  $("#serverAddrOut").textContent = state.serverAddress || "—";
+}
+
+$("#profileSelect").addEventListener("change", e => {
+  persistActiveProgress();
+  state.activeProfile = e.target.value;
+  save();
+  refreshProfileUi();
+  refreshBalance();
+  refreshKills();
+  refreshHud();
+  spawnMonster();
+  refreshInventory();
+});
+
+$("#btnNewProfile").addEventListener("click", async () => {
+  const name = (prompt("Profil-Name (z.B. Spieler2):", `Spieler${Object.keys(state.profiles).length+1}`) || "").trim();
+  if (!name) return;
+  if (state.profiles[name]) return toast("bad", "Name existiert bereits");
+  try {
+    persistActiveProgress();
+    const r = await api("/api/v1/sdk/wallet/generate", { method: "POST", body: { words: 12 }});
+    state.profiles[name] = { mnemonic: r.mnemonic, address: r.address };
+    state.activeProfile = name;
+    save(); refreshProfileUi(); refreshBalance();
+    refreshKills(); refreshHud(); spawnMonster(); refreshInventory();
+    toast("ok", `Profil "${name}" erstellt`);
+  } catch (e) { toast("bad", e.message); }
+});
+
+$("#btnImportProfile").addEventListener("click", async () => {
+  const name = (prompt("Profil-Name:") || "").trim();
+  if (!name) return;
+  if (state.profiles[name]) return toast("bad", "Name existiert bereits");
+  const m = (prompt("Mnemonic einfügen (12 oder 24 Wörter):") || "").trim();
+  if (!m) return;
+  try {
+    persistActiveProgress();
+    const r = await api("/api/v1/sdk/wallet/derive", { method: "POST", body: { mnemonic: m }});
+    state.profiles[name] = { mnemonic: m, address: r.address };
+    state.activeProfile = name;
+    save(); refreshProfileUi(); refreshBalance();
+    refreshKills(); refreshHud(); spawnMonster(); refreshInventory();
+    toast("ok", `Profil "${name}" importiert`);
+  } catch (e) { toast("bad", e.message); }
+});
+
+$("#btnRenameProfile").addEventListener("click", () => {
+  if (!state.activeProfile) return;
+  const newName = (prompt("Neuer Name:", state.activeProfile) || "").trim();
+  if (!newName || newName === state.activeProfile) return;
+  if (state.profiles[newName]) return toast("bad", "Name existiert bereits");
+  const oldProgressKey = profileProgressKey();
+  state.profiles[newName] = state.profiles[state.activeProfile];
+  delete state.profiles[state.activeProfile];
+  state.activeProfile = newName;
+  if (oldProgressKey && state.profileProgress && state.profileProgress[oldProgressKey]) {
+    const newProgressKey = profileProgressKey();
+    if (newProgressKey && !state.profileProgress[newProgressKey]) {
+      state.profileProgress[newProgressKey] = state.profileProgress[oldProgressKey];
+      delete state.profileProgress[oldProgressKey];
+    }
+  }
+  save(); refreshProfileUi();
+});
+
+$("#btnDeleteProfile").addEventListener("click", () => {
+  if (!state.activeProfile) return;
+  if (!confirm(`Profil "${state.activeProfile}" wirklich löschen? (Mnemonic geht verloren!)`)) return;
+  const doomed = state.profiles[state.activeProfile];
+  const doomedKey = doomed?.address || state.activeProfile;
+  persistActiveProgress();
+  delete state.profiles[state.activeProfile];
+  if (doomedKey && state.profileProgress) delete state.profileProgress[doomedKey];
+  state.activeProfile = Object.keys(state.profiles)[0] || "";
+  save(); refreshProfileUi(); refreshBalance();
+  refreshKills(); refreshHud(); spawnMonster(); refreshInventory();
+});
+
+$("#btnUseActiveAsServer").addEventListener("click", () => {
+  if (!state.mnemonic) return toast("bad", "Kein aktives Profil");
+  state.serverMnemonic = state.mnemonic;
+  state.serverAddress  = state.address;
+  save();
+  $("#serverAddrOut").textContent = state.serverAddress;
+  toast("ok", "Aktives Wallet ist jetzt Server-Wallet");
+});
+
+$("#btnClearServer").addEventListener("click", () => {
+  if (!confirm("Server-Wallet entfernen? Loot-Drops werden dann fehlschlagen.")) return;
+  state.serverMnemonic = ""; state.serverAddress = ""; save();
+  $("#serverAddrOut").textContent = "—";
+});
+
+$("#btnForget").addEventListener("click", () => {
+  if (!confirm("ALLES (alle Profile, Server-Wallet, lokaler State) löschen?")) return;
+  localStorage.removeItem(STORE_KEY);
+  localStorage.removeItem(LEGACY_KEY);
+  location.reload();
+});
+
+$("#btnRefreshBal").addEventListener("click", refreshBalance);
+
+async function refreshBalance() {
+  if (!state.address) { $("#balMain").textContent="—"; $("#balGame").textContent="—"; return; }
+  try {
+    const r = await api(`/api/v1/sdk/wallet/balance?wallet=${state.address}`);
+    $("#balMain").textContent = r.main_balance ?? "—";
+    const g = (r.game_wallets || []).find(w => w.game_id === state.gameId);
+    $("#balGame").textContent = g ? g.balance : "—";
+  } catch (e) { /* still showing previous */ }
+  try {
+    const r = await fetch(state.serverUrl.replace(/\/$/,"") + "/api/v1/token/market");
+    if (r.ok) {
+      const j = await r.json();
+      const p = j.market && j.market.current_price;
+      if (p) $("#oracleRate").textContent = Number(p).toFixed(4);
+    }
+  } catch {}
+}
+
+refreshProfileUi();
+ping();
+setTimeout(refreshBalance, 400);
+
+//──────────────────────────────────────────────────────────────────────────────
+//  Developer pane: register game + create shop items
+//──────────────────────────────────────────────────────────────────────────────
+$("#gameId").value     = state.gameId || "";
+$("#apiKeyOut").textContent = state.apiKey ? state.apiKey.slice(0,16)+"…" : "—";
+$("#apiKeyInput").value = state.apiKey || "";
+
+async function connectApiKeyAndLoadGame(requireGameId = false) {
+  const key = $("#apiKeyInput").value.trim() || state.apiKey;
+  const wantedId = $("#gameId").value.trim() || state.gameId;
+  if (!key) throw new Error("API-Key fehlt");
+  if (requireGameId && !wantedId) throw new Error("game_id fehlt");
+
+  const dash = await api("/api/v1/sdk/developer/dashboard", {
+    method: "GET",
+    headers: { "Content-Type": "application/json", "X-SDK-Key": key },
+  });
+
+  const loadedGameId = dash?.game?.game_id;
+  if (!loadedGameId) throw new Error("API-Key gültig, aber kein Spiel gefunden");
+  if (wantedId && loadedGameId !== wantedId) {
+    throw new Error(`API-Key gehört zu '${loadedGameId}', nicht zu '${wantedId}'`);
+  }
+
+  state.apiKey = key;
+  state.gameId = loadedGameId;
+  state.ownerWallet = dash?.developer_wallet || state.ownerWallet || "";
+  save();
+  $("#gameId").value = loadedGameId;
+  $("#gameName").value = dash?.game?.name || $("#gameName").value;
+  $("#apiKeyInput").value = key;
+  $("#apiKeyOut").textContent = key.slice(0,16) + "…";
+  if (state.ownerWallet) {
+    $("#serverAddrOut").textContent = state.ownerWallet;
+  }
+  return dash;
+}
+
+function findProfileByAddress(address) {
+  if (!address) return null;
+  return Object.entries(state.profiles).find(([, p]) => p.address === address) || null;
+}
+
+async function ensureDropServerWallet() {
+  const gid = state.gameId || $("#gameId").value.trim();
+  if (!gid) throw new Error("Kein Spiel geladen");
+  if (!state.apiKey) throw new Error("API-Key fehlt. Bitte im Developer-Tab verbinden.");
+
+  const servers = await api(`/api/v1/sdk/game/${encodeURIComponent(gid)}/servers`);
+  const owner = servers.owner;
+  state.ownerWallet = owner || state.ownerWallet || "";
+
+  const authorized = new Set([owner]);
+  for (const s of (servers.servers || [])) {
+    if (!s.revoked_at) authorized.add(s.pubkey);
+  }
+
+  if (state.serverMnemonic && state.serverAddress && authorized.has(state.serverAddress)) {
+    return;
+  }
+
+  const ownerProfile = findProfileByAddress(owner);
+  const activeAddr = state.address;
+
+  if (activeAddr && state.mnemonic && authorized.has(activeAddr)) {
+    state.serverMnemonic = state.mnemonic;
+    state.serverAddress = activeAddr;
+    save();
+    $("#serverAddrOut").textContent = state.serverAddress;
+    return;
+  }
+
+  if (ownerProfile && activeAddr && state.mnemonic && activeAddr !== owner && !authorized.has(activeAddr)) {
+    const ownerMnemonic = ownerProfile[1].mnemonic;
+    await api("/api/v1/sdk/game/server/add", {
+      method: "POST",
+      body: {
+        owner_mnemonic: ownerMnemonic,
+        game_id: gid,
+        server_pubkey: activeAddr,
+        label: `auto-${state.activeProfile || "player"}`,
+      },
+    });
+    state.serverMnemonic = state.mnemonic;
+    state.serverAddress = activeAddr;
+    save();
+    $("#serverAddrOut").textContent = state.serverAddress;
+    toast("ok", "Aktives Profil wurde automatisch als Server-Key autorisiert");
+    return;
+  }
+
+  if (ownerProfile) {
+    state.serverMnemonic = ownerProfile[1].mnemonic;
+    state.serverAddress = owner;
+    save();
+    $("#serverAddrOut").textContent = state.serverAddress;
+    return;
+  }
+
+  state.serverMnemonic = "";
+  state.serverAddress = owner || state.serverAddress;
+  save();
+  $("#serverAddrOut").textContent = state.serverAddress || "—";
+  throw new Error(
+    `Owner-Wallet ${owner} nicht lokal vorhanden. Bitte Owner-Mnemonic als Profil importieren oder aktives Profil einmalig als Server-Key freischalten.`
+  );
+}
+
+$("#btnUseApiKey").addEventListener("click", async () => {
+  try {
+    const dash = await connectApiKeyAndLoadGame(false);
+    await ensureDropServerWallet();
+    toast("ok", `API-Key verbunden · ${dash.game?.game_id || state.gameId}`);
+    refreshServerKeys();
+  } catch (e) {
+    toast("bad", e.message);
+  }
+});
+
+$("#btnRegisterGame").addEventListener("click", async () => {
+  const id = $("#gameId").value.trim();
+  if (!state.address) return toast("bad", "Wallet zuerst laden");
+  if (!id) return toast("bad", "game_id fehlt");
+  try {
+    const r = await api("/api/v1/sdk/quick-register", { method: "POST", body: {
+      game_id: id,
+      name: $("#gameName").value || id,
+      description: "Stone Dungeon Test",
+      website: "",
+      max_daily_limit: $("#gameLimit").value || "1000",
+      permissions: ["basic","marketplace","assets"],
+      developer_pubkey: state.address,
+    }});
+    state.gameId = id; state.apiKey = r.api_key;
+    state.ownerWallet = state.address;
+    // Wallet, das das Spiel registriert hat == Server-Wallet (developer_wallet).
+    state.serverMnemonic = state.mnemonic;
+    state.serverAddress  = state.address;
+    save();
+    $("#apiKeyOut").textContent = r.api_key.slice(0,16)+"…";
+    $("#apiKeyInput").value = r.api_key;
+    $("#serverAddrOut").textContent = state.serverAddress;
+    toast("ok", `Game registriert · Server-Wallet ${state.serverAddress.slice(0,10)}…`);
+  } catch (e) { toast("bad", e.message); }
+});
+
+$("#btnLoadGame").addEventListener("click", async () => {
+  try {
+    const dash = await connectApiKeyAndLoadGame(true);
+    await ensureDropServerWallet();
+    toast("ok", `Game "${dash.game?.name||state.gameId}" geladen`);
+    refreshServerKeys();
+  } catch (e) { toast("bad", e.message); }
+});
+
+$("#btnClaimGame").addEventListener("click", async () => {
+  const id = $("#gameId").value.trim();
+  if (!state.mnemonic) return toast("bad", "Wallet zuerst laden");
+  if (!id) return toast("bad", "game_id fehlt (die on-chain registrierte ID)");
+  try {
+    const r = await api("/api/v1/sdk/claim", { method: "POST", body: {
+      mnemonic: state.mnemonic,
+      game_id: id,
+      max_wallet_limit: $("#gameLimit").value || "1000",
+      permissions: ["basic","marketplace","assets"],
+    }});
+    state.gameId = id; state.apiKey = r.api_key;
+    state.ownerWallet = state.address;
+    state.serverMnemonic = state.mnemonic;
+    state.serverAddress  = state.address;
+    save();
+    $("#apiKeyOut").textContent = r.api_key.slice(0,16)+"…";
+    $("#apiKeyInput").value = r.api_key;
+    $("#serverAddrOut").textContent = state.serverAddress;
+    toast("ok", `On-Chain-Spiel "${r.name||id}" geclaimt · Server-Wallet ${state.serverAddress.slice(0,10)}…`);
+  } catch (e) { toast("bad", e.message); }
+});
+
+$("#btnRotateApiKey").addEventListener("click", async () => {
+  const gid = state.gameId || $("#gameId").value.trim();
+  if (!gid) return toast("bad", "Kein Spiel geladen");
+  if (!state.mnemonic) return toast("bad", "Owner-Wallet (mnemonic) zuerst laden");
+  if (!confirm(`⚠️  API-Key für "${gid}" rotieren?\n\nDer alte Key wird SOFORT ungültig.\nDer neue Key wird nur EINMAL angezeigt.\n\nFortfahren?`)) return;
+  try {
+    // 1) Challenge anfordern (server bindet action+game_id+nonce+owner_wallet in canonical_message)
+    const c = await api("/api/v1/sdk/owner/challenge", { method: "POST", body: {
+      game_id: gid,
+      action: "rotate_api_key",
+    }});
+    // 2) canonical_message lokal mit Owner-Wallet signieren (Dev-Helper /sdk/wallet/sign)
+    const s = await api("/api/v1/sdk/wallet/sign", { method: "POST", body: {
+      mnemonic: state.mnemonic,
+      message:  c.canonical_message,
+    }});
+    if (s.address !== c.owner_wallet) {
+      return toast("bad", `Owner-Mismatch: dein Wallet ${s.address.slice(0,10)}… ist nicht Owner (${c.owner_wallet.slice(0,10)}…)`);
+    }
+    // 3) Rotation ausführen
+    const r = await api("/api/v1/sdk/owner/api-key/rotate", { method: "POST", body: {
+      game_id: gid,
+      challenge_id: c.challenge_id,
+      signature: s.signature,
+    }});
+    state.apiKey = r.api_key;
+    save();
+    $("#apiKeyOut").textContent = r.api_key.slice(0,16)+"…";
+    $("#apiKeyInput").value = r.api_key;
+    // Einmal-Anzeige im Klartext (Copy-Dialog)
+    prompt(`✅ Neuer API-Key (NUR EINMAL angezeigt — jetzt kopieren!):\n\nWarnung: Der alte Key ist tot.`, r.api_key);
+    toast("ok", `API-Key rotiert für "${gid}"`);
+  } catch (e) { toast("bad", `Rotate fehlgeschlagen: ${e.message}`); }
+});
+
+//──────────────────────────────────────────────────────────────────────────────
+//  Server-Key-Manager
+//──────────────────────────────────────────────────────────────────────────────
+
+$("#btnUseActiveAsKey").addEventListener("click", () => {
+  if (!state.address) return toast("bad", "Kein aktives Profil");
+  $("#serverKeyInput").value = state.address;
+  if (!$("#serverKeyLabel").value.trim()) {
+    $("#serverKeyLabel").value = state.activeProfile || "active";
+  }
+});
+
+$("#btnAddServerKey").addEventListener("click", async () => {
+  const gid = state.gameId || $("#gameId").value.trim();
+  if (!gid) return toast("bad", "Kein Spiel geladen");
+  const pubkey = $("#serverKeyInput").value.trim();
+  if (!pubkey) return toast("bad", "Server-Pubkey fehlt");
+  // Owner-Mnemonic = aktuell geladenes Profil (state.mnemonic).
+  if (!state.mnemonic) return toast("bad", "Aktives Profil hat keinen Mnemonic");
+  try {
+    const r = await api("/api/v1/sdk/game/server/add", { method: "POST", body: {
+      owner_mnemonic: state.mnemonic,
+      game_id:        gid,
+      server_pubkey:  pubkey,
+      label:          $("#serverKeyLabel").value.trim() || "unnamed",
+    }});
+    toast("ok", `Server-Key hinzugefügt: ${r.server.label}`);
+    $("#serverKeyInput").value = ""; $("#serverKeyLabel").value = "";
+    refreshServerKeys();
+  } catch (e) { toast("bad", e.message); }
+});
+
+$("#btnRefreshServerKeys").addEventListener("click", refreshServerKeys);
+
+async function refreshServerKeys() {
+  const gid = state.gameId || $("#gameId").value.trim();
+  const box = $("#serverKeysList");
+  if (!gid) { box.innerHTML = `<div class="muted">Kein Spiel geladen.</div>`; return; }
+  try {
+    const r = await api(`/api/v1/sdk/game/${encodeURIComponent(gid)}/servers`);
+    const rows = [];
+    rows.push(`<div class="card"><div class="name">👑 Owner</div>
+      <div class="meta addr">${escapeHtml(r.owner)}</div>
+      <div class="muted" style="margin-top:.2rem">immer autorisiert · darf Keys verwalten</div></div>`);
+    for (const s of (r.servers || [])) {
+      const active = !s.revoked_at;
+      const isMe = state.address === s.pubkey;
+      rows.push(`<div class="card">
+        <div class="name">${active ? "🔑" : "⛔"} ${escapeHtml(s.label || "unnamed")} ${isMe ? '<span class="rarity rar-rare">aktives Profil</span>' : ""}</div>
+        <div class="meta addr">${escapeHtml(s.pubkey)}</div>
+        <div class="muted" style="margin-top:.2rem">
+          Status: <strong>${active ? "aktiv" : "revoziert"}</strong>
+          · seit ${new Date(s.added_at*1000).toLocaleString()}
+          ${s.revoked_at ? ` · revoziert ${new Date(s.revoked_at*1000).toLocaleString()}` : ""}
+        </div>
+        ${active ? `<div class="row" style="margin-top:.5rem"><button data-revoke="${escapeHtml(s.pubkey)}" class="ghost">Revozieren</button></div>` : ""}
+      </div>`);
+    }
+    box.innerHTML = `<div class="grid">${rows.join("")}</div>`;
+    box.querySelectorAll("[data-revoke]").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        if (!state.mnemonic) return toast("bad", "Kein Owner-Mnemonic im aktiven Profil");
+        const pk = btn.getAttribute("data-revoke");
+        if (!confirm(`Server-Key ${pk.slice(0,16)}… wirklich revozieren?`)) return;
+        try {
+          await api("/api/v1/sdk/game/server/revoke", { method: "POST", body: {
+            owner_mnemonic: state.mnemonic, game_id: gid, server_pubkey: pk,
+          }});
+          toast("warn", "Server-Key revoziert");
+          refreshServerKeys();
+        } catch (e) { toast("bad", e.message); }
+      });
+    });
+  } catch (e) { box.innerHTML = `<div class="muted">${escapeHtml(e.message)}</div>`; }
+}
+
+// Server-Keys bei Tab-Wechsel zum Developer-Tab laden.
+document.querySelector('[data-tab="dev"]')?.addEventListener("click", () => {
+  setTimeout(refreshServerKeys, 50);
+});
+
+$("#btnCreateShop").addEventListener("click", async () => {
+  if (!state.apiKey) return toast("bad", "Game zuerst registrieren");
+  const body = {
+    shop_item_id: $("#shopId").value.trim() || ("item-"+Date.now()),
+    name:         $("#shopName").value.trim() || "Mystery Item",
+    description:  "Dungeon Loot",
+    price:        $("#shopPrice").value || "1",
+    rarity:       $("#shopRarity").value,
+  };
+  try {
+    await api(`/api/v1/sdk/shop/item`, {
+      method: "POST",
+      headers: { "Content-Type":"application/json", "X-SDK-Key": state.apiKey },
+      body,
+    });
+    toast("ok", "Shop-Item angelegt");
+    refreshShopCatalog();
+  } catch (e) { toast("bad", e.message); }
+});
+
+$("#btnLoadShop").addEventListener("click", refreshShopCatalog);
+async function refreshShopCatalog() {
+  if (!state.gameId) return;
+  try {
+    const r = await api(`/api/v1/sdk/shop/catalog?game_id=${encodeURIComponent(state.gameId)}`);
+    const grid = $("#shopCatalog"); grid.innerHTML = "";
+    (r.items || []).forEach(si => {
+      grid.appendChild(renderShopCard(si));
+    });
+  } catch (e) { /* leise */ }
+}
+function renderShopCard(si) {
+  const d = document.createElement("div");
+  d.className = "card";
+  d.innerHTML = `
+    <div class="name">${escapeHtml(si.name)}</div>
+    <div class="meta"><span class="rarity rar-${si.rarity}">${si.rarity}</span> · ${si.category||"shop"}</div>
+    <div class="price">${si.price} STONE</div>
+    <div class="meta">verkauft: ${si.sold||0}${si.stock?(" / "+si.stock):""}</div>
+  `;
+  return d;
+}
+
+//──────────────────────────────────────────────────────────────────────────────
+//  Dungeon — Combat-Engine (Phase 2)
+//──────────────────────────────────────────────────────────────────────────────
+
+// Stage-Definitionen: progressiver Schwierigkeitsgrad.
+// Balance-Idee: Player-Base = 5 ATK / 0 DEF / 100 HP / 5% CRIT.
+// Ohne Equipment ist man bis Stage 2-3 ok, danach **muss** man droppen.
+// Differenz Player-ATK vs Monster-ATK bestimmt grob die Gewinnchance:
+//   diff = +2 → klarer Vorteil, diff = 0 → 50/50, diff = -2 → klar im Nachteil.
+const STAGES = [
+  // tier = Loot-Bias: 0=common-only … 5=legendary möglich
+  { from: 1,  to: 2,  tier: 0, pool: [{ name:"Slime",     emoji:"🟢", hp: 20,  atk: 3,  def: 0 }] },
+  { from: 3,  to: 5,  tier: 1, pool: [{ name:"Goblin",    emoji:"👺", hp: 35,  atk: 5,  def: 1 },
+                                       { name:"Ratte",    emoji:"🐀", hp: 30,  atk: 4,  def: 0 }] },
+  { from: 6,  to: 9,  tier: 2, pool: [{ name:"Skelett",   emoji:"💀", hp: 55,  atk: 7,  def: 2 },
+                                       { name:"Zombie",    emoji:"🧟", hp: 70,  atk: 6,  def: 2 }] },
+  { from: 10, to: 14, tier: 3, pool: [{ name:"Ork",       emoji:"👹", hp: 100, atk: 10, def: 4 },
+                                       { name:"Werwolf",   emoji:"🐺", hp: 85,  atk: 12, def: 3 }] },
+  { from: 15, to: 22, tier: 4, pool: [{ name:"Troll",     emoji:"🧌", hp: 150, atk: 15, def: 6 },
+                                       { name:"Vampir",    emoji:"🧛", hp: 130, atk: 18, def: 5 }] },
+  { from: 23, to: 99, tier: 5, pool: [{ name:"Drache",    emoji:"🐉", hp: 250, atk: 24, def: 10 },
+                                       { name:"Lich-Lord", emoji:"👻", hp: 220, atk: 28, def: 8 }] },
+];
+
+function stageDef(stage) {
+  return STAGES.find(s => stage >= s.from && stage <= s.to) || STAGES[STAGES.length-1];
+}
+
+// Player-Stats: Base + alle ausgerüsteten Slots summiert.
+// Base atk = 5 (statt 10) damit Equipment-Bonus von ~3-15 wirklich was bewirkt.
+function playerStats() {
+  let atk  = 5, def = 0, crit = 5;
+  let effect = null, effect_pct = 25;
+  // Slots in EQUIP_SLOTS-Reihenfolge → Waffen-Effekt hat Priorität, dann Relikt.
+  for (const slot of EQUIP_SLOTS) {
+    const eq = state.equipment[slot];
+    if (!eq) continue;
+    const m = eq.metadata || {};
+    atk  += Number(m.damage     || 0);
+    def  += Number(m.armor      || 0);
+    crit += Number(m.crit_bonus || 0);
+    if (!effect && m.effect) {
+      effect = m.effect;
+      effect_pct = Number(m.effect_pct || 25);
+    }
+  }
+  return {
+    hp_max:    100,
+    atk, def,
+    crit_pct:  crit,
+    crit_mul:  2,
+    effect, effect_pct,
+  };
+}
+
+let monster = null;
+let monsterMaxHp = 1;
+let isDead = false;
+let attackBusy = false;
+
+function refreshHud() {
+  const s = playerStats();
+  $("#statAtk").textContent  = s.atk;
+  $("#statDef").textContent  = s.def;
+  $("#statCrit").textContent = s.crit_pct;
+  $("#playerHpText").textContent = `${Math.max(0, Math.round(state.playerHp))}/${s.hp_max}`;
+  $("#playerHpBar").style.width = Math.max(0, (state.playerHp / s.hp_max) * 100) + "%";
+
+  const eqSlots = EQUIP_SLOTS
+    .map(slot => state.equipment[slot] ? { slot, item: state.equipment[slot] } : null)
+    .filter(Boolean);
+  if (eqSlots.length) {
+    $("#equippedLine").innerHTML = "Ausgerüstet: " + eqSlots.map(({slot, item}) => {
+      const eff = item.metadata && item.metadata.effect
+        ? ` <span class="effect-tag ${item.metadata.effect}">${item.metadata.effect}</span>` : "";
+      return `<span title="${SLOT_LABEL[slot]}">${SLOT_EMOJI[slot]} <strong>${escapeHtml(item.name)}</strong> <span class="rarity rar-${item.rarity}">${item.rarity}</span>${eff}</span>`;
+    }).join(" · ");
+  } else {
+    $("#equippedLine").innerHTML = `Ausgerüstet: <strong>— bloße Fäuste —</strong>`;
+  }
+  refreshPower();
+}
+
+// Effective "Kampfkraft" = roher Damage-Output unter Berücksichtigung der DEF
+// des Gegners. Für die Anzeige reicht eine einfache Heuristik.
+function refreshPower() {
+  if (!monster) return;
+  const s = playerStats();
+  // Effektive Schlagkraft beider Seiten (max 1, damit immer was rauskommt).
+  const pPower = Math.max(1, s.atk - monster.def);
+  const mPower = Math.max(1, monster.atk - s.def);
+  const total  = pPower + mPower;
+  const pPct   = Math.round((pPower / total) * 100);
+  $("#powerPlayer").textContent  = pPower;
+  $("#powerMonster").textContent = mPower;
+  $("#powerSplit").style.width   = pPct + "%";
+
+  const diff = pPower - mPower;
+  let verdict, color;
+  if      (diff >=  4) { verdict = "🟢 klarer Vorteil";  color = "#4ade80"; }
+  else if (diff >=  2) { verdict = "🟢 Vorteil dir";     color = "#86efac"; }
+  else if (diff >= -1) { verdict = "⚖️ ausgeglichen";    color = "#fde68a"; }
+  else if (diff >= -3) { verdict = "🔴 Gegner stärker"; color = "#fca5a5"; }
+  else                 { verdict = "💀 chancenlos";      color = "#f87171"; }
+  const v = $("#powerVerdict");
+  v.textContent = verdict; v.style.color = color;
+}
+
+function refreshKills() {
+  $("#killCount").textContent  = state.kills;
+  $("#lootCount").textContent  = state.loot;
+  $("#stageCount").textContent = state.stage;
+  $("#stage").textContent      = state.stage;
+  $("#stageMonsterPool").textContent = stageDef(state.stage).pool.map(p=>p.name).join(" / ");
+}
+
+function spawnMonster() {
+  const def = stageDef(state.stage);
+  const proto = def.pool[Math.floor(Math.random() * def.pool.length)];
+  monster = { ...proto, hp_max: proto.hp };
+  monsterMaxHp = proto.hp;
+  $("#monsterEmoji").textContent = monster.emoji;
+  $("#monsterName").textContent  = monster.name;
+  $("#monsterHp").style.width = "100%";
+  $("#monHpText").textContent = `${monster.hp}/${monster.hp_max}`;
+  $("#monAtk").textContent    = monster.atk;
+  $("#monDef").textContent    = monster.def;
+  $("#dungeonArena .death-overlay")?.remove();
+  isDead = false;
+  $("#btnAttack").disabled = false;
+  refreshPower();
+}
+
+// Floating damage number bei x,y relativ zur Arena.
+function spawnDmg(text, kind="") {
+  const arena = $("#dungeonArena");
+  const el = document.createElement("div");
+  el.className = `dmg-float ${kind}`;
+  el.textContent = text;
+  // Position: zentral oben, leichte zufällige X-Streuung
+  const jitter = (Math.random() - 0.5) * 60;
+  el.style.left = `calc(50% + ${jitter}px)`;
+  el.style.top  = "30%";
+  arena.appendChild(el);
+  setTimeout(() => el.remove(), 950);
+}
+
+function spawnPlayerHit(text) {
+  const arena = $("#dungeonArena");
+  const el = document.createElement("div");
+  el.className = "dmg-float player-hit";
+  el.textContent = text;
+  el.style.left = "50%";
+  el.style.top  = "70%";
+  arena.appendChild(el);
+  setTimeout(() => el.remove(), 950);
+}
+
+function playerAttack() {
+  const s = playerStats();
+  const isCrit = Math.random() * 100 < s.crit_pct;
+  // Schaden-Streuung ±15%
+  const variance = 0.85 + Math.random() * 0.3;
+  let dmg = Math.max(1, Math.round((s.atk * variance) - monster.def));
+  if (isCrit) dmg = Math.round(dmg * s.crit_mul);
+  monster.hp -= dmg;
+
+  spawnDmg(isCrit ? `${dmg} CRIT!` : `${dmg}`, isCrit ? "crit" : "");
+
+  // Effekt-Trigger (z.B. Fire-DoT, Lifesteal, …)
+  if (s.effect && Math.random() * 100 < s.effect_pct) {
+    applyEffect(s.effect, dmg);
+  }
+  return dmg;
+}
+
+function applyEffect(effect, baseDmg) {
+  switch (effect) {
+    case "fire": {
+      // Fire-DoT: 3× über je 200ms, ~30% des Hits
+      let ticks = 3;
+      const tickDmg = Math.max(1, Math.round(baseDmg * 0.3));
+      const iv = setInterval(() => {
+        if (!monster || monster.hp <= 0) { clearInterval(iv); return; }
+        monster.hp -= tickDmg;
+        spawnDmg(`🔥 ${tickDmg}`, "");
+        updateMonsterUI();
+        if (--ticks <= 0) clearInterval(iv);
+      }, 200);
+      break;
+    }
+    case "poison": {
+      let ticks = 5;
+      const tickDmg = Math.max(1, Math.round(baseDmg * 0.15));
+      const iv = setInterval(() => {
+        if (!monster || monster.hp <= 0) { clearInterval(iv); return; }
+        monster.hp -= tickDmg;
+        spawnDmg(`☠ ${tickDmg}`, "");
+        updateMonsterUI();
+        if (--ticks <= 0) clearInterval(iv);
+      }, 300);
+      break;
+    }
+    case "ice": {
+      // Monster verfehlt nächsten Counter
+      monster.frozen = true;
+      spawnDmg("❄ FROZEN", "");
+      break;
+    }
+    case "lifesteal": {
+      const heal = Math.round(baseDmg * 0.2);
+      state.playerHp = Math.min(playerStats().hp_max, state.playerHp + heal);
+      spawnPlayerHit(`+${heal} ❤`);
+      break;
+    }
+  }
+}
+
+function monsterCounter() {
+  if (monster.frozen) {
+    monster.frozen = false;
+    return 0;
+  }
+  const s = playerStats();
+  const variance = 0.85 + Math.random() * 0.3;
+  let dmg = Math.max(0, Math.round((monster.atk * variance) - s.def));
+  // 10% Miss-Chance
+  if (Math.random() < 0.10) {
+    spawnPlayerHit("MISS");
+    return 0;
+  }
+  state.playerHp -= dmg;
+  spawnPlayerHit(`-${dmg}`);
+  return dmg;
+}
+
+function updateMonsterUI() {
+  if (!monster) return;
+  $("#monsterHp").style.width = Math.max(0, (monster.hp / monsterMaxHp) * 100) + "%";
+  $("#monHpText").textContent = `${Math.max(0, Math.round(monster.hp))}/${monster.hp_max}`;
+}
+
+function showDeath() {
+  isDead = true;
+  $("#btnAttack").disabled = true;
+  const ov = document.createElement("div");
+  ov.className = "death-overlay";
+  ov.innerHTML = `
+    <h3>💀 GAME OVER</h3>
+    <div class="muted">Du bist auf Stage ${state.stage} gefallen nach ${state.kills} Kills.</div>
+    <button class="primary" id="btnRespawn">↻ Respawn (Stage 1)</button>
+  `;
+  $("#dungeonArena").appendChild(ov);
+  ov.querySelector("#btnRespawn").addEventListener("click", () => {
+    state.playerHp = playerStats().hp_max;
+    state.stage = 1;
+    save(); refreshKills(); refreshHud();
+    spawnMonster();
+    toast("warn", "Du wurdest wiederbelebt. Loot bleibt im Inventar.");
+  });
+}
+
+$("#btnAttack").addEventListener("click", async () => {
+  if (isDead || attackBusy || !monster) return;
+  attackBusy = true;
+  try {
+    $("#monsterEmoji").classList.add("hit");
+    setTimeout(() => $("#monsterEmoji").classList.remove("hit"), 200);
+    playerAttack();
+    updateMonsterUI();
+
+    if (monster.hp <= 0) {
+      state.kills++;
+      // Stage-Aufstieg alle 3 Kills
+      let stagedUp = false;
+      if (state.kills % 3 === 0) {
+        state.stage++;
+        stagedUp = true;
+        toast("ok", `📈 Stage ${state.stage}!`);
+      }
+      save(); refreshKills();
+      monster = null;
+      await triggerLoot();
+
+      // Alle 5 Stages: Schrein statt nächstes Monster.
+      if (stagedUp && state.stage % 5 === 0) {
+        setTimeout(openShrine, 400);
+        return;
+      }
+      setTimeout(spawnMonster, 350);
+      return;
+    }
+
+    // Monster schlägt zurück
+    monsterCounter();
+    refreshHud();
+    save();
+    if (state.playerHp <= 0) {
+      state.playerHp = 0; save(); refreshHud();
+      showDeath();
+    }
+  } finally {
+    attackBusy = false;
+  }
+});
+
+$("#btnResetDungeon").addEventListener("click", () => {
+  if (!confirm("Dungeon-Fortschritt zurücksetzen?\nKills, Stage, HP und Ausrüstung werden zurückgesetzt.\nInventar bleibt erhalten.")) return;
+  state.playerHp     = 100;
+  state.playerHpMax  = 100;
+  state.stage        = 1;
+  state.kills        = 0;
+  state.loot         = 0;
+  state.equippedItemId = "";
+  state.equippedItem   = null;
+  state.equipment      = {};
+  state.shrineSeen   = [];
+  save();
+  $("#dungeonArena .shrine-overlay")?.remove();
+  refreshKills(); refreshHud(); spawnMonster();
+  toast("ok", "Dungeon zurückgesetzt — Stage 1, Volle HP");
+});
+
+// Quick-Heal: konsumiert stärksten Trank aus dem Inventar.
+$("#btnQuickHeal").addEventListener("click", async () => {
+  const pots = listPotions();
+  if (!pots.length) return toast("warn", "Kein Heiltrank im Inventar");
+  const it = pots[0];
+  const max = playerStats().hp_max;
+  if (state.playerHp >= max) return toast("warn", "HP bereits voll");
+  const heal = Number(it.metadata.heal || 0);
+  const btn = $("#btnQuickHeal"); btn.disabled = true;
+  try {
+    await api("/api/v1/sdk/game/burn", { method: "POST", body: {
+      mnemonic: state.mnemonic, item_id: it.item_id,
+    }});
+    const before = state.playerHp;
+    state.playerHp = Math.min(max, state.playerHp + heal);
+    save();
+    spawnPlayerHit(`+${state.playerHp - before} ❤`);
+    refreshHud();
+    toast("ok", `🧪 ${it.name} → +${state.playerHp - before} HP`);
+    refreshInventory();
+  } catch (e) {
+    toast("bad", "Heilen: " + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+});
+
+//──────────────────────────────────────────────────────────────────────────────
+//  Schrein-Etagen (alle 5 Stages) — Spieler wählt 1 von 3 Items
+//──────────────────────────────────────────────────────────────────────────────
+function openShrine() {
+  const arena = $("#dungeonArena");
+  if (!arena || arena.querySelector(".shrine-overlay")) return;
+  // Gegen Doppel-Trigger pro Stage absichern.
+  if (state.shrineSeen?.includes(state.stage)) {
+    spawnMonster(); return;
+  }
+
+  // Drei Loot-Optionen würfeln. Erste forcieren wir auf Heiltrank,
+  // damit der Spieler zwischen "heilen" oder "Power" wählen kann.
+  const picks = [
+    forceLootCategory(generateLoot(state.stage), "potion"),
+    generateLoot(state.stage),
+    generateLoot(state.stage),
+  ];
+
+  const ov = document.createElement("div");
+  ov.className = "shrine-overlay";
+  ov.innerHTML = `
+    <h3>⛩ Schrein der Stage ${state.stage}</h3>
+    <div class="muted">Wähle EINE Belohnung — die anderen verfallen.</div>
+    <div class="shrine-grid">
+      ${picks.map((p,i) => `
+        <div class="shrine-card" data-pick="${i}">
+          <div class="em">${p.emoji || "✨"}</div>
+          <div class="nm">${escapeHtml(p.name)}</div>
+          <div class="meta"><span class="rarity rar-${p.rarity}">${p.rarity}</span></div>
+          <div class="meta">${shrineStatLine(p)}</div>
+        </div>
+      `).join("")}
+    </div>
+  `;
+  arena.appendChild(ov);
+
+  ov.querySelectorAll(".shrine-card").forEach(card => {
+    card.addEventListener("click", async () => {
+      const idx = Number(card.getAttribute("data-pick"));
+      const pick = picks[idx];
+      // Doppelclick verhindern.
+      ov.querySelectorAll(".shrine-card").forEach(c => c.style.pointerEvents = "none");
+      card.style.borderColor = "#ffd966";
+      try {
+        await triggerLootFromPick(pick);
+        state.shrineSeen = state.shrineSeen || [];
+        state.shrineSeen.push(state.stage);
+        save();
+        ov.remove();
+        toast("ok", `⛩ Belohnung erhalten: ${pick.name}`);
+        setTimeout(spawnMonster, 250);
+      } catch (e) {
+        toast("bad", "Schrein: " + e.message);
+        ov.querySelectorAll(".shrine-card").forEach(c => c.style.pointerEvents = "");
+      }
+    });
+  });
+}
+
+function forceLootCategory(loot, category) {
+  if (loot.category === category) return loot;
+  // Neu würfeln mit erzwungener Kategorie via Template-Pool.
+  const tpls = LOOT_TEMPLATES[category];
+  if (!tpls || !tpls.length) return loot;
+  const tpl = tpls[Math.floor(Math.random() * tpls.length)];
+  const fresh = generateLoot(state.stage);
+  // Übernimm Rarity vom ursprünglichen Roll, ersetze name/emoji/category/metadata.
+  fresh.category = category;
+  fresh.name     = tpl.name;
+  fresh.emoji    = tpl.emoji;
+  fresh.metadata = {};
+  if (tpl.heal) {
+    const [lo, hi] = tpl.heal;
+    const base = Math.floor(lo + Math.random() * (hi - lo + 1));
+    const mult = (typeof RARITY_MULT !== "undefined") ? (RARITY_MULT[fresh.rarity] || 1) : 1;
+    fresh.metadata.heal = Math.max(1, Math.round(base * mult));
+  }
+  return fresh;
+}
+
+function shrineStatLine(p) {
+  const m = p.metadata || {};
+  const parts = [];
+  if (m.damage)     parts.push(`⚔️ +${m.damage}`);
+  if (m.armor)      parts.push(`🛡 +${m.armor}`);
+  if (m.crit_bonus) parts.push(`💥 +${m.crit_bonus}%`);
+  if (m.heal)       parts.push(`❤ +${m.heal}`);
+  if (m.effect)     parts.push(m.effect);
+  return parts.join(" · ") || "—";
+}
+
+async function triggerLootFromPick(pick) {
+  await ensureDropServerWallet();
+  // Wie triggerLoot, aber mit explizitem name/category/rarity/metadata aus Schrein-Wahl.
+  const r = await api("/api/v1/sdk/game/drop", { method: "POST", body: {
+    game_id: state.gameId,
+    server_wallet_mnemonic: state.serverMnemonic,
+    player_wallet: state.address,
+    name: pick.name,
+    category: pick.category,
+    rarity: pick.rarity,
+    metadata: pick.metadata || {},
+    reason: `shrine-stage-${state.stage}`,
+  }});
+  state.loot = (state.loot || 0) + 1;
+  save(); refreshKills();
+  refreshInventory();
+  return r;
+}
+
+refreshKills(); refreshHud(); spawnMonster();
+// ── Loot-Generator ──────────────────────────────────────────────────────────
+// Templates pro Kategorie + Rarität-Pool. Stats werden gewürfelt.
+const LOOT_TEMPLATES = {
+  weapon: [
+    // dmg = roher ATK-Bonus VOR Rarity-Mult. Player-Base atk=5 → +3 ist spürbar.
+    { name:"Knüppel",        emoji:"🪵", dmg:[1,2]   },
+    { name:"Dolch",          emoji:"🔪", dmg:[2,3]   },
+    { name:"Kurzschwert",    emoji:"🗡", dmg:[3,5]   },
+    { name:"Streitaxt",      emoji:"🪓", dmg:[4,7]   },
+    { name:"Langschwert",    emoji:"⚔️", dmg:[6,9]   },
+    { name:"Kriegshammer",   emoji:"🔨", dmg:[8,12]  },
+    { name:"Magischer Stab", emoji:"🪄", dmg:[7,11]  },
+    { name:"Drachenklinge",  emoji:"🐲", dmg:[12,18] },
+  ],
+  armor: [
+    { name:"Lederweste",     emoji:"🦺", armor:[1,2] },
+    { name:"Kettenpanzer",   emoji:"⛓", armor:[2,4] },
+    { name:"Plattenrüstung", emoji:"🛡", armor:[4,7] },
+  ],
+  helmet: [
+    { name:"Lederkappe",     emoji:"🧢", armor:[1,1] },
+    { name:"Eisenhelm",      emoji:"⛑", armor:[1,2] },
+    { name:"Drachenhelm",    emoji:"👑", armor:[2,4], crit:[2,5] },
+  ],
+  boots: [
+    { name:"Lederstiefel",   emoji:"🥾", armor:[1,1] },
+    { name:"Stahlstiefel",   emoji:"🦶", armor:[1,3] },
+    { name:"Windschuhe",     emoji:"👟", armor:[1,2], crit:[2,4] },
+  ],
+  gloves: [
+    { name:"Lederhandschuhe",emoji:"🧤", dmg:[1,1] },
+    { name:"Krallenhandschuh",emoji:"🦅", dmg:[1,2], crit:[1,3] },
+    { name:"Berserker-Faust",emoji:"👊", dmg:[2,4] },
+  ],
+  ring: [
+    { name:"Schlichter Ring",emoji:"💍", crit:[1,3] },
+    { name:"Rubinring",      emoji:"♦️", crit:[2,5], effect:"fire" },
+    { name:"Saphirring",     emoji:"💠", crit:[2,5], effect:"ice"  },
+  ],
+  amulet: [
+    { name:"Talisman",       emoji:"🔮", crit:[2,4] },
+    { name:"Lebensmedaillon",emoji:"📿", armor:[1,3], effect:"lifesteal" },
+    { name:"Schlangenamulett",emoji:"🐍", dmg:[1,3], effect:"poison" },
+  ],
+  potion: [
+    { name:"Heiltrank",      emoji:"🧪", heal:[20,40] },
+    { name:"Stärketrank",    emoji:"🥤", buff:"atk"   },
+  ],
+  relic: [
+    { name:"Glücksstein",    emoji:"🪨", crit:[3,6]   },
+    { name:"Drachenherz",    emoji:"💎", crit:[7,12]  },
+    { name:"Phönix-Feder",   emoji:"🪶", effect:"fire"},
+  ],
+};
+
+// Rarity-Multiplier: common 1.0 → legendary 2.5. Mit weapon-base 12-18 erreicht
+// eine legendäre Drachenklinge ~+45 atk → total ~50 → klar Drache-tauglich.
+const RARITY_MULT = { common: 1.0, uncommon: 1.3, rare: 1.7, epic: 2.1, legendary: 2.5 };
+const RARITY_PREFIX = {
+  common: "",
+  uncommon: ["Geschliffene","Verbesserte","Geweihte"],
+  rare: ["Mystische","Glühende","Verzauberte"],
+  epic: ["Antike","Dämonen-","Drachen-"],
+  legendary: ["Legendäre","Götter-","Excalibur-"],
+};
+const RARITY_EFFECT_CHANCE = { common: 0, uncommon: 0, rare: 25, epic: 60, legendary: 100 };
+const EFFECTS = ["fire","poison","ice","lifesteal"];
+
+function rollRarity(stage) {
+  // tier 0..5 → Wahrscheinlichkeiten verschieben sich nach oben
+  const def = stageDef(stage);
+  const t = def.tier;
+  // Roll 0..99
+  const r = Math.random() * 100;
+  // Cumulative-Table je Tier
+  const tables = [
+    // tier 0:  common 95, uncommon 5
+    { common:95, uncommon:100 },
+    // tier 1
+    { common:80, uncommon:97, rare:100 },
+    // tier 2
+    { common:55, uncommon:85, rare:97, epic:100 },
+    // tier 3
+    { common:30, uncommon:65, rare:90, epic:99, legendary:100 },
+    // tier 4
+    { common:15, uncommon:40, rare:75, epic:95, legendary:100 },
+    // tier 5
+    { common:5,  uncommon:20, rare:50, epic:85, legendary:100 },
+  ];
+  const tab = tables[Math.min(t, tables.length-1)];
+  for (const [rar, cum] of Object.entries(tab)) {
+    if (r < cum) return rar;
+  }
+  return "common";
+}
+
+function rollInt(min, max) { return min + Math.floor(Math.random() * (max - min + 1)); }
+
+function generateLoot(stage) {
+  const rarity = rollRarity(stage);
+  const mul = RARITY_MULT[rarity];
+
+  // Kategorie wählen — gewichtete Verteilung über alle Slots.
+  // Legendaries bevorzugen Waffe/Relikt, sonstige Rarities streuen breiter.
+  let catRoll = Math.random();
+  let category;
+  if (rarity === "legendary" || rarity === "epic") {
+    category = catRoll < 0.40 ? "weapon"
+            : catRoll < 0.55 ? "relic"
+            : catRoll < 0.65 ? "armor"
+            : catRoll < 0.74 ? "helmet"
+            : catRoll < 0.82 ? "boots"
+            : catRoll < 0.88 ? "gloves"
+            : catRoll < 0.94 ? "ring"
+            : "amulet";
+  } else {
+    category = catRoll < 0.28 ? "weapon"
+            : catRoll < 0.43 ? "armor"
+            : catRoll < 0.55 ? "helmet"
+            : catRoll < 0.66 ? "boots"
+            : catRoll < 0.74 ? "gloves"
+            : catRoll < 0.81 ? "ring"
+            : catRoll < 0.87 ? "amulet"
+            : catRoll < 0.96 ? "potion"
+            : "relic";
+  }
+
+  const pool = LOOT_TEMPLATES[category];
+  const tmpl = pool[Math.floor(Math.random() * pool.length)];
+
+  // Name mit Rarity-Präfix
+  let name = tmpl.name;
+  const prefixes = RARITY_PREFIX[rarity];
+  if (Array.isArray(prefixes)) {
+    name = prefixes[Math.floor(Math.random() * prefixes.length)] + " " + name;
+  }
+
+  // Stats würfeln
+  const metadata = {};
+  if (tmpl.dmg) {
+    metadata.damage = Math.round(rollInt(tmpl.dmg[0], tmpl.dmg[1]) * mul);
+  }
+  if (tmpl.armor) {
+    metadata.armor = Math.round(rollInt(tmpl.armor[0], tmpl.armor[1]) * mul);
+  }
+  if (tmpl.crit) {
+    metadata.crit_bonus = rollInt(tmpl.crit[0], tmpl.crit[1]);
+  }
+  if (tmpl.heal) {
+    metadata.heal = Math.round(rollInt(tmpl.heal[0], tmpl.heal[1]) * mul);
+  }
+
+  // Element-Effekt — Chance je Rarität
+  const effChance = RARITY_EFFECT_CHANCE[rarity];
+  if (tmpl.effect) {
+    metadata.effect = tmpl.effect;
+    metadata.effect_pct = 30 + Math.floor(mul * 10);
+  } else if (effChance > 0 && Math.random() * 100 < effChance) {
+    metadata.effect = EFFECTS[Math.floor(Math.random() * EFFECTS.length)];
+    metadata.effect_pct = 20 + Math.floor(mul * 8);
+  }
+
+  metadata.stage_dropped = stage;
+  metadata.level = Math.ceil(mul);
+
+  return {
+    name, category, rarity, emoji: tmpl.emoji, metadata,
+    description: `${tmpl.emoji} ${rarity} ${category} aus Stage ${stage}`,
+  };
+}
+
+async function triggerLoot() {
+  if (!state.apiKey || !state.gameId) {
+    toast("warn", "Kein Game registriert — kein Loot");
+    return;
+  }
+  if (!state.address) {
+    toast("bad", "Kein aktives Spieler-Profil");
+    return;
+  }
+
+  try {
+    await ensureDropServerWallet();
+  } catch (e) {
+    toast("bad", "Loot: " + e.message);
+    return;
+  }
+
+  const pick = generateLoot(state.stage);
+
+  try {
+    const r = await api("/api/v1/sdk/game/drop", { method: "POST", body: {
+      game_id:                state.gameId,
+      server_wallet_mnemonic: state.serverMnemonic,
+      player_wallet:          state.address,
+      name:                   pick.name,
+      description:            pick.description,
+      category:               pick.category,
+      rarity:                 pick.rarity,
+      metadata:               pick.metadata,
+      reason:                 `Stage ${state.stage} Kill #${state.kills}`,
+    }});
+    state.loot++; save(); refreshKills();
+    const stats = [];
+    if (pick.metadata.damage)     stats.push(`⚔️${pick.metadata.damage}`);
+    if (pick.metadata.armor)      stats.push(`🛡${pick.metadata.armor}`);
+    if (pick.metadata.crit_bonus) stats.push(`💥+${pick.metadata.crit_bonus}%`);
+    if (pick.metadata.heal)       stats.push(`❤+${pick.metadata.heal}`);
+    if (pick.metadata.effect)     stats.push(pick.metadata.effect);
+    const statStr = stats.length ? ` · ${stats.join(" ")}` : "";
+    toast("ok", `+1 ${pick.emoji} ${pick.name} [${pick.rarity}]${statStr}`);
+  } catch (e) {
+    toast("bad", "Loot: " + e.message);
+  }
+}
+
+//──────────────────────────────────────────────────────────────────────────────
+//  Inventory
+//──────────────────────────────────────────────────────────────────────────────
+$("#btnRefreshInv").addEventListener("click", refreshInventory);
+
+async function refreshInventory() {
+  if (!state.address) return;
+  const grid = $("#inventoryGrid"); grid.innerHTML = "";
+  try {
+    const r = await api(`/api/v1/sdk/wallet/nft-inventory?wallet=${state.address}`);
+    const items = r.items || [];
+    inventoryCache = items;
+    $("#invCount").textContent = items.length + " Items";
+    items.forEach(it => grid.appendChild(renderInventoryCard(it)));
+    refreshPotionCount();
+  } catch (e) { toast("bad", e.message); }
+}
+
+function listPotions() {
+  return inventoryCache
+    .filter(it => it.category === "potion" && Number((it.metadata||{}).heal||0) > 0)
+    // Stärksten Trank zuerst (höchster heal-Wert).
+    .sort((a,b) => Number(b.metadata.heal) - Number(a.metadata.heal));
+}
+function refreshPotionCount() {
+  const el = $("#potionCount"); if (!el) return;
+  el.textContent = `(${listPotions().length})`;
+}
+function renderInventoryCard(it) {
+  const d = document.createElement("div");
+  d.className = "card";
+  const m = it.metadata || {};
+  // Stats-Chips
+  const stats = [];
+  if (m.damage)     stats.push(`<span class="effect-tag">⚔️ +${m.damage}</span>`);
+  if (m.armor)      stats.push(`<span class="effect-tag">🛡 +${m.armor}</span>`);
+  if (m.crit_bonus) stats.push(`<span class="effect-tag crit">💥 +${m.crit_bonus}%</span>`);
+  if (m.heal)       stats.push(`<span class="effect-tag lifesteal">❤ +${m.heal}</span>`);
+  if (m.effect)     stats.push(`<span class="effect-tag ${m.effect}">${m.effect}${m.effect_pct?` ${m.effect_pct}%`:""}</span>`);
+
+  const isEquippable = isEquipSlot(it.category);
+  const slotItem     = isEquippable ? state.equipment[it.category] : null;
+  const isEquipped   = slotItem && slotItem.item_id === it.item_id;
+  const slotLabel    = isEquippable ? (SLOT_LABEL[it.category] || it.category) : "";
+  const isPotion     = (it.category === "potion") && Number(m.heal || 0) > 0;
+
+  d.innerHTML = `
+    <div class="name">${escapeHtml(it.name)}</div>
+    <div class="meta">
+      <span class="rarity rar-${it.rarity}">${it.rarity}</span>
+      · ${escapeHtml(it.category||"")}${isEquippable ? ` <span class="muted">(${slotLabel})</span>` : ""}
+    </div>
+    ${stats.length ? `<div class="meta" style="margin-top:.25rem">${stats.join(" ")}</div>` : ""}
+    <div class="meta addr">${it.item_id}</div>
+    <div class="row" style="margin-top:.5rem;gap:.3rem;flex-wrap:wrap">
+      ${isEquippable ? `<button class="${isEquipped?"":"primary"}" data-equip>${isEquipped?`✓ ${slotLabel}`:`Ausrüsten (${slotLabel})`}</button>` : ""}
+      ${isPotion     ? `<button class="primary" data-drink>🧪 Trinken (+${m.heal} HP)</button>` : ""}
+      <input data-price placeholder="Preis" style="width:5rem">
+      <select data-cur style="width:5rem">
+        <option value="stone">STONE</option>
+        <option value="usd">USD</option>
+      </select>
+      <button class="primary" data-sell>Verkauf</button>
+    </div>
+  `;
+  const eqBtn = d.querySelector("[data-equip]");
+  if (eqBtn) {
+    eqBtn.addEventListener("click", () => {
+      const cur = state.equipment[it.category];
+      if (cur && cur.item_id === it.item_id) {
+        // Bereits in diesem Slot ausgerüstet → ablegen.
+        delete state.equipment[it.category];
+        // Legacy-Felder synchronisieren falls dieses Item das "primary" war.
+        if (state.equippedItemId === it.item_id) {
+          state.equippedItemId = ""; state.equippedItem = null;
+        }
+        toast("warn", `Abgelegt: ${it.name}`);
+      } else {
+        // In Slot legen (ersetzt ggf. vorheriges Item im selben Slot).
+        state.equipment[it.category] = {
+          item_id: it.item_id,
+          name:    it.name,
+          rarity:  it.rarity,
+          category: it.category,
+          metadata: m,
+        };
+        // Legacy-Spiegel: bei Waffen das primäre Item setzen.
+        if (it.category === "weapon") {
+          state.equippedItemId = it.item_id;
+          state.equippedItem   = { name: it.name, rarity: it.rarity, metadata: m, category: it.category };
+        }
+        toast("ok", `Ausgerüstet (${slotLabel}): ${it.name}`);
+      }
+      save(); refreshHud(); refreshInventory();
+    });
+  }
+  const drinkBtn = d.querySelector("[data-drink]");
+  if (drinkBtn) {
+    drinkBtn.addEventListener("click", async () => {
+      const heal = Number(m.heal || 0);
+      const max  = playerStats().hp_max;
+      if (state.playerHp >= max) return toast("warn", "HP bereits voll");
+      drinkBtn.disabled = true;
+      try {
+        // Trank verbrennen (on-chain). Schlägt fehl → kein Heal.
+        await api("/api/v1/sdk/game/burn", { method: "POST", body: {
+          mnemonic: state.mnemonic, item_id: it.item_id,
+        }});
+        const before = state.playerHp;
+        state.playerHp = Math.min(max, state.playerHp + heal);
+        save();
+        spawnPlayerHit(`+${state.playerHp - before} ❤`);
+        refreshHud();
+        toast("ok", `🧪 ${it.name} → +${state.playerHp - before} HP`);
+        refreshInventory();
+      } catch (e) {
+        drinkBtn.disabled = false;
+        toast("bad", "Trinken: " + e.message);
+      }
+    });
+  }
+  d.querySelector("[data-sell]").addEventListener("click", async () => {
+    const price = d.querySelector("[data-price]").value.trim();
+    const currency = d.querySelector("[data-cur]").value;
+    if (!price) return toast("bad", "Preis fehlt");
+    try {
+      const r = await api("/api/v1/sdk/tx/sell-item", { method: "POST", body: {
+        mnemonic: state.mnemonic,
+        item_id: it.item_id,
+        price, currency,
+        expires_hours: 168,
+      }});
+      let msg = `Listing erstellt: ${r.listing.price} STONE`;
+      if (r.listing.warnings && r.listing.warnings.length) {
+        msg += " ⚠ " + r.listing.warnings.join("; ");
+        toast("warn", msg, 7000);
+      } else {
+        toast("ok", msg);
+      }
+      // Falls verkauftes Item gerade ausgerüstet → aus Slot entfernen
+      let unequipped = false;
+      for (const slot of EQUIP_SLOTS) {
+        if (state.equipment[slot] && state.equipment[slot].item_id === it.item_id) {
+          delete state.equipment[slot];
+          unequipped = true;
+        }
+      }
+      if (state.equippedItemId === it.item_id) {
+        state.equippedItemId = ""; state.equippedItem = null;
+        unequipped = true;
+      }
+      if (unequipped) { save(); refreshHud(); }
+      refreshInventory();
+    } catch (e) { toast("bad", e.message); }
+  });
+  return d;
+}
+
+//──────────────────────────────────────────────────────────────────────────────
+//  Marketplace
+//──────────────────────────────────────────────────────────────────────────────
+$("#btnRefreshMarket").addEventListener("click", refreshMarket);
+async function refreshMarket() {
+  const grid = $("#marketGrid"); grid.innerHTML = "";
+  try {
+    const r = await api("/api/v1/sdk/market/listings");
+    const listings = r.listings || [];
+    $("#marketCount").textContent = listings.length + " Listings";
+    listings.forEach(l => grid.appendChild(renderListingCard(l)));
+  } catch (e) { toast("bad", e.message); }
+}
+function renderListingCard(entry) {
+  const l = entry.listing || entry;
+  const item = entry.item || {};
+  const d = document.createElement("div");
+  d.className = "card";
+  const isUsd = l.price_mode && l.price_mode.mode === "usd";
+  const priceLine = isUsd
+    ? `<div class="price">${l.price_mode.amount} USD <span class="muted" style="font-weight:normal">(snapshot ${l.price} STONE)</span></div>`
+    : `<div class="price">${l.price} STONE</div>`;
+  d.innerHTML = `
+    <div class="name">${escapeHtml(item.name || "?")}</div>
+    <div class="meta">
+      <span class="rarity rar-${item.rarity||"common"}">${item.rarity||"?"}</span>
+      · von <span class="addr">${(l.seller||"").slice(0,10)}…</span>
+    </div>
+    ${priceLine}
+    ${l.warnings && l.warnings.length ? `<div class="warnings">⚠ ${l.warnings.join("; ")}</div>` : ""}
+    <div class="actions">
+      <button class="primary" data-buy>Kaufen</button>
+      ${l.seller === state.address ? '<button class="danger" data-delist>Delist</button>' : ""}
+    </div>
+  `;
+  d.querySelector("[data-buy]")?.addEventListener("click", async () => {
+    if (l.seller === state.address) return toast("bad", "Eigenes Listing");
+    try {
+      const r = await api("/api/v1/sdk/tx/buy-item", { method: "POST", body: {
+        mnemonic: state.mnemonic, listing_id: l.listing_id,
+      }});
+      toast("ok", `Gekauft für ${r.price} STONE (Fee ${r.fee})`);
+      refreshMarket(); refreshBalance();
+    } catch (e) { toast("bad", e.message); }
+  });
+  d.querySelector("[data-delist]")?.addEventListener("click", async () => {
+    try {
+      await api("/api/v1/sdk/market/delist", { method: "POST", body: {
+        mnemonic: state.mnemonic, listing_id: l.listing_id,
+      }});
+      toast("ok", "Delisted");
+      refreshMarket();
+    } catch (e) { toast("bad", e.message); }
+  });
+  return d;
+}
+</script>
+</body>
+</html>

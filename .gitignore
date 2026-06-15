@@ -7,6 +7,19 @@
 token.bin
 /stone_data/shared/
 
+# Firebase / Google Cloud Service-Account-Keys (NIE committen)
+*firebase*adminsdk*.json
+*-sa.json
+firebase-sa.json
+service-account*.json
+gcp-*.json
+
+# Node-Config enthält api_key + password_hash → nie versionieren.
+# Template liegt unter node_config.example.json.
+node_config.json
+node_config.*.json
+!node_config.example.json
+
 # ─── Laufzeit-Daten (generiert vom Node, nicht versioniert) ──────────────────
 /stone_data/
 /stone_data_mainnet/

@@ -2,16 +2,17 @@
 //!
 //! Definiert die initiale Token-Verteilung beim Start der Chain.
 //!
-//! ## Supply-Verteilung (55.000.000 STONE)
+//! ## Supply-Verteilung (100.000.000 STONE)
 //!
 //! | Pool             | Anteil  | STONE      | Vesting            |
 //! |------------------|---------|------------|--------------------|
-//! | Mining Rewards   | 54,55%  | 30.000.000 | Halving-Emission   |
-//! | Governance       |  9,09%  |  5.000.000 | Grants/Voting      |
-//! | Treasury / Dev   | 13,64%  |  7.500.000 | 3 Jahre linear     |
-//! | Onboarding       |  9,09%  |  5.000.000 | Sofort (gesperrt)  |
-//! | Founders         |  9,09%  |  5.000.000 | 4 Jahre linear     |
-//! | Liquidity        |  4,55%  |  2.500.000 | Sofort             |
+//! | Mining Rewards   | 30%     | 30.000.000 | Halving-Emission   |
+//! | Gaming Pool      | 45%     | 45.000.000 | Sofort (Play-2-Earn) |
+//! | Treasury / Dev   |  7,5%   |  7.500.000 | 3 Jahre linear     |
+//! | Governance       |  5%     |  5.000.000 | Grants/Voting      |
+//! | Onboarding       |  5%     |  5.000.000 | Sofort (gesperrt)  |
+//! | Founders         |  5%     |  5.000.000 | 4 Jahre linear     |
+//! | Liquidity        |  2,5%   |  2.500.000 | Sofort             |
 //!
 //! ## Netzwerk-Modus
 //!
@@ -32,7 +33,13 @@ use super::ledger::TokenLedger;
 const TESTNET_FAUCET_AMOUNT: &str = "1000000";
 
 /// Maximales Supply (auch in ledger.rs definiert, hier zur Dokumentation)
-const TOTAL_SUPPLY: &str = "55000000";
+const TOTAL_SUPPLY: &str = "100000000";
+
+/// Adresse des Gaming-Pools (Play-to-Earn Auszahlungen).
+pub const POOL_GAMING: &str = "pool:gaming";
+
+/// Initial allokierter Betrag im Gaming-Pool.
+pub const GAMING_POOL_AMOUNT: &str = "45000000";
 
 // ─── Netzwerk-Modus ──────────────────────────────────────────────────────────
 
@@ -119,12 +126,18 @@ impl GenesisConfig {
 
     /// Testnet-Allokation: alles auf System-Pools + Faucet
     fn testnet_allocations(_total: Decimal) -> Vec<GenesisAllocation> {
-        // Feste Beträge statt Prozente (55M lässt sich nicht sauber per % aufteilen)
+        // Feste Beträge statt Prozente. Summe = 100M.
         vec![
             GenesisAllocation {
                 address: "pool:mining_rewards".into(),
                 amount: Decimal::new(30_000_000, 0),
                 label: "Mining Rewards Pool".into(),
+                vesting_months: 0,
+            },
+            GenesisAllocation {
+                address: POOL_GAMING.into(),
+                amount: Decimal::new(45_000_000, 0),
+                label: "Gaming Pool (Play-to-Earn)".into(),
                 vesting_months: 0,
             },
             GenesisAllocation {
@@ -162,15 +175,19 @@ impl GenesisConfig {
 
     /// Mainnet-Allokation: echte Adressen mit Vesting
     fn mainnet_allocations(_total: Decimal) -> Vec<GenesisAllocation> {
-        // Mainnet-Adressen werden später über Config-Datei oder ENV gesetzt.
-        // Hier die gleiche Pool-Struktur mit Vesting-Schedules.
-        // Feste Beträge statt Prozente (55M lässt sich nicht sauber per % aufteilen)
+        // Feste Beträge statt Prozente. Summe = 100M.
         vec![
             GenesisAllocation {
                 address: "pool:mining_rewards".into(),
                 amount: Decimal::new(30_000_000, 0),
                 label: "Mining Rewards Pool".into(),
-                vesting_months: 0, // Emission über Halving-Schema
+                vesting_months: 0,
+            },
+            GenesisAllocation {
+                address: POOL_GAMING.into(),
+                amount: Decimal::new(45_000_000, 0),
+                label: "Gaming Pool (Play-to-Earn)".into(),
+                vesting_months: 0,
             },
             GenesisAllocation {
                 address: "pool:governance".into(),
@@ -182,7 +199,7 @@ impl GenesisConfig {
                 address: "pool:treasury".into(),
                 amount: Decimal::new(7_500_000, 0),
                 label: "Treasury / Development".into(),
-                vesting_months: 36, // 3 Jahre
+                vesting_months: 36,
             },
             GenesisAllocation {
                 address: "pool:onboarding".into(),
@@ -194,7 +211,7 @@ impl GenesisConfig {
                 address: "pool:founders".into(),
                 amount: Decimal::new(5_000_000, 0),
                 label: "Founders".into(),
-                vesting_months: 48, // 4 Jahre
+                vesting_months: 48,
             },
             GenesisAllocation {
                 address: "pool:liquidity".into(),
@@ -274,6 +291,7 @@ pub fn apply_genesis(ledger: &mut TokenLedger) -> Result<Vec<super::transaction:
             memo: alloc.label.clone(),
             chain_id: format!("stone-{}", config.network),
             fee_tier: super::transaction::FeeTier::Priority,
+            signed_by: None,
         };
         let tx_id = super::transaction::compute_tx_id(&tx);
         let tx = super::transaction::TokenTx { tx_id, ..tx };
@@ -321,6 +339,97 @@ pub fn apply_genesis(ledger: &mut TokenLedger) -> Result<Vec<super::transaction:
     );
 
     Ok(txs)
+}
+
+/// Einmalige Migration: Gaming-Pool mit 45M STONE auffüllen.
+///
+/// Wird bei jedem Node-Start aufgerufen. Idempotent: Wenn `pool:gaming`
+/// bereits funded ist (oder Genesis frisch angewendet wurde, was den Pool
+/// schon enthält), passiert nichts.
+///
+/// Auf bestehenden Chains (Genesis bereits angewendet, Pool existiert nicht)
+/// wird einmalig 45M direkt in den Pool gemintet. Das erhöht das
+/// `total_supply` um 45M auf 100M und benötigt entsprechend hohes
+/// `MAX_SUPPLY` im Ledger.
+pub fn migrate_pool_gaming(ledger: &mut TokenLedger) -> Result<bool, String> {
+    let pool_balance = ledger.balance(POOL_GAMING);
+    if pool_balance > Decimal::ZERO {
+        return Ok(false);
+    }
+    let amount: Decimal = GAMING_POOL_AMOUNT
+        .parse()
+        .map_err(|e| format!("GAMING_POOL_AMOUNT parse: {e}"))?;
+    ledger
+        .mint(POOL_GAMING, amount)
+        .map_err(|e| format!("Gaming-Pool Mint fehlgeschlagen: {e}"))?;
+    if let Err(e) = ledger.persist() {
+        eprintln!("[token] ⚠️  Persistierung nach Gaming-Pool-Migration fehlgeschlagen: {e}");
+    }
+    println!(
+        "[token] 🎮 Gaming-Pool migriert: +{} STONE → {} (Supply: {}/{})",
+        amount,
+        POOL_GAMING,
+        ledger.total_supply(),
+        ledger.max_supply()
+    );
+    Ok(true)
+}
+
+/// Liest die Foundation Gaming-Wallet-Adresse aus der Umgebung
+/// (`STONE_GAMING_POOL_MNEMONIC` → abgeleitete Public-Key-Adresse).
+///
+/// Gibt `None` zurück wenn die Variable nicht gesetzt oder das Mnemonic
+/// ungültig ist (Server kann ohne Play-to-Earn-Wallet trotzdem laufen,
+/// aber `/play-drop` schlägt fehl).
+pub fn foundation_gaming_address() -> Option<String> {
+    let mnemonic = std::env::var("STONE_GAMING_POOL_MNEMONIC").ok()?;
+    let mnemonic = mnemonic.trim();
+    if mnemonic.is_empty() {
+        return None;
+    }
+    match crate::token::wallet::Wallet::from_mnemonic(mnemonic) {
+        Ok(w) => Some(w.address()),
+        Err(e) => {
+            eprintln!(
+                "[token] ⚠️  STONE_GAMING_POOL_MNEMONIC ungültig: {e} — Foundation-Wallet inaktiv"
+            );
+            None
+        }
+    }
+}
+
+/// Verschiebt die Gaming-Pool-Allokation auf die Foundation-Wallet,
+/// damit Play-Drop-TXs vom Server signiert werden können.
+///
+/// Idempotent: Sobald die Foundation-Wallet ein Guthaben > 0 hat,
+/// passiert nichts mehr.
+pub fn unlock_gaming_pool_to_foundation(ledger: &mut TokenLedger) -> Result<bool, String> {
+    let Some(addr) = foundation_gaming_address() else {
+        return Ok(false);
+    };
+    let wallet_balance = ledger.balance(&addr);
+    if wallet_balance > Decimal::ZERO {
+        return Ok(false);
+    }
+    let pool_balance = ledger.balance(POOL_GAMING);
+    if pool_balance <= Decimal::ZERO {
+        return Ok(false);
+    }
+    // Direkter Ledger-Transfer (System-Operation, kein TX in der Chain).
+    if let Err(e) = ledger.system_pool_transfer(POOL_GAMING, &addr, pool_balance) {
+        return Err(format!("Pool-Transfer fehlgeschlagen: {e}"));
+    }
+    if let Err(e) = ledger.persist() {
+        eprintln!(
+            "[token] ⚠️  Persistierung nach Gaming-Pool-Unlock fehlgeschlagen: {e}"
+        );
+    }
+    println!(
+        "[token] 🎮 Gaming-Pool entsperrt: {} STONE → Foundation-Wallet {}",
+        pool_balance,
+        &addr[..16.min(addr.len())]
+    );
+    Ok(true)
 }
 
 // ─── Supply-Info ─────────────────────────────────────────────────────────────

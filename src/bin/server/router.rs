@@ -11,11 +11,24 @@ use tower_http::compression::CompressionLayer;
 
 use super::state::{AppState, MAX_UPLOAD_BYTES};
 use super::handlers::{
+    action::{
+        handle_action_create, handle_action_mobile_approve,
+        handle_action_mobile_pending, handle_action_mobile_reject,
+    },
     auth::{handle_login, handle_signup, handle_sync_users, handle_wallet_claim,
            handle_request_challenge, handle_verify_challenge,
-           handle_qr_create, handle_qr_status, handle_qr_approve},
+           handle_qr_create, handle_qr_status, handle_qr_approve,
+           handle_discord_login, handle_discord_callback},
     blocks::{handle_get_block, handle_list_blocks},
     chunks::handle_get_chunk,
+    dashboard_v2::{
+        handle_dashboard_v2_capabilities, handle_dashboard_v2_manifest_schema,
+        handle_dashboard_v2_manifest_validate, handle_dashboard_v2_scopes,
+        handle_dashboard_v2_shell, handle_dashboard_v2_widgets,
+        handle_dashboard_v2_tokens_issue, handle_dashboard_v2_tokens_list,
+        handle_dashboard_v2_tokens_revoke,
+        handle_dashboard_v2_widgets_install, handle_dashboard_v2_widgets_remove,
+    },
     documents::{
         handle_delete_document, handle_document_history, handle_get_document,
         handle_get_document_data, handle_list_documents, handle_list_user_documents,
@@ -65,8 +78,9 @@ use super::handlers::{
         handle_remove_member, handle_send_message, handle_set_role,
     },
     p2p::{
-        handle_p2p_config, handle_p2p_dial, handle_p2p_info, handle_p2p_peers,
-        handle_p2p_ping, handle_p2p_precommit, handle_p2p_proposal, handle_p2p_status,
+        handle_p2p_chaos_penalty, handle_p2p_config, handle_p2p_dial, handle_p2p_info,
+        handle_p2p_peers, handle_p2p_ping, handle_p2p_precommit, handle_p2p_proposal,
+        handle_p2p_status,
     },
     peers::{handle_add_peer, handle_list_peers, handle_register_peer, handle_remove_peer, handle_sync},
     poa::{
@@ -106,13 +120,16 @@ use super::handlers::{
     },
     game::{
         // SDK Developer
-        handle_sdk_register, handle_sdk_quick_register,
+        handle_sdk_register, handle_sdk_quick_register, handle_sdk_claim,
+        // SDK Owner-Sig 2FA (Discord-Bot-Token-Style)
+        handle_owner_challenge, handle_owner_totp_setup, handle_rotate_api_key,
         handle_sdk_game_info, handle_sdk_game_status,
         // SDK Consent
         handle_sdk_consent_request, handle_sdk_consent_pending,
         handle_sdk_consent_approve, handle_sdk_consent_reject,
         // SDK Wallet
         handle_sdk_wallet_create, handle_sdk_wallet_link, handle_sdk_wallet_balance,
+        handle_sdk_wallet_derive, handle_sdk_wallet_generate, handle_sdk_wallet_sign,
         handle_sdk_wallet_transactions, handle_sdk_wallet_send,
         handle_sdk_wallet_withdraw, handle_sdk_nft_inventory,
         handle_sdk_wallet_freeze, handle_sdk_wallet_unfreeze,
@@ -120,13 +137,28 @@ use super::handlers::{
         // SDK TX
         handle_sdk_buy_item, handle_sdk_sell_item, handle_sdk_transfer,
         handle_sdk_batch_tx, handle_sdk_tx_status,
+        // SDK TX – Client-Side-Signing (Phase 1.1)
+        handle_sdk_tx_submit,
         // SDK Market
         handle_sdk_market_listings, handle_sdk_market_list,
-        handle_sdk_market_delist, handle_sdk_market_offer,
+        handle_sdk_market_buy, handle_sdk_market_delist, handle_sdk_market_offer,
         handle_sdk_market_history, handle_sdk_market_floor,
         // SDK Game
-        handle_sdk_game_reward, handle_sdk_game_burn,
+        handle_sdk_game_reward, handle_sdk_game_burn, handle_sdk_game_drop,
+        handle_sdk_play_drop, handle_sdk_play_drop_stats, handle_sdk_play_drop_pool_status,
+        handle_sdk_play_sell, handle_sdk_pool_rate,
+        handle_owner_gaming_pool_configure, handle_owner_gaming_pool_delete, handle_owner_gaming_pool_status,
+        handle_owner_gaming_pool_refill,
         handle_sdk_game_leaderboard, handle_sdk_tournament_prize,
+        handle_sdk_game_server_add, handle_sdk_game_server_revoke,
+        handle_sdk_game_servers_list,
+        handle_game_config_upload, handle_game_config_read, handle_game_config_history,
+        // SDK Game – Forks & Ownership
+        handle_sdk_game_transfer_ownership,
+        handle_sdk_game_fork_propose, handle_sdk_game_fork_challenge,
+        handle_sdk_game_fork_cancel, handle_sdk_game_fork_finalize,
+        handle_sdk_game_fork_sweep,
+        handle_sdk_game_forks_list, handle_sdk_game_effective_status,
         // SDK Auth
         handle_sdk_link_wallet, handle_sdk_session, handle_sdk_revoke,
         handle_sdk_permissions, handle_sdk_audit_log,
@@ -144,6 +176,7 @@ use super::handlers::{
         handle_snapshot_meta, handle_snapshot_download, handle_snapshot_create,
         handle_snapshot_state_root,
     },
+    spv::{handle_spv_headers, handle_spv_tip, handle_spv_tx_proof, handle_spv_doc_proof, handle_spv_item_proof, handle_spv_item_history},
     users::{handle_delete_user, handle_delete_own_account, handle_list_users, handle_list_users_public,
            handle_testnet_users, handle_submit_bug_report, handle_list_bug_reports,
            handle_my_bug_reports, handle_update_bug_report},
@@ -153,6 +186,12 @@ use super::handlers::{
         handle_hub_support_reply, handle_hub_get_support_replies,
     },
     ws::handle_websocket,
+    game_chain::{
+        handle_game_chain_submit, handle_list_companies, handle_get_company,
+        handle_company_games, handle_list_games, handle_get_game, handle_account_type,
+        handle_list_verified_games, handle_company_roles, handle_wallet_profile,
+        handle_game_coin_supply, handle_game_coin_balance,
+    },
 };
 
 pub fn build_router(state: AppState) -> Router {
@@ -161,6 +200,18 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/health", get(handle_health))
         // Kombinierter Dashboard-Endpoint (1 Request statt 6)
         .route("/api/v1/dashboard", get(handle_dashboard))
+        // Dashboard v2 (Custom Dashboard Contracts)
+        .route("/api/v2/dashboard/capabilities", get(handle_dashboard_v2_capabilities))
+        .route("/api/v2/dashboard/scopes", get(handle_dashboard_v2_scopes))
+        .route("/api/v2/dashboard/manifest/schema", get(handle_dashboard_v2_manifest_schema))
+        .route("/api/v2/dashboard/manifest/validate", post(handle_dashboard_v2_manifest_validate))
+        .route("/api/v2/dashboard/widgets", get(handle_dashboard_v2_widgets))
+        .route("/api/v2/dashboard/widgets/install", post(handle_dashboard_v2_widgets_install))
+        .route("/api/v2/dashboard/widgets/{app_id}", delete(handle_dashboard_v2_widgets_remove))
+        .route("/api/v2/dashboard/tokens", get(handle_dashboard_v2_tokens_list))
+        .route("/api/v2/dashboard/tokens/issue", post(handle_dashboard_v2_tokens_issue))
+        .route("/api/v2/dashboard/tokens/{token_id}/revoke", post(handle_dashboard_v2_tokens_revoke))
+        .route("/ui/dashboard-v2", get(handle_dashboard_v2_shell))
         // Öffentliche Node-Info (kein Auth, für Peer-Discovery)
         .route("/api/v1/info", get(handle_info))
         // Node-Liste für Client-Discovery (kein Auth)
@@ -175,6 +226,13 @@ pub fn build_router(state: AppState) -> Router {
         // Blöcke (Admin)
         .route("/api/v1/blocks", get(handle_list_blocks))
         .route("/api/v1/blocks/{index}", get(handle_get_block))
+        // SPV / Light-Client (öffentlich, Chain-Daten sind nicht vertraulich)
+        .route("/api/v1/spv/headers", get(handle_spv_headers))
+        .route("/api/v1/spv/tip", get(handle_spv_tip))
+        .route("/api/v1/spv/tx/{tx_id}/proof", get(handle_spv_tx_proof))
+        .route("/api/v1/spv/doc/{doc_id}/proof", get(handle_spv_doc_proof))
+        .route("/api/v1/spv/item/{item_id}/proof", get(handle_spv_item_proof))
+        .route("/api/v1/spv/item/{item_id}/history", get(handle_spv_item_history))
         // Dokumente
         .route(
             "/api/v1/documents",
@@ -225,6 +283,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/p2p/peers", get(handle_p2p_peers))
         .route("/api/v1/p2p/status", get(handle_p2p_status))
         .route("/api/v1/p2p/ping/{peer_id}", post(handle_p2p_ping))
+        .route("/api/v1/p2p/chaos/penalty", post(handle_p2p_chaos_penalty))
         .route("/api/v1/p2p/dial", post(handle_p2p_dial))
         .route("/api/v1/p2p/info", get(handle_p2p_info))
         .route("/api/v1/p2p/config", get(handle_p2p_config))
@@ -242,6 +301,8 @@ pub fn build_router(state: AppState) -> Router {
         // Auth
         .route("/api/v1/auth/signup", post(handle_signup))
         .route("/api/v1/auth/login", post(handle_login))
+        .route("/api/v1/auth/discord", post(handle_discord_login))
+        .route("/api/v1/auth/discord/callback", get(handle_discord_callback))
         .route("/api/v1/auth/wallet-claim", post(handle_wallet_claim))
         // Challenge-Response Auth (Cross-Platform Login)
         .route("/api/v1/auth/challenge", post(handle_request_challenge))
@@ -308,6 +369,21 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/wallet/{address}/rotations", get(handle_wallet_rotations))
         .route("/api/v1/wallet/{address}", get(handle_wallet_info))
         .route("/api/v1/wallet/{address}/balance", get(handle_wallet_balance))
+        // ─── On-Chain Game-Registry (Phase B) ────────────────────────────────
+        .route("/api/v1/game-chain/submit", post(handle_game_chain_submit))
+        .route("/api/v1/companies", get(handle_list_companies))
+        .route("/api/v1/companies/{wallet}", get(handle_get_company))
+        .route("/api/v1/companies/{wallet}/games", get(handle_company_games))
+        .route("/api/v1/companies/{wallet}/roles", get(handle_company_roles))
+        .route("/api/v1/games", get(handle_list_games))
+        .route("/api/v1/games/verified", get(handle_list_verified_games))
+        .route("/api/v1/games/{game_id}", get(handle_get_game))
+        .route("/api/v1/games/{game_id}/config", get(handle_game_config_read))
+        .route("/api/v1/games/{game_id}/config/history", get(handle_game_config_history))
+        .route("/api/v1/games/{game_id}/supply", get(handle_game_coin_supply))
+        .route("/api/v1/games/{game_id}/coins/{wallet}", get(handle_game_coin_balance))
+        .route("/api/v1/account/{wallet}/type", get(handle_account_type))
+        .route("/api/v1/wallet/{wallet}/profile", get(handle_wallet_profile))
         // ─── Testnet-Markt-Simulation (entfernbar) ───────────────────────────
         .route("/api/v1/token/market", get(handle_market_info))
         .route("/api/v1/token/market/history", get(handle_market_history))
@@ -358,6 +434,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/stone/testnet/send-coins", post(handle_hub_send_coins))
         .route("/stone/testnet/support-reply", post(handle_hub_support_reply))
         .route("/stone/testnet/support-replies", get(handle_hub_get_support_replies))
+        // ─── Mobile Action Confirmation (Revolut-Pay-ähnlicher Flow) ─────
+        .route("/stone/action/create", post(handle_action_create))
+        .route("/stone/action/mobile/pending", get(handle_action_mobile_pending))
+        .route("/stone/action/mobile/approve", post(handle_action_mobile_approve))
+        .route("/stone/action/mobile/reject", post(handle_action_mobile_reject))
         // ─── OTA Updates ─────────────────────────────────────────────────────
         .route("/api/v1/updates/status", get(handle_update_status))
         .route("/api/v1/updates/chunk/{index}", get(handle_update_chunk))
@@ -460,6 +541,10 @@ pub fn build_router(state: AppState) -> Router {
         // Developer
         .route("/api/v1/sdk/register", post(handle_sdk_register))
         .route("/api/v1/sdk/quick-register", post(handle_sdk_quick_register))
+        .route("/api/v1/sdk/claim", post(handle_sdk_claim))
+        .route("/api/v1/sdk/owner/challenge", post(handle_owner_challenge))
+        .route("/api/v1/sdk/owner/totp/setup", post(handle_owner_totp_setup))
+        .route("/api/v1/sdk/owner/api-key/rotate", post(handle_rotate_api_key))
         .route("/api/v1/sdk/game/{game_id}", get(handle_sdk_game_info))
         .route("/api/v1/sdk/game/{game_id}/status", post(handle_sdk_game_status))
         // Consent
@@ -470,6 +555,9 @@ pub fn build_router(state: AppState) -> Router {
         // Wallet
         .route("/api/v1/sdk/wallet/create", post(handle_sdk_wallet_create))
         .route("/api/v1/sdk/wallet/link", post(handle_sdk_wallet_link))
+        .route("/api/v1/sdk/wallet/derive", post(handle_sdk_wallet_derive))
+        .route("/api/v1/sdk/wallet/sign", post(handle_sdk_wallet_sign))
+        .route("/api/v1/sdk/wallet/generate", post(handle_sdk_wallet_generate))
         .route("/api/v1/sdk/wallet/balance", get(handle_sdk_wallet_balance))
         .route("/api/v1/sdk/wallet/transactions", get(handle_sdk_wallet_transactions))
         .route("/api/v1/sdk/wallet/send", post(handle_sdk_wallet_send))
@@ -484,18 +572,43 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/sdk/tx/transfer", post(handle_sdk_transfer))
         .route("/api/v1/sdk/tx/batch", post(handle_sdk_batch_tx))
         .route("/api/v1/sdk/tx/status/{tx_id}", get(handle_sdk_tx_status))
+        // Client-Side-Signing: nimmt vorsignierte TokenTx ohne Mnemonic
+        .route("/api/v1/sdk/tx/submit", post(handle_sdk_tx_submit))
         // Market
         .route("/api/v1/sdk/market/listings", get(handle_sdk_market_listings))
         .route("/api/v1/sdk/market/list", post(handle_sdk_market_list))
+        .route("/api/v1/sdk/market/buy", post(handle_sdk_market_buy))
         .route("/api/v1/sdk/market/delist", post(handle_sdk_market_delist))
         .route("/api/v1/sdk/market/offer", post(handle_sdk_market_offer))
         .route("/api/v1/sdk/market/history/{item_id}", get(handle_sdk_market_history))
         .route("/api/v1/sdk/market/floor/{category}", get(handle_sdk_market_floor))
         // Game
         .route("/api/v1/sdk/game/reward", post(handle_sdk_game_reward))
+        .route("/api/v1/sdk/game/play-drop", post(handle_sdk_play_drop))
+        .route("/api/v1/sdk/game/play-drop/stats", get(handle_sdk_play_drop_stats))
+        .route("/api/v1/sdk/game/play-sell", post(handle_sdk_play_sell))
+        .route("/api/v1/sdk/game/pool/rate", get(handle_sdk_pool_rate))
+        .route("/api/v1/sdk/game/pool/status", get(handle_sdk_play_drop_pool_status))
+        .route("/api/v1/sdk/owner/gaming-pool/configure", post(handle_owner_gaming_pool_configure))
+        .route("/api/v1/sdk/owner/gaming-pool/delete", post(handle_owner_gaming_pool_delete))
+        .route("/api/v1/sdk/owner/gaming-pool/refill", post(handle_owner_gaming_pool_refill))
+        .route("/api/v1/sdk/owner/gaming-pool/status", get(handle_owner_gaming_pool_status))
+        .route("/api/v1/sdk/game/drop", post(handle_sdk_game_drop))
+        .route("/api/v1/sdk/game/server/add",    post(handle_sdk_game_server_add))
+        .route("/api/v1/sdk/game/server/revoke", post(handle_sdk_game_server_revoke))
+        .route("/api/v1/sdk/game/{game_id}/servers", get(handle_sdk_game_servers_list))
         .route("/api/v1/sdk/game/burn", post(handle_sdk_game_burn))
         .route("/api/v1/sdk/game/leaderboard", get(handle_sdk_game_leaderboard))
         .route("/api/v1/sdk/game/tournament/prize", post(handle_sdk_tournament_prize))
+        // Game – Forks & Ownership-Transfer
+        .route("/api/v1/sdk/game/transfer-ownership", post(handle_sdk_game_transfer_ownership))
+        .route("/api/v1/sdk/game/fork/propose",   post(handle_sdk_game_fork_propose))
+        .route("/api/v1/sdk/game/fork/challenge", post(handle_sdk_game_fork_challenge))
+        .route("/api/v1/sdk/game/fork/cancel",    post(handle_sdk_game_fork_cancel))
+        .route("/api/v1/sdk/game/fork/finalize",  post(handle_sdk_game_fork_finalize))
+        .route("/api/v1/sdk/game/fork/sweep",     post(handle_sdk_game_fork_sweep))
+        .route("/api/v1/sdk/game/{game_id}/forks", get(handle_sdk_game_forks_list))
+        .route("/api/v1/sdk/game/{game_id}/effective-status", get(handle_sdk_game_effective_status))
         // Auth
         .route("/api/v1/sdk/auth/link-wallet", post(handle_sdk_link_wallet))
         .route("/api/v1/sdk/auth/session", post(handle_sdk_session))
@@ -527,8 +640,12 @@ pub fn build_cors() -> CorsLayer {
             .collect();
 
     if allowed_origins.is_empty() {
+        // Security Fix: Default-CORS erlaubt KEINE wildcard Origins mehr.
+        // Setze STONE_CORS_ORIGINS=* explizit um Any zu erlauben (nur Dev).
+        // Im Produktionsbetrieb müssen konkrete Origins gesetzt werden.
+        eprintln!("[cors] WARNUNG: STONE_CORS_ORIGINS nicht gesetzt – CORS restriktiv (keine Origins erlaubt).");
         CorsLayer::new()
-            .allow_origin(Any)
+            .allow_origin(tower_http::cors::AllowOrigin::mirror_request())
             .allow_methods([
                 Method::GET,
                 Method::POST,

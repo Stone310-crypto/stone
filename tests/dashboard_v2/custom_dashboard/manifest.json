@@ -1,0 +1,26 @@
+{
+  "app_id": "com.leon.custom-dashboard",
+  "name": "Leon Custom Dashboard",
+  "version": "0.1.0",
+  "entry_url": "http://127.0.0.1:8765/tests/dashboard_v2/custom_dashboard/index.html",
+  "description": "Local custom dashboard smoke test",
+  "author": "Leon",
+  "required_permissions": [
+    "dashboard:read",
+    "metrics:read"
+  ],
+  "supported_api_versions": [
+    "v2"
+  ],
+  "allowed_origins": [
+    "http://127.0.0.1:8765"
+  ],
+  "default_layout": [
+    {
+      "widget_id": "custom.health",
+      "zone": "top",
+      "min_w": 3,
+      "min_h": 2
+    }
+  ]
+}

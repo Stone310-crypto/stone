@@ -1,0 +1,136 @@
+# Stonechain node base URL.
+# Default: localhost – der Stone-Node läuft auf derselben Maschine wie der
+# Minecraft-Server und kommuniziert via P2P (Noise-verschlüsselt) mit dem
+# gesamten Stone-Netzwerk. Keine Remote-IP nötig.
+# Nur ändern, falls Node auf einem anderen Server läuft (nicht empfohlen).
+node_url: "http://212.227.54.241:3080"
+
+# Game ID as registered on the Stonechain node (see /sdk/game/server/add).
+game_id: "mc-pop-test"
+
+# API key of the registered game (Developer SDK key).
+# In production, prefer environment variable: STONE_GAME_API_KEY
+game_api_key: "sk_your_game_api_key_here"
+
+# Drop tuning
+drops:
+  # Probability per allowed block break (0.0 - 1.0).
+  chance: 0.10
+  # Per-player local cooldown in seconds (defense-in-depth alongside node cooldown).
+  player_cooldown_secs: 5
+  # Shards pro Block-Drop (Integer). 64 Shards = 1 Coin = 1 STONE.
+  # Blöcke, die hier nicht stehen, droppen nie.
+  tiers:
+    STONE:                  1
+    COBBLESTONE:            1
+    DEEPSLATE:              1
+    COAL_ORE:               1
+    DEEPSLATE_COAL_ORE:     1
+    IRON_ORE:               2
+    DEEPSLATE_IRON_ORE:     2
+    GOLD_ORE:               3
+    DEEPSLATE_GOLD_ORE:     3
+    DIAMOND_ORE:            8
+    DEEPSLATE_DIAMOND_ORE:  8
+    EMERALD_ORE:            10
+    DEEPSLATE_EMERALD_ORE:  10
+    ANCIENT_DEBRIS:         16
+
+# Sidebar (right-side scoreboard) showing pending / earned / redeemed.
+scoreboard:
+  enabled: true
+  title: "§6§lStone-Coins"
+
+# Auto-redeem: once pending >= threshold, the plugin will trigger
+# /stoneredeem automatically (requires linked wallet).
+# Set threshold to 0 to disable.
+auto_redeem:
+  threshold: 0.0
+
+# libp2p-lite: Echter P2P-Teilnehmer mit Ed25519-PeerId.
+# Verbindet sich per WebSocket mit den Haupt-Nodes und empfängt
+# TXs/Blöcke in Echtzeit (kein Polling).
+#
+# Deaktivierbar: enabled: false
+# Bootstrap: Liste der Haupt-Nodes (HTTP-URLs, Auto-WS-Upgrade)
+# Resource-Limits: 0 = unlimitiert
+p2p_node:
+  enabled: true
+  # Bootstrap-Nodes: HTTP-URLs deiner Stone-Nodes.
+  # Das Plugin upgraded automatisch auf WebSocket (ws://).
+  # Muss KEINE IP sein — die Nodes aus nodes.toml reichen.
+  bootstrap_nodes:
+    - "http://212.227.54.241:3080"
+  # Resource-Limits (0 = kein Limit)
+  resource_limits:
+    # CPU-Last in Prozent (0-100). 0 = unlimitiert. Empfohlen: 10
+    cpu_percent: 10
+    # RAM in MB. 0 = unlimitiert. Empfohlen: 64
+    ram_mb: 64
+    # Netzwerk in KB/s. 0 = unlimitiert. Empfohlen: 256
+    network_kbps: 256
+  # Max gecachte Transaktionen.
+  tx_cache_size: 1000
+
+# Mob-kill drops. Shards pro Kill (Integer). 64 Shards = 1 Coin.
+# Empty `tiers` disables the feature entirely.
+mobs:
+  chance: 0.20
+  player_cooldown_secs: 3
+  tiers:
+    ZOMBIE:          1
+    SKELETON:        1
+    SPIDER:          1
+    CREEPER:         2
+    ENDERMAN:        4
+    WITCH:           4
+    BLAZE:           5
+    PIGLIN_BRUTE:    8
+    WITHER_SKELETON: 8
+    ENDER_DRAGON:    256
+    WITHER:          384
+
+# HTTP timeouts (ms)
+http:
+  connect_timeout_ms: 3000
+  request_timeout_ms: 7000
+
+# Death protection toggles (runtime-changeable via /stonedeathprotect by OP/admin)
+death_protect:
+  coins: true
+  shards: true
+
+# Anti-dupe periodic scanner: checks all online player inventories for excess
+# Stone Coins / Shards.  On violation: items are removed and the player is kicked.
+# Set scan_interval_seconds to 0 to disable the periodic scan.
+anti_dupe:
+  scan_interval_seconds: 120
+
+# Redeem limits for /stoneredeem.
+# limit_mode:
+#   per_day         - max_coins STONE per UTC calendar day (resets at midnight UTC)
+#   per_transaction - max_coins STONE per /stoneredeem call
+#   total           - max_coins STONE lifetime (useful for closed beta testing)
+redeem:
+  limit_mode: per_day
+  max_coins: 5
+
+# Player claim system (2-point area selection).
+# Server owner can cap max claim dimensions here.
+claims:
+  tool_material: GOLDEN_SHOVEL
+  max_width: 64
+  max_length: 64
+  max_area: 4096
+  max_claims_per_player: 5
+  # Players can also claim their current chunk directly via /stoneclaim chunk or /smenu.
+  # The same max_claims_per_player limit applies to these direct chunk claims.
+
+# Rare placeable block that rewards many shards when mined.
+rare_block:
+  enabled: true
+  material: CRYING_OBSIDIAN
+  # Chance per successful shard-eligible block break to find 1 Stone Core.
+  find_chance: 0.0005
+  drop_cooldown_secs: 15
+  shard_reward: 32

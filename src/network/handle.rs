@@ -1,7 +1,10 @@
 // ─── Öffentliche API ──────────────────────────────────────────────────────────
 
 use libp2p::{Multiaddr, PeerId};
-use std::collections::HashMap;
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    time::Instant,
+};
 use tokio::sync::{broadcast, mpsc};
 
 use super::*;
@@ -201,6 +204,9 @@ pub async fn start_network(
     let keypair = load_or_create_keypair();
     let local_peer_id = PeerId::from_public_key(&keypair.public()).to_string();
 
+    // Mainnet-Guardrail: Mindestens 2 eindeutige Seed-PeerIds verlangen,
+    // sonst droht effektiver Single-Anchor und Discovery-Zentralisierung.
+    let diversity = crate::network::analyze_bootstrap_diversity(&config.bootstrap_nodes);
     println!("[p2p] Stone P2P-Netzwerk startet");
     println!("[p2p] PeerId: {local_peer_id}");
     println!("[p2p] Listen: {}", config.listen_addr);
@@ -215,6 +221,19 @@ pub async fn start_network(
     // NAT-Traversal Konfiguration loggen
     println!("[p2p] NAT-Traversal:");
     println!("[p2p]   QUIC:     ✅ (UDP, native TLS 1.3)");
+    let allow_single_seed = std::env::var("STONE_ALLOW_SINGLE_SEED")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if crate::network::is_mainnet()
+        && !allow_single_seed
+        && !config.bootstrap_nodes.is_empty()
+        && diversity.unique_peer_ids < 2
+    {
+        return Err(format!(
+            "Unsichere Seed-Topologie auf Mainnet: unique_peer_ids={} (setze STONE_ALLOW_SINGLE_SEED=1 nur für Notfallbetrieb)",
+            diversity.unique_peer_ids,
+        ).into());
+    }
     println!("[p2p]   AutoNAT:  {}", if config.autonat_enabled { "✅" } else { "❌" });
     println!("[p2p]   UPnP:     {}", if config.upnp_enabled { "✅" } else { "❌" });
     println!("[p2p]   DCUtR:    {}", if config.dcutr_enabled { "✅" } else { "❌" });
@@ -235,6 +254,69 @@ pub async fn start_network(
     let (cmd_tx, cmd_rx) = mpsc::channel(128);
 
     let bootstrap_addrs = config.bootstrap_nodes.clone();
+    let bootstrap_peer_ids: HashSet<PeerId> = bootstrap_addrs
+        .iter()
+        .filter_map(|s| s.parse::<Multiaddr>().ok())
+        .filter_map(|addr| {
+            addr.iter().find_map(|p| {
+                if let libp2p::multiaddr::Protocol::P2p(pid) = p {
+                    Some(pid)
+                } else {
+                    None
+                }
+            })
+        })
+        .collect();
+
+    let reconnect_jitter_max_secs = std::env::var("STONE_P2P_RECONNECT_JITTER_MAX_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(7);
+    let prefer_successful_bootstrap = std::env::var("STONE_P2P_SEED_PRIORITY")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+
+    println!(
+        "[p2p] WS-B: Seed-Priorität={} Reconnect-Jitter<= {}s BootstrapPeers={}",
+        if prefer_successful_bootstrap { "an" } else { "aus" },
+        reconnect_jitter_max_secs,
+        bootstrap_peer_ids.len(),
+    );
+
+    let sync_recovery_stage1_enabled = std::env::var("STONE_SYNC_RECOVERY_STAGE1")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    let sync_recovery_stage2_enabled = std::env::var("STONE_SYNC_RECOVERY_STAGE2")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    let sync_recovery_stage3_enabled = std::env::var("STONE_SYNC_RECOVERY_STAGE3")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    let sync_recovery_stage4_enabled = std::env::var("STONE_SYNC_RECOVERY_STAGE4")
+        .map(|v| v != "0")
+        .unwrap_or(true);
+    let sync_stall_timeout_secs = std::env::var("STONE_SYNC_STALL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(45);
+    let sync_recovery_cooldown_secs = std::env::var("STONE_SYNC_RECOVERY_COOLDOWN_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(15);
+    let sync_snapshot_escalation_cooldown_secs = std::env::var("STONE_SYNC_SNAPSHOT_ESCALATION_COOLDOWN_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(300);
+
+    println!(
+        "[p2p] WS-C: stage1={} stage2={} stage3={} stage4={} stall_timeout={}s cooldown={}s",
+        if sync_recovery_stage1_enabled { "an" } else { "aus" },
+        if sync_recovery_stage2_enabled { "an" } else { "aus" },
+        if sync_recovery_stage3_enabled { "an" } else { "aus" },
+        if sync_recovery_stage4_enabled { "an" } else { "aus" },
+        sync_stall_timeout_secs,
+        sync_recovery_cooldown_secs,
+    );
 
     let relay_addrs = config.relay_nodes.clone();
 
@@ -261,15 +343,41 @@ pub async fn start_network(
         peer_storage: HashMap::new(),
         peer_rate_limiters: HashMap::new(),
         chain_ref: None,
+        genesis_hash_cache: None,
         pending_chain_info: HashMap::new(),
         sync_buffer: std::collections::BTreeMap::new(),
         sync_buffer_last_insert: None,
         sync_expected_next: 0,
+        sync_last_progress_at: Instant::now(),
+        sync_last_progress_height: 0,
+        sync_target_peer: None,
+        sync_recovery_stage: super::swarm_task::SyncRecoveryStage::Idle,
+        sync_recovery_attempts: 0,
+        sync_last_recovery_reason: String::new(),
+        sync_recovery_cooldown_until: None,
+        sync_recovery_stage1_enabled,
+        sync_recovery_stage2_enabled,
+        sync_recovery_stage3_enabled,
+        sync_recovery_stage4_enabled,
+        sync_stall_timeout_secs,
+        sync_recovery_cooldown_secs,
+        sync_snapshot_escalation_cooldown_secs,
         local_stake_level: 0,
         reconnect_backoff: HashMap::new(),
+        bootstrap_peer_ids,
+        bootstrap_peer_scores: HashMap::new(),
+        reconnect_jitter_max_secs,
+        prefer_successful_bootstrap,
         keepalive_pings: HashMap::new(),
         peer_latencies: HashMap::new(),
         rate_limit_grace: HashMap::new(),
+        protocol_mismatch_cooldown: HashMap::new(),
+        health_state: super::swarm_task::NetworkHealthState::Degraded,
+        health_failure: None,
+        health_recovery_level: super::swarm_task::RecoveryLevel::None,
+        health_last_transition: Instant::now(),
+        health_last_reason: String::new(),
+        health_cooldown_until: None,
     };
 
     tokio::spawn(task.run());

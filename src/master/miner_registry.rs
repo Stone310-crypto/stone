@@ -440,29 +440,32 @@ pub fn validate_heartbeat_with_template(
         return Err("signatur ungültig".into());
     }
 
-    // Partial PoW: Argon2id neu rechnen (selbe Inputs wie Vollblock-PoW)
-    let computed = crate::consensus::compute_argon2_pow_hash(
-        &template.previous_hash,
-        template.block_index,
-        &template.validator_pubkey,
-        msg.nonce,
-    );
-    let computed_hex = hex::encode(computed);
-    if computed_hex != msg.partial_hash {
-        return Err("partial_hash != argon2id(inputs)".into());
-    }
+    // Partial PoW: Argon2id-Verifikation nur wenn Block-PoW aktiv.
+    // Im PoA-Modus reicht die Signatur als "I'm alive"-Beweis.
+    if crate::consensus::BLOCK_POW_ENABLED {
+        let computed = crate::consensus::compute_argon2_pow_hash(
+            &template.previous_hash,
+            template.block_index,
+            &template.validator_pubkey,
+            msg.nonce,
+        );
+        let computed_hex = hex::encode(computed);
+        if computed_hex != msg.partial_hash {
+            return Err("partial_hash != argon2id(inputs)".into());
+        }
 
-    let eff = if template.effective_difficulty > 0 {
-        template.effective_difficulty
-    } else {
-        template.difficulty
-    };
-    let required = eff.saturating_sub(partial_delta).max(1);
-    let zeros = crate::consensus::leading_zero_bits(&computed);
-    if zeros < required {
-        return Err(format!(
-            "partial difficulty zu niedrig: {zeros} < {required} (eff={eff}, delta={partial_delta})"
-        ));
+        let eff = if template.effective_difficulty > 0 {
+            template.effective_difficulty
+        } else {
+            template.difficulty
+        };
+        let required = eff.saturating_sub(partial_delta).max(1);
+        let zeros = crate::consensus::leading_zero_bits(&computed);
+        if zeros < required {
+            return Err(format!(
+                "partial difficulty zu niedrig: {zeros} < {required} (eff={eff}, delta={partial_delta})"
+            ));
+        }
     }
 
     Ok(())

@@ -62,10 +62,24 @@ pub async fn handle_update_status(
 
 /// Gibt die Rohdaten eines Update-Chunks zurück.
 /// Öffentlich – damit andere Nodes Chunks herunterladen können.
+///
+/// SECURITY (U3): Rate-Limit pro IP gegen Bandwidth-DoS.
+/// Default: 30 Chunks/60s/IP — bei 1 MiB Chunks max 30 MiB/min pro IP.
 pub async fn handle_update_chunk(
+    headers: HeaderMap,
     State(state): State<AppState>,
     Path(index): Path<usize>,
 ) -> impl IntoResponse {
+    let ip = super::super::rate_limiter::extract_client_ip(&headers);
+    if !state.rate_limits.update_chunk.check(&ip) {
+        let retry = state.rate_limits.update_chunk.retry_after_secs(&ip);
+        return (
+            StatusCode::TOO_MANY_REQUESTS,
+            [("retry-after", retry.to_string())],
+            axum::Json(json!({ "error": "Update-Chunk-Rate-Limit erreicht", "retry_after": retry })),
+        ).into_response();
+    }
+
     let updater = state.updater.read().unwrap_or_else(|e| e.into_inner());
 
     match updater.get_chunk(index) {
@@ -85,15 +99,42 @@ pub async fn handle_update_chunk(
 
 // ─── POST /api/v1/updates/publish (Admin) ────────────────────────────────────
 
+/// Max akzeptierte Publish-Body-Größe (binary + base64-Overhead).
+/// 80 MiB Body ≈ 60 MiB Binary nach base64-decode.
+/// Größere Binaries müssen über die geplante streamed-Publish-API (TODO) hochgeladen werden.
+const MAX_PUBLISH_BODY_BYTES: u64 = 80 * 1024 * 1024;
+
 /// Empfängt ein Update (Manifest + Chunks) vom stone-publish-update CLI.
 /// Validiert Signatur und speichert das Update lokal.
 /// Broadcastet das Manifest per Gossipsub an alle Peers.
+///
+/// SECURITY (U6): Body-Size-Limit pro Request, um RAM-Erschöpfung zu verhindern.
+/// Bei Binaries > 60 MiB muss die streamed-API verwendet werden (siehe TODO).
 pub async fn handle_update_publish(
     headers: HeaderMap,
     State(state): State<AppState>,
     axum::Json(payload): axum::Json<PublishPayload>,
 ) -> Result<impl IntoResponse, Response> {
     require_admin(&headers, &state)?;
+
+    // U6: Content-Length zusätzlich prüfen (defense in depth — globales Body-Limit fängt es bereits ab,
+    // aber wir wollen einen klaren 413-Fehler hier).
+    if let Some(cl) = headers.get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.parse::<u64>().ok())
+    {
+        if cl > MAX_PUBLISH_BODY_BYTES {
+            return Err((
+                StatusCode::PAYLOAD_TOO_LARGE,
+                axum::Json(json!({
+                    "error": format!(
+                        "Publish-Body {cl} Bytes überschreitet Limit {MAX_PUBLISH_BODY_BYTES}. \
+                         Für große Updates: streamed-Publish-API verwenden (TODO)."
+                    )
+                })),
+            ).into_response());
+        }
+    }
 
     // Chunks dekodieren
     let mut chunk_data: Vec<(usize, Vec<u8>)> = Vec::new();
@@ -125,7 +166,7 @@ pub async fn handle_update_publish(
     // Manifest per Gossipsub broadcasten
     if let Some(ref net) = state.network {
         let manifest_json = serde_json::to_vec(&payload.manifest).unwrap_or_default();
-        net.publish_gossip(stone::updater::TOPIC_UPDATES, manifest_json).await;
+        net.publish_gossip(stone::updater::TOPIC_UPDATES.as_str(), manifest_json).await;
     }
 
     Ok((
@@ -433,18 +474,27 @@ pub async fn handle_update_config(
     }
     if let Some(ref keys) = payload.add_trusted_keys {
         for key in keys {
-            if !updater.config.trusted_keys.contains(key) {
-                updater.config.trusted_keys.push(key.clone());
-                println!("[updater] + Trusted Key: {}…", &key[..16.min(key.len())]);
+            // SECURITY: Nur gültige hex-kodierte Ed25519 public keys (32 bytes) akzeptieren
+            match hex::decode(key) {
+                Ok(bytes) if bytes.len() == 32 => {
+                    if !updater.config.trusted_keys.contains(key) {
+                        updater.config.trusted_keys.push(key.clone());
+                        println!("[updater] + Trusted Key: {}…", &key[..16.min(key.len())]);
+                    }
+                }
+                _ => {
+                    return Err((
+                        StatusCode::BAD_REQUEST,
+                        axum::Json(json!({ "error": "Trusted-Key muss 32-Byte hex sein" })),
+                    )
+                        .into_response());
+                }
             }
         }
     }
-    if let Some(ref keys) = payload.remove_trusted_keys {
-        for key in keys {
-            updater.config.trusted_keys.retain(|k| k != key);
-            println!("[updater] - Trusted Key entfernt: {}…", &key[..16.min(key.len())]);
-        }
-    }
+    // SECURITY (U1): `remove_trusted_keys` wurde absichtlich entfernt.
+    // Trusted Keys können nur additiv über die API erweitert werden.
+    // Zum Entfernen: `trusted_update_keys.txt` editieren + Node-Restart.
     if let Some(ref hour_opt) = payload.auto_update_hour {
         updater.config.auto_update_hour = hour_opt.filter(|&h| h < 24);
         if let Some(h) = updater.config.auto_update_hour {
@@ -481,7 +531,10 @@ pub struct UpdateConfigPayload {
     pub auto_download: Option<bool>,
     pub auto_install: Option<bool>,
     pub add_trusted_keys: Option<Vec<String>>,
-    pub remove_trusted_keys: Option<Vec<String>>,
+    /// SECURITY (U1): Remove-Funktion entfernt. Keys können nur via Datei + Restart entfernt werden.
+    #[serde(default, skip_serializing)]
+    #[allow(dead_code)]
+    pub remove_trusted_keys: Option<serde_json::Value>,
     #[serde(default)]
     pub auto_update_hour: Option<Option<u8>>,
 }

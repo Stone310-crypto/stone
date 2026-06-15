@@ -28,6 +28,7 @@ use libp2p::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    hash::{Hash, Hasher},
     time::{Duration, Instant},
 };
 use tokio::sync::{broadcast, mpsc};
@@ -89,7 +90,21 @@ pub(crate) struct SwarmTask {
 
     /// Optionale Referenz auf die Chain — wird nach Start per Command injiziert.
     /// Ermöglicht dem SwarmTask Blöcke direkt aus der lokalen Chain zu servieren.
+    ///
+    /// **Wichtig:** Dieser `Mutex` wird auf dem Block-Commit-Pfad vom
+    /// HTTP-Handler/Mining-Pfad gehalten und kann den Async-Task für Dutzende
+    /// ms blockieren. Hot-Path-Reads (Height, Genesis-Hash) gehen deshalb
+    /// **nicht** über diesen Lock, sondern über `local_chain_count`
+    /// (atomar via `SetLocalChainCount` aktualisiert) und
+    /// `genesis_hash_cache` (einmalig bei `SetChainRef` gecached). Der Lock
+    /// wird nur noch beim tatsächlichen Bedienen von Block-Daten in
+    /// `events.rs` gehalten.
     pub(crate) chain_ref: Option<std::sync::Arc<std::sync::Mutex<crate::blockchain::StoneChain>>>,
+
+    /// Genesis-Hash der lokalen Chain – einmalig bei `SetChainRef` gecached,
+    /// danach lock-free lesbar. Der Genesis-Block ändert sich nach
+    /// Initialisierung nicht mehr, deshalb ist Caching sicher.
+    pub(crate) genesis_hash_cache: Option<std::sync::Arc<String>>,
 
     /// Shard-Speicher für eingehende Shard-Requests
     pub(crate) shard_store: crate::shard::ShardStore,
@@ -123,6 +138,31 @@ pub(crate) struct SwarmTask {
     pub(crate) sync_buffer_last_insert: Option<Instant>,
     /// Erwarteter nächster Block-Index für den Sync (= unsere Chain-Höhe beim Sync-Start)
     pub(crate) sync_expected_next: u64,
+    /// Letzter Zeitpunkt mit messbarem Sync-Fortschritt
+    pub(crate) sync_last_progress_at: Instant,
+    /// Letzte lokale Chain-Höhe zum Progress-Vergleich
+    pub(crate) sync_last_progress_height: u64,
+    /// Derzeit bevorzugter Sync-Partner
+    pub(crate) sync_target_peer: Option<PeerId>,
+    /// Aktuelle Recovery-Stage
+    pub(crate) sync_recovery_stage: SyncRecoveryStage,
+    /// Anzahl Recovery-Aktionen seit Start
+    pub(crate) sync_recovery_attempts: u32,
+    /// Letzter Recovery-Grund
+    pub(crate) sync_last_recovery_reason: String,
+    /// Cooldown bis zur nächsten Recovery-Aktion
+    pub(crate) sync_recovery_cooldown_until: Option<Instant>,
+    /// Stage-Flags
+    pub(crate) sync_recovery_stage1_enabled: bool,
+    pub(crate) sync_recovery_stage2_enabled: bool,
+    pub(crate) sync_recovery_stage3_enabled: bool,
+    pub(crate) sync_recovery_stage4_enabled: bool,
+    /// Timeout ohne Fortschritt bis Recovery
+    pub(crate) sync_stall_timeout_secs: u64,
+    /// Cooldown zwischen Recovery-Aktionen
+    pub(crate) sync_recovery_cooldown_secs: u64,
+    /// Langer Cooldown nach Stage4-Eskalation
+    pub(crate) sync_snapshot_escalation_cooldown_secs: u64,
 
     // ─── Stake-basierte Relay-Priorität ──────────────────────────────────
 
@@ -137,6 +177,19 @@ pub(crate) struct SwarmTask {
     /// Verhindert Connect-Disconnect-Storms wenn beide Seiten gleichzeitig dialen.
     pub(crate) reconnect_backoff: HashMap<PeerId, (Instant, Duration)>,
 
+    /// Menge aller Bootstrap-PeerIds (aus konfigurierten Multiaddrs extrahiert).
+    pub(crate) bootstrap_peer_ids: HashSet<PeerId>,
+
+    /// Lernender Score pro Bootstrap-Peer.
+    /// Positive Werte = erreichbar/stabil, negative Werte = häufige Dial-Fehler.
+    pub(crate) bootstrap_peer_scores: HashMap<PeerId, i32>,
+
+    /// Maximaler Jitter (Sekunden), der auf den Reconnect-Backoff addiert wird.
+    pub(crate) reconnect_jitter_max_secs: u64,
+
+    /// Aktiviert Priorisierung bereits erfolgreicher Bootstrap-Peers.
+    pub(crate) prefer_successful_bootstrap: bool,
+
     // ─── Keepalive / Warm Peer Table ─────────────────────────────────────
 
     /// Laufende Keepalive-Pings: request_id → (PeerId, Sende-Zeitpunkt)
@@ -149,6 +202,26 @@ pub(crate) struct SwarmTask {
     /// Grace-Zähler für aufeinanderfolgende Rate-Limit-Verletzungen pro Peer.
     /// Erst nach RATE_LIMIT_GRACE Verletzungen wird eine Penalty vergeben.
     pub(crate) rate_limit_grace: HashMap<PeerId, u32>,
+
+    /// Cooldown für Peers mit Protokoll-Inkompatibilität.
+    /// Während des Cooldowns werden aktive Sync/Shard-Requests gegen den Peer
+    /// ausgesetzt, um Error-Stürme zu vermeiden.
+    pub(crate) protocol_mismatch_cooldown: HashMap<PeerId, Instant>,
+
+    // ─── Deterministischer Network Health Controller ─────────────────────
+
+    /// Aktueller Health-Status der Node.
+    pub(crate) health_state: NetworkHealthState,
+    /// Zuletzt klassifizierte Fehlerklasse (falls vorhanden).
+    pub(crate) health_failure: Option<FailureClass>,
+    /// Aktuelle Recovery-Eskalationsstufe.
+    pub(crate) health_recovery_level: RecoveryLevel,
+    /// Letzter Transition-Zeitpunkt.
+    pub(crate) health_last_transition: Instant,
+    /// Letzter Controller-Grundtext (deterministisch berechnet).
+    pub(crate) health_last_reason: String,
+    /// Cooldown bis zur nächsten orchestrierten Health-Aktion.
+    pub(crate) health_cooldown_until: Option<Instant>,
 }
 
 /// Tracking für Fehlverhalten eines Peers
@@ -158,16 +231,115 @@ pub(crate) struct PeerPenalty {
     pub(crate) reasons: Vec<String>,
     /// Wie oft dieser Peer bereits gebannt wurde (für eskalierende Ban-Dauer)
     pub(crate) ban_count: u32,
+    /// Anzahl starker Evidenz-Offenses (z.B. ungültige Signaturen/Hashes).
+    pub(crate) strong_evidence_count: u32,
 }
 
 /// Ab diesem Score wird ein Peer gebannt (Verbindung getrennt, kein Re-Dial)
 pub(super) const BAN_THRESHOLD: u32 = 200;
+
+/// Höherer Ban-Threshold für bekannte Bootstrap/Seed-Peers.
+/// Diese Peers sind zentral für den Netzaufbau und dürfen bei Burst- oder
+/// Übergangszuständen nicht zu schnell aus dem Mesh fallen.
+pub(super) const BAN_THRESHOLD_BOOTSTRAP: u32 = 600;
+
+/// Mindestanzahl starker Evidenz-Offenses bevor ein Ban greift.
+pub(super) const BAN_MIN_STRONG_EVIDENCE: u32 = 1;
+
+/// Für Bootstrap/Seed-Peers gilt eine strengere Evidenz-Anforderung,
+/// damit sie nicht durch Soft-Offense-Kaskaden ausfallen.
+pub(super) const BAN_MIN_STRONG_EVIDENCE_BOOTSTRAP: u32 = 2;
 
 /// Penalty-Punkte verfallen nach dieser Zeit (Minuten)
 pub(super) const PENALTY_DECAY_MINS: u64 = 30;
 
 /// Aufeinanderfolgende Rate-Limit-Verletzungen bevor Penalty vergeben wird
 pub(super) const RATE_LIMIT_GRACE: u32 = 15;
+
+/// Mehr Toleranz für Rate-Limit-Bursts von Bootstrap-Peers.
+pub(super) const RATE_LIMIT_GRACE_BOOTSTRAP: u32 = 60;
+
+/// Zustandsmaschine des deterministischen Network Health Controllers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NetworkHealthState {
+    Healthy,
+    Degraded,
+    Isolated,
+    Partitioned,
+    Syncing,
+    Recovering,
+    SnapshotRecovery,
+    Critical,
+}
+
+impl NetworkHealthState {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::Healthy => "healthy",
+            Self::Degraded => "degraded",
+            Self::Isolated => "isolated",
+            Self::Partitioned => "partitioned",
+            Self::Syncing => "syncing",
+            Self::Recovering => "recovering",
+            Self::SnapshotRecovery => "snapshot_recovery",
+            Self::Critical => "critical",
+        }
+    }
+}
+
+/// Deterministische Fehlerklassifikation für Recovery-Entscheidungen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FailureClass {
+    DiscoveryFailure,
+    BootstrapFailure,
+    SyncDivergence,
+    PeerPoisoning,
+    HighChurn,
+    RelayCollapse,
+    DatabaseInconsistency,
+    NetworkPartition,
+}
+
+impl FailureClass {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::DiscoveryFailure => "discovery_failure",
+            Self::BootstrapFailure => "bootstrap_failure",
+            Self::SyncDivergence => "sync_divergence",
+            Self::PeerPoisoning => "peer_poisoning",
+            Self::HighChurn => "high_churn",
+            Self::RelayCollapse => "relay_collapse",
+            Self::DatabaseInconsistency => "database_inconsistency",
+            Self::NetworkPartition => "network_partition",
+        }
+    }
+}
+
+/// Eskalationsleiter des Controllers (Level 1..6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RecoveryLevel {
+    None,
+    Level1SoftReconnect,
+    Level2PeerTableRefresh,
+    Level3KadBootstrapReset,
+    Level4PeerCacheInvalidation,
+    Level5SnapshotSync,
+    Level6CriticalIsolation,
+}
+
+impl RecoveryLevel {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Level1SoftReconnect => "level1_soft_reconnect",
+            Self::Level2PeerTableRefresh => "level2_peer_table_refresh",
+            Self::Level3KadBootstrapReset => "level3_kad_bootstrap_reset",
+            Self::Level4PeerCacheInvalidation => "level4_peer_cache_invalidation",
+            Self::Level5SnapshotSync => "level5_snapshot_sync",
+            Self::Level6CriticalIsolation => "level6_critical_isolation",
+        }
+    }
+}
 
 // ─── Persistierte Ban-Liste ───────────────────────────────────────────────────
 
@@ -183,6 +355,9 @@ struct BannedPeerEntry {
     /// Wie oft dieser Peer bereits gebannt wurde
     #[serde(default)]
     ban_count: u32,
+    /// Anzahl starker Evidenz-Offenses zum Ban-Zeitpunkt.
+    #[serde(default)]
+    strong_evidence_count: u32,
     /// Letzte bekannte Adressen (IP/Multiaddr) zum Ban-Zeitpunkt
     #[serde(default)]
     last_known_addresses: Vec<String>,
@@ -217,6 +392,7 @@ pub(crate) fn load_banned_peers() -> HashMap<PeerId, PeerPenalty> {
                 last_offense: Instant::now(), // konservativ: als "gerade passiert" behandeln
                 reasons: entry.reasons,
                 ban_count: entry.ban_count,
+                strong_evidence_count: entry.strong_evidence_count,
             });
         }
     }
@@ -265,6 +441,7 @@ pub(super) fn save_banned_peers_with_context(
                 banned_at: now,
                 expires_at: now + ban_secs,
                 ban_count: p.ban_count,
+                strong_evidence_count: p.strong_evidence_count,
                 last_known_addresses: addrs,
                 agent_version: agent,
                 ban_duration: format_ban_duration(ban_secs),
@@ -285,6 +462,28 @@ pub(crate) enum NatStatus {
     Unknown,
     Public,
     Private,
+}
+
+/// Aktuelle Stage der Sync-Selbstheilung (WS-C).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SyncRecoveryStage {
+    Idle,
+    Stage1SoftReset,
+    Stage2PeerSwitch,
+    Stage3RebuildNetwork,
+    Stage4SnapshotEscalation,
+}
+
+impl SyncRecoveryStage {
+    pub(crate) fn as_str(&self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Stage1SoftReset => "stage1_soft_reset",
+            Self::Stage2PeerSwitch => "stage2_peer_switch",
+            Self::Stage3RebuildNetwork => "stage3_rebuild_network",
+            Self::Stage4SnapshotEscalation => "stage4_snapshot_escalation",
+        }
+    }
 }
 
 /// Prüft ob eine IPv6-Adresse nicht global routbar ist (Link-Local, ULA, etc.)
@@ -313,7 +512,11 @@ pub(super) fn strip_p2p_suffix(addr: libp2p::Multiaddr) -> libp2p::Multiaddr {
 
 // ─── Sync-Handshake Nachricht ─────────────────────────────────────────────────
 
-pub const TOPIC_SYNC_HANDSHAKE: &str = "stone/sync/v1";
+pub static TOPIC_SYNC_HANDSHAKE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| format!(
+        "stone/{}/sync/v1",
+        if crate::network::is_mainnet() { "mainnet" } else { "testnet" },
+    ));
 
 /// Kurze Nachricht die beim Verbinden gesendet wird um Chain-Längen zu vergleichen.
 /// Enthält Genesis-Hash und Protokoll-Version für Kompatibilitätsprüfung.
@@ -335,16 +538,90 @@ pub(super) struct SyncHandshake {
 // ─── Gossipsub: Topics abonnieren ─────────────────────────────────────────────
 
 pub(crate) fn subscribe_all_topics(gossipsub: &mut gossipsub::Behaviour) -> Result<(), String> {
-    for topic in [TOPIC_BLOCKS, TOPIC_PEERS, TOPIC_SYNC_HANDSHAKE, TOPIC_MEMPOOL, TOPIC_CHAT, TOPIC_CHAT_CONTENT, crate::updater::TOPIC_UPDATES, TOPIC_STORAGE, crate::network::TOPIC_MINERS] {
+    let topics: [&str; 9] = [
+        TOPIC_BLOCKS.as_str(),
+        TOPIC_PEERS.as_str(),
+        TOPIC_SYNC_HANDSHAKE.as_str(),
+        TOPIC_MEMPOOL.as_str(),
+        TOPIC_CHAT.as_str(),
+        TOPIC_CHAT_CONTENT.as_str(),
+        crate::updater::TOPIC_UPDATES.as_str(),
+        TOPIC_STORAGE.as_str(),
+        crate::network::TOPIC_MINERS.as_str(),
+    ];
+    for topic in topics {
         gossipsub.subscribe(&IdentTopic::new(topic))
             .map_err(|e| format!("Subscribe '{topic}': {e}"))?;
     }
     Ok(())
 }
 
+// ─── Wire-Encoding für Gossip-Payloads ────────────────────────────────────────
+//
+// Block, TokenTx und SyncHandshake werden seit Protokoll-Version 0.8 via
+// bincode (statt JSON) über Gossipsub gesendet. Vorteile:
+//   - ~2-4× kleinere Payloads
+//   - ~5-10× schnellere Deserialisierung
+//   - identisches Wire-Format wie der on-disk Storage (RocksDB) – kein
+//     doppelter Codepfad mehr (vermeidet Klassen von Wire-Format-Bugs wie
+//     dem TxType-rename_all-Issue).
+//
+// Andere Topics (Storage, Chat, Updates, Miners) bleiben vorerst auf JSON,
+// damit die Umstellung minimal bleibt und Cross-Binary-Konsumenten (setup.rs,
+// stone_miner, Master-API-Handler) nicht in einem Aufwasch gepatcht werden
+// müssen.
+
+pub(super) fn encode_gossip<T: Serialize>(value: &T) -> Result<Vec<u8>, String> {
+    bincode::serde::encode_to_vec(value, bincode::config::standard())
+        .map_err(|e| format!("bincode encode: {e}"))
+}
+
+pub(super) fn decode_gossip<T: serde::de::DeserializeOwned>(data: &[u8]) -> Result<T, String> {
+    bincode::serde::decode_from_slice(data, bincode::config::standard())
+        .map(|(v, _)| v)
+        .map_err(|e| format!("bincode decode: {e}"))
+}
+
 // ─── SwarmTask: run() + Helfer ────────────────────────────────────────────────
 
 impl SwarmTask {
+    fn jitter_for_peer(&self, peer_id: &PeerId) -> Duration {
+        if self.reconnect_jitter_max_secs == 0 {
+            return Duration::from_secs(0);
+        }
+
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.swarm.local_peer_id().hash(&mut hasher);
+        peer_id.hash(&mut hasher);
+
+        // 5s-Zeit-Buckets verhindern synchrones Reconnect-Verhalten,
+        // ohne dass der Jitter bei jedem Tick komplett neu springt.
+        let bucket = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() / 5;
+        bucket.hash(&mut hasher);
+
+        let span = self.reconnect_jitter_max_secs.saturating_add(1);
+        let jitter_secs = hasher.finish() % span;
+        Duration::from_secs(jitter_secs)
+    }
+
+    fn update_bootstrap_score(&mut self, peer_id: PeerId, delta: i32, reason: &str) {
+        if !self.bootstrap_peer_ids.contains(&peer_id) {
+            return;
+        }
+
+        let entry = self.bootstrap_peer_scores.entry(peer_id).or_insert(0);
+        *entry = (*entry + delta).clamp(-20, 50);
+
+        println!(
+            "[p2p] Seed-Score {} -> {} ({reason})",
+            peer_id,
+            *entry,
+        );
+    }
+
     pub(crate) async fn run(mut self) {
         let listen_addr: Multiaddr = match self.config.listen_addr.parse() {
             Ok(a) => a,
@@ -475,6 +752,10 @@ impl SwarmTask {
         let mut keepalive_ticker = tokio::time::interval(Duration::from_secs(45));
         keepalive_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        // Health-Controller-Ticker: alle 15s deterministische Zustandsermittlung + Recovery-Orchestrierung
+        let mut health_ticker = tokio::time::interval(Duration::from_secs(15));
+        health_ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         loop {
             tokio::select! {
                 event = self.swarm.next() => {
@@ -505,6 +786,9 @@ impl SwarmTask {
                 }
                 _ = keepalive_ticker.tick() => {
                     self.keepalive_ping_peers();
+                }
+                _ = health_ticker.tick() => {
+                    self.run_health_controller();
                 }
             }
         }
@@ -590,6 +874,7 @@ impl SwarmTask {
         }
 
         let mut attempted = 0u32;
+        let mut candidates: Vec<(i32, String, Multiaddr, PeerId)> = Vec::new();
         for addr_str in self.bootstrap_addrs.clone() {
             use libp2p::multiaddr::Protocol;
             if let Ok(addr) = addr_str.parse::<Multiaddr>() {
@@ -601,42 +886,75 @@ impl SwarmTask {
                     }
                 });
                 if let Some(pid) = peer_id_opt {
-                    // Eigene PeerId nicht anwählen
-                    if pid == *self.swarm.local_peer_id() {
-                        continue;
-                    }
-                    if connected_peer_ids.contains(&pid.to_string()) {
-                        continue;
-                    }
-
-                    // ── Exponentieller Backoff pro Peer ──────────────────
-                    // Verhindert Connect-Disconnect-Storm wenn beide Seiten
-                    // gleichzeitig dialen und libp2p die doppelte Verbindung
-                    // sofort wieder schließt.
-                    const MIN_BACKOFF: Duration = Duration::from_secs(5);
-                    const MAX_BACKOFF: Duration = Duration::from_secs(300); // 5 min
-
-                    if let Some((next_try, _)) = self.reconnect_backoff.get(&pid) {
-                        if now < *next_try {
-                            continue; // Backoff noch nicht abgelaufen
-                        }
-                    }
-
-                    // Backoff aktualisieren: verdoppeln (exponentiell), max 5 min
-                    let current_backoff = self.reconnect_backoff
-                        .get(&pid)
-                        .map(|(_, d)| *d)
-                        .unwrap_or(MIN_BACKOFF);
-                    let next_backoff = (current_backoff * 2).min(MAX_BACKOFF);
-                    self.reconnect_backoff.insert(
-                        pid,
-                        (now + next_backoff, next_backoff),
-                    );
-
-                    println!("[p2p] Reconnect-Versuch: {pid} ({addr_str}) [backoff={:.0}s]", next_backoff.as_secs_f64());
-                    let _ = self.swarm.dial(addr);
-                    attempted += 1;
+                    let score = self.bootstrap_peer_scores.get(&pid).copied().unwrap_or(0);
+                    candidates.push((score, addr_str.clone(), addr, pid));
                 }
+            }
+        }
+
+        if self.prefer_successful_bootstrap {
+            candidates.sort_by(|a, b| {
+                b.0.cmp(&a.0)
+                    .then_with(|| a.1.cmp(&b.1))
+            });
+        }
+
+        for (score, addr_str, addr, pid) in candidates {
+            // Eigene PeerId nicht anwählen
+            if pid == *self.swarm.local_peer_id() {
+                continue;
+            }
+            if connected_peer_ids.contains(&pid.to_string()) {
+                continue;
+            }
+
+            // ── Exponentieller Backoff pro Peer ──────────────────
+            // Verhindert Connect-Disconnect-Storm wenn beide Seiten
+            // gleichzeitig dialen und libp2p die doppelte Verbindung
+            // sofort wieder schließt.
+            const MIN_BACKOFF: Duration = Duration::from_secs(5);
+            const MAX_BACKOFF: Duration = Duration::from_secs(300); // 5 min
+
+            if let Some((next_try, _)) = self.reconnect_backoff.get(&pid) {
+                if now < *next_try {
+                    continue; // Backoff noch nicht abgelaufen
+                }
+            }
+
+            // Backoff aktualisieren: verdoppeln (exponentiell), max 5 min + Jitter
+            let current_backoff = self.reconnect_backoff
+                .get(&pid)
+                .map(|(_, d)| *d)
+                .unwrap_or(MIN_BACKOFF);
+            let next_backoff = (current_backoff * 2).min(MAX_BACKOFF);
+            let jitter = self.jitter_for_peer(&pid);
+            self.reconnect_backoff.insert(
+                pid,
+                (now + next_backoff + jitter, next_backoff),
+            );
+
+            println!(
+                "[p2p] Reconnect-Versuch: {pid} ({addr_str}) [seed_score={score}, backoff={:.0}s, jitter={}s]",
+                next_backoff.as_secs_f64(),
+                jitter.as_secs(),
+            );
+            let _ = self.swarm.dial(addr);
+            attempted += 1;
+        }
+
+        if self.prefer_successful_bootstrap && !self.bootstrap_peer_scores.is_empty() {
+            let mut ranked: Vec<(PeerId, i32)> = self.bootstrap_peer_scores
+                .iter()
+                .map(|(pid, score)| (*pid, *score))
+                .collect();
+            ranked.sort_by(|a, b| b.1.cmp(&a.1));
+            let top: Vec<String> = ranked
+                .into_iter()
+                .take(3)
+                .map(|(pid, score)| format!("{}:{}", pid, score))
+                .collect();
+            if !top.is_empty() {
+                println!("[p2p] Seed-Priorität (Top): {}", top.join(", "));
             }
         }
 
@@ -687,6 +1005,7 @@ impl SwarmTask {
 
                 // Events + Sync nur bei erster Verbindung
                 if num_established.get() == 1 {
+                    self.update_bootstrap_score(peer_id, 3, "connection established");
                     let _ = self.event_tx.send(NetworkEvent::PeerConnected {
                         peer_id: peer_id.to_string(),
                         addr,
@@ -707,6 +1026,29 @@ impl SwarmTask {
                         self.send_sync_handshake();
                     }
                 }
+
+                // Security Fix: Connection-Limit durchsetzen (Eclipse/Sybil-Mitigation).
+                // Ohne diesen Check kann ein Angreifer mit 10.000 Fake-Peers den
+                // Connection-Pool erschöpfen und legitime Peers verdrängen.
+                let connected_count = self.swarm.connected_peers().count();
+                if connected_count > self.config.max_peers {
+                    // Finde den verbundenen Peer mit dem niedrigsten Penalty-Score
+                    if let Some((lowest_id, _)) = self.peers.iter()
+                        .filter(|(_, info)| info.connected)
+                        .min_by_key(|(pid, _)| {
+                            self.peer_penalties.get(pid)
+                                .map(|p| p.score)
+                                .unwrap_or(0)
+                        })
+                    {
+                        eprintln!(
+                            "[p2p] ⚠ Connection-Limit ({}) erreicht ({} verbunden) — \
+                             trenne {lowest_id} (niedrigster Score)",
+                            self.config.max_peers, connected_count,
+                        );
+                        let _ = self.swarm.disconnect_peer_id(*lowest_id);
+                    }
+                }
             }
 
             SwarmEvent::ConnectionClosed { peer_id, num_established, cause, .. } => {
@@ -714,6 +1056,11 @@ impl SwarmTask {
                 // Nur loggen wenn es die letzte Verbindung zu diesem Peer war
                 if num_established == 0 {
                     println!("[p2p] ✗ Getrennt: {peer_id} ({reason})");
+                    self.update_bootstrap_score(peer_id, -1, "connection closed");
+                    if Some(peer_id) == self.sync_target_peer {
+                        self.sync_target_peer = None;
+                        self.sync_last_recovery_reason = "sync target disconnected".to_string();
+                    }
 
                     if let Some(info) = self.peers.get_mut(&peer_id) {
                         info.connected = false;
@@ -765,6 +1112,9 @@ impl SwarmTask {
 
                 if is_harmless || peer_now_connected {
                     return;
+                }
+                if let Some(pid) = peer_id {
+                    self.update_bootstrap_score(pid, -2, "outgoing connection error");
                 }
                 eprintln!("[p2p] Verbindungsfehler zu {:?}: {error}", peer_id);
             }

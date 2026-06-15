@@ -26,6 +26,8 @@ pub enum PushType {
     PaymentConfirmed,
     #[serde(rename = "announcement")]
     Announcement,
+    #[serde(rename = "incoming_call")]
+    IncomingCall,
 }
 
 impl PushType {
@@ -35,6 +37,7 @@ impl PushType {
             Self::PaymentRequest   => "payment_request",
             Self::PaymentConfirmed => "payment_confirmed",
             Self::Announcement     => "announcement",
+            Self::IncomingCall     => "incoming_call",
         }
     }
 
@@ -44,6 +47,7 @@ impl PushType {
             Self::PaymentRequest   => "Zahlungsanfrage",
             Self::PaymentConfirmed => "Zahlung bestätigt",
             Self::Announcement     => "Community Announcement",
+            Self::IncomingCall     => "Eingehender Anruf",
         }
     }
 
@@ -51,6 +55,7 @@ impl PushType {
         match self {
             Self::NewMessage | Self::PaymentRequest | Self::PaymentConfirmed => "HIGH",
             Self::Announcement => "HIGH",
+            Self::IncomingCall => "HIGH",
         }
     }
 }
@@ -178,7 +183,7 @@ impl FcmClient {
 
         // Prüfen ob cached token noch gültig (5 Min Buffer)
         {
-            let cache = self.cached_token.lock().unwrap();
+            let cache = self.cached_token.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(ref ct) = *cache {
                 if Instant::now() < ct.expires_at {
                     return Some(ct.access_token.clone());
@@ -237,7 +242,7 @@ impl FcmClient {
         let expires_at = Instant::now() + Duration::from_secs(token_resp.expires_in.saturating_sub(300));
         let access_token = token_resp.access_token.clone();
         {
-            let mut cache = self.cached_token.lock().unwrap();
+            let mut cache = self.cached_token.lock().unwrap_or_else(|e| e.into_inner());
             *cache = Some(CachedToken { access_token: access_token.clone(), expires_at });
         }
 
@@ -290,6 +295,7 @@ impl FcmClient {
                             PushType::NewMessage => "stone_messages",
                             PushType::PaymentRequest | PushType::PaymentConfirmed => "stone_payments",
                             PushType::Announcement => "stone_social",
+                            PushType::IncomingCall => "stone_calls",
                         },
                     },
                 },
@@ -354,6 +360,90 @@ impl FcmClient {
         match store.get_token(&wallet_hash) {
             Some(token) => self.send_push_with_body(&token.fcm_token, push_type, body).await,
             None => false,
+        }
+    }
+
+    /// Eingehenden Anruf an eine Wallet melden (mit call_id und from_wallet im data-Payload)
+    pub async fn notify_wallet_incoming_call(
+        &self,
+        store: &PushTokenStore,
+        to_wallet: &str,
+        from_wallet: &str,
+        from_name: &str,
+        call_id: &str,
+    ) -> bool {
+        if !self.is_configured() { return false; }
+        let wallet_hash = hash_wallet(to_wallet);
+        let fcm_token = match store.get_token(&wallet_hash) {
+            Some(t) => t.fcm_token.clone(),
+            None => return false,
+        };
+
+        let sa = match &self.sa {
+            Some(sa) => sa,
+            None => return false,
+        };
+        let access_token = match self.get_access_token().await {
+            Some(t) => t,
+            None => {
+                eprintln!("[push] Kein Access Token – Call-Push übersprungen");
+                return false;
+            }
+        };
+        let url = format!(
+            "https://fcm.googleapis.com/v1/projects/{}/messages:send",
+            sa.project_id
+        );
+        let caller_display = if from_name.is_empty() {
+            &from_wallet[..from_wallet.len().min(12)]
+        } else {
+            from_name
+        };
+        let payload = serde_json::json!({
+            "message": {
+                "token": fcm_token,
+                "notification": {
+                    "title": "Eingehender Anruf",
+                    "body": caller_display,
+                },
+                "android": {
+                    "priority": "HIGH",
+                    "ttl": "60s",
+                    "notification": {
+                        "channel_id": "stone_calls",
+                    },
+                },
+                "data": {
+                    "type": "incoming_call",
+                    "title": "Eingehender Anruf",
+                    "body": caller_display,
+                    "call_id": call_id,
+                    "from_wallet": from_wallet,
+                    "from_name": from_name,
+                }
+            }
+        });
+        match self.http
+            .post(&url)
+            .bearer_auth(&access_token)
+            .json(&payload)
+            .send()
+            .await
+        {
+            Ok(resp) => {
+                let status = resp.status();
+                if !status.is_success() {
+                    let body = resp.text().await.unwrap_or_default();
+                    eprintln!("[push] ❌ Call-Push FCM-Fehler {status}: {body}");
+                    return false;
+                }
+                println!("[push] 📞 Call-Push an {} → {call_id}", &to_wallet[..to_wallet.len().min(12)]);
+                true
+            }
+            Err(e) => {
+                eprintln!("[push] ❌ Call-Push HTTP-Fehler: {e}");
+                false
+            }
         }
     }
 }

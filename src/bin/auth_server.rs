@@ -734,6 +734,23 @@ async fn list_node_metrics(
     Json(serde_json::json!({ "metrics": list })).into_response()
 }
 
+async fn management_nodes_data(State(state): State<AppState>) -> impl IntoResponse {
+    let nodes: Vec<NodeInfo> = {
+        let reg = state.reg.lock().unwrap_or_else(|e| e.into_inner());
+        reg.nodes.values().cloned().collect()
+    };
+    let metrics: Vec<NodeMetricsEntry> = {
+        let map = state.metrics.lock().unwrap_or_else(|e| e.into_inner());
+        map.values().cloned().collect()
+    };
+    Json(serde_json::json!({
+        "ok": true,
+        "server_time": now(),
+        "nodes": nodes,
+        "metrics": metrics,
+    }))
+}
+
 // --- PKI-Stubs (Platzhalter für spätere echte PKI) ---
 async fn pki_root_stub(State(state): State<AppState>) -> impl IntoResponse {
     let body: String = state.ca_pem.as_str().to_owned();
@@ -789,6 +806,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/nodes", get(list_nodes).post(register_node))
+        .route("/management/nodes/data", get(management_nodes_data))
         .route("/nodes/allow/{url}", post(allow_node))
         .route("/nodes/deny/{url}", post(deny_node))
         .route("/nodes/quarantine/{url}", post(quarantine_node))

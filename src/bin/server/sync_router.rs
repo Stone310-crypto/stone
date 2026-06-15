@@ -316,6 +316,8 @@ async fn sync_receive_users(
                 account_type: stone::auth::default_account_type(),
                 org_id: String::new(),
                 org_role: String::new(),
+                discord_id: String::new(),
+                discord_username: String::new(),
             });
             added += 1;
         }

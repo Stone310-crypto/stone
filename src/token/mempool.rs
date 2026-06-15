@@ -34,11 +34,15 @@ use super::ledger::TokenLedger;
 
 // ─── Konstanten ──────────────────────────────────────────────────────────────
 
-/// Maximale Anzahl von TXs im Mempool
-pub const MAX_MEMPOOL_SIZE: usize = 10_000;
+/// Maximale Anzahl von TXs im Mempool.
+/// Bei 30s Block-Intervall + 2000 TX/Block kann der Mempool 25 Blocks (~12 min)
+/// Backlog halten, ohne TXs zu verwerfen.
+pub const MAX_MEMPOOL_SIZE: usize = 50_000;
 
-/// Maximale TXs pro Block
-pub const MAX_TXS_PER_BLOCK: usize = 500;
+/// Maximale TXs pro Block.
+/// Bei 30s Block-Intervall ergibt das eine sustained Throughput von ~66 TX/s.
+/// TX-Größe ~250 Byte → ~500 KB/Block (vernachlässigbar für P2P-Propagation).
+pub const MAX_TXS_PER_BLOCK: usize = 2_000;
 
 /// TX Time-To-Live: TXs die älter als 1 Stunde sind werden verworfen
 pub const TX_TTL_SECS: i64 = 3600;
@@ -49,8 +53,46 @@ const MAX_KNOWN_IDS: usize = 50_000;
 /// Maximale Anzahl von Requeue-Versuchen bevor TX endgültig verworfen wird
 const MAX_REQUEUE_ATTEMPTS: u32 = 3;
 
-/// SECURITY: Maximale pending TXs pro Sender (Anti-Spam)
-const MAX_PENDING_PER_SENDER: usize = 50;
+/// SECURITY: Maximale pending TXs pro Sender (Anti-Spam).
+///
+/// Auf `MAX_TXS_PER_BLOCK` gesetzt → ein einzelner Sender kann maximal einen
+/// ganzen Block füllen, aber nicht mehr (verhindert Mempool-Domination).
+/// Frühere 50 waren zu eng für Game-Server-Wallets, die in Lastspitzen
+/// (Schrein-Etagen, viele aktive Spieler gleichzeitig) Anchor-TXs für jedes
+/// Loot-Drop minten — ein Spieler konnte das Limit innerhalb weniger Sekunden
+/// erreichen, was zu "On-Chain Anchor abgelehnt"-Fehlern führte.
+const MAX_PENDING_PER_SENDER: usize = MAX_TXS_PER_BLOCK;
+
+/// SECURITY: Maximale Größe einer einzelnen TX in Bytes.
+///
+/// Verhindert dass ein böswilliger Sender den Mempool mit wenigen riesigen
+/// TXs (z.B. künstlich aufgeblasener `memo`) volllädt. 64 KiB reicht für
+/// realistische Chat-Nachrichten und alle on-chain Metadaten-TXs
+/// (CompanyRegister, GameRegister usw.).
+pub const MAX_TX_BYTES: usize = 64 * 1024;
+
+/// SECURITY: Maximale Gesamt-Größe des Mempools in Bytes.
+///
+/// Verhindert Memory-DoS auch wenn Sender-Limit + Count-Limit umgangen werden
+/// (z.B. viele Sender mit moderat großen TXs). 128 MiB ist großzügig genug für
+/// 50k normale TXs und gleichzeitig hart genug um OOM zu vermeiden.
+pub const MAX_MEMPOOL_BYTES: usize = 128 * 1024 * 1024;
+
+/// Grobe Größenabschätzung einer TX (in Bytes).
+///
+/// Zählt die variabel langen Felder + 96 Byte fixen Overhead (Decimals,
+/// Timestamp, Nonce, Tx-Type usw.). Bewusst eine Untergrenze — Bincode-
+/// Serialisierung wäre genauer, aber zu teuer für jeden `add_tx`-Aufruf.
+fn tx_size_bytes(tx: &TokenTx) -> usize {
+    96
+        + tx.tx_id.len()
+        + tx.from.len()
+        + tx.to.len()
+        + tx.memo.len()
+        + tx.signature.len()
+        + tx.chain_id.len()
+        + tx.signed_by.as_ref().map(|s| s.len()).unwrap_or(0)
+}
 
 // ─── Mempool-Fehler ──────────────────────────────────────────────────────────
 
@@ -72,6 +114,10 @@ pub enum MempoolError {
     FutureTimestamp { drift_secs: i64 },
     /// SECURITY: Sender hat zu viele pending TXs
     SenderLimitExceeded { sender: String, limit: usize },
+    /// SECURITY: Einzelne TX überschreitet die maximale Byte-Größe
+    TxTooLarge { size: usize, limit: usize },
+    /// SECURITY: Mempool-Bytecap erreicht (Memory-DoS-Schutz)
+    BytesFull { used: usize, limit: usize },
 }
 
 impl std::fmt::Display for MempoolError {
@@ -92,6 +138,12 @@ impl std::fmt::Display for MempoolError {
             }
             MempoolError::SenderLimitExceeded { sender, limit } => {
                 write!(f, "Sender {} hat bereits {limit} pending TXs (Limit)", &sender[..12.min(sender.len())])
+            }
+            MempoolError::TxTooLarge { size, limit } => {
+                write!(f, "TX zu groß: {size} Byte (Limit: {limit} Byte)")
+            }
+            MempoolError::BytesFull { used, limit } => {
+                write!(f, "Mempool-Speicher voll: {used} Byte belegt (Limit: {limit} Byte)")
             }
         }
     }
@@ -143,6 +195,15 @@ impl Mempool {
     /// 4. Kapazitäts-Limit
     /// 5. Pre-Check gegen Ledger (Balance, Nonce) – optional, bei Aufruf mit Ledger
     pub fn add_tx(&self, tx: TokenTx, ledger: Option<&TokenLedger>) -> Result<(), MempoolError> {
+        // 0. SECURITY: Per-TX Byte-Limit (vor Validierung — verhindert Hash-DoS)
+        let tx_bytes = tx_size_bytes(&tx);
+        if tx_bytes > MAX_TX_BYTES {
+            return Err(MempoolError::TxTooLarge {
+                size: tx_bytes,
+                limit: MAX_TX_BYTES,
+            });
+        }
+
         // 1. Strukturelle Validierung
         validate_tx(&tx)?;
 
@@ -168,9 +229,18 @@ impl Mempool {
             return Err(MempoolError::Duplicate(tx.tx_id.clone()));
         }
 
-        // 3. Kapazitäts-Limit
+        // 3. Kapazitäts-Limit (Count)
         if inner.queue.len() >= MAX_MEMPOOL_SIZE {
             return Err(MempoolError::Full);
+        }
+
+        // 3b. SECURITY: Kapazitäts-Limit (Bytes) — Memory-DoS-Schutz
+        let bytes_used: usize = inner.queue.iter().map(tx_size_bytes).sum();
+        if bytes_used + tx_bytes > MAX_MEMPOOL_BYTES {
+            return Err(MempoolError::BytesFull {
+                used: bytes_used,
+                limit: MAX_MEMPOOL_BYTES,
+            });
         }
 
         // SECURITY: Per-Sender Rate-Limit (Anti-Spam)
@@ -515,6 +585,8 @@ impl Mempool {
         let oldest_age = inner.queue.front().map(|tx| now - tx.timestamp).unwrap_or(0);
         let newest_age = inner.queue.back().map(|tx| now - tx.timestamp).unwrap_or(0);
 
+        let bytes_used: usize = inner.queue.iter().map(tx_size_bytes).sum();
+
         MempoolStats {
             pending_count: inner.queue.len(),
             known_ids_count: inner.known_ids.len(),
@@ -523,6 +595,9 @@ impl Mempool {
             max_size: MAX_MEMPOOL_SIZE,
             max_per_block: MAX_TXS_PER_BLOCK,
             ttl_secs: TX_TTL_SECS,
+            bytes_used,
+            max_bytes: MAX_MEMPOOL_BYTES,
+            max_tx_bytes: MAX_TX_BYTES,
         }
     }
 }
@@ -539,6 +614,9 @@ pub struct MempoolStats {
     pub max_size: usize,
     pub max_per_block: usize,
     pub ttl_secs: i64,
+    pub bytes_used: usize,
+    pub max_bytes: usize,
+    pub max_tx_bytes: usize,
 }
 
 impl Default for Mempool {

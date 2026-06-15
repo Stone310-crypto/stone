@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::token::transaction::{TokenTx, TxType, FeeTier, compute_tx_id};
+use crate::consensus::CheckpointStore;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -62,7 +63,16 @@ pub fn data_dir() -> String {
     })
 }
 
-pub const MAX_BLOCK_SIZE: u64 = 5 * 1024 * 1024 * 1024; // 5 GiB
+/// Maximale Block-Größe (Summe aller `data_size`-Werte der enthaltenen Dokumente).
+///
+/// **Sicherheits-Limit gegen DoS:** Ein Validator könnte sonst einen
+/// beliebig großen Block proposen, der das gesamte Netz für Minuten blockiert.
+///
+/// Große Game-Assets gehören NICHT direkt in den Block — sie liegen
+/// content-addressed im `ChunkStore` und werden im Block nur per
+/// `ChunkRef.hash` referenziert. 16 MiB reicht aus für viele
+/// kleine Dokumente + Token-TXs pro Block.
+pub const MAX_BLOCK_SIZE: u64 = 16 * 1024 * 1024; // 16 MiB
 pub fn chunk_dir() -> String { format!("{}/chunks", data_dir()) }
 pub const CHUNK_SIZE: usize = 8 * 1024 * 1024; // 8 MiB
 
@@ -687,11 +697,26 @@ impl StoneChain {
     ///   - `None`  → PoA-Prüfung wird übersprungen (kein Validator-Set geladen)
     ///   - `Some(true)`  → Prüfung bestanden
     ///   - `Some(false)` → Prüfung fehlgeschlagen → Block wird abgelehnt
+    /// Akzeptiert einen Block von einem Peer und fügt ihn in die Chain ein.
+    ///
+    /// `checkpoints` (optional): Wenn `Some`, wird vor jedem Reorg geprüft, dass
+    /// kein finalisierter Checkpoint verletzt würde (Long-Range-Attack-Schutz).
+    /// Nodes ohne Checkpoint-Store (z.B. Sync-Only-Clients) können `None` übergeben
+    /// — dann gilt nur der `MAX_REORG_DEPTH`-Schutz.
     pub fn accept_peer_block(
         &mut self,
         mut block: Block,
         poa_ok: Option<bool>,
+        checkpoints: Option<&CheckpointStore>,
     ) -> Result<(), String> {
+        // ── DoS-Schutz: Block-Größe begrenzen ────────────────────────────
+        if block.data_size > MAX_BLOCK_SIZE {
+            return Err(format!(
+                "Block #{} zu groß: data_size={} > MAX_BLOCK_SIZE={}",
+                block.index, block.data_size, MAX_BLOCK_SIZE
+            ));
+        }
+
         let local_len = self.blocks.len() as u64;
 
         // ── Fork-Reorg: Block liegt hinter unserer Chain ──────────────────
@@ -763,6 +788,11 @@ impl StoneChain {
                     // Bei tieferem Reorg: einzelner Block kann unseren Tip nicht schlagen
                     // → im Fork-Cache speichern für spätere Auflösung.
                     if incoming_cd > our_tip_cd {
+                        // Reorg-Schutz: finalisierter Checkpoint darf nicht verletzt werden.
+                        if let Some(cps) = checkpoints {
+                            cps.check_reorg_allowed(block.index)
+                                .map_err(|e| format!("Checkpoint-Schutz: {e}"))?;
+                        }
                         println!(
                             "[chain] 🔄 Fork-Reorg bei Block #{}: lokal={}… peer={}… (Tiefe: {}, cd: {} > {}) – ersetze lokale Blöcke",
                             block.index,
@@ -799,6 +829,11 @@ impl StoneChain {
                         };
 
                         if prefer_incoming {
+                            // Reorg-Schutz: finalisierter Checkpoint darf nicht verletzt werden.
+                            if let Some(cps) = checkpoints {
+                                cps.check_reorg_allowed(block.index)
+                                    .map_err(|e| format!("Checkpoint-Schutz: {e}"))?;
+                            }
                             println!(
                                 "[chain] 🔄 Fork-Tiebreak bei Block #{}: lokal={}… peer={}…",
                                 block.index,
@@ -890,6 +925,11 @@ impl StoneChain {
                         "[chain] 🔄 Fork-Reorg: Lokale Chain hat {} Blöcke, Fork bei #{} – ersetze {} Blöcke (cd: {} > {})",
                         local_len, fork_point, reorg_depth, incoming_cd, our_tip_cd,
                     );
+                    // Reorg-Schutz: finalisierter Checkpoint darf nicht verletzt werden.
+                    if let Some(cps) = checkpoints {
+                        cps.check_reorg_allowed(fork_point)
+                            .map_err(|e| format!("Checkpoint-Schutz: {e}"))?;
+                    }
                     let orphaned = self.truncate_to(fork_point);
                     self.orphaned_blocks.extend(orphaned);
                     // Jetzt sollte latest_hash == block.previous_hash sein
@@ -912,7 +952,7 @@ impl StoneChain {
                     // Kein gemeinsamer Vorgänger in der Hauptchain → Fork-Cache prüfen
                     // Speichere den Block im Cache und versuche den Fork aufzulösen
                     self.store_fork_block(block.clone());
-                    match self.try_resolve_fork(&block) {
+                    match self.try_resolve_fork(&block, checkpoints) {
                         Ok(true) => {
                             // Fork wurde aufgelöst, neuer Block kann normal angefügt werden
                             // (latest_hash sollte jetzt block.previous_hash sein)
@@ -1055,8 +1095,8 @@ impl StoneChain {
             return Err("Block hat keinen Signer".to_string());
         }
 
-        // ── Argon2id CPU-PoW Verifikation (ab Activation-Block) ──────────
-        {
+        // ── Argon2id CPU-PoW Verifikation (nur wenn BLOCK_POW_ENABLED) ──
+        if crate::consensus::BLOCK_POW_ENABLED {
             use crate::consensus::{
                 get_current_pow_difficulty, verify_argon2_pow,
                 ARGON2_POW_ACTIVATION_BLOCK, MIN_EFFECTIVE_POW_DIFFICULTY,
@@ -1209,7 +1249,11 @@ impl StoneChain {
     /// Prüft ob ein Fork im Cache zusammen mit einem neuen Block schwerer ist
     /// als unsere aktuelle Chain. Wenn ja, führt die Reorg durch.
     /// Gibt Ok(true) zurück wenn reorgt wurde, Ok(false) wenn nicht.
-    pub fn try_resolve_fork(&mut self, new_block: &Block) -> Result<bool, String> {
+    pub fn try_resolve_fork(
+        &mut self,
+        new_block: &Block,
+        checkpoints: Option<&CheckpointStore>,
+    ) -> Result<bool, String> {
         // Suche ob new_block.previous_hash auf einen Fork-Block zeigt
         if let Some((fork_point, fork_chain)) = self.build_fork_chain(&new_block.previous_hash) {
             // Kumulative Difficulty des Forks berechnen
@@ -1227,11 +1271,17 @@ impl StoneChain {
                         .unwrap_or(0);
                     let mut cd = anchor_cd;
                     for fb in &fork_chain {
-                        cd = cd.saturating_add(block_work(fb.pow_difficulty));
+                        cd = cd.saturating_add(block_work_effective(
+                            fb.effective_difficulty,
+                            fb.pow_difficulty,
+                        ));
                     }
                     cd
                 };
-                last_cd.saturating_add(block_work(new_block.pow_difficulty))
+                last_cd.saturating_add(block_work_effective(
+                    new_block.effective_difficulty,
+                    new_block.pow_difficulty,
+                ))
             };
 
             let our_tip_cd = self.blocks.last()
@@ -1252,6 +1302,12 @@ impl StoneChain {
                     fork_chain.len(), fork_tip_cd, our_tip_cd, reorg_depth,
                 );
 
+                // Reorg-Schutz: finalisierter Checkpoint darf nicht verletzt werden.
+                if let Some(cps) = checkpoints {
+                    cps.check_reorg_allowed(fork_point)
+                        .map_err(|e| format!("Checkpoint-Schutz: {e}"))?;
+                }
+
                 // Hauptchain kürzen
                 let orphaned = self.truncate_to(fork_point);
                 self.orphaned_blocks.extend(orphaned);
@@ -1262,7 +1318,10 @@ impl StoneChain {
                         let parent_cd = self.blocks.last()
                             .map(|b| b.cumulative_difficulty)
                             .unwrap_or(0);
-                        fb.cumulative_difficulty = parent_cd + block_work(fb.pow_difficulty);
+                        fb.cumulative_difficulty = parent_cd + block_work_effective(
+                            fb.effective_difficulty,
+                            fb.pow_difficulty,
+                        );
                     }
                     // Entferne aus Fork-Cache
                     self.fork_blocks.remove(&fb.hash);
@@ -1527,6 +1586,7 @@ pub fn memorial_tx() -> TokenTx {
                Forever in the Stonechain. #neverforgetdennis".to_string(),
         chain_id: "stone-memorial".to_string(),
         fee_tier: FeeTier::Standard,
+        signed_by: None,
     };
     tx.tx_id = compute_tx_id(&tx);
     tx
@@ -1569,7 +1629,7 @@ Rest in peace, dear friend.
 If this project becomes successful, I will donate 10% of my earnings to cancer research.
 Because Dennis died of cancer and nobody could do anything.
 
-#neverforgetdennis aka BauserHD"
+#nRestinPeaceBauserHD i miss you every day and will never forget you"
         .to_string();
 
     let memorial_doc = Document {

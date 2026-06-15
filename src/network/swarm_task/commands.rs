@@ -23,10 +23,10 @@ impl SwarmTask {
                     // Duplicate-Filter hat ihn gerade neu eingetragen → gut
                 }
 
-                match serde_json::to_vec(&*block) {
+                match super::encode_gossip(&*block) {
                     Ok(data) => {
                         let data_len = data.len() as u64;
-                        let topic = IdentTopic::new(TOPIC_BLOCKS);
+                        let topic = IdentTopic::new(TOPIC_BLOCKS.as_str());
                         match self.swarm.behaviour_mut().gossipsub.publish(topic, data) {
                             Ok(_) => {
                                 println!("[p2p] 📡 Block #{} gebroadcastet (hash={}...)", block.index, &hash[..8.min(hash.len())]);
@@ -59,10 +59,10 @@ impl SwarmTask {
                     // hat gerade eingetragen → gut
                 }
 
-                match serde_json::to_vec(&*tx) {
+                match super::encode_gossip(&*tx) {
                     Ok(data) => {
                         let data_len = data.len() as u64;
-                        let topic = IdentTopic::new(TOPIC_MEMPOOL);
+                        let topic = IdentTopic::new(TOPIC_MEMPOOL.as_str());
                         match self.swarm.behaviour_mut().gossipsub.publish(topic, data) {
                             Ok(_) => {
                                 println!("[p2p] 💸 TX {tx_id} gebroadcastet");
@@ -101,12 +101,35 @@ impl SwarmTask {
             }
 
             NetworkCommand::SetLocalChainCount(count) => {
+                if count > self.local_chain_count {
+                    self.mark_sync_progress("set local chain count");
+                }
                 self.local_chain_count = count;
                 false
             }
 
             NetworkCommand::SetChainRef(chain_arc) => {
-                println!("[p2p] Chain-Referenz gesetzt");
+                // Beim Setzen der Chain-Referenz Genesis-Hash und initiale Höhe
+                // einmal unter Lock lesen und cachen. Danach werden Hot-Path-
+                // Reads (gossip.rs, sync.rs) ausschließlich gegen den Cache
+                // bzw. `local_chain_count` ausgeführt – kein Lock-Contention
+                // mit dem Commit-Pfad mehr.
+                if let Ok(chain) = chain_arc.lock() {
+                    if let Some(genesis) = chain.blocks.first() {
+                        self.genesis_hash_cache = Some(std::sync::Arc::new(genesis.hash.clone()));
+                    }
+                    let height = chain.blocks.len() as u64;
+                    if height > self.local_chain_count {
+                        self.local_chain_count = height;
+                    }
+                }
+                println!(
+                    "[p2p] Chain-Referenz gesetzt (genesis={}, height={})",
+                    self.genesis_hash_cache.as_deref()
+                        .map(|s| &s[..12.min(s.len())])
+                        .unwrap_or("?"),
+                    self.local_chain_count,
+                );
                 self.chain_ref = Some(chain_arc);
                 false
             }
@@ -142,7 +165,7 @@ impl SwarmTask {
                 let mesh_peers: HashSet<String> = self.swarm
                     .behaviour()
                     .gossipsub
-                    .mesh_peers(&gossipsub::TopicHash::from_raw(TOPIC_BLOCKS))
+                    .mesh_peers(&gossipsub::TopicHash::from_raw(TOPIC_BLOCKS.as_str()))
                     .map(|p| p.to_string())
                     .collect();
 
@@ -201,6 +224,23 @@ impl SwarmTask {
                     peers,
                     metrics,
                     peer_storage: self.peer_storage.values().cloned().collect(),
+                    sync_recovery: SyncRecoveryStatus {
+                        stage: self.sync_recovery_stage.as_str().to_string(),
+                        attempts: self.sync_recovery_attempts,
+                        seconds_since_progress: self.sync_last_progress_at.elapsed().as_secs(),
+                        target_peer: self.sync_target_peer.map(|p| p.to_string()),
+                        last_reason: self.sync_last_recovery_reason.clone(),
+                    },
+                    health_controller: HealthControllerStatus {
+                        state: self.health_state.as_str().to_string(),
+                        failure: self.health_failure.map(|f| f.as_str()).unwrap_or("none").to_string(),
+                        recovery_level: self.health_recovery_level.as_str().to_string(),
+                        seconds_since_transition: self.health_last_transition.elapsed().as_secs(),
+                        cooldown_remaining_secs: self.health_cooldown_until
+                            .map(|until| until.saturating_duration_since(std::time::Instant::now()).as_secs())
+                            .unwrap_or(0),
+                        last_reason: self.health_last_reason.clone(),
+                    },
                 });
                 false
             }
@@ -213,6 +253,9 @@ impl SwarmTask {
             // ── Shard-Befehle ─────────────────────────────────────────────────
 
             NetworkCommand::RequestShard { peer_id, chunk_hash, shard_index } => {
+                if self.is_protocol_mismatch_quarantined(&peer_id) {
+                    return false;
+                }
                 println!("[p2p] → Shard anfordern: {chunk_hash}[{shard_index}] von {peer_id}");
                 self.swarm.behaviour_mut().shard_exchange.send_request(
                     &peer_id,
@@ -222,6 +265,9 @@ impl SwarmTask {
             }
 
             NetworkCommand::StoreShard { peer_id, chunk_hash, shard_index, shard_hash, data } => {
+                if self.is_protocol_mismatch_quarantined(&peer_id) {
+                    return false;
+                }
                 let data_len = data.len() as u64;
                 println!("[p2p] → Shard senden: {chunk_hash}[{shard_index}] an {peer_id} ({} bytes)", data.len());
                 self.net_metrics.bytes_out += data_len;
@@ -235,6 +281,10 @@ impl SwarmTask {
             }
 
             NetworkCommand::ListPeerShards { peer_id, chunk_hash, reply } => {
+                if self.is_protocol_mismatch_quarantined(&peer_id) {
+                    let _ = reply.send(vec![]);
+                    return false;
+                }
                 println!("[p2p] → Shard-Liste anfordern: {chunk_hash} von {peer_id}");
                 let req_id = self.swarm.behaviour_mut().shard_exchange.send_request(
                     &peer_id,

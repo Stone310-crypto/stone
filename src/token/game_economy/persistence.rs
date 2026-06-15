@@ -28,6 +28,10 @@ impl GameEconomyStore {
                 let val = serde_json::to_vec(cr).map_err(|e| format!("serialize consent: {e}"))?;
                 db.put_cf(cf, key.as_bytes(), &val).map_err(|e| format!("put consent: {e}"))?;
             }
+            for (game_id, secret) in &self.owner_totp_secrets {
+                let key = format!("totp/{}", game_id);
+                db.put_cf(cf, key.as_bytes(), secret.as_bytes()).map_err(|e| format!("put totp: {e}"))?;
+            }
         }
 
         // ── game_wallets CF ──────────────────────────────────────────
@@ -159,6 +163,19 @@ impl GameEconomyStore {
                         if !String::from_utf8_lossy(&key).starts_with("consent/") { break; }
                         if let Ok(cr) = serde_json::from_slice::<ConsentRequest>(&value) {
                             store.consent_requests.insert(cr.request_id.clone(), cr);
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+            for item in db.prefix_iterator_cf(cf, b"totp/") {
+                match item {
+                    Ok((key, value)) => {
+                        let key_str = String::from_utf8_lossy(&key);
+                        if !key_str.starts_with("totp/") { break; }
+                        let game_id = key_str.trim_start_matches("totp/").to_string();
+                        if let Ok(secret) = String::from_utf8(value.to_vec()) {
+                            store.owner_totp_secrets.insert(game_id, secret);
                         }
                     }
                     Err(_) => break,

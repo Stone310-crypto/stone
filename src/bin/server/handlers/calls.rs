@@ -87,6 +87,19 @@ pub async fn handle_send_signal(
         timestamp: now,
     });
 
+    // FCM-Push bei eingehendem Anruf (nur beim Offer)
+    if matches!(signal_type, SignalType::Offer) {
+        let push_store = state.push_tokens.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let fcm = state.fcm_client.clone();
+        let to_wallet = req.to_wallet.clone();
+        let from_wallet = user.wallet_address.clone();
+        let from_name = user.name.clone();
+        let call_id = req.call_id.clone();
+        tokio::spawn(async move {
+            fcm.notify_wallet_incoming_call(&push_store, &to_wallet, &from_wallet, &from_name, &call_id).await;
+        });
+    }
+
     (
         StatusCode::OK,
         axum::Json(json!({

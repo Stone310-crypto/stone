@@ -1,0 +1,4 @@
+   Compiling stone v0.9.8 (/Users/leon/stone-1)
+src/bin/server/handlers/testnet_hub.rs:516:9: warning: field `amount` is never read
+warning: `stone` (bin "stone-master") generated 1 warning
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 17.77s

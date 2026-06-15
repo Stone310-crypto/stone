@@ -827,7 +827,7 @@ mod tests {
         // Erstellen
         store.create(
             "htlc_001".into(), "sender_addr".into(), "receiver_addr".into(),
-            Decimal::new(100, 0), hash.clone(), time_lock, 42,
+            Decimal::new(100, 0), hash.clone(), time_lock, 42, None,
         );
 
         assert_eq!(store.get("htlc_001").unwrap().status, HtlcStatus::Locked);
@@ -850,7 +850,7 @@ mod tests {
 
         store.create(
             "htlc_002".into(), "sender".into(), "receiver".into(),
-            Decimal::new(50, 0), hash, 2000, 42,
+            Decimal::new(50, 0), hash, 2000, 42, None,
         );
 
         let result = store.claim(
@@ -869,7 +869,7 @@ mod tests {
 
         store.create(
             "htlc_003".into(), "sender".into(), "receiver".into(),
-            Decimal::new(50, 0), hash, time_lock, 42,
+            Decimal::new(50, 0), hash, time_lock, 42, None,
         );
 
         // Claim nach Ablauf → Fehler
@@ -885,7 +885,7 @@ mod tests {
 
         store.create(
             "htlc_004".into(), "sender".into(), "receiver".into(),
-            Decimal::new(50, 0), hash, time_lock, 42,
+            Decimal::new(50, 0), hash, time_lock, 42, None,
         );
 
         // Refund vor Ablauf → Fehler
@@ -927,9 +927,9 @@ mod tests {
         let mut store = HtlcStore::new();
         let hash = "a".repeat(64);
 
-        store.create("h1".into(), "s".into(), "r".into(), Decimal::new(10, 0), hash.clone(), 1000, 1);
-        store.create("h2".into(), "s".into(), "r".into(), Decimal::new(20, 0), hash.clone(), 2000, 1);
-        store.create("h3".into(), "s".into(), "r".into(), Decimal::new(30, 0), hash, 3000, 1);
+        store.create("h1".into(), "s".into(), "r".into(), Decimal::new(10, 0), hash.clone(), 1000, 1, None);
+        store.create("h2".into(), "s".into(), "r".into(), Decimal::new(20, 0), hash.clone(), 2000, 1, None);
+        store.create("h3".into(), "s".into(), "r".into(), Decimal::new(30, 0), hash, 3000, 1, None);
 
         let expired = store.find_expired(1500);
         assert_eq!(expired.len(), 1);

@@ -24,6 +24,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 
+pub mod genres;
+pub use genres::{validate_genres, parse_genre_list, GenreFilter};
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Konstanten
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -36,6 +38,23 @@ pub const MAX_BATCH_SIZE: usize = 20;
 pub const MARKETPLACE_POOL: &str = "pool:marketplace";
 pub const CONSENT_TTL_SECS: i64 = 7 * 24 * 3600; // 7 Tage
 pub const MAX_AUDIT_ENTRIES: usize = 50_000;
+
+// ─── Community-Fork & Dormancy ───────────────────────────────────────────────
+//
+// Wird ein Spiel-Owner inaktiv (keine SDK-Aktivität für eine längere Zeit),
+// kann ein Community-Mitglied das Spiel forken und die in den Wallets der
+// Spieler liegenden Items in einem Nachfolger-Spiel weiter benutzbar machen.
+//
+//  Aktiv  ──30d──▶  Dormant  ──+60d──▶  Abandoned  ──Fork──▶  Forked { ... }
+//
+pub const GAME_DORMANT_SECS:    i64 = 30 * 24 * 3600;  // 30 Tage
+pub const GAME_ABANDON_SECS:    i64 = 90 * 24 * 3600;  // 90 Tage
+pub const FORK_CHALLENGE_SECS:  i64 = 14 * 24 * 3600;  // 14 Tage Einspruchsfrist
+pub const FORK_BOND_POOL:       &str = "pool:fork";
+/// Mindest-Bond in STONE für einen Fork-Antrag. Wird beim Ablauf der
+/// Challenge-Period an den Claimant freigegeben (vesting 30d).
+pub const FORK_MIN_BOND_STONE:  &str = "1000";
+pub const FORK_BOND_VEST_SECS:  i64 = 30 * 24 * 3600;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Permission-System
@@ -86,6 +105,37 @@ pub enum GameStatus {
     Suspended { reason: String, until: Option<i64> },
     /// Permanent gesperrt (z.B. Betrug)
     Blacklisted { reason: String },
+    /// Kein Owner-Heartbeat seit `GAME_DORMANT_SECS`. Spiel funktioniert weiter
+    /// normal, aber UI zeigt eine Warnung an. Fork-Anträge sind noch nicht
+    /// möglich – erst nach Übergang in `Abandoned`.
+    Dormant { since: i64 },
+    /// Kein Owner-Heartbeat seit `GAME_ABANDON_SECS`. Community-Forks dürfen
+    /// jetzt beantragt werden (siehe `ForkProposal`).
+    Abandoned { since: i64 },
+    /// Spiel wurde an einen Community-Nachfolger übergeben. Reads bleiben
+    /// erlaubt, der Nachfolger darf Items via `inherited_game_ids` mutieren.
+    Forked { successor: String, at: i64 },
+}
+
+/// Ein autorisierter Server-Key, der im Namen eines Spiels Drops/Mints
+/// ausführen darf. Erlaubt es, den Owner-Key (cold) vom Hot-Key der
+/// Produktions-Server zu trennen und mehrere Server-Instanzen parallel
+/// zu betreiben.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServerKey {
+    /// Hex-encoded Public-Key des Server-Wallets (gleiche Form wie `developer_wallet`).
+    pub pubkey: String,
+    /// Frei wählbares Label, z.B. "eu-west-prod", "dev-laptop".
+    pub label: String,
+    /// Sub-Scope: dieser Key darf nur diese Subset-Berechtigungen ausüben.
+    /// Leer = erbt alle Permissions des Spiels.
+    #[serde(default)]
+    pub permissions: Vec<GamePermission>,
+    /// Hinzugefügt am (Unix-Sekunden).
+    pub added_at: i64,
+    /// Revoke-Zeitpunkt (None = aktiv).
+    #[serde(default)]
+    pub revoked_at: Option<i64>,
 }
 
 /// Ein registriertes Spiel mit API-Key und Berechtigungen.
@@ -99,7 +149,7 @@ pub struct RegisteredGame {
     pub description: String,
     /// Website des Spiels
     pub website: String,
-    /// Wallet des Entwicklers (Eigentümer)
+    /// Wallet des Entwicklers (Eigentümer = Owner, darf Server-Keys verwalten).
     pub developer_wallet: String,
     /// SHA-256 Hash des API-Keys (Key wird nur einmalig angezeigt)
     pub api_key_hash: String,
@@ -107,12 +157,213 @@ pub struct RegisteredGame {
     pub max_wallet_limit: Decimal,
     /// Genehmigte Berechtigungen
     pub permissions: Vec<GamePermission>,
+    /// Zusätzlich autorisierte Server-Keys (Hot-Keys). Der `developer_wallet`
+    /// ist immer implizit autorisiert und muss hier nicht aufgeführt werden.
+    #[serde(default)]
+    pub authorized_servers: Vec<ServerKey>,
     /// Status
     pub status: GameStatus,
     /// Registriert am
     pub created_at: i64,
     /// Letzte Änderung
     pub updated_at: i64,
+    /// Unix-Sekunden des letzten Owner-/Server-Key-Auth-Calls. Wird von
+    /// `touch_owner_heartbeat` gepflegt und ist die Basis für die
+    /// Dormancy-Übergänge (`Active` → `Dormant` → `Abandoned`).
+    /// 0 = noch nie geupdatet (Fallback: `created_at`).
+    #[serde(default)]
+    pub last_owner_heartbeat: i64,
+    /// IDs vorheriger Spiele, deren Items dieser Nachfolger weiter mutieren darf.
+    /// Wird beim Finalisieren eines Fork-Antrags gesetzt. Mehrere Einträge
+    /// erlauben das Konsolidieren mehrerer aufgegebener Spiele.
+    #[serde(default)]
+    pub inherited_game_ids: Vec<String>,
+    /// Direkter Vorgänger (nur Anzeige/Provenance). Synonym zum letzten
+    /// Eintrag in `inherited_game_ids` direkt nach dem Fork.
+    #[serde(default)]
+    pub successor_of: Option<String>,
+    #[serde(default)]
+    pub genres: Vec<GameGenre>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum GameGenre {
+    // action & Combat
+    Shooter,
+    BattleRoyale,
+    MOBA,
+
+    // Exploration & World
+    OpenWorld,
+    RPG,
+    StoryDriven,
+
+    // Strategy & Simulation
+    RealTimeStrategy,
+    TurnBased,
+
+    // Kreativität & Bau
+    Crafting,
+    Survival,
+    Simulation,
+    Minecraft,
+
+
+    // Stonstiges
+    Sports,
+    Racing,
+    Puzzle,
+    Music,
+    Idle,
+    Rougelike,
+    BlockchainGaming,
+    Custom,
+}
+
+impl std::fmt::Display for GameGenre {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Shooter => write!(f, "shooter"),
+            Self::BattleRoyale => write!(f, "battle_royale"),
+            Self::MOBA => write!(f, "moba"),
+            Self::OpenWorld => write!(f, "open_world"),
+            Self::RPG => write!(f, "rpg"),
+            Self::StoryDriven => write!(f, "story_driven"),
+            Self::RealTimeStrategy => write!(f, "real_time_strategy"),
+            Self::TurnBased => write!(f, "turn_based"),
+            Self::Crafting => write!(f, "crafting"),
+            Self::Minecraft => write!(f, "minecraft"),
+            Self::Survival => write!(f, "survival"),
+            Self::Simulation => write!(f, "simulation"),
+            Self::Sports => write!(f, "sports"),
+            Self::Racing => write!(f, "racing"),
+            Self::Puzzle => write!(f, "puzzle"),
+            Self::Music => write!(f, "music"),
+            Self::Idle => write!(f, "idle"),
+            Self::Rougelike => write!(f, "rougelike"),
+            Self::BlockchainGaming => write!(f, "blockchain_gaming"),
+            Self::Custom => write!(f, "custom"),
+        }
+    }
+}
+
+impl GameGenre {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().trim() {
+            "shooter" => Some(Self::Shooter),
+            "battle_royale" | "battle royale" | "battleroyale" | "battle-royale" => Some(Self::BattleRoyale),
+            "moba" => Some(Self::MOBA),
+            "open_world" | "open world" | "openworld" => Some(Self::OpenWorld),
+            "rpg" => Some(Self::RPG),
+            "story_driven" | "story driven" | "storydriven" => Some(Self::StoryDriven),
+            "real_time_strategy" | "real time strategy" | "realtimestrategy" => Some(Self::RealTimeStrategy),
+            "turn_based" | "turn based" | "turnbased" => Some(Self::TurnBased),
+            "crafting" => Some(Self::Crafting),
+            "survival" => Some(Self::Survival),
+            "simulation" => Some(Self::Simulation),
+            "minecraft" => Some(Self::Minecraft),
+            "sports" => Some(Self::Sports),
+            "racing" => Some(Self::Racing),
+            "puzzle" => Some(Self::Puzzle),
+            "music" => Some(Self::Music),
+            "idle" => Some(Self::Idle),
+            "rougelike" | "roguelike" | "rogue like" => Some(Self::Rougelike),
+            "blockchain_gaming" | "blockchain gaming" | "blockchaingaming" => Some(Self::BlockchainGaming),
+            "custom" => Some(Self::Custom),
+             _ => None,
+        }
+    }
+
+    pub fn form_str(s: &str) -> Option<Self> {
+        Self::from_str(s)
+    }
+
+    pub fn all_names() -> Vec<&'static str> {
+        vec![
+            "shooter",
+            "battle_royale",
+            "moba",
+            "open_world",
+            "rpg",
+            "story_driven",
+            "real_time_strategy",
+            "turn_based",
+            "crafting",
+            "survival",
+            "simulation",
+            "minecraft",
+            "sports",
+            "racing",
+            "puzzle",
+            "music",
+            "idle",
+            "rougelike",
+            "blockchain_gaming",
+            "custom",
+        ]
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Community-Fork & Successor-Übergang
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Status eines Fork-Antrags. Der Lebenszyklus:
+///
+///   Pending ──(challenge)──▶ Challenged ──(finalize_winner)──▶ Finalized
+///       │                                                    │
+///       └──(timeout, no challenge)────────────────────────────┘
+///       │
+///       └──(owner_veto / cancel)──▶ Cancelled
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ForkProposalStatus {
+    Pending,
+    Challenged,
+    Finalized,
+    Cancelled { reason: String },
+}
+
+/// Fork-Antrag: Jemand möchte ein verlassenes Spiel als Community-Server
+/// fortführen und die Items der bisherigen Spieler weiter nutzbar machen.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForkProposal {
+    /// Eindeutige Antrags-ID (z.B. SHA-256 von predecessor:new_game_id:ts).
+    pub proposal_id: String,
+    /// ID des verlassenen Vorgänger-Spiels.
+    pub predecessor_game_id: String,
+    /// Geplante neue Game-ID des Community-Spiels.
+    pub new_game_id: String,
+    /// Anzeigename des Community-Spiels.
+    pub new_name: String,
+    /// Pubkey des Antragstellers (wird beim Finalisieren neuer Owner).
+    pub claimant_pubkey: String,
+    /// Höhe des gelockten Stake-Bonds in STONE.
+    /// Bei mehreren Kandidaten gewinnt der höhere Bond (+ Vote).
+    pub stake_amount: Decimal,
+    /// Erstellt am (Unix-Sekunden).
+    pub created_at: i64,
+    /// Frühestes Finalisierungs-Datum (created_at + FORK_CHALLENGE_SECS).
+    pub challenge_until: i64,
+    /// Status.
+    pub status: ForkProposalStatus,
+    /// Konkurrierende Bewerber (pubkey → stake). Wird bei
+    /// `challenge_fork` ergänzt; höchster Stake gewinnt.
+    #[serde(default)]
+    pub challengers: HashMap<String, Decimal>,
+    /// On-Chain Escrow-Adresse, an die alle Bond-Beträge fließen.
+    /// Deterministisch aus predecessor + new_game_id abgeleitet:
+    /// `pool:fork:<predecessor>:<new_game_id>`.
+    #[serde(default)]
+    pub bond_pool: String,
+    /// Bond-TX-IDs je Pubkey (claimant + challengers). Wird für späteren
+    /// Refund/Sweep nach Finalize/Cancel gebraucht.
+    #[serde(default)]
+    pub bond_tx_ids: HashMap<String, String>,
+    /// Pubkeys, deren Bond bereits vom Sweeper ausgezahlt wurde (idempotent).
+    /// Enthält den Sieger erst nach abgelaufenem Vesting.
+    #[serde(default)]
+    pub bonds_refunded: Vec<String>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -307,15 +558,49 @@ pub enum ListingStatus {
     Expired,
 }
 
+// ─── PriceMode ────────────────────────────────────────────────────────────────
+//
+// Ein Listing/Shop-Item kann seinen Preis in zwei Modi fixieren:
+//   - Stone: klassischer fester STONE-Betrag (Verhalten vor v0.x)
+//   - Usd:   USD-Betrag, der beim Kauf via Oracle in STONE umgerechnet wird
+//            → steigt der Stone-Kurs, sinkt der nötige STONE-Betrag
+//
+// MarketListing.price und ShopItem.price bleiben als STONE-Snapshot (zur
+// Anzeige/Floor-Preis-Berechnung); maßgeblich beim Kauf ist `price_mode`,
+// falls gesetzt. Wenn `price_mode == None` → Legacy-Pfad mit `price`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+pub enum PriceMode {
+    /// Verkäufer fixiert STONE-Betrag — kein Oracle nötig.
+    Stone { amount: Decimal },
+    /// Verkäufer fixiert USD-Betrag — Stone-Betrag wird live über Oracle berechnet.
+    Usd { amount: Decimal },
+}
+
+impl PriceMode {
+    pub fn stone(amount: Decimal) -> Self { Self::Stone { amount } }
+    pub fn usd(amount: Decimal) -> Self { Self::Usd { amount } }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MarketListing {
     pub listing_id: String,
     pub item_id: String,
     pub seller: String,
+    /// STONE-Snapshot zum Listing-Zeitpunkt (für Floor-Preis, UI, Backward-Compat).
+    /// Bei USD-Listings wird hier der zur Erstellung berechnete STONE-Betrag
+    /// gespeichert; maßgeblich beim Kauf ist `price_mode`.
     pub price: Decimal,
     pub status: ListingStatus,
     pub created_at: i64,
     pub expires_at: Option<i64>,
+    /// Optionaler Preis-Modus. `None` = Legacy (nutzt `price` als Stone-Betrag).
+    #[serde(default)]
+    pub price_mode: Option<PriceMode>,
+    /// Nicht-blockierende Warnungen (z.B. Rarity-Guard hat ausgeschlagen).
+    /// Werden für UI/Audit mitgeführt, beeinflussen den Kauf nicht.
+    #[serde(default)]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -331,10 +616,18 @@ pub struct MarketOffer {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PriceHistoryEntry {
     pub item_id: String,
+    /// Tatsächlich gezahlter STONE-Betrag.
     pub price: Decimal,
     pub seller: String,
     pub buyer: String,
     pub timestamp: i64,
+    /// USD-Wert zum Verkaufszeitpunkt (Snapshot vom Oracle).
+    /// `None` = Legacy-Eintrag ohne Oracle.
+    #[serde(default)]
+    pub price_usd_at_sale: Option<Decimal>,
+    /// Quelle des USD-Snapshots (z.B. "testnet_sim", "fixed"). Leer = unbekannt.
+    #[serde(default)]
+    pub oracle_source: String,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -419,6 +712,9 @@ pub struct ShopItem {
     pub metadata: serde_json::Value,
     pub active: bool,
     pub created_at: i64,
+    /// Optionaler Preis-Modus. `None` = Legacy (nutzt `price` als Stone-Betrag).
+    #[serde(default)]
+    pub price_mode: Option<PriceMode>,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -450,6 +746,16 @@ pub struct GameEconomyStore {
     pub shop_items: HashMap<String, ShopItem>,
     /// Audit-Log (letzte MAX_AUDIT_ENTRIES Einträge)
     pub audit_log: Vec<AuditLogEntry>,
+    /// Plausibilitäts-Schranke pro Rarität (USD).
+    #[serde(default)]
+    pub rarity_guard: RarityPriceGuard,
+    /// Offene und finalisierte Fork-Anträge: proposal_id → ForkProposal.
+    #[serde(default)]
+    pub fork_proposals: HashMap<String, ForkProposal>,
+    /// TOTP-Secrets pro Spiel (Google Authenticator), key = game_id.
+    /// Wird nicht über öffentliche SDK-Responses ausgegeben.
+    #[serde(default)]
+    pub owner_totp_secrets: HashMap<String, String>,
 }
 
 pub mod registry;
@@ -457,6 +763,12 @@ pub mod wallet;
 pub mod marketplace;
 pub mod session;
 pub mod persistence;
+pub mod oracle;
+pub mod rarity_guard;
+pub mod fork;
+
+pub use oracle::{PriceOracle, FixedOracle, MarketSimOracle, ResolvedPrice, resolve_price_stone};
+pub use rarity_guard::RarityPriceGuard;
 
 impl GameEconomyStore {
     pub fn new() -> Self {
@@ -472,6 +784,9 @@ impl GameEconomyStore {
             wallet_links: HashMap::new(),
             shop_items: HashMap::new(),
             audit_log: Vec::new(),
+            rarity_guard: RarityPriceGuard::default(),
+            fork_proposals: HashMap::new(),
+            owner_totp_secrets: HashMap::new(),
         }
     }
 
@@ -502,6 +817,14 @@ pub enum GameEconomyError {
     DailyLimitExceeded { limit: Decimal, spent: Decimal, requested: Decimal },
     GameSuspended { game_id: String, reason: String },
     GameBlacklisted { game_id: String, reason: String },
+    /// Spiel ist (noch) nicht verlassen – ein Fork-Antrag ist daher unzulässig.
+    GameNotAbandoned { game_id: String },
+    /// Spiel wurde bereits geforkt; nur der Nachfolger darf Items mutieren.
+    GameAlreadyForked { game_id: String, successor: String },
+    /// Die Challenge-Periode eines Fork-Antrags läuft noch.
+    ForkChallengeOpen { proposal_id: String, until: i64 },
+    /// Es liegt bereits ein offener Fork-Antrag für dieses Spiel vor.
+    ForkProposalActive { proposal_id: String },
 }
 
 impl std::fmt::Display for GameEconomyError {
@@ -526,6 +849,18 @@ impl std::fmt::Display for GameEconomyError {
             }
             Self::GameSuspended { game_id, reason } => write!(f, "Spiel '{game_id}' gesperrt: {reason}"),
             Self::GameBlacklisted { game_id, reason } => write!(f, "Spiel '{game_id}' blacklisted: {reason}"),
+            Self::GameNotAbandoned { game_id } => {
+                write!(f, "Spiel '{game_id}' ist noch nicht als verlassen markiert")
+            }
+            Self::GameAlreadyForked { game_id, successor } => {
+                write!(f, "Spiel '{game_id}' wurde bereits an '{successor}' übergeben")
+            }
+            Self::ForkChallengeOpen { proposal_id, until } => {
+                write!(f, "Fork-Antrag '{proposal_id}' ist noch in Challenge-Period (bis {until})")
+            }
+            Self::ForkProposalActive { proposal_id } => {
+                write!(f, "Es läuft bereits ein Fork-Antrag '{proposal_id}'")
+            }
         }
     }
 }
@@ -596,6 +931,7 @@ mod tests {
             "https://example.com", "dev_wallet_abc",
             Decimal::from(500),
             vec![GamePermission::Basic, GamePermission::Marketplace, GamePermission::Tournament],
+            vec![GameGenre::RPG],
         ).unwrap();
 
         assert_eq!(game.game_id, "chain-empires");
@@ -613,6 +949,7 @@ mod tests {
         assert!(store.register_game(
             "chain-empires", "X", "X", "X", "X",
             Decimal::from(100), vec![],
+            vec![GameGenre::Custom],
         ).is_err());
     }
 
@@ -623,6 +960,7 @@ mod tests {
             "test-game", "Test", "", "", "dev1",
             Decimal::from(200),
             vec![GamePermission::Basic, GamePermission::Social],
+            vec![GameGenre::Custom],
         ).unwrap();
 
         // Consent anfragen
@@ -657,6 +995,7 @@ mod tests {
             "game-x", "Game X", "", "", "dev2",
             Decimal::from(100),
             vec![GamePermission::Basic],
+            vec![GameGenre::Custom],
         ).unwrap();
 
         let cr = store.request_consent(
@@ -678,6 +1017,7 @@ mod tests {
             "limit-game", "Limit", "", "", "dev3",
             Decimal::from(100),
             vec![GamePermission::Basic],
+            vec![GameGenre::Custom],
         ).unwrap();
 
         store.create_game_wallet(
@@ -705,6 +1045,7 @@ mod tests {
             "freeze-game", "FG", "", "", "dev4",
             Decimal::from(100),
             vec![GamePermission::Basic],
+            vec![GameGenre::Custom],
         ).unwrap();
 
         store.create_game_wallet(
@@ -735,6 +1076,7 @@ mod tests {
             "perm-game", "PG", "", "", "dev5",
             Decimal::from(100),
             vec![GamePermission::Basic, GamePermission::Marketplace],
+            vec![GameGenre::Custom],
         ).unwrap();
 
         // Spiel versucht Tournament-Permission zu beantragen → Fehler
@@ -770,6 +1112,7 @@ mod tests {
             "bad-game", "Bad", "", "", "dev6",
             Decimal::from(100),
             vec![GamePermission::Basic],
+            vec![GameGenre::Custom],
         ).unwrap();
 
         store.create_game_wallet(
@@ -796,6 +1139,7 @@ mod tests {
             "audit-game", "AG", "", "", "dev7",
             Decimal::from(100),
             vec![GamePermission::Basic],
+            vec![GameGenre::Custom],
         ).unwrap();
 
         // Audit-Einträge vorhanden
@@ -814,14 +1158,87 @@ mod tests {
             HashMap::new(), true,
         ).unwrap();
 
-        let listing = store.list_item("seller1", "item-100", Decimal::from(50), None).unwrap();
+        let listing = store.list_item_stone("seller1", "item-100", Decimal::from(50), None).unwrap();
         assert_eq!(listing.status, ListingStatus::Active);
 
-        let (fee, seller_amount, seller) = store.buy_item(&listing.listing_id, "buyer1").unwrap();
+        let oracle = FixedOracle(Decimal::ONE);
+        let (fee, seller_amount, seller) = store.buy_item(&listing.listing_id, "buyer1", &oracle).unwrap();
         assert_eq!(seller, "seller1");
         assert!(fee > Decimal::ZERO);
         assert_eq!(fee + seller_amount, Decimal::from(50));
         assert_eq!(store.items.get("item-100").unwrap().owner, "buyer1");
+    }
+
+    #[test]
+    fn test_usd_listing_repricing_via_oracle() {
+        // Verkäufer listet ein Item für 10 USD.
+        // Kursanstieg: 1 STONE = 20 USD → Käufer zahlt nur 0,5 STONE.
+        let mut store = test_store();
+        store.mint_item(
+            "item-usd", "Gem", "Edelstein", "misc",
+            ItemRarity::Rare, "seller_usd", "game1", "server1",
+            HashMap::new(), true,
+        ).unwrap();
+
+        // Listing zum Zeitpunkt der Erstellung: 1 STONE = 1 USD
+        let list_oracle = FixedOracle(Decimal::ONE);
+        let listing = store.list_item(
+            "seller_usd", "item-usd",
+            PriceMode::Usd { amount: Decimal::from(10) },
+            None,
+            &list_oracle,
+        ).unwrap();
+        // Snapshot-Floor = 10 STONE.
+        assert_eq!(listing.price, Decimal::from(10));
+
+        // Kursanstieg auf 20 USD/STONE beim Kauf.
+        let buy_oracle = FixedOracle(Decimal::from(20));
+        let (fee, seller_amount, _) = store
+            .buy_item(&listing.listing_id, "buyer_usd", &buy_oracle).unwrap();
+
+        // Tatsächlicher STONE-Preis = 10 USD / 20 USD = 0.5 STONE.
+        assert_eq!(fee + seller_amount, Decimal::new(5, 1)); // 0.5
+    }
+
+    #[test]
+    fn test_rarity_guard_warns_soft() {
+        let mut store = test_store();
+        store.mint_item(
+            "item-cheap", "Stick", "Holz", "weapon",
+            ItemRarity::Common, "seller_g", "game1", "server1",
+            HashMap::new(), true,
+        ).unwrap();
+
+        // Common-Limit = 5 USD; 50 USD soll Warnung erzeugen, aber Listing erlauben.
+        let listing = store.list_item(
+            "seller_g", "item-cheap",
+            PriceMode::Usd { amount: Decimal::from(50) },
+            None,
+            &FixedOracle(Decimal::ONE),
+        ).unwrap();
+        assert!(!listing.warnings.is_empty(), "expected rarity warning");
+    }
+
+    #[test]
+    fn test_rarity_guard_hard_rejects() {
+        let mut store = test_store();
+        store.rarity_guard.hard = true;
+        store.mint_item(
+            "item-cheap2", "Twig", "Zweig", "weapon",
+            ItemRarity::Common, "seller_h", "game1", "server1",
+            HashMap::new(), true,
+        ).unwrap();
+
+        let err = store.list_item(
+            "seller_h", "item-cheap2",
+            PriceMode::Usd { amount: Decimal::from(50) },
+            None,
+            &FixedOracle(Decimal::ONE),
+        ).unwrap_err();
+        match err {
+            GameEconomyError::InvalidInput { .. } => {}
+            other => panic!("expected InvalidInput, got {other:?}"),
+        }
     }
 
     #[test]
@@ -840,6 +1257,7 @@ mod tests {
             "lim-game", "LG", "", "", "dev8",
             Decimal::from(200),
             vec![GamePermission::Basic],
+            vec![GameGenre::Custom],
         ).unwrap();
 
         store.create_game_wallet(
@@ -856,4 +1274,49 @@ mod tests {
         // Über Game-Max → Fehler
         assert!(store.set_daily_limit("player8", "lim-game", Decimal::from(300)).is_err());
     }
+
+    #[cfg(test)]
+    mod genre_tests {
+    use super::*;
+
+    #[test]
+    fn test_genre_parsing() {
+        assert_eq!(GameGenre::form_str("rpg"), Some(GameGenre::RPG));
+        assert_eq!(GameGenre::form_str("open world"), Some(GameGenre::OpenWorld));
+        assert_eq!(GameGenre::form_str("RpG"), Some(GameGenre::RPG));
+        assert_eq!(GameGenre::form_str("unknown"), None);
+    }
+
+    #[test]
+    fn test_genre_list_parsing() {
+        let result = parse_genre_list("rpg, crafting, blockchain gaming");
+        assert!(result.is_ok());
+        let genres = result.unwrap();
+        assert_eq!(genres.len(), 3);
+    }
+
+    #[test]
+    fn test_genre_validation_empty() {
+        let result = validate_genres(&[]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_genre_validation_too_many() {
+        let genres = vec![
+            GameGenre::RPG, GameGenre::Shooter,
+            GameGenre::Crafting, GameGenre::Survival,
+            GameGenre::BlockchainGaming, GameGenre::Idle, // 6 total
+        ];
+        let result = validate_genres(&genres);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_genre_duplicates() {
+        let genres = vec![GameGenre::RPG, GameGenre::RPG];
+        let result = validate_genres(&genres);
+        assert!(result.is_err());
+    }
+}
 }

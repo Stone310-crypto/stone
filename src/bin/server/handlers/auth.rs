@@ -1,8 +1,8 @@
 //! Auth handlers: signup, login, sync-users, push_user_to_peers, challenge-response, QR-login.
 
 use axum::{
-    extract::{Path, State},
-    http::{HeaderMap, StatusCode},
+    extract::{Path, Query, State},
+    http::{HeaderMap, StatusCode, header},
     response::IntoResponse,
 };
 use serde::Deserialize;
@@ -394,6 +394,8 @@ pub async fn handle_login(
             account_type: stone::auth::default_account_type(),
             org_id: String::new(),
             org_role: String::new(),
+            discord_id: String::new(),
+            discord_username: String::new(),
         };
         users.push(new_user);
         save_users(&users);
@@ -752,11 +754,15 @@ pub async fn handle_qr_status(
                         "status": "approved",
                         "session_token": approved.session_token,
                         "expires_in": SESSION_TOKEN_TTL_SECS,
-                        "api_key": api_key,                        "phrase": approved.approved_phrase,                        "user": {
+                        "api_key": api_key,
+                        "phrase": approved.approved_phrase,
+                        "user": {
                             "id": approved.approved_user_id,
                             "name": approved.approved_user_name,
                             "wallet_address": approved.approved_wallet,
                             "account_type": approved.approved_account_type,
+                            "discord_id": approved.approved_discord_id,
+                            "discord_username": approved.approved_discord_username,
                         },
                     })),
                 )
@@ -838,4 +844,296 @@ pub async fn handle_qr_approve(
         )
             .into_response()
     }
+}
+
+// ─── Discord OAuth2 Login ─────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct DiscordLoginRequest {
+    /// OAuth2 authorization code (from redirect)
+    pub code: String,
+    /// Redirect URI used in the OAuth2 flow (must match Discord app settings)
+    pub redirect_uri: String,
+}
+
+/// POST /api/v1/auth/discord
+///
+/// Exchange a Discord OAuth2 code for a Stonechain session.
+/// Flow:
+///   1. App opens Discord OAuth2 URL, user approves
+///   2. Discord redirects to deep link with `code=...`
+///   3. App calls this endpoint with the code
+///   4. We exchange it with Discord API, get user profile
+///   5. Find or create a Stonechain account linked to the Discord ID
+///   6. Return api_key, wallet_address etc.
+pub async fn handle_discord_login(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::Json(req): axum::Json<DiscordLoginRequest>,
+) -> impl IntoResponse {
+    // Rate limiting
+    let ip = extract_client_ip(&headers);
+    if let Some(resp) = check_rate_limit_tuple(&state.rate_limits.auth_login, &ip, "DiscordLogin") {
+        return resp;
+    }
+
+    let client_id = match std::env::var("DISCORD_CLIENT_ID") {
+        Ok(v) if !v.is_empty() => v,
+        _ => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(json!({"error": "Discord-Login nicht konfiguriert"})),
+            );
+        }
+    };
+    let client_secret = match std::env::var("DISCORD_CLIENT_SECRET") {
+        Ok(v) if !v.is_empty() => v,
+        _ => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(json!({"error": "Discord-Login nicht konfiguriert"})),
+            );
+        }
+    };
+
+    if req.code.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"error": "Kein OAuth2-Code angegeben"})),
+        );
+    }
+
+    let http = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"error": "HTTP-Client Fehler"})),
+            );
+        }
+    };
+
+    // ── 1. Code gegen Discord-Token tauschen ────────────────────────────────
+    let token_resp = http
+        .post("https://discord.com/api/oauth2/token")
+        .form(&[
+            ("client_id", client_id.as_str()),
+            ("client_secret", client_secret.as_str()),
+            ("grant_type", "authorization_code"),
+            ("code", req.code.as_str()),
+            ("redirect_uri", req.redirect_uri.as_str()),
+        ])
+        .send()
+        .await;
+
+    let token_body: serde_json::Value = match token_resp {
+        Ok(r) if r.status().is_success() => match r.json().await {
+            Ok(v) => v,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    axum::Json(json!({"error": "Discord-Token-Antwort nicht parsierbar"})),
+                );
+            }
+        },
+        Ok(r) => {
+            let status_code = r.status().as_u16();
+            let body = r.json::<serde_json::Value>().await.unwrap_or_default();
+            eprintln!("[discord-auth] Token-Exchange fehlgeschlagen: HTTP {status_code} – {body}");
+            return (
+                StatusCode::UNAUTHORIZED,
+                axum::Json(json!({"error": "Discord-Authentifizierung fehlgeschlagen"})),
+            );
+        }
+        Err(e) => {
+            eprintln!("[discord-auth] Token-Request Fehler: {e}");
+            return (
+                StatusCode::BAD_GATEWAY,
+                axum::Json(json!({"error": "Discord nicht erreichbar"})),
+            );
+        }
+    };
+
+    let access_token = match token_body.get("access_token").and_then(|v| v.as_str()) {
+        Some(t) => t.to_string(),
+        None => {
+            eprintln!("[discord-auth] Kein access_token in Antwort: {token_body}");
+            return (
+                StatusCode::UNAUTHORIZED,
+                axum::Json(json!({"error": "Kein Discord-Token erhalten"})),
+            );
+        }
+    };
+
+    // ── 2. Discord-Profil abrufen ────────────────────────────────────────────
+    let profile_resp = http
+        .get("https://discord.com/api/users/@me")
+        .header("Authorization", format!("Bearer {access_token}"))
+        .send()
+        .await;
+
+    let profile: serde_json::Value = match profile_resp {
+        Ok(r) if r.status().is_success() => match r.json().await {
+            Ok(v) => v,
+            Err(_) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    axum::Json(json!({"error": "Discord-Profil nicht parsierbar"})),
+                );
+            }
+        },
+        Ok(_) | Err(_) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                axum::Json(json!({"error": "Discord-Profil nicht abrufbar"})),
+            );
+        }
+    };
+
+    let discord_id = match profile.get("id").and_then(|v| v.as_str()) {
+        Some(id) => id.to_string(),
+        None => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                axum::Json(json!({"error": "Discord-Profil hat keine ID"})),
+            );
+        }
+    };
+
+    // Discord username: new format is just "username", legacy is "username#discriminator"
+    let discord_username = {
+        let base = profile.get("username").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let disc = profile.get("discriminator").and_then(|v| v.as_str()).unwrap_or("0");
+        if disc == "0" {
+            base.to_string()
+        } else {
+            format!("{base}#{disc}")
+        }
+    };
+
+    // ── 3. Existierenden User suchen oder neuen anlegen ─────────────────────
+    let mut users = state.users.lock().unwrap_or_else(|e| e.into_inner());
+
+    // Zuerst nach discord_id suchen
+    if let Some(idx) = users.iter().position(|u| u.discord_id == discord_id) {
+        // Username ggf. aktualisieren
+        if users[idx].discord_username != discord_username {
+            users[idx].discord_username = discord_username.clone();
+            save_users(&users);
+        }
+        let user = &users[idx];
+        println!("[discord-auth] 🔑 Login: {} (Discord: {discord_username})", user.name);
+        return (
+            StatusCode::OK,
+            axum::Json(json!({
+                "id": user.id,
+                "name": user.name,
+                "api_key": user.api_key,
+                "wallet_address": user.wallet_address,
+                "discord_id": discord_id,
+                "discord_username": discord_username,
+            })),
+        );
+    }
+
+    // Neuen Account erstellen (gleiche Logik wie /signup)
+    let display_name = discord_username.clone();
+    let id = format!("u-{}", uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("0000"));
+    let (mut new_user, phrase) = create_user_with_phrase(&display_name);
+    new_user.id = id.clone();
+    new_user.discord_id = discord_id.clone();
+    new_user.discord_username = discord_username.clone();
+    users.push(new_user.clone());
+    save_users(&users);
+
+    println!("[discord-auth] 🆕 Neuer Account für Discord-User {discord_username} ({discord_id}): wallet={}", &new_user.wallet_address.get(..16).unwrap_or(&new_user.wallet_address));
+
+    // AccountRegister TX in die Chain
+    if !new_user.wallet_address.is_empty() {
+        let wallet = new_user.wallet_address.clone();
+        let name = new_user.name.clone();
+        let api_key_hash = new_user.api_key.clone();
+        let node = state.node.clone();
+        let phrase_clone = phrase.clone();
+        tokio::spawn(async move {
+            if let Ok(mnemonic) = bip39::Mnemonic::parse_in(bip39::Language::English, &phrase_clone) {
+                let entropy = mnemonic.to_entropy();
+                let key_bytes: [u8; 32] = if entropy.len() == 32 {
+                    entropy.try_into().unwrap()
+                } else {
+                    use sha2::{Digest, Sha256};
+                    Sha256::digest(&entropy).into()
+                };
+                let signing_key = ed25519_dalek::SigningKey::from_bytes(&key_bytes);
+                let nonce = {
+                    let ledger = node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
+                    let base = ledger.nonce(&wallet);
+                    base + node.mempool.sender_pending_count(&wallet)
+                };
+                let memo = serde_json::json!({"name": name, "api_key_hash": api_key_hash}).to_string();
+                if let Ok(tx) = stone::token::create_signed_tx(
+                    &signing_key,
+                    stone::token::TxType::AccountRegister,
+                    wallet.clone(), wallet.clone(),
+                    rust_decimal::Decimal::ZERO, rust_decimal::Decimal::ZERO,
+                    nonce, memo,
+                    stone::token::transaction::FeeTier::Priority,
+                ) {
+                    let _ = node.mempool.add_tx(tx, None);
+                }
+            }
+        });
+    }
+
+    (
+        StatusCode::CREATED,
+        axum::Json(json!({
+            "id": id,
+            "name": new_user.name,
+            "api_key": new_user.api_key,
+            "wallet_address": new_user.wallet_address,
+            "phrase": phrase,
+            "discord_id": discord_id,
+            "discord_username": discord_username,
+            "message": "Neuer Account erstellt. Bitte die Phrase sicher aufbewahren!",
+        })),
+    )
+}
+
+// ─── Discord OAuth2 Callback (Redirect) ──────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct DiscordCallbackParams {
+    pub code: Option<String>,
+    pub error: Option<String>,
+}
+
+/// GET /api/v1/auth/discord/callback
+///
+/// Discord leitet nach der Autorisierung hierher weiter.
+/// Wir nehmen den Code und leiten per 302 an die App weiter:
+///   stonechain://auth/discord?code=...
+pub async fn handle_discord_callback(
+    Query(params): Query<DiscordCallbackParams>,
+) -> impl IntoResponse {
+    if let Some(err) = params.error {
+        let deep_link = format!("stonechain://auth/discord?error={}", err);
+        return axum::response::Redirect::temporary(&deep_link).into_response();
+    }
+
+    let code = match params.code {
+        Some(c) if !c.is_empty() => c,
+        _ => {
+            return axum::response::Redirect::temporary(
+                "stonechain://auth/discord?error=missing_code",
+            )
+            .into_response();
+        }
+    };
+
+    let deep_link = format!("stonechain://auth/discord?code={}", code);
+    axum::response::Redirect::temporary(&deep_link).into_response()
 }

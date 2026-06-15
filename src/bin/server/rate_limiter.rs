@@ -165,6 +165,10 @@ pub struct RateLimits {
     // ── Catch-All ────────────────────────────────────────────────────────
     /// Allgemeine Schreib-Operationen: 60 pro Minute pro IP
     pub general_write: RateLimiter,
+
+    // ── Updater (Peer-Sync) ──────────────────────────────────────────────
+    /// Update-Chunk-Download: 30 Anfragen pro 60 Sekunden pro IP (U3 — Bandwidth-DoS-Schutz)
+    pub update_chunk: RateLimiter,
 }
 
 impl RateLimits {
@@ -181,6 +185,7 @@ impl RateLimits {
             document_upload: RateLimiter::new(10, 60),
             trust_request: RateLimiter::new(3, 300),
             general_write: RateLimiter::new(60, 60),
+            update_chunk: RateLimiter::new(30, 60),
         }
     }
 
@@ -196,6 +201,7 @@ impl RateLimits {
         self.document_upload.cleanup();
         self.trust_request.cleanup();
         self.general_write.cleanup();
+        self.update_chunk.cleanup();
     }
 }
 

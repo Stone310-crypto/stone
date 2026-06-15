@@ -123,6 +123,33 @@ impl ChatIndex {
         self.conversations.entry(key).or_default().push(entry);
     }
 
+    /// PooledMessage (off-chain, soeben per Gossip empfangen) in den Index aufnehmen,
+    /// damit der Empfänger sie sofort über `/api/v1/chat/messages/:peer` sieht.
+    ///
+    /// Gibt `true` zurück wenn ein neuer Eintrag eingefügt wurde (für Persist-Trigger).
+    pub fn upsert_pool_message(&mut self, msg: &crate::message_pool::PooledMessage) -> bool {
+        let key = Self::conv_key(&msg.from_wallet, &msg.to_wallet);
+        let entries = self.conversations.entry(key).or_default();
+        if entries.iter().any(|e| e.msg_id == msg.msg_id) {
+            return false;
+        }
+        let content_hash = compute_content_hash(&msg.encrypted_content, &msg.nonce);
+        entries.push(ChatEntry {
+            msg_id: msg.msg_id.clone(),
+            from_wallet: msg.from_wallet.clone(),
+            to_wallet: msg.to_wallet.clone(),
+            from_user_id: msg.from_user_id.clone(),
+            from_name: msg.from_name.clone(),
+            encrypted_content: msg.encrypted_content.clone(),
+            nonce: msg.nonce.clone(),
+            content_hash,
+            timestamp: msg.timestamp,
+            block_index: 0,
+            tx_id: String::new(),
+        });
+        true
+    }
+
     /// Alle Konversationen für eine Wallet-Adresse abrufen.
     pub fn conversations_for(&self, wallet: &str, users: &[crate::auth::User]) -> Vec<ConversationSummary> {
         let mut result: Vec<ConversationSummary> = Vec::new();
@@ -263,10 +290,21 @@ impl ChatIndex {
                 }
                 for m in msgs {
                     let key = Self::conv_key(&m.from_wallet, &m.to_wallet);
-                    let already = index.conversations.get(&key)
-                        .map(|entries| entries.iter().any(|e| e.msg_id == m.msg_id))
-                        .unwrap_or(false);
-                    if already { continue; }
+                    if let Some(entries) = index.conversations.get_mut(&key) {
+                        if let Some(ex) = entries.iter_mut().find(|e| e.msg_id == m.msg_id) {
+                            // Nachricht war bereits off-chain pending im Index und wird jetzt
+                            // durch den Batch on-chain bestaetigt.
+                            ex.block_index = block.index;
+                            if ex.encrypted_content.is_empty() && !m.encrypted_content.is_empty() {
+                                ex.encrypted_content = m.encrypted_content.clone();
+                                ex.nonce = m.nonce.clone();
+                            }
+                            if ex.content_hash.is_empty() {
+                                ex.content_hash = compute_content_hash(&m.encrypted_content, &m.nonce);
+                            }
+                            continue;
+                        }
+                    }
 
                     let entry = ChatEntry {
                         msg_id: m.msg_id.clone(),
@@ -441,12 +479,22 @@ impl ChatIndex {
                     );
                 }
                 for m in msgs {
-                    // Duplikat-Check: msg_id bereits im Index?
+                    // Duplikat-Check + Upgrade: msg_id bereits als pending vorhanden?
                     let key = Self::conv_key(&m.from_wallet, &m.to_wallet);
-                    let already = self.conversations.get(&key)
-                        .map(|entries| entries.iter().any(|e| e.msg_id == m.msg_id))
-                        .unwrap_or(false);
-                    if already { continue; }
+                    if let Some(entries) = self.conversations.get_mut(&key) {
+                        if let Some(ex) = entries.iter_mut().find(|e| e.msg_id == m.msg_id) {
+                            ex.block_index = block.index;
+                            if ex.encrypted_content.is_empty() && !m.encrypted_content.is_empty() {
+                                ex.encrypted_content = m.encrypted_content.clone();
+                                ex.nonce = m.nonce.clone();
+                            }
+                            if ex.content_hash.is_empty() {
+                                ex.content_hash = compute_content_hash(&m.encrypted_content, &m.nonce);
+                            }
+                            chat_count += 1;
+                            continue;
+                        }
+                    }
 
                     let entry = ChatEntry {
                         msg_id: m.msg_id.clone(),

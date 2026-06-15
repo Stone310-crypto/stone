@@ -78,7 +78,7 @@ impl SwarmTask {
         let expired_penalties: Vec<PeerId> = self.peer_penalties.iter()
             .filter(|(_, p)| {
                 p.last_offense.elapsed() > Duration::from_secs(PENALTY_DECAY_MINS * 60 * 2)
-                    && p.score < BAN_THRESHOLD
+                    && p.score < BAN_THRESHOLD_BOOTSTRAP
             })
             .map(|(pid, _)| *pid)
             .collect();
@@ -160,5 +160,9 @@ impl SwarmTask {
 
         // 9. Latenz-Daten: Einträge für nicht mehr bekannte Peers entfernen
         self.peer_latencies.retain(|pid, _| self.peers.contains_key(pid));
+
+        // 10. Protocol-Mismatch-Quarantäne: abgelaufene Einträge entfernen
+        let now = Instant::now();
+        self.protocol_mismatch_cooldown.retain(|_, until| *until > now);
     }
 }

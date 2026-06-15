@@ -34,7 +34,13 @@ use sha2::{Digest, Sha256};
 // ─── Transaktionstyp ─────────────────────────────────────────────────────────
 
 /// Art der Token-Transaktion.
+///
+/// Wire-Format (JSON): snake_case, identisch zur `Display`-Implementierung
+/// und zur kanonischen `sign_input`-Codierung. So passen JSON-Deserialization
+/// (`tx_type: "company_register"`) und Signatur-Berechnung exakt zusammen.
+/// Akzeptiert zusätzlich die historischen PascalCase-Namen als Aliases.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum TxType {
     /// Nutzer-zu-Nutzer Überweisung
     Transfer,
@@ -92,6 +98,56 @@ pub enum TxType {
     /// `from` = "pool:htlc_escrow", `to` = Sender-Wallet, `amount` = HTLC-Betrag
     /// `memo` = JSON: {"htlc_id":"..."}
     HtlcRefund,
+    /// Firmen-Account registrieren. `from` == `to` == Owner-Wallet, `amount` = 0,
+    /// `memo` = JSON: {"name":"…","country":"DE","website":"…"}.
+    /// Siehe `crate::token::game_chain::CompanyRegisterMemo`.
+    CompanyRegister,
+    /// Firmen-Profil aktualisieren (Website, Country). `from`==`to`==Owner-Wallet.
+    /// `memo` = JSON: {"country"?:"…","website"?:"…"}. Name ist immutable.
+    CompanyUpdate,
+    /// Spiel on-chain registrieren. `from` == `to` == Owner-Wallet einer Firma,
+    /// `amount` = 0, `memo` = JSON: {"game_id":"…","name":"…","version":"…",…}.
+    /// Siehe `crate::token::game_chain::GameRegisterMemo`.
+    GameRegister,
+    /// Spiel-Eintrag aktualisieren. `from`==`to`==Owner-Wallet der besitzenden Firma.
+    /// `memo` = JSON: {"game_id":"…","version"?:"…","icon_uri"?:"…","coin_address"?:"…"}.
+    GameUpdate,
+    /// Spiel als veraltet markieren. `from`==`to`==Owner-Wallet.
+    /// `memo` = JSON: {"game_id":"…"}.
+    GameDeprecate,
+    /// Founder-signed Firmen-Verifizierung. `from`==`to`==Founder-Wallet,
+    /// `memo` = JSON: {"target":"<wallet>","reason":"…"}.
+    CompanyVerify,
+    /// Founder-signed Spiel-Verifizierung. `from`==`to`==Founder-Wallet,
+    /// `memo` = JSON: {"target":"<game_id>","reason":"…"}.
+    GameVerify,
+    /// Sub-Key zu einer Firma hinzufügen. `from`==`to`==Owner-Wallet,
+    /// `memo` = JSON: {"sub_wallet":"…","role":"developer|finance|support","daily_limit_stone":"…"}.
+    RoleGrant,
+    /// Sub-Key aus einer Firma entfernen. `from`==`to`==Owner-Wallet,
+    /// `memo` = JSON: {"sub_wallet":"…"}.
+    RoleRevoke,
+    /// **Phase D**: Game-Coin minten. `from`==`to`==Firma. amount=0.
+    /// `memo` = JSON: {"game_id":"…","to":"<wallet>","amount":"…"}.
+    /// Mint legt Game-Coins für `to` an. Nur Owner oder Developer-Sub-Key.
+    #[serde(rename = "gamecoin_mint")]
+    GameCoinMint,
+    /// **Phase D**: Game-Coin transferieren. `from`/`to` = STONE-Wallets,
+    /// `memo` = JSON: {"game_id":"…","amount":"…"}. STONE-`amount` muss 0 sein.
+    #[serde(rename = "gamecoin_transfer")]
+    GameCoinTransfer,
+    /// **Phase D**: Game-Coin burnen. `from`==`to`==Halter.
+    /// `memo` = JSON: {"game_id":"…","amount":"…"}.
+    #[serde(rename = "gamecoin_burn")]
+    GameCoinBurn,
+    /// **Game-Forks**: Privileged System-TX – Bond aus dem Fork-Escrow auszahlen.
+    /// `from` = `pool:fork:<predecessor>:<new_game_id>`, `to` = Empfänger-Wallet,
+    /// `amount` = Bond-Betrag, `fee` = 0, `signature` = "fork-bond-refund".
+    /// `memo` = JSON: {"proposal_id":"…","reason":"winner_vest|loser_refund|owner_veto"}.
+    /// Wird serverseitig vom Sweeper erstellt nach Validierung im
+    /// `GameEconomyStore` und ist signaturfrei (analog `HtlcClaim`/`HtlcRefund`).
+    #[serde(rename = "fork_bond_refund")]
+    ForkBondRefund,
 }
 
 // ─── Fee-Tier ────────────────────────────────────────────────────────────────
@@ -164,6 +220,19 @@ impl std::fmt::Display for TxType {
             TxType::HtlcCreate      => write!(f, "htlc_create"),
             TxType::HtlcClaim       => write!(f, "htlc_claim"),
             TxType::HtlcRefund      => write!(f, "htlc_refund"),
+            TxType::CompanyRegister => write!(f, "company_register"),
+            TxType::CompanyUpdate   => write!(f, "company_update"),
+            TxType::GameRegister    => write!(f, "game_register"),
+            TxType::GameUpdate      => write!(f, "game_update"),
+            TxType::GameDeprecate   => write!(f, "game_deprecate"),
+            TxType::CompanyVerify   => write!(f, "company_verify"),
+            TxType::GameVerify      => write!(f, "game_verify"),
+            TxType::RoleGrant       => write!(f, "role_grant"),
+            TxType::RoleRevoke      => write!(f, "role_revoke"),
+            TxType::GameCoinMint    => write!(f, "gamecoin_mint"),
+            TxType::GameCoinTransfer=> write!(f, "gamecoin_transfer"),
+            TxType::GameCoinBurn    => write!(f, "gamecoin_burn"),
+            TxType::ForkBondRefund  => write!(f, "fork_bond_refund"),
         }
     }
 }
@@ -204,6 +273,12 @@ pub struct TokenTx {
     /// Gebührenstufe: Priority (0.001, bevorzugt), Standard (0.0001, Basis-Fee)
     #[serde(default)]
     pub fee_tier: FeeTier,
+    /// **Phase D**: Optionaler Sub-Key-Pubkey (64-hex). Wenn gesetzt,
+    /// wird die Signatur gegen diesen Key geprüft (statt `from`).
+    /// `from` ist dann die Firma im Namen derer der Sub-Key handelt.
+    /// `None` = Owner signiert direkt (Standard, Backward-Compat).
+    #[serde(default)]
+    pub signed_by: Option<String>,
 }
 
 /// Default Chain-ID: liest aus STONE_NETWORK ENV, Fallback "stone-testnet"
@@ -279,6 +354,13 @@ fn tx_id_input(tx: &TokenTx) -> Vec<u8> {
     buf.extend_from_slice(&tx.timestamp.to_le_bytes());
     buf.push(b'|');
     buf.extend_from_slice(tx.chain_id.as_bytes());
+    // Security Fix: signed_by einbeziehen, um TX-ID-Kollisionen zwischen
+    // Owner- und SubKey-Transaktionen mit gleichen Basis-Daten zu verhindern.
+    if let Some(ref sb) = tx.signed_by {
+        buf.push(b'|');
+        buf.extend_from_slice(b"signed_by:");
+        buf.extend_from_slice(sb.as_bytes());
+    }
     buf
 }
 
@@ -289,6 +371,11 @@ fn sign_input(tx: &TokenTx) -> Vec<u8> {
     buf.extend_from_slice(tx.memo.as_bytes());
     buf.push(b'|');
     buf.extend_from_slice(tx.fee_tier.to_string().as_bytes());
+    if let Some(sb) = &tx.signed_by {
+        buf.push(b'|');
+        buf.extend_from_slice(b"signed_by:");
+        buf.extend_from_slice(sb.as_bytes());
+    }
     buf
 }
 
@@ -326,6 +413,14 @@ pub fn create_signed_tx(
     if tx_type == TxType::RotateKey || tx_type == TxType::AccountRegister
         || tx_type == TxType::AccountUpdate || tx_type == TxType::ChatMessage
         || tx_type == TxType::Memorial
+        || tx_type == TxType::CompanyRegister || tx_type == TxType::GameRegister
+        || tx_type == TxType::CompanyUpdate
+        || tx_type == TxType::GameUpdate || tx_type == TxType::GameDeprecate
+        || tx_type == TxType::CompanyVerify || tx_type == TxType::GameVerify
+        || tx_type == TxType::RoleGrant || tx_type == TxType::RoleRevoke
+        || tx_type == TxType::GameCoinMint
+        || tx_type == TxType::GameCoinTransfer
+        || tx_type == TxType::GameCoinBurn
     {
         // Diese TX-Typen: amount muss 0 sein, fee >= 0
         if amount != Decimal::ZERO {
@@ -352,6 +447,7 @@ pub fn create_signed_tx(
     // Memo-Limit: ChatMessage 4096, HTLC 512 (JSON mit hash_lock/preimage), andere 256 Bytes
     let memo_limit = if tx_type == TxType::ChatMessage { 4096 }
         else if tx_type == TxType::HtlcCreate || tx_type == TxType::HtlcClaim || tx_type == TxType::HtlcRefund { 512 }
+        else if tx_type == TxType::ForkBondRefund { 512 }
         else { 256 };
     if memo.len() > memo_limit {
         return Err(TxError::MissingField(format!("Memo darf maximal {} Bytes sein (hat {})", memo_limit, memo.len())));
@@ -370,6 +466,7 @@ pub fn create_signed_tx(
         memo,
         chain_id: default_chain_id(),
         fee_tier,
+        signed_by: None,
     };
 
     // TX-ID berechnen
@@ -398,6 +495,32 @@ pub fn verify_tx_signature(tx: &TokenTx) -> Result<(), TxError> {
         return Ok(());
     }
 
+    // **Phase D — Sub-Key-Signatur**: Wenn `signed_by` gesetzt ist, prüfen wir
+    // die Signatur gegen den Sub-Key, nicht gegen `from`. Die Autorisierung
+    // (existiert dieser Sub-Key in der Firma + ist die Rolle für diesen TxType
+    // freigegeben + Daily-Limit) wird im Ledger durchgeführt.
+    if let Some(sb) = &tx.signed_by {
+        if tx.from.starts_with("pool:") {
+            return Err(TxError::InvalidKey("Pool-Konten können nicht durch Sub-Keys signiert werden".into()));
+        }
+        let pub_bytes = hex::decode(sb)
+            .map_err(|e| TxError::InvalidKey(format!("Sub-Key Hex ungültig: {e}")))?;
+        if pub_bytes.len() != 32 {
+            return Err(TxError::InvalidKey("Sub-Key muss 32 Byte sein".into()));
+        }
+        let verifying_key = VerifyingKey::from_bytes(
+            pub_bytes.as_slice().try_into().unwrap()
+        ).map_err(|e| TxError::InvalidKey(format!("Sub-Key ungültig: {e}")))?;
+        let sig_bytes = hex::decode(&tx.signature)
+            .map_err(|e| TxError::InvalidSignature(format!("Signatur Hex ungültig: {e}")))?;
+        if sig_bytes.len() != 64 {
+            return Err(TxError::InvalidSignature("Signatur muss 64 Byte sein".into()));
+        }
+        let signature = Signature::from_bytes(sig_bytes.as_slice().try_into().unwrap());
+        return verify_with_fallback(&verifying_key, &signature, tx,
+            "Sub-Key Signatur ungültig");
+    }
+
     // Pool-Konten (pool:community, pool:staking, pool:onboarding, etc.) haben keine privaten Schlüssel.
     // Transfers von Pool-Konten werden nur serverseitig erstellt (z.B. Faucet, Onboarding).
     if tx.from.starts_with("pool:") {
@@ -414,14 +537,18 @@ pub fn verify_tx_signature(tx: &TokenTx) -> Result<(), TxError> {
         return Ok(());
     }
 
-    // Testnet-Markt: Sell-TXs werden serverseitig erstellt (nach API-Auth).
-    // Signatur "market-sell" ist ein Platzhalter — kein User-Key nötig.
-    if tx.signature == "market-sell" && tx.memo.starts_with("Market Sell:") {
-        return Ok(());
-    }
+    // Testnet-Markt: Sell-TXs werden serverseitig mit dem Server-Private-Key
+    // signiert. Der "market-sell"-Platzhalter wurde entfernt (Sicherheitsfix).
+    // Market-Sell-TXs durchlaufen die normale Ed25519-Signatur-Prüfung.
 
     // HTLC Claim/Refund: System-TXs von pool:htlc_escrow (serverseitig erstellt).
     if tx.tx_type == TxType::HtlcClaim || tx.tx_type == TxType::HtlcRefund {
+        return Ok(());
+    }
+
+    // Fork-Bond-Refund: System-TX vom Fork-Escrow-Pool. Sweeper validiert
+    // den GameEconomyStore vor dem Submit; Ledger trusted die TX wie HTLC.
+    if tx.tx_type == TxType::ForkBondRefund {
         return Ok(());
     }
 
@@ -508,6 +635,42 @@ fn verify_with_fallback(
         .map_err(|_| TxError::InvalidSignature(error_msg.to_string()))
 }
 
+/// **Phase D**: Erstellt eine TX, die im Namen einer Firma von einem Sub-Key
+/// signiert wird. `from` = Firma, `signing_key` = Sub-Key. Setzt `signed_by`
+/// auf den Sub-Key-Public-Key und signiert mit ihm.
+///
+/// Hinweis: Die Autorisierung (Rolle + Daily-Limit) wird im Ledger geprüft.
+pub fn create_signed_tx_as_subkey(
+    sub_signing_key: &SigningKey,
+    tx_type: TxType,
+    company_wallet: String,
+    to: String,
+    amount: Decimal,
+    fee: Decimal,
+    nonce: u64,
+    memo: String,
+    fee_tier: FeeTier,
+) -> Result<TokenTx, TxError> {
+    // Standard-Validierung (amount-Regeln pro TxType)
+    let mut tx = create_signed_tx(
+        sub_signing_key, tx_type, company_wallet, to,
+        amount, fee, nonce, memo, fee_tier,
+    )?;
+    // tx ist jetzt signed mit dem Sub-Key, aber from==pubkey_of(sub_signing_key).
+    // Wir fixen das: from = Firma, signed_by = Sub-Key-Pubkey.
+    let sub_pubkey = hex::encode(sub_signing_key.verifying_key().to_bytes());
+    // Da `from` falsch ist, setzen wir es neu, re-rechnen tx_id, re-signieren.
+    // Aufrufer übergibt `company_wallet` bereits korrekt — `create_signed_tx`
+    // hat es als `from` übernommen. Wir setzen nur signed_by + re-sign.
+    tx.signed_by = Some(sub_pubkey);
+    tx.tx_id = compute_tx_id(&tx);
+    let input = sign_input(&tx);
+    let hash = Sha256::digest(&input);
+    let sig = sub_signing_key.sign(&hash);
+    tx.signature = hex::encode(sig.to_bytes());
+    Ok(tx)
+}
+
 /// Validiert eine Transaktion strukturell (ohne Ledger-Zustand).
 ///
 /// Prüft:
@@ -528,6 +691,14 @@ pub fn validate_tx(tx: &TokenTx) -> Result<(), TxError> {
     if tx.tx_type == TxType::RotateKey || tx.tx_type == TxType::AccountRegister
         || tx.tx_type == TxType::AccountUpdate || tx.tx_type == TxType::ChatMessage
         || tx.tx_type == TxType::Memorial
+        || tx.tx_type == TxType::CompanyRegister || tx.tx_type == TxType::GameRegister
+        || tx.tx_type == TxType::CompanyUpdate
+        || tx.tx_type == TxType::GameUpdate || tx.tx_type == TxType::GameDeprecate
+        || tx.tx_type == TxType::CompanyVerify || tx.tx_type == TxType::GameVerify
+        || tx.tx_type == TxType::RoleGrant || tx.tx_type == TxType::RoleRevoke
+        || tx.tx_type == TxType::GameCoinMint
+        || tx.tx_type == TxType::GameCoinTransfer
+        || tx.tx_type == TxType::GameCoinBurn
     {
         if tx.amount != Decimal::ZERO {
             return Err(TxError::InvalidAmount(format!("{}: Betrag muss 0 sein", tx.tx_type)));

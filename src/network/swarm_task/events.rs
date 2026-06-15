@@ -27,15 +27,19 @@ impl SwarmTask {
             // ── Identify ──────────────────────────────────────────────────────
             StoneBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. }) => {
                 let addrs: Vec<String> = info.listen_addrs.iter().map(|a| a.to_string()).collect();
-                println!("[p2p] Identify: {peer_id} – agent={}", info.agent_version);
+                println!(
+                    "[p2p] Identify: {peer_id} – agent={} protocol={}",
+                    info.agent_version,
+                    info.protocol_version,
+                );
 
                 // SECURITY: Protokoll-Version prüfen. Peers mit inkompatibler
                 // Major-Version werden getrennt um Chain-Korruption zu verhindern.
                 {
                     let our_major = STONE_PROTOCOL_VERSION.split('/').nth(1)
                         .and_then(|v| v.split('.').next());
-                    let peer_major = if info.agent_version.starts_with("stone/") {
-                        info.agent_version.strip_prefix("stone/")
+                    let peer_major = if info.protocol_version.starts_with("stone/") {
+                        info.protocol_version.strip_prefix("stone/")
                             .and_then(|v| v.split('.').next())
                     } else {
                         None
@@ -43,8 +47,8 @@ impl SwarmTask {
                     if let (Some(ours), Some(theirs)) = (our_major, peer_major) {
                         if ours != theirs {
                             eprintln!(
-                                "[p2p] ⚠ Peer {peer_id} hat inkompatible Version {} (wir: {}) – Verbindung getrennt",
-                                info.agent_version, STONE_PROTOCOL_VERSION,
+                                "[p2p] ⚠ Peer {peer_id} hat inkompatible Protokoll-Version {} (wir: {}) – Verbindung getrennt",
+                                info.protocol_version, STONE_PROTOCOL_VERSION,
                             );
                             let _ = self.swarm.disconnect_peer_id(peer_id);
                             return;
@@ -217,48 +221,77 @@ impl SwarmTask {
                 self.net_metrics.bytes_in += msg_len;
                 self.net_metrics.messages_in += 1;
 
-                if topic == TOPIC_BLOCKS {
-                    self.handle_gossip_block(message.data, propagation_source);
-                } else if topic == TOPIC_SYNC_HANDSHAKE {
-                    self.handle_sync_handshake(message.data, propagation_source);
-                } else if topic == TOPIC_MEMPOOL {
-                    self.handle_gossip_tx(message.data, propagation_source);
-                } else if topic == crate::updater::TOPIC_UPDATES {
+                // Manuelle Validierung (Gossipsub `validate_messages` aktiv).
+                // Jede Topic-Branch liefert ein `MessageAcceptance` zurück, das
+                // anschließend an Gossipsub gemeldet wird:
+                //   - Accept  → Mesh-Propagation + positives Peer-Score
+                //   - Reject  → KEINE Propagation + P4-Penalty (Mesh-Prune)
+                //   - Ignore  → KEINE Propagation, neutrales Score
+                let acceptance = if topic == *TOPIC_BLOCKS {
+                    self.handle_gossip_block(message.data, propagation_source)
+                } else if topic == *TOPIC_SYNC_HANDSHAKE {
+                    self.handle_sync_handshake(message.data, propagation_source)
+                } else if topic == *TOPIC_MEMPOOL {
+                    self.handle_gossip_tx(message.data, propagation_source)
+                } else if topic == *crate::updater::TOPIC_UPDATES {
                     println!("[p2p] 🆕 Update-Manifest von {propagation_source} empfangen");
                     let _ = self.event_tx.send(NetworkEvent::UpdateManifestReceived {
                         manifest_json: message.data,
                         from_peer: propagation_source.to_string(),
                     });
-                } else if topic == TOPIC_STORAGE {
-                    if let Ok(ann) = serde_json::from_slice::<StorageAnnouncement>(&message.data) {
-                        println!(
-                            "[p2p] 💾 Storage-Announcement von {} – {} GB angeboten, {} bytes belegt",
-                            &ann.peer_id[..12.min(ann.peer_id.len())], ann.offered_gb, ann.used_bytes
-                        );
-                        self.peer_storage.insert(ann.peer_id.clone(), ann.clone());
-                        let _ = self.event_tx.send(NetworkEvent::StorageAnnouncementReceived {
-                            announcement: ann,
-                            from_peer: propagation_source.to_string(),
-                        });
+                    gossipsub::MessageAcceptance::Accept
+                } else if topic == *TOPIC_STORAGE {
+                    match serde_json::from_slice::<StorageAnnouncement>(&message.data) {
+                        Ok(ann) => {
+                            println!(
+                                "[p2p] 💾 Storage-Announcement von {} – {} GB angeboten, {} bytes belegt",
+                                &ann.peer_id[..12.min(ann.peer_id.len())], ann.offered_gb, ann.used_bytes
+                            );
+                            self.peer_storage.insert(ann.peer_id.clone(), ann.clone());
+                            let _ = self.event_tx.send(NetworkEvent::StorageAnnouncementReceived {
+                                announcement: ann,
+                                from_peer: propagation_source.to_string(),
+                            });
+                            gossipsub::MessageAcceptance::Accept
+                        }
+                        Err(_) => {
+                            self.add_peer_penalty(&propagation_source, 10, "malformed storage ann");
+                            gossipsub::MessageAcceptance::Reject
+                        }
                     }
-                } else if topic == TOPIC_CHAT {
-                    if let Ok(msg) = serde_json::from_slice::<crate::message_pool::PooledMessage>(&message.data) {
-                        let _ = self.event_tx.send(NetworkEvent::ChatMessageReceived {
-                            message: msg,
-                            from_peer: propagation_source.to_string(),
-                        });
+                } else if topic == *TOPIC_CHAT {
+                    match serde_json::from_slice::<crate::message_pool::PooledMessage>(&message.data) {
+                        Ok(msg) => {
+                            let _ = self.event_tx.send(NetworkEvent::ChatMessageReceived {
+                                message: msg,
+                                from_peer: propagation_source.to_string(),
+                            });
+                            gossipsub::MessageAcceptance::Accept
+                        }
+                        Err(_) => {
+                            self.add_peer_penalty(&propagation_source, 10, "malformed chat msg");
+                            gossipsub::MessageAcceptance::Reject
+                        }
                     }
-                } else if topic == TOPIC_CHAT_CONTENT {
-                    if let Ok(content) = serde_json::from_slice::<crate::chat::ChatContentSync>(&message.data) {
-                        let _ = self.event_tx.send(NetworkEvent::ChatContentReceived {
-                            content,
-                            from_peer: propagation_source.to_string(),
-                        });
+                } else if topic == *TOPIC_CHAT_CONTENT {
+                    match serde_json::from_slice::<crate::chat::ChatContentSync>(&message.data) {
+                        Ok(content) => {
+                            let _ = self.event_tx.send(NetworkEvent::ChatContentReceived {
+                                content,
+                                from_peer: propagation_source.to_string(),
+                            });
+                            gossipsub::MessageAcceptance::Accept
+                        }
+                        Err(_) => {
+                            self.add_peer_penalty(&propagation_source, 10, "malformed chat content");
+                            gossipsub::MessageAcceptance::Reject
+                        }
                     }
-                } else if topic == crate::network::TOPIC_MINERS {
+                } else if topic == *crate::network::TOPIC_MINERS {
                     // Payload-Format: 1 Byte kind-Tag (0=connect, 1=heartbeat) + JSON
                     if message.data.len() < 2 {
-                        let _ = message_id;
+                        self.add_peer_penalty(&propagation_source, 5, "miner payload too short");
+                        gossipsub::MessageAcceptance::Reject
                     } else {
                         let kind = match message.data[0] {
                             0 => "connect",
@@ -271,10 +304,21 @@ impl SwarmTask {
                             payload,
                             from_peer: propagation_source.to_string(),
                         });
+                        gossipsub::MessageAcceptance::Accept
                     }
                 } else {
-                    let _ = message_id; // acknowledged
-                }
+                    // Unbekanntes Topic – nicht weiterleiten, kein Penalty
+                    gossipsub::MessageAcceptance::Ignore
+                };
+
+                // Validierungs-Ergebnis an Gossipsub melden (Pflicht bei
+                // `validate_messages` Modus, sonst wird der Peer P3-gepenaltet).
+                let _ = self.swarm.behaviour_mut().gossipsub
+                    .report_message_validation_result(
+                        &message_id,
+                        &propagation_source,
+                        acceptance,
+                    );
             }
 
             StoneBehaviourEvent::Gossipsub(gossipsub::Event::Subscribed { peer_id, topic }) => {
@@ -325,7 +369,12 @@ impl SwarmTask {
                         // Verletzungen eine Penalty vergeben (Sync-Bursts tolerieren)
                         let grace = self.rate_limit_grace.entry(peer).or_insert(0);
                         *grace += 1;
-                        if *grace > RATE_LIMIT_GRACE {
+                        let grace_limit = if self.bootstrap_peer_ids.contains(&peer) {
+                            RATE_LIMIT_GRACE_BOOTSTRAP
+                        } else {
+                            RATE_LIMIT_GRACE
+                        };
+                        if *grace > grace_limit {
                             self.add_peer_penalty(&peer, 5, "request rate limit");
                         }
                         let _ = self.swarm.behaviour_mut().block_exchange.send_response(
@@ -341,25 +390,19 @@ impl SwarmTask {
                     self.rate_limit_grace.remove(&peer);
 
                     if request.block_index == BLOCK_REQUEST_CHAIN_INFO {
-                        // Chain-Info zurückgeben
-                        let (height, genesis, latest) = if let Some(ref chain_arc) = self.chain_ref {
-                            if let Ok(chain) = chain_arc.lock() {
-                                let h = chain.blocks.len() as u64;
-                                let g = chain.blocks.first().map(|b| b.hash.clone());
-                                let l = chain.blocks.last().map(|b| b.hash.clone());
-                                (Some(h), g, l)
-                            } else {
-                                (None, None, None)
-                            }
-                        } else {
-                            (Some(self.local_chain_count), None, None)
-                        };
-                        println!("[p2p] 📊 ChainInfo-Anfrage von {peer} → height={height:?}");
+                        // Chain-Info zurückgeben: Höhe & Genesis aus dem Cache
+                        // (kein Lock), `latest_hash` braucht weiterhin den Lock.
+                        let height = self.local_chain_count;
+                        let genesis = self.genesis_hash_cache.as_deref().map(|s| s.to_string());
+                        let latest = self.chain_ref.as_ref().and_then(|arc| {
+                            arc.lock().ok().and_then(|c| c.blocks.last().map(|b| b.hash.clone()))
+                        });
+                        println!("[p2p] 📊 ChainInfo-Anfrage von {peer} → height={height}");
                         let _ = self.swarm.behaviour_mut().block_exchange.send_response(
                             channel,
                             BlockResponse {
                                 block: None, blocks: vec![],
-                                chain_height: height, genesis_hash: genesis, latest_hash: latest,
+                                chain_height: Some(height), genesis_hash: genesis, latest_hash: latest,
                             },
                         );
                     } else if let Some(end) = request.block_index_end {
@@ -427,17 +470,44 @@ impl SwarmTask {
                             error: None,
                         });
                     } else if !response.blocks.is_empty() {
-                        // Range-Response → IMMER als Batch via RangeSyncReceived senden
-                        let block_count = response.blocks.len();
-                        println!("[p2p] ← {block_count} Blöcke via Range-Sync von {peer}");
-
-                        if let Some(entry) = self.peers.get_mut(&peer) {
-                            entry.blocks_received += block_count as u64;
+                        // Range-Response → validiere jeden Block vor Weitergabe
+                        let peer_str = peer.to_string();
+                        let mut invalid = false;
+                        for blk in &response.blocks {
+                            if blk.index == 0
+                                || blk.hash.is_empty()
+                                || blk.previous_hash.is_empty()
+                            {
+                                eprintln!(
+                                    "[p2p] ❌ Invalider Range-Sync-Block von {peer_str}: \
+                                     index={}, hash_len={}, prev_hash_len={}",
+                                    blk.index,
+                                    blk.hash.len(),
+                                    blk.previous_hash.len(),
+                                );
+                                invalid = true;
+                                break;
+                            }
                         }
-                        let _ = self.event_tx.send(NetworkEvent::RangeSyncReceived {
-                            blocks: response.blocks,
-                            from_peer: peer.to_string(),
-                        });
+                        if invalid {
+                            eprintln!("[p2p] 🔨 Range-Sync von {peer_str} abgebrochen – invalider Block");
+                            let _ = self.event_tx.send(NetworkEvent::Error {
+                                message: format!("Invalider Range-Sync-Block von {peer_str}"),
+                            });
+                            let _ = self.swarm.disconnect_peer_id(peer);
+                        } else {
+                            let block_count = response.blocks.len();
+                            println!("[p2p] ← {block_count} Blöcke via Range-Sync von {peer}");
+                            self.mark_sync_progress("range response received");
+
+                            if let Some(entry) = self.peers.get_mut(&peer) {
+                                entry.blocks_received += block_count as u64;
+                            }
+                            let _ = self.event_tx.send(NetworkEvent::RangeSyncReceived {
+                                blocks: response.blocks,
+                                from_peer: peer_str,
+                            });
+                        }
                     } else if let Some(block) = response.block {
                         // Einzelner Block-Sync
                         let hash = block.hash.clone();
@@ -462,10 +532,7 @@ impl SwarmTask {
 
                         // Genesis-Prüfung falls beide Seiten eine Chain haben
                         if let Some(ref remote_genesis) = response.genesis_hash {
-                            let our_genesis = self.chain_ref.as_ref().and_then(|arc| {
-                                arc.lock().ok().and_then(|c| c.blocks.first().map(|b| b.hash.clone()))
-                            });
-                            if let Some(ref our_gen) = our_genesis {
+                            if let Some(our_gen) = self.genesis_hash_cache.as_deref() {
                                 if our_gen != remote_genesis {
                                     eprintln!(
                                         "[p2p] ⛔ Genesis-Mismatch mit {peer}: lokal={}… remote={}…",
@@ -479,10 +546,8 @@ impl SwarmTask {
                             }
                         }
 
-                        // Aktuelle lokale Höhe aus chain_ref lesen (genauer als local_chain_count)
-                        let actual_local = self.chain_ref.as_ref()
-                            .and_then(|arc| arc.lock().ok().map(|c| c.blocks.len() as u64))
-                            .unwrap_or(self.local_chain_count);
+                        // Aktuelle lokale Höhe lock-free aus `local_chain_count`
+                        let actual_local = self.local_chain_count;
 
                         if remote_height > actual_local {
                             println!(
@@ -506,6 +571,7 @@ impl SwarmTask {
                             });
 
                             self.sync_expected_next = sync_from;
+                            self.start_sync_session(peer, "chain info indicates remote ahead");
 
                             // Range-Requests für fehlende Blöcke
                             let mut idx = sync_from;
@@ -518,6 +584,9 @@ impl SwarmTask {
                                 idx = end + 1;
                             }
                         }
+                        if remote_height <= actual_local {
+                            self.sync_target_peer = None;
+                        }
                         self.pending_chain_info.remove(&request_id);
                     }
                 }
@@ -527,17 +596,37 @@ impl SwarmTask {
             StoneBehaviourEvent::BlockExchange(
                 request_response::Event::OutboundFailure { peer, request_id, error, .. }
             ) => {
+                let err_str = error.to_string();
+                if err_str.contains("supports none of the requested protocols") {
+                    let until = std::time::Instant::now() + std::time::Duration::from_secs(120);
+                    let should_log = self.protocol_mismatch_cooldown
+                        .get(&peer)
+                        .map(|t| *t <= std::time::Instant::now())
+                        .unwrap_or(true);
+                    self.protocol_mismatch_cooldown.insert(peer, until);
+                    if should_log {
+                        eprintln!(
+                            "[p2p] ⚠ Peer {peer} protokoll-inkompatibel – 120s Quarantäne aktiviert"
+                        );
+                    }
+                }
+
                 if let Some((peer_id_str, _, reply)) = self.pending_pings.remove(&request_id) {
                     let _ = reply.send(PingResult {
                         peer_id: peer_id_str,
                         reachable: false,
                         latency_ms: None,
-                        error: Some(error.to_string()),
+                        error: Some(err_str.clone()),
                     });
                 } else {
                     // pending_chain_info aufräumen bei Fehler (verhindert Memory-Leak + Sync-Blockade)
                     self.pending_chain_info.remove(&request_id);
-                    eprintln!("[p2p] Request-Fehler zu {peer}: {error}");
+                    if Some(peer) == self.sync_target_peer {
+                        self.sync_last_recovery_reason = format!("request failure to target peer: {err_str}");
+                    }
+                    if !err_str.contains("supports none of the requested protocols") {
+                        eprintln!("[p2p] Request-Fehler zu {peer}: {err_str}");
+                    }
                 }
             }
 
@@ -792,11 +881,30 @@ impl SwarmTask {
             StoneBehaviourEvent::ShardExchange(
                 request_response::Event::OutboundFailure { peer, request_id, error, .. }
             ) => {
+                let err_str = error.to_string();
+                if err_str.contains("supports none of the requested protocols") {
+                    let until = std::time::Instant::now() + std::time::Duration::from_secs(120);
+                    let should_log = self.protocol_mismatch_cooldown
+                        .get(&peer)
+                        .map(|t| *t <= std::time::Instant::now())
+                        .unwrap_or(true);
+                    self.protocol_mismatch_cooldown.insert(peer, until);
+                    if should_log {
+                        eprintln!(
+                            "[p2p] ⚠ Peer {peer} protokoll-inkompatibel – 120s Quarantäne aktiviert"
+                        );
+                    }
+                }
+
                 if let Some((_chunk_hash, reply)) = self.pending_shard_lists.remove(&request_id) {
-                    eprintln!("[p2p] Shard-Liste Fehler zu {peer}: {error}");
+                    if !err_str.contains("supports none of the requested protocols") {
+                        eprintln!("[p2p] Shard-Liste Fehler zu {peer}: {err_str}");
+                    }
                     let _ = reply.send(vec![]);
                 } else {
-                    eprintln!("[p2p] Shard-Request Fehler zu {peer}: {error}");
+                    if !err_str.contains("supports none of the requested protocols") {
+                        eprintln!("[p2p] Shard-Request Fehler zu {peer}: {err_str}");
+                    }
                 }
             }
 

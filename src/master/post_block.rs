@@ -14,6 +14,16 @@ use super::MasterNodeState;
 use super::types::NodeEvent;
 
 impl MasterNodeState {
+    /// Kanonische Validator-Identität für Slashing/Jail:
+    /// bevorzugt unveränderlicher Ed25519-PubKey, fallback node_id.
+    fn canonical_validator_id(node_id: &str, validator_pub_key: &str) -> String {
+        if !validator_pub_key.is_empty() {
+            validator_pub_key.to_string()
+        } else {
+            node_id.to_string()
+        }
+    }
+
     /// Öffentlicher Wrapper für alle Post-Block-Hooks.
     /// Wird vom Mining-Submit-Handler aufgerufen.
     pub fn run_post_block_hooks(state: &Arc<Self>, block: &Block) {
@@ -166,6 +176,7 @@ impl MasterNodeState {
                     signature: "system".to_string(),
                     chain_id: crate::token::transaction::default_chain_id(),
                     fee_tier: crate::token::transaction::FeeTier::default(),
+                    signed_by: None,
                 };
                 refund_tx.tx_id = compute_tx_id(&refund_tx);
                 if let Err(e) = state.mempool.add_tx(refund_tx, None) {
@@ -256,8 +267,17 @@ impl MasterNodeState {
 
         let mut slash_store = state.slashing_store.write().unwrap_or_else(|e| e.into_inner());
 
-        // 1. Block-Signer als aktiv markieren
+        // 1. Block-Signer als aktiv markieren (kanonisch über PubKey)
         if !block.signer.is_empty() {
+            let signer_pubkey = {
+                let vs = state.validator_set.read().unwrap_or_else(|e| e.into_inner());
+                vs.get(&block.signer)
+                    .map(|v| v.public_key_hex.clone())
+                    .unwrap_or_else(|| block.validator_pub_key.clone())
+            };
+            let signer_canonical = Self::canonical_validator_id(&block.signer, &signer_pubkey);
+            slash_store.mark_active(&signer_canonical, block.index);
+            // Rückwärtskompatibel: alte node_id-basierte Historie weiterführen.
             slash_store.mark_active(&block.signer, block.index);
         }
 
@@ -271,22 +291,31 @@ impl MasterNodeState {
         }
 
         // 3. Downtime-Check für alle aktiven Validatoren
-        let validators: Vec<(String, Option<String>)> = {
+        let validators: Vec<(String, String)> = {
             let vs = state.validator_set.read().unwrap_or_else(|e| e.into_inner());
             vs.validators.iter()
                 .filter(|v| v.active)
                 .filter(|v| v.node_id != block.signer) // Signer ist ja aktiv
-                .map(|v| (v.node_id.clone(), None)) // wallet_address ist Optional
+                .map(|v| {
+                    (
+                        v.node_id.clone(),
+                        Self::canonical_validator_id(&v.node_id, &v.public_key_hex),
+                    )
+                })
                 .collect()
         };
 
-        for (vid, _) in &validators {
+        for (vid, canonical_id) in &validators {
             // Bereits gejailed? Dann nicht nochmal prüfen
-            if slash_store.is_jailed(vid) {
+            if slash_store.is_jailed(canonical_id) || slash_store.is_jailed(vid) {
                 continue;
             }
 
-            if let Some(offense) = slash_store.check_downtime(vid, block.index) {
+            let offense = slash_store
+                .check_downtime(canonical_id, block.index)
+                .or_else(|| slash_store.check_downtime(vid, block.index));
+
+            if let Some(offense) = offense {
                 // Wallet-Adresse des Validators ermitteln (falls bekannt)
                 let wallet_addr = Self::resolve_validator_wallet(state, vid);
 
@@ -303,7 +332,7 @@ impl MasterNodeState {
                 };
 
                 let record = slash_store.record_slash(
-                    vid,
+                    canonical_id,
                     wallet_addr.as_deref(),
                     offense,
                     slashed_amount,
@@ -341,14 +370,23 @@ impl MasterNodeState {
         use crate::consensus::SlashingOffense;
 
         // Validator-NodeId via pub_key auflösen
-        let (validator_id, wallet_addr) = {
+        let (validator_node_id, validator_pubkey, wallet_addr) = {
             let vs = state.validator_set.read().unwrap_or_else(|e| e.into_inner());
             let found = vs.validators.iter().find(|v| v.public_key_hex == evidence.validator_pub_key);
             match found {
-                Some(v) => (v.node_id.clone(), Self::resolve_validator_wallet(state, &v.node_id)),
-                None => (evidence.validator_pub_key.clone(), None),
+                Some(v) => (
+                    v.node_id.clone(),
+                    v.public_key_hex.clone(),
+                    Self::resolve_validator_wallet(state, &v.node_id),
+                ),
+                None => (
+                    evidence.validator_pub_key.clone(),
+                    evidence.validator_pub_key.clone(),
+                    None,
+                ),
             }
         };
+        let canonical_validator_id = Self::canonical_validator_id(&validator_node_id, &validator_pubkey);
 
         let offense = SlashingOffense::DoubleSigning {
             block_index: evidence.block_index,
@@ -370,7 +408,7 @@ impl MasterNodeState {
 
         let mut slash_store = state.slashing_store.write().unwrap_or_else(|e| e.into_inner());
         let record = slash_store.record_slash(
-            &validator_id,
+            &canonical_validator_id,
             wallet_addr.as_deref(),
             offense,
             slashed_amount,
@@ -381,12 +419,12 @@ impl MasterNodeState {
         // Validator deaktivieren
         {
             let mut vs = state.validator_set.write().unwrap_or_else(|e| e.into_inner());
-            vs.set_active(&validator_id, false);
+            vs.set_active(&validator_node_id, false);
         }
 
         eprintln!(
             "[slashing] ⚠️  EQUIVOCATION SLASH: {} – {} STONE geslasht (Block #{}, hashes: {}…/{}…)",
-            validator_id,
+            validator_node_id,
             record.slashed_amount,
             evidence.block_index,
             &evidence.hash_a[..12.min(evidence.hash_a.len())],
@@ -394,7 +432,7 @@ impl MasterNodeState {
         );
 
         state.events.publish(NodeEvent::ValidatorSlashed {
-            validator_id,
+            validator_id: validator_node_id,
             offense: record.offense.description(),
             slashed_amount: record.slashed_amount,
             timestamp: record.timestamp,
@@ -504,6 +542,9 @@ impl MasterNodeState {
         // 4. Voting-Rewards + Moderation-Rewards auszahlen
         let voting_payouts = gov.drain_voting_rewards();
         let moderation_payouts = gov.drain_moderation_rewards();
+        if let Err(e) = gov.persist() {
+            eprintln!("[governance] Persist fehlgeschlagen: {e}");
+        }
         drop(gov);
 
         if !voting_payouts.is_empty() || !moderation_payouts.is_empty() {

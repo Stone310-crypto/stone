@@ -286,6 +286,7 @@ async fn execute_auto_claim(state: &AppState, buy: &PendingBuy) {
         memo,
         chain_id: default_chain_id(),
         fee_tier: FeeTier::Standard,
+        signed_by: None,
     };
     tx.tx_id = compute_tx_id(&tx);
     let tx_id = tx.tx_id.clone();
