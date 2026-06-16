@@ -1,0 +1,111 @@
+name: Create Release (Binaries)
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag (z.B. v0.1.0)'
+        required: true
+
+jobs:
+  build-and-release:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            asset_suffix: macos-aarch64
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            asset_suffix: macos-x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            asset_suffix: windows-x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build stone-app-node
+        run: cargo build --release --bin stone-app-node --target ${{ matrix.target }}
+
+      - name: Build stone-master
+        run: cargo build --release --bin stone-master --target ${{ matrix.target }}
+
+      - name: Prepare asset names
+        shell: bash
+        run: |
+          echo "NODE_ASSET=stone-app-node-${{ matrix.asset_suffix }}" >> $GITHUB_ENV
+          echo "NODE_SHA=stone-app-node-${{ matrix.asset_suffix }}.sha256" >> $GITHUB_ENV
+          echo "MASTER_ASSET=stone-master-${{ matrix.asset_suffix }}" >> $GITHUB_ENV
+          echo "MASTER_SHA=stone-master-${{ matrix.asset_suffix }}.sha256" >> $GITHUB_ENV
+
+      - name: Rename binaries (standardize asset names)
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release
+          if [ -f stone-app-node.exe ]; then cp stone-app-node.exe "$NODE_ASSET"; else cp stone-app-node "$NODE_ASSET"; fi
+          if [ -f stone-master.exe ]; then cp stone-master.exe "$MASTER_ASSET"; else cp stone-master "$MASTER_ASSET"; fi
+
+      - name: Generate SHA256 checksums
+        shell: bash
+        run: |
+          cd target/${{ matrix.target }}/release
+          if [ "$(uname)" = "Darwin" ]; then
+            shasum -a 256 "$NODE_ASSET" | awk '{print $1}' > "$NODE_SHA"
+            shasum -a 256 "$MASTER_ASSET" | awk '{print $1}' > "$MASTER_SHA"
+          else
+            sha256sum "$NODE_ASSET" | awk '{print $1}' > "$NODE_SHA"
+            sha256sum "$MASTER_ASSET" | awk '{print $1}' > "$MASTER_SHA"
+          fi
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-${{ matrix.asset_suffix }}
+          path: |
+            target/${{ matrix.target }}/release/${{ env.NODE_ASSET }}
+            target/${{ matrix.target }}/release/${{ env.NODE_SHA }}
+            target/${{ matrix.target }}/release/${{ env.MASTER_ASSET }}
+            target/${{ matrix.target }}/release/${{ env.MASTER_SHA }}
+
+  create-release:
+    needs: build-and-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: assets
+          merge-multiple: true
+
+      - name: List assets
+        run: ls -la assets/
+
+      - name: Determine tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "TAG=${{ github.event.inputs.tag }}" >> $GITHUB_OUTPUT
+          else
+            echo "TAG=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.TAG }}
+          name: ${{ steps.tag.outputs.TAG }}
+          files: assets/*
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
