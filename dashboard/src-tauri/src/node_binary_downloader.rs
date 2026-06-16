@@ -36,12 +36,15 @@ pub struct BinaryVersion {
 
 /// Synchroner Wrapper — lädt Binaries herunter, falls keine lokal vorhanden sind.
 /// Wird von `node_start_internal` aufgerufen, bevor die Binary-Suche startet.
+/// Nutzt `reqwest::blocking` um Konflikte mit der vorhandenen Tauri-Tokio-Runtime zu vermeiden.
 pub fn ensure_binaries_available(app: &AppHandle) -> Result<(), String> {
     let data_dir = app
         .path()
         .app_data_dir()
         .map_err(|e| format!("App-Datenverzeichnis nicht verfügbar: {e}"))?;
     let binaries_dir = data_dir.join("binaries");
+    std::fs::create_dir_all(&binaries_dir)
+        .map_err(|e| format!("binaries/ Ordner konnte nicht erstellt werden: {e}"))?;
 
     // Prüfen ob mindestens eine Binary schon da ist
     #[cfg(target_os = "windows")]
@@ -55,16 +58,118 @@ pub fn ensure_binaries_available(app: &AppHandle) -> Result<(), String> {
         return Ok(()); // Schon vorhanden — nichts tun
     }
 
-    // Keine Binary lokal → von GitHub holen (blocking im aktuellen Thread)
-    let rt = tokio::runtime::Runtime::new()
-        .map_err(|e| format!("Async-Runtime-Fehler: {e}"))?;
+    // Keine Binary lokal → von GitHub holen (synchron mit blocking-Client)
+    eprintln!("[binary-dl] Keine lokale Binary gefunden, lade von GitHub Release…");
 
-    rt.block_on(async {
-        install_or_update_binaries(app)
-            .await
-            .map(|_| ())
-            .map_err(|e| format!("Download fehlgeschlagen: {e}"))
-    })
+    let client = reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .map_err(|e| format!("HTTP-Client-Fehler: {e}"))?;
+
+    let release: GitHubRelease = client
+        .get(GITHUB_API)
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "StoneDashboard/1.0")
+        .send()
+        .map_err(|e| format!("GitHub-API nicht erreichbar: {e}"))?
+        .json()
+        .map_err(|e| format!("Ungültige Release-Daten: {e}"))?;
+
+    for name in BINARY_NAMES {
+        let binary_name = platform_binary_name(name);
+        let sha_name = format!("{}.sha256", binary_name);
+
+        // SHA256-Asset finden und herunterladen
+        let sha_asset = release
+            .assets
+            .iter()
+            .find(|a| a.name == sha_name)
+            .ok_or_else(|| format!("Keine SHA256-Datei für {}", binary_name))?;
+
+        let expected_sha: String = client
+            .get(&sha_asset.browser_download_url)
+            .header("Accept", "application/octet-stream")
+            .header("User-Agent", "StoneDashboard/1.0")
+            .send()
+            .map_err(|e| format!("SHA256-Download-Fehler: {e}"))?
+            .text()
+            .map_err(|e| format!("SHA256-Text-Fehler: {e}"))?
+            .trim()
+            .to_string();
+
+        // Binary-Asset finden und herunterladen
+        let binary_asset = release
+            .assets
+            .iter()
+            .find(|a| a.name == binary_name)
+            .ok_or_else(|| format!("Kein Binary-Asset: {}", binary_name))?;
+
+        let bytes = client
+            .get(&binary_asset.browser_download_url)
+            .header("Accept", "application/octet-stream")
+            .header("User-Agent", "StoneDashboard/1.0")
+            .send()
+            .map_err(|e| format!("Binary-Download-Fehler: {e}"))?
+            .bytes()
+            .map_err(|e| format!("Binary-Bytes-Fehler: {e}"))?;
+
+        // SHA256 verifizieren
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        let actual_sha = hex::encode(hasher.finalize());
+
+        if actual_sha.to_lowercase() != expected_sha.to_lowercase() {
+            return Err(format!(
+                "SHA256-Prüfung fehlgeschlagen für {}: erwartet {}, erhalten {}",
+                binary_name, expected_sha, actual_sha
+            ));
+        }
+
+        // Speichern
+        #[cfg(target_os = "windows")]
+        let final_name = format!("{}.exe", name);
+        #[cfg(not(target_os = "windows"))]
+        let final_name = name.to_string();
+
+        let dest_path = binaries_dir.join(&final_name);
+        std::fs::write(&dest_path, &bytes).map_err(|e| {
+            format!(
+                "Binary konnte nicht geschrieben werden: {} — {e}",
+                dest_path.display()
+            )
+        })?;
+
+        // Ausführbar machen (Unix)
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let meta =
+                std::fs::metadata(&dest_path).map_err(|e| format!("Permissions-Fehler: {e}"))?;
+            let mut perms = meta.permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&dest_path, perms)
+                .map_err(|e| format!("Permissions setzen fehlgeschlagen: {e}"))?;
+        }
+
+        eprintln!(
+            "[binary-dl] {} heruntergeladen: {} (Release: {})",
+            name,
+            dest_path.display(),
+            release.tag_name
+        );
+    }
+
+    // Version speichern
+    let version = BinaryVersion {
+        tag: release.tag_name,
+        sha256: String::new(),
+    };
+    let version_json = serde_json::to_string_pretty(&version)
+        .map_err(|e| format!("Version-Serialisierung: {e}"))?;
+    std::fs::write(binaries_dir.join("version.json"), version_json)
+        .map_err(|e| format!("Version-Datei: {e}"))?;
+
+    Ok(())
 }
 
 /// Lädt die neuesten Release-Informationen von GitHub.
