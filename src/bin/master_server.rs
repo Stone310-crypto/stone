@@ -367,6 +367,9 @@ async fn main() {
 
     let users = load_users();
 
+    // ── Organisations laden ──────────────────────────────────────────────
+    let orgs = Arc::new(std::sync::Mutex::new(stone::organization::load_orgs()));
+
     // On-Chain Account-Registry: Merge Chain-registrierte Accounts mit lokalen Users
     {
         let ledger = node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
@@ -384,7 +387,7 @@ async fn main() {
     // Hintergrund-Tasks starten
     // master_server ist ein reiner Full-Node (Sync, API, Validierung, Storage).
     MasterNodeState::start_heartbeat(node.clone(), HEARTBEAT_INTERVAL);
-    spawn_auto_sync_task(node.clone(), api_key.clone(), users.clone());
+    spawn_auto_sync_task(node.clone(), api_key.clone(), users.clone(), orgs.clone());
 
     // Auto-Block-Timer: produziert nach auto_timeout_secs einen Block, wenn
     // kein CPU-Miner und kein aktiver Minecraft-PoP-Server verbunden ist.

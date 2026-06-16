@@ -1,5 +1,5 @@
 //! Peer synchronisation logic: pull_from_peer, pull_users_from_peer,
-//! pull_game_economy_from_peer, fetch_missing_chunks, spawn_auto_sync_task.
+//! pull_game_economy_from_peer, pull_organizations_from_peer, spawn_auto_sync_task.
 
 use std::{
     sync::{Arc, Mutex},
@@ -9,6 +9,7 @@ use stone::{
     auth::{save_users, User},
     consensus::verify_block_signature_standalone,
     master::{MasterNodeState, NodeEvent, PeerStatus},
+    organization::{load_orgs, save_orgs, Organization},
     storage::ChunkStore,
 };
 
@@ -261,7 +262,6 @@ pub async fn pull_game_economy_from_peer(node: &Arc<MasterNodeState>, peer_url: 
 
     let mut local = node.game_economy.write().unwrap_or_else(|e| e.into_inner());
 
-    // Merge registered_games (Peer gewinnt bei gleicher game_id)
     if let Some(remote_games) = economy_json.get("registered_games").and_then(|v| v.as_object()) {
         for (game_id, game_val) in remote_games {
             if !local.registered_games.contains_key(game_id) {
@@ -272,7 +272,6 @@ pub async fn pull_game_economy_from_peer(node: &Arc<MasterNodeState>, peer_url: 
         }
     }
 
-    // Merge shop_items (Peer gewinnt bei gleicher shop_item_id)
     if let Some(remote_shop) = economy_json.get("shop_items").and_then(|v| v.as_object()) {
         for (item_id, item_val) in remote_shop {
             if !local.shop_items.contains_key(item_id) {
@@ -292,10 +291,111 @@ pub async fn pull_game_economy_from_peer(node: &Arc<MasterNodeState>, peer_url: 
     }
 }
 
+/// Holt die Organisations-Liste von einem Peer und merged sie lokal.
+pub async fn pull_organizations_from_peer(orgs: &Arc<Mutex<Vec<Organization>>>, peer_url: &str) {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .danger_accept_invalid_certs(std::env::var("STONE_INSECURE_SSL").map(|v| v == "1").unwrap_or(false))
+        .build()
+    { Ok(c) => c, Err(_) => return };
+
+    let sync_url = to_sync_url(peer_url);
+    let url = format!("{}/organizations", sync_url);
+    let resp = match client.get(&url).send().await { Ok(r) => r, Err(_) => return };
+    if !resp.status().is_success() { return; }
+    let body: serde_json::Value = match resp.json().await { Ok(v) => v, Err(_) => return };
+    let sync_list = match body.get("organizations") { Some(s) => s.clone(), None => return };
+    let entries: Vec<stone::organization::OrgSyncEntry> =
+        match serde_json::from_value(sync_list.clone()) {
+            Ok(e) => e,
+            Err(_) => {
+                // Versuche als OrgSyncList wrapper
+                if let Ok(wrapped) =
+                    serde_json::from_value::<stone::organization::OrgSyncList>(sync_list)
+                {
+                    wrapped.organizations
+                } else {
+                    return;
+                }
+            }
+        };
+
+    let mut local = orgs.lock().unwrap_or_else(|e| e.into_inner());
+    let mut added = 0usize;
+    let mut updated = 0usize;
+
+    for inc in &entries {
+        if inc.chain_hash.is_empty() {
+            continue;
+        }
+        // Verifiziere Proof-Hash
+        let reconstructed = {
+            let mut h = sha2::Sha256::new();
+            use sha2::Digest;
+            h.update(inc.id.as_bytes());
+            h.update(inc.name.as_bytes());
+            h.update(inc.owner_id.as_bytes());
+            h.update(&inc.created_at.to_le_bytes());
+            hex::encode(h.finalize())
+        };
+        if reconstructed != inc.chain_hash {
+            continue;
+        }
+
+        if let Some(existing) = local.iter_mut().find(|o| o.id == inc.id) {
+            if existing.chain_block_index < inc.chain_block_index {
+                existing.chain_hash = inc.chain_hash.clone();
+                existing.chain_block_index = inc.chain_block_index;
+                existing.chain_block_hash = inc.chain_block_hash.clone();
+                updated += 1;
+            }
+        } else {
+            let mut org = Organization::create(&inc.name, &inc.description, &inc.owner_id, "synced-user");
+            org.id = inc.id.clone();
+            org.chain_hash = inc.chain_hash.clone();
+            org.chain_block_index = inc.chain_block_index;
+            org.chain_block_hash = inc.chain_block_hash.clone();
+            org.created_at = inc.created_at;
+            local.push(org);
+            added += 1;
+        }
+    }
+
+    if added > 0 || updated > 0 {
+        save_orgs(&local);
+        println!("[sync] 🏢 {added} neue + {updated} aktualisierte Organisationen von {peer_url}");
+    }
+}
+
+/// Pusht die lokalen Orgs zu allen Peers.
+pub async fn push_all_orgs_to_peers(peer_urls: &[String], orgs: &Arc<Mutex<Vec<Organization>>>) {
+    let org_sync = {
+        let local = orgs.lock().unwrap_or_else(|e| e.into_inner());
+        stone::organization::build_org_sync_list(&local)
+    };
+    if org_sync.organizations.is_empty() {
+        return;
+    }
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .danger_accept_invalid_certs(std::env::var("STONE_INSECURE_SSL").map(|v| v == "1").unwrap_or(false))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return,
+    };
+    for peer_url in peer_urls {
+        let sync_url = to_sync_url(peer_url);
+        let url = format!("{}/sync-organizations", sync_url);
+        let _ = client.post(&url).json(&org_sync).send().await;
+    }
+}
+
 pub fn spawn_auto_sync_task(
     node: Arc<MasterNodeState>,
     api_key: Arc<String>,
     users: Arc<Mutex<Vec<User>>>,
+    orgs: Arc<Mutex<Vec<Organization>>>,
 ) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(AUTO_SYNC_INTERVAL);
@@ -311,6 +411,7 @@ pub fn spawn_auto_sync_task(
                     pull_from_peer(&node, &best.url, &api_key).await;
                     pull_users_from_peer(&best.url, &api_key, &users).await;
                     pull_game_economy_from_peer(&node, &best.url).await;
+                    pull_organizations_from_peer(&orgs, &best.url).await;
                 } else {
                     node.metrics.initial_sync_done.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
@@ -319,10 +420,12 @@ pub fn spawn_auto_sync_task(
                     pull_from_peer(&node, &peer.url, &api_key).await;
                     pull_users_from_peer(&peer.url, &api_key, &users).await;
                     pull_game_economy_from_peer(&node, &peer.url).await;
+                    pull_organizations_from_peer(&orgs, &peer.url).await;
                 }
             }
 
             push_all_users_to_peers(&peers.iter().map(|p| p.url.clone()).collect::<Vec<_>>(), &users).await;
+            push_all_orgs_to_peers(&peers.iter().map(|p| p.url.clone()).collect::<Vec<_>>(), &orgs).await;
             chain_sync_counter += 1;
             if chain_sync_counter % 4 == 0 {
                 sync_chain_accounts_to_users(&node, &users);

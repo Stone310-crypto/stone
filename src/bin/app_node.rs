@@ -92,6 +92,9 @@ async fn main() {
     // ── Users laden ──────────────────────────────────────────────────────
     let users = load_users();
 
+    // ── Organisations laden ──────────────────────────────────────────────
+    let orgs = Arc::new(std::sync::Mutex::new(stone::organization::load_orgs()));
+
     // ── Gespeicherte Peers laden ─────────────────────────────────────────
     let mut saved_peers = load_peers_from_disk();
     // Trust-Registry laden (kein Fehler wenn Datei fehlt)
@@ -123,7 +126,7 @@ async fn main() {
 
     // ── Heartbeat, Auto-Sync, Block-Timer ────────────────────────────────
     MasterNodeState::start_heartbeat(node.clone(), HEARTBEAT_INTERVAL);
-    spawn_auto_sync_task(node.clone(), api_key.clone(), users.clone());
+    spawn_auto_sync_task(node.clone(), api_key.clone(), users.clone(), orgs.clone());
 
     let pop_mining_shared = stone::pop_mining::PopMiningState::new();
     MasterNodeState::start_block_timer(node.clone(), pop_mining_shared.clone());

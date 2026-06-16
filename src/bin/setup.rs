@@ -377,6 +377,9 @@ async fn start_full_node(state: SetupState) {
 
     let users = load_users();
 
+    // ── Organisations laden ──────────────────────────────────────────────
+    let orgs = Arc::new(std::sync::Mutex::new(stone::organization::load_orgs()));
+
     // On-Chain Account-Registry: Merge Chain-registrierte Accounts mit lokalen Users
     {
         let ledger = node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
@@ -399,7 +402,7 @@ async fn start_full_node(state: SetupState) {
     MasterNodeState::start_heartbeat(node.clone(), HEARTBEAT_INTERVAL);
     let pop_mining_shared = stone::pop_mining::PopMiningState::new();
     MasterNodeState::start_block_timer(node.clone(), pop_mining_shared.clone());
-    spawn_auto_sync_task(node.clone(), api_key.clone(), users.clone());
+    spawn_auto_sync_task(node.clone(), api_key.clone(), users.clone(), orgs.clone());
 
     // Peer-Discovery: Bei Bootstrap-Nodes registrieren & Health-Check starten
     bootstrap_announce(&node).await;

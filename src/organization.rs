@@ -1,4 +1,4 @@
-//! Organisationen (Firmen) auf der StoneChain
+//! Organisationen (Firmen/Server) auf der StoneChain
 //!
 //! ## Konzept
 //!
@@ -20,8 +20,16 @@
 //! Jede Organisation hat Channels (ähnlich wie Ordner), in denen
 //! Dokumente und Chat-Nachrichten gruppiert werden können.
 //! Permissions werden pro Channel gesetzt.
+//!
+//! ## On-Chain Proof
+//!
+//! Beim Erstellen einer Organisation wird deren SHA-256-Hash (über alle
+//! Kern-Felder) als Document in der Blockchain gespeichert. Der Hash dient
+//! als Proof-of-Existence — jede Node kann verifizieren dass die Organisation
+//! authentisch ist, ohne die vollen Daten on-chain speichern zu müssen.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
 
@@ -171,13 +179,6 @@ pub struct OrgInvite {
 
 // ─── Chat-Nachricht ──────────────────────────────────────────────────────────
 
-/// Eine verschlüsselte Chat-Nachricht.
-///
-/// Nachrichten werden E2E-verschlüsselt gespeichert:
-/// - Jede Organisation hat einen Shared Secret (ECDH-abgeleitet)
-/// - Der Content ist AES-256-GCM verschlüsselt
-/// - Nur Mitglieder mit dem Shared Secret können entschlüsseln
-/// - Die Nachricht wird in der Blockchain gespeichert → unveränderlich
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct ChatMessage {
     pub msg_id: String,
@@ -201,7 +202,7 @@ pub struct ChatMessage {
 
 // ─── Organisation ────────────────────────────────────────────────────────────
 
-/// Eine Organisation (Firma / Gruppe) auf der StoneChain.
+/// Eine Organisation (Firma/Server/Gruppe) auf der StoneChain.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Organization {
     /// Einzigartige Organisations-ID (UUID)
@@ -226,12 +227,24 @@ pub struct Organization {
     #[serde(default)]
     pub chat_messages: Vec<ChatMessage>,
     /// Verschlüsselungs-Key (AES-256): verschlüsselt mit dem Owner-Wallet-Key
-    /// Wird bei Mitglied-Aufnahme per ECDH an das neue Mitglied weitergegeben
     #[serde(default)]
     pub encrypted_org_key: String,
     /// Nonce für den org_key (base64)
     #[serde(default)]
     pub org_key_nonce: String,
+
+    // ─── On-Chain Proof ──────────────────────────────────────────────────────
+    /// SHA-256 Hash der Organisation für den On-Chain Proof-of-Existence.
+    /// Dieser Hash wird als Document in der Blockchain gespeichert.
+    /// Er wird aus (id || name || owner_id || created_at || members_count) berechnet.
+    #[serde(default)]
+    pub chain_hash: String,
+    /// Block-Index in dem der Proof gespeichert wurde (0 = noch nicht on-chain).
+    #[serde(default)]
+    pub chain_block_index: u64,
+    /// Block-Hash des Blocks der den Proof enthält.
+    #[serde(default)]
+    pub chain_block_hash: String,
 }
 
 // ─── Persistenz ──────────────────────────────────────────────────────────────
@@ -253,10 +266,94 @@ pub fn save_orgs(orgs: &[Organization]) {
     }
 }
 
+// ─── On-Chain Proof ──────────────────────────────────────────────────────────
+
+/// Berechnet den für die Blockchain verwendeten Proof-Hash einer Organisation.
+///
+/// Der Hash wird über (id || name || owner_id || created_at) gebildet und
+/// dient als kryptographischer Fingerprint für den Proof-of-Existence.
+pub fn compute_org_proof_hash(org: &Organization) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(org.id.as_bytes());
+    hasher.update(org.name.as_bytes());
+    hasher.update(org.owner_id.as_bytes());
+    hasher.update(&org.created_at.to_le_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// Verifiziert dass der gespeicherte chain_hash mit den aktuellen Org-Daten übereinstimmt.
+pub fn verify_org_proof(org: &Organization) -> bool {
+    if org.chain_hash.is_empty() {
+        return false;
+    }
+    compute_org_proof_hash(org) == org.chain_hash
+}
+
+// ─── Organisation-Sync-Container (für Netzwerk-Sync) ─────────────────────────
+
+/// Container für die syncbare Organisationsliste.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct OrgSyncList {
+    pub version: u32,
+    pub updated_at: i64,
+    pub organizations: Vec<OrgSyncEntry>,
+}
+
+impl Default for OrgSyncList {
+    fn default() -> Self {
+        OrgSyncList {
+            version: 1,
+            updated_at: chrono::Utc::now().timestamp(),
+            organizations: Vec::new(),
+        }
+    }
+}
+
+/// Ein einzelner syncbarer Organisations-Eintrag (reduzierte Felder).
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct OrgSyncEntry {
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub owner_id: String,
+    pub created_at: i64,
+    pub member_count: usize,
+    pub channel_count: usize,
+    pub chain_hash: String,
+    pub chain_block_index: u64,
+    pub chain_block_hash: String,
+}
+
+impl From<&Organization> for OrgSyncEntry {
+    fn from(org: &Organization) -> Self {
+        OrgSyncEntry {
+            id: org.id.clone(),
+            name: org.name.clone(),
+            description: org.description.clone(),
+            owner_id: org.owner_id.clone(),
+            created_at: org.created_at,
+            member_count: org.members.len(),
+            channel_count: org.channels.len(),
+            chain_hash: org.chain_hash.clone(),
+            chain_block_index: org.chain_block_index,
+            chain_block_hash: org.chain_block_hash.clone(),
+        }
+    }
+}
+
+/// Erzeugt eine OrgSyncList aus der vollen Organisations-Liste.
+pub fn build_org_sync_list(orgs: &[Organization]) -> OrgSyncList {
+    OrgSyncList {
+        version: 1,
+        updated_at: chrono::Utc::now().timestamp(),
+        organizations: orgs.iter().map(OrgSyncEntry::from).collect(),
+    }
+}
+
 // ─── CRUD-Operationen ────────────────────────────────────────────────────────
 
 impl Organization {
-    /// Erstellt eine neue Organisation.
+    /// Erstellt eine neue Organisation und berechnet sofort den On-Chain-Proof-Hash.
     pub fn create(name: &str, description: &str, owner_id: &str, owner_name: &str) -> Self {
         let now = chrono::Utc::now().timestamp();
         let id = format!("org-{}", &uuid::Uuid::new_v4().to_string()[..12]);
@@ -285,7 +382,7 @@ impl Organization {
             )]),
         };
 
-        Organization {
+        let mut org = Organization {
             id,
             name: name.to_string(),
             description: description.to_string(),
@@ -297,7 +394,14 @@ impl Organization {
             chat_messages: Vec::new(),
             encrypted_org_key: String::new(),
             org_key_nonce: String::new(),
-        }
+            chain_hash: String::new(),
+            chain_block_index: 0,
+            chain_block_hash: String::new(),
+        };
+
+        // Proof-Hash berechnen und im chain_hash speichern
+        org.chain_hash = compute_org_proof_hash(&org);
+        org
     }
 
     /// Prüft ob ein User Mitglied ist.
@@ -395,7 +499,6 @@ impl Organization {
         if !matches!(requester_role, Some(OrgRole::Owner | OrgRole::Admin)) {
             return Err("Keine Berechtigung zum Einladen".into());
         }
-        // Prüfe ob bereits eine offene Einladung existiert
         if self.invites.iter().any(|i| i.target_user_id == target_user_id && i.status == InviteStatus::Pending) {
             return Err(format!("User {} hat bereits eine offene Einladung", target_user_id));
         }
@@ -408,7 +511,7 @@ impl Organization {
             role,
             status: InviteStatus::Pending,
             created_at: now,
-            expires_at: now + 7 * 24 * 3600, // 7 Tage
+            expires_at: now + 7 * 24 * 3600,
         };
         self.invites.push(invite.clone());
         Ok(invite)
@@ -466,7 +569,6 @@ impl Organization {
         };
         self.channels.push(ch.clone());
 
-        // Allen Mitgliedern Standardrechte für den neuen Channel geben
         for m in &mut self.members {
             m.channel_permissions.insert(id.clone(), ChannelPermission {
                 read: true,
@@ -486,7 +588,6 @@ impl Organization {
         if !role.can_write_chat() {
             return Err("Keine Berechtigung zum Schreiben im Chat".into());
         }
-        // Prüfe Channel-Permission
         if let Some(member) = self.members.iter().find(|m| m.user_id == msg.sender_id) {
             if let Some(perm) = member.channel_permissions.get(&msg.channel_id) {
                 if !perm.write {

@@ -4,7 +4,9 @@ import { chat as chatApi, groups as groupsApi } from "../../api/stone";
 import { useAuth } from "../../auth/AuthContext";
 import Avatar from "../../components/ui/Avatar";
 import type { ChatEntry, GroupMessage, ConversationSummary, GroupSummary } from "../../types/api";
-import { Send, Hash, Users, KeyRound } from "lucide-react";
+import { Send, Hash, Users, KeyRound, Plus } from "lucide-react";
+import { invoke } from "@tauri-apps/api/core";
+import { open } from "@tauri-apps/plugin-dialog";
 
 // ── Decode encrypted_content from server (base64 plaintext or raw) ────────────
 
@@ -49,17 +51,38 @@ function shortAddr(addr: string): string {
   return addr.length > 12 ? `${addr.slice(0, 6)}…${addr.slice(-4)}` : addr;
 }
 
+function formatSize(bytes: number): string {
+  if (bytes === 0) return "0 B";
+  const units = ["B", "KB", "MB", "GB"];
+  const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+  return (bytes / Math.pow(1024, i)).toFixed(i === 0 ? 0 : 1) + " " + units[i];
+}
+
 // ── Message bubble ────────────────────────────────────────────────────────────
 
 function MessageBubble({ msg, isOwn, showSender, senderName }: { msg: ChatEntry | GroupMessage; isOwn: boolean; showSender: boolean; senderName: string }) {
   const isCoin = "type" in msg && (msg.type === "send_coins" || msg.type === "request_coins");
+  const isFileUpload = (msg as any).type === "file_upload";
   const content = getMsgContent(msg);
   return (
     <div className={`flex gap-3 px-4 py-0.5 group hover:bg-white/[0.02] ${isOwn ? "flex-row-reverse" : ""}`}>
       {showSender ? <Avatar name={senderName} size={34} /> : <div style={{ width: 34, flexShrink: 0 }} />}
       <div className={`flex flex-col max-w-lg ${isOwn ? "items-end" : ""}`}>
         {showSender && <div className="flex items-baseline gap-2 mb-1"><span className="text-sm font-semibold" style={{ color: "var(--text)" }}>{senderName}</span><span className="text-xs" style={{ color: "var(--text-muted)" }}>{fmtTime(msg.timestamp)}</span></div>}
-        {isCoin ? (
+        {isFileUpload ? (
+          <div style={{ background: "rgba(34,197,94,0.08)", border: "1px solid rgba(34,197,94,0.25)", borderRadius: 14, padding: "10px 14px", fontSize: 13, color: "var(--text)", lineHeight: 1.5 }}>
+            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+              <span style={{ fontSize: 16 }}>📎</span>
+              <div>
+                <div style={{ fontWeight: 600 }}>{(msg as any).file_name ?? "Datei"}</div>
+                <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 1 }}>
+                  {(msg as any).file_size ? formatSize((msg as any).file_size) : ""}
+                  {(msg as any).doc_id ? ` · Doc #${(msg as any).doc_id}` : ""}
+                </div>
+              </div>
+            </div>
+          </div>
+        ) : isCoin ? (
           <div style={{ background: "var(--accent-dim)", border: "1px solid var(--accent)", borderRadius: 14, padding: "8px 14px", fontSize: 13, color: "var(--text)" }}>
             {"type" in msg && msg.type === "send_coins" ? "💸" : "🪙"} <strong>{"amount" in msg ? (msg as ChatEntry).amount : ""} STONE</strong> — {content}
           </div>
@@ -132,6 +155,8 @@ function MessageThread({ active, myWallet }: { active: ActiveChat; myWallet: str
   const bottomRef = useRef<HTMLDivElement>(null);
   const [input, setInput] = useState("");
   const [showPhrasePrompt, setShowPhrasePrompt] = useState(false);
+  const [uploading, setUploading] = useState(false);
+  const [uploadToast, setUploadToast] = useState<{ msg: string; ok: boolean } | null>(null);
 
   const dmQuery = useQuery({ queryKey: ["chat-messages", active.type === "dm" ? active.wallet : null], queryFn: () => active.type === "dm" ? chatApi.messages(active.wallet) : Promise.resolve({ messages: [], peer_name: "" }), enabled: active.type === "dm", refetchInterval: 4_000 });
   const groupQuery = useQuery({ queryKey: ["group-messages", active.type === "group" ? active.id : null], queryFn: () => active.type === "group" ? groupsApi.messages(active.id) : Promise.resolve({ messages: [], group_name: "" }), enabled: active.type === "group", refetchInterval: 4_000 });
@@ -143,6 +168,11 @@ function MessageThread({ active, myWallet }: { active: ActiveChat; myWallet: str
   });
 
   useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages.length]);
+  useEffect(() => {
+    if (!uploadToast) return;
+    const t = setTimeout(() => setUploadToast(null), 5000);
+    return () => clearTimeout(t);
+  }, [uploadToast]);
 
   function handleSend(e: FormEvent) {
     e.preventDefault();
@@ -152,12 +182,80 @@ function MessageThread({ active, myWallet }: { active: ActiveChat; myWallet: str
     setShowPhrasePrompt(false); setInput(""); sendMutation.mutate(text);
   }
 
+  async function handleFileUpload() {
+    try {
+      const selected = await open({
+        multiple: false,
+        title: "Datei auswählen – Hochladen in diesen Chat",
+      });
+      if (!selected) return;
+      const filePath = Array.isArray(selected) ? selected[0] : selected;
+      if (!filePath) return;
+
+      setUploading(true);
+      const result: any = await invoke("upload_file", {
+        path: filePath,
+        masterUrl: "http://127.0.0.1:3080",
+        apiKey: "stone-local-dev",
+        sessionToken: null,
+      });
+
+      if (result?.success) {
+        const parts = filePath.replace(/\\/g, "/").split("/");
+        const fileName = parts[parts.length - 1] || filePath;
+        const docId = result.doc_id ? result.doc_id.slice(0, 8) : "?";
+        const blockInfo = result.block_index != null ? `Block #${result.block_index}` : "";
+        setUploadToast({
+          msg: `📎 "${fileName}" hochgeladen — Doc #${docId} ${blockInfo}${result.shards_distributed ? " · ✓ Shards verteilt" : ""}`,
+          ok: true,
+        });
+
+        // Sende eine Chat-Nachricht mit den File-Infos
+        const chatMsg = `📎 Datei gesendet: ${fileName} (${formatSize(result.file_size)})\nDoc: ${result.doc_id ?? "?"}\nBlock: #${result.block_index ?? "?"}\nSHA-256: ${(result.file_hash ?? "").slice(0, 16)}…`;
+        if (active.type === "dm") {
+          await chatApi.send(active.wallet, chatMsg, phrase);
+        } else {
+          await groupsApi.send(active.id, chatMsg);
+        }
+        qc.invalidateQueries({ queryKey: active.type === "dm" ? ["chat-messages", active.wallet] : ["group-messages", active.id] });
+      } else {
+        setUploadToast({ msg: `❌ Upload fehlgeschlagen: ${result?.error ?? "Unbekannter Fehler"}`, ok: false });
+      }
+    } catch (err) {
+      setUploadToast({ msg: `❌ Fehler: ${String(err)}`, ok: false });
+    } finally {
+      setUploading(false);
+    }
+  }
+
   return (
     <div className="flex flex-col h-full">
       <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 16px", borderBottom: "1px solid var(--border)", background: "rgba(255,255,255,0.01)" }}>
         {active.type === "dm" ? <Avatar name={active.name} size={30} /> : <div style={{ width: 30, height: 30, borderRadius: 10, background: "var(--surface-2)", display: "flex", alignItems: "center", justifyContent: "center" }}><Hash size={14} style={{ color: "var(--text-dim)" }} /></div>}
         <div><p style={{ fontSize: 14, fontWeight: 600, color: "var(--text)" }}>{active.name}</p>{active.type === "dm" && <p style={{ fontSize: 11, fontFamily: "monospace", color: "var(--text-muted)" }}>{shortAddr(active.wallet)}</p>}</div>
       </div>
+
+      {/* Upload Toast */}
+      {uploadToast && (
+        <div style={{
+          margin: "0 12px",
+          padding: "10px 14px",
+          borderRadius: 10,
+          background: uploadToast.ok ? "rgba(34,197,94,0.08)" : "rgba(239,68,68,0.08)",
+          border: `1px solid ${uploadToast.ok ? "rgba(34,197,94,0.25)" : "rgba(239,68,68,0.25)"}`,
+          fontSize: 12,
+          color: uploadToast.ok ? "#22c55e" : "#ef4444",
+          position: "absolute",
+          top: 56,
+          left: 12,
+          right: 12,
+          zIndex: 10,
+          backdropFilter: "blur(12px)",
+        }}>
+          {uploadToast.msg}
+        </div>
+      )}
+
       <div style={{ flex: 1, overflowY: "auto", paddingTop: 12, paddingBottom: 8 }}>
         {messages.map((msg, i) => {
           const prevMsg = messages[i - 1]; const currSender = getSenderWallet(msg); const prevSender = prevMsg ? getSenderWallet(prevMsg) : "";
@@ -172,7 +270,36 @@ function MessageThread({ active, myWallet }: { active: ActiveChat; myWallet: str
       {showPhrasePrompt && <PhrasePrompt onSave={(p) => { storePhrase(p); setShowPhrasePrompt(false); }} />}
       {sendMutation.isError && !showPhrasePrompt && <div style={{ padding: "0 12px 8px" }}><div style={{ background: "rgba(237,66,69,0.1)", border: "1px solid rgba(237,66,69,0.3)", borderRadius: 10, padding: "7px 12px", fontSize: 12, color: "var(--red)" }}>{sendMutation.error instanceof Error ? sendMutation.error.message : "Fehler beim Senden"}</div></div>}
       <form onSubmit={handleSend} style={{ padding: "0 12px 12px" }}>
-        <div style={{ display: "flex", alignItems: "flex-end", gap: 8, background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 14, padding: "8px 10px" }}>
+        <div style={{ display: "flex", alignItems: "flex-end", gap: 6, background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 14, padding: "6px 8px" }}>
+          {/* Upload-Button */}
+          <button
+            type="button"
+            onClick={handleFileUpload}
+            disabled={uploading}
+            title="Datei hochladen"
+            style={{
+              width: 32, height: 32, borderRadius: 10,
+              background: uploading ? "rgba(34,197,94,0.15)" : "rgba(255,255,255,0.05)",
+              color: uploading ? "#22c55e" : "var(--text-muted)",
+              border: "none", display: "flex", alignItems: "center", justifyContent: "center",
+              cursor: uploading ? "not-allowed" : "pointer",
+              transition: "all 0.15s", flexShrink: 0,
+            }}
+            onMouseEnter={(e) => {
+              if (!uploading) {
+                (e.currentTarget as HTMLElement).style.background = "rgba(34,197,94,0.12)";
+                (e.currentTarget as HTMLElement).style.color = "#22c55e";
+              }
+            }}
+            onMouseLeave={(e) => {
+              if (!uploading) {
+                (e.currentTarget as HTMLElement).style.background = "rgba(255,255,255,0.05)";
+                (e.currentTarget as HTMLElement).style.color = "var(--text-muted)";
+              }
+            }}
+          >
+            <Plus size={16} />
+          </button>
           <textarea value={input} onChange={(e) => { setInput(e.target.value); e.currentTarget.style.height = "auto"; e.currentTarget.style.height = Math.min(e.currentTarget.scrollHeight, 120) + "px"; }} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSend(e as unknown as FormEvent); } }} placeholder={`Nachricht an ${active.name}…`} rows={1} style={{ flex: 1, background: "transparent", border: "none", outline: "none", resize: "none", color: "var(--text)", fontSize: 13, minHeight: 22, maxHeight: 120, paddingTop: 2, lineHeight: 1.5 }} autoComplete="off" spellCheck={false} />
           <button type="submit" disabled={!input.trim() || sendMutation.isPending} style={{ width: 32, height: 32, borderRadius: 10, background: input.trim() && !sendMutation.isPending ? "var(--accent)" : "rgba(255,255,255,0.05)", color: input.trim() && !sendMutation.isPending ? "#fff" : "var(--text-muted)", border: "none", display: "flex", alignItems: "center", justifyContent: "center", cursor: input.trim() ? "pointer" : "not-allowed", transition: "all 0.15s", flexShrink: 0 }}><Send size={14} /></button>
         </div>

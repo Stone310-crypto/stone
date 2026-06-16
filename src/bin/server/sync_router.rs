@@ -10,6 +10,9 @@
 //!   GET  /blocks            – Blöcke (paginiert, für Resync)
 //!   GET  /blocks/{index}     – Einzelner Block
 //!   POST /sync-users        – User-Push empfangen
+//!   GET  /organizations      – Organisations-Liste für Peer-Sync
+//!   POST /sync-organizations – Organisations-Liste empfangen
+//!   GET  /game-economy       – Game-Economy-Daten
 //!   GET  /chunk/{hash}       – Chunk-Daten für Peer-Sync
 
 use axum::{
@@ -21,6 +24,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::json;
+use sha2::Digest;
 use tower_http::cors::{Any, CorsLayer};
 
 use super::state::AppState;
@@ -287,7 +291,6 @@ async fn sync_receive_users(
         if inc.name.is_empty() {
             continue;
         }
-        // Match by wallet (primary) or id
         let existing = users.iter_mut().find(|u| {
             (!u.wallet_address.is_empty() && u.wallet_address == inc.wallet_address)
                 || (!inc.id.is_empty() && u.id == inc.id)
@@ -357,6 +360,84 @@ async fn sync_game_economy(State(state): State<AppState>) -> impl IntoResponse {
     )
 }
 
+// ─── Organisation Sync ───────────────────────────────────────────────────────
+
+/// GET /organizations – Organisations-Liste für Peer-Sync
+async fn sync_organizations(State(state): State<AppState>) -> impl IntoResponse {
+    let orgs = state.orgs.lock().unwrap_or_else(|e| e.into_inner());
+    let sync_list = stone::organization::build_org_sync_list(&orgs);
+    (
+        StatusCode::OK,
+        axum::Json(json!({"ok": true, "organizations": sync_list})),
+    )
+}
+
+/// POST /sync-organizations – Organisations-Liste von anderen Nodes empfangen und mergen
+async fn sync_receive_organizations(
+    State(state): State<AppState>,
+    axum::Json(incoming): axum::Json<stone::organization::OrgSyncList>,
+) -> impl IntoResponse {
+    let mut orgs = state.orgs.lock().unwrap_or_else(|e| e.into_inner());
+    let mut added = 0usize;
+    let mut updated = 0usize;
+
+    for inc in &incoming.organizations {
+        if inc.chain_hash.is_empty() {
+            continue;
+        }
+
+        // Verifiziere den Proof-Hash on-the-fly
+        let reconstructed = {
+            let mut h = sha2::Sha256::new();
+            use sha2::Digest;
+            h.update(inc.id.as_bytes());
+            h.update(inc.name.as_bytes());
+            h.update(inc.owner_id.as_bytes());
+            h.update(&inc.created_at.to_le_bytes());
+            hex::encode(h.finalize())
+        };
+        if reconstructed != inc.chain_hash {
+            continue; // Proof ungültig – überspringe
+        }
+
+        if let Some(existing) = orgs.iter_mut().find(|o| o.id == inc.id) {
+            if existing.chain_block_index < inc.chain_block_index {
+                existing.chain_hash = inc.chain_hash.clone();
+                existing.chain_block_index = inc.chain_block_index;
+                existing.chain_block_hash = inc.chain_block_hash.clone();
+                updated += 1;
+            }
+        } else {
+            // Neue Organisation anlegen (nur Metadaten)
+            let mut org = stone::organization::Organization::create(
+                &inc.name,
+                &inc.description,
+                &inc.owner_id,
+                "synced-user",
+            );
+            org.id = inc.id.clone();
+            org.chain_hash = inc.chain_hash.clone();
+            org.chain_block_index = inc.chain_block_index;
+            org.chain_block_hash = inc.chain_block_hash.clone();
+            org.created_at = inc.created_at;
+            orgs.push(org);
+            added += 1;
+        }
+    }
+
+    if added > 0 || updated > 0 {
+        stone::organization::save_orgs(&orgs);
+        println!(
+            "[sync-port] {added} neue + {updated} aktualisierte Organisationen empfangen"
+        );
+    }
+
+    (
+        StatusCode::OK,
+        axum::Json(json!({"ok": true, "added": added, "updated": updated})),
+    )
+}
+
 /// GET /chunk/{hash} – Chunk-Daten für Peer-Sync
 async fn sync_chunk(
     Path(hash): Path<String>,
@@ -409,6 +490,8 @@ pub fn build_sync_router(state: AppState) -> Router {
         .route("/blocks", get(sync_blocks))
         .route("/blocks/{index}", get(sync_block))
         .route("/sync-users", post(sync_receive_users))
+        .route("/organizations", get(sync_organizations))
+        .route("/sync-organizations", post(sync_receive_organizations))
         .route("/game-economy", get(sync_game_economy))
         .route("/chunk/{hash}", get(sync_chunk))
         .layer(cors)

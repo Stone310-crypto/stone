@@ -2656,6 +2656,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     load_trust_from_disk(&node);
 
     let users = load_users();
+
+    // ── Organisations laden ──────────────────────────────────────────────
+    let orgs = Arc::new(std::sync::Mutex::new(stone::organization::load_orgs()));
     {
         let ledger = node.token_ledger.read().unwrap_or_else(|e| e.into_inner());
         if ledger.registered_account_count() > 0 {
@@ -2670,7 +2673,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     MasterNodeState::start_heartbeat(node.clone(), HEARTBEAT_INTERVAL);
     // WICHTIG: Kein lokaler Master-Mining-Loop im Miner-Binary.
     // Der Miner nutzt Remote-Templates + Remote-Submit gegen Master-Nodes.
-    spawn_auto_sync_task(node.clone(), api_key.clone(), users.clone());
+    spawn_auto_sync_task(node.clone(), api_key.clone(), users.clone(), orgs.clone());
 
     // Peer-Discovery: Bei Bootstrap-Nodes registrieren & Health-Check starten
     bootstrap_announce(&node).await;
