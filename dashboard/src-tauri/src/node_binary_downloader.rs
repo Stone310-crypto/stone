@@ -188,21 +188,23 @@ async fn fetch_latest_release(client: &reqwest::Client) -> Result<GitHubRelease>
 
 /// Ermittelt den Binary-Namen für die aktuelle Plattform.
 /// z.B. `stone-app-node-x86_64-pc-windows-msvc.exe`
+/// Liefert den Asset-Namen im GitHub Release (OHNE .exe Suffix — das wird beim
+/// Speichern in der finalen Datei angehängt).
 fn platform_binary_name(base: &str) -> String {
     #[cfg(target_os = "macos")]
-    let (os, suffix) = {
+    let os = {
         if cfg!(target_arch = "aarch64") {
-            ("macos-aarch64", "")
+            "macos-aarch64"
         } else {
-            ("macos-x86_64", "")
+            "macos-x86_64"
         }
     };
     #[cfg(target_os = "windows")]
-    let (os, suffix) = ("windows-x86_64", ".exe");
+    let os = "windows-x86_64";
     #[cfg(target_os = "linux")]
-    let (os, suffix) = ("linux-x86_64", "");
+    let os = "linux-x86_64";
 
-    format!("{}-{}{}", base, os, suffix)
+    format!("{}-{}", base, os)
 }
 
 /// Lädt eine einzelne Binary herunter und prüft SHA256 gegen die `.sha256`-Datei.
