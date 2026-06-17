@@ -10,6 +10,44 @@ use node_manager::{
     load_config,
 };
 use std::sync::{Arc, Mutex};
+use serde::Serialize;
+
+#[derive(Serialize, Clone)]
+struct SystemStatsResponse {
+    system_cpu_pct: f32,
+    system_memory_used_mb: u64,
+    system_memory_total_mb: u64,
+    app_cpu_pct: f32,
+    app_memory_mb: u64,
+}
+
+#[tauri::command]
+fn get_system_stats() -> SystemStatsResponse {
+    use sysinfo::{System, ProcessesToUpdate};
+    let mut sys = System::new_all();
+    sys.refresh_all();
+
+    let total_mem = sys.total_memory() / (1024 * 1024);
+    let used_mem = sys.used_memory() / (1024 * 1024);
+
+    let cpu = sys.global_cpu_usage() as f32;
+    let pid = std::process::id();
+    sys.refresh_processes(ProcessesToUpdate::Some(&[sysinfo::Pid::from_u32(pid as u32)]), true);
+    let process_mem = sys.process(sysinfo::Pid::from_u32(pid as u32))
+        .map(|p| p.memory() / (1024 * 1024))
+        .unwrap_or(0);
+    let process_cpu = sys.process(sysinfo::Pid::from_u32(pid as u32))
+        .map(|p| p.cpu_usage() as f32)
+        .unwrap_or(0.0);
+
+    SystemStatsResponse {
+        system_cpu_pct: cpu,
+        system_memory_used_mb: used_mem,
+        system_memory_total_mb: total_mem,
+        app_cpu_pct: process_cpu,
+        app_memory_mb: process_mem,
+    }
+}
 
 use tauri::WebviewUrl;
 use tauri::WebviewWindowBuilder;
@@ -81,6 +119,7 @@ pub fn run() {
         .plugin(tauri_plugin_deep_link::init())
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_notification::init())
         .setup(|app| {
             let cfg = load_config(app.handle());
             let enabled = cfg.enabled;
@@ -125,6 +164,7 @@ pub fn run() {
             detect_file_type_cmd,
             node_binary_check_updates,
             node_binary_download_latest,
+            get_system_stats,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

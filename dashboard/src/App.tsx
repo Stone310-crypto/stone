@@ -13,6 +13,8 @@ import ChatView from "./views/chat/ChatView";
 import WalletView from "./views/wallet/WalletView";
 import ProfileEditOverlay from "./views/profile/ProfileEditOverlay";
 import FriendAddOverlay from "./views/chat/FriendAddOverlay";
+import SettingsOverlay from "./views/profile/SettingsOverlay";
+import { useWebSocketEvents } from "./hooks/useWebSocketEvents";
 
 declare global {
   interface WindowEventMap {
@@ -80,6 +82,7 @@ function CreateServerDialog({ onClose }: { onClose: () => void }) {
 
 function MainApp() {
   const { session } = useAuth();
+  useWebSocketEvents();
   const [activeSection, setActiveSection] = useState<string>("home");
   const [selectedServer, setSelectedServer] = useState<string | null>(null);
   const [activeConversation, setActiveConversation] = useState<ActiveConversation | null>(null);
@@ -87,6 +90,7 @@ function MainApp() {
   const [showWalletOverlay, setShowWalletOverlay] = useState(false);
   const [showProfileOverlay, setShowProfileOverlay] = useState(false);
   const [showFriendOverlay, setShowFriendOverlay] = useState(false);
+  const [showSettingsOverlay, setShowSettingsOverlay] = useState(false);
 
   // Listen for stone-navigate events from UserBar etc.
   useEffect(() => {
@@ -98,6 +102,10 @@ function MainApp() {
       }
       if (s === "profile") {
         setShowProfileOverlay(true);
+        return;
+      }
+      if (s === "settings") {
+        setShowSettingsOverlay(true);
         return;
       }
       if (["home", "explorer", "games", "node"].includes(s)) {
@@ -176,6 +184,11 @@ function MainApp() {
       {/* ── Friend Add Overlay ───────────────────────────── */}
       {showFriendOverlay && (
         <FriendAddOverlay onClose={() => setShowFriendOverlay(false)} />
+      )}
+
+      {/* ── Settings Overlay ──────────────────────────────── */}
+      {showSettingsOverlay && (
+        <SettingsOverlay onClose={() => setShowSettingsOverlay(false)} />
       )}
     </div>
   );

@@ -5,7 +5,7 @@ import { useAuth } from "../../auth/AuthContext";
 import {
   Blocks, Gamepad2, Server, User, Home as HomeIcon, Wallet,
   ChevronUp, ChevronDown,
-  Plus, Hash, UserPlus,
+  Plus, Hash, UserPlus, Settings,
   Loader2, LogOut, Circle, Moon, MinusCircle,
 } from "lucide-react";
 import { useNodeHealth } from "../../hooks/useNodeHealth";
@@ -582,6 +582,10 @@ function UserBar() {
             </button>
             <button onClick={() => navigate("wallet")} style={{ display: "flex", alignItems: "center", gap: 10, width: "100%", padding: "8px 10px", borderRadius: 6, background: "transparent", border: "none", color: "var(--text-primary)", cursor: "pointer", fontSize: 13, textAlign: "left" }}>
               <Wallet size={15} /> Wallet anzeigen
+            </button>
+            <div style={{ height: 1, background: "var(--border)", margin: "2px 8px" }} />
+            <button onClick={() => navigate("settings")} style={{ display: "flex", alignItems: "center", gap: 10, width: "100%", padding: "8px 10px", borderRadius: 6, background: "transparent", border: "none", color: "var(--text-primary)", cursor: "pointer", fontSize: 13, textAlign: "left" }}>
+              <Settings size={15} /> Einstellungen
             </button>
             <div style={{ height: 1, background: "var(--border)", margin: "2px 8px" }} />
             <button

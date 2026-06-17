@@ -10,6 +10,10 @@
     "shell:allow-open",
     "shell:allow-execute",
     "deep-link:default",
-    "http:default"
+    "http:default",
+    "notification:default",
+    "notification:allow-notify",
+    "notification:allow-is-permission-granted",
+    "notification:allow-request-permission"
   ]
 }

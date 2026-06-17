@@ -21,7 +21,7 @@ export function clearSession(): void {
 }
 
 const defaultSettings: NodeSettings = {
-  nodeUrl: "http://127.0.0.1:13080",
+  nodeUrl: "http://127.0.0.1:3080",
   label: "Stonechain Desktop Node",
 };
 
