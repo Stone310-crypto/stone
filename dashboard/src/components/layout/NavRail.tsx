@@ -1,147 +1,71 @@
-import type { ReactNode } from "react";
-import { MessageSquare, Wallet, Blocks, Gamepad2, Megaphone, Server, User, Globe, Upload } from "lucide-react";
+import { useState, type ReactNode } from "react";
+import { useQuery } from "@tanstack/react-query";
+import { orgs } from "../../api/stone";
+import { useAuth } from "../../auth/AuthContext";
+import {
+  Blocks, Gamepad2, Server, User, Home as HomeIcon, Wallet,
+  ChevronUp, ChevronDown,
+  Plus, Hash,
+  Loader2, LogOut, Circle, Moon, MinusCircle,
+} from "lucide-react";
 import { useNodeHealth } from "../../hooks/useNodeHealth";
+import { chat, groups } from "../../api/stone";
 
-export type NavSection =
-  | "chat"
-  | "wallet"
-  | "explorer"
-  | "games"
-  | "servers"
-  | "announcements"
-  | "node"
-  | "profile"
-  | "files";
+export interface SelectedServer {
+  type: "server";
+  orgId: string;
+  name: string;
+}
+
+export interface SelectedDM {
+  type: "dm";
+  wallet: string;
+  name: string;
+}
+
+export interface SelectedGroup {
+  type: "group";
+  id: string;
+  name: string;
+}
+
+export type ActiveConversation = SelectedServer | SelectedDM | SelectedGroup;
 
 interface NavRailProps {
-  active: NavSection;
-  onChange: (s: NavSection) => void;
-  unreadChat?: number;
+  selectedServer: string | null;
+  onSelectServer: (orgId: string) => void;
+  activeConversation: ActiveConversation | null;
+  onSelectConversation: (conv: ActiveConversation) => void;
+  onCreateServer: () => void;
 }
 
-interface NavItem {
-  id: NavSection;
-  icon: ReactNode;
-  label: string;
-  badge?: number;
+interface Org {
+  org_id: string;
+  name: string;
+  member_count: number;
+  channel_count: number;
 }
 
-function RailButton({
-  item,
-  active,
-  onClick,
-}: {
-  item: NavItem;
-  active: boolean;
-  onClick: () => void;
-}) {
-  return (
-    <div className="relative flex justify-center" title={item.label}>
-      {/* Active pill indicator */}
-      <div
-        className="absolute left-0 top-1/2 -translate-y-1/2 w-1 rounded-r-full transition-all"
-        style={{
-          height: active ? 28 : 8,
-          background: active ? "#fff" : "transparent",
-          opacity: active ? 1 : 0,
-        }}
-      />
-
-      <button
-        onClick={onClick}
-        className="relative flex items-center justify-center transition-all"
-        style={{
-          width: 48,
-          height: 48,
-          background: active ? "var(--accent)" : "var(--surface)",
-          color: active ? "#fff" : "var(--text-dim)",
-          borderRadius: active ? "16px" : "24px",
-          border: "none",
-          cursor: "pointer",
-        }}
-        onMouseEnter={(e) => {
-          if (!active) {
-            (e.currentTarget as HTMLButtonElement).style.borderRadius = "16px";
-            (e.currentTarget as HTMLButtonElement).style.background = "var(--accent)";
-            (e.currentTarget as HTMLButtonElement).style.color = "#fff";
-          }
-        }}
-        onMouseLeave={(e) => {
-          if (!active) {
-            (e.currentTarget as HTMLButtonElement).style.borderRadius = "24px";
-            (e.currentTarget as HTMLButtonElement).style.background = "var(--surface)";
-            (e.currentTarget as HTMLButtonElement).style.color = "var(--text-dim)";
-          }
-        }}
-      >
-        {item.icon}
-        {!!item.badge && (
-          <span
-            className="absolute flex items-center justify-center text-white font-bold rounded-full"
-            style={{
-              background: "var(--red)",
-              fontSize: 9,
-              minWidth: 16,
-              height: 16,
-              top: -2,
-              right: -2,
-              padding: "0 3px",
-            }}
-          >
-            {item.badge > 99 ? "99+" : item.badge}
-          </span>
-        )}
-      </button>
-    </div>
-  );
+function shortAddr(addr: string): string {
+  return addr.length > 12 ? `${addr.slice(0, 6)}…${addr.slice(-4)}` : addr;
 }
-
-// ── Network status widget ─────────────────────────────────────────────────────
 
 function NetworkStatus() {
   const { connected, blockHeight, network } = useNodeHealth();
-
   return (
     <div
-      title={
-        connected
-          ? `Verbunden · ${network} · Block #${blockHeight.toLocaleString()}`
-          : "Keine Verbindung zum Netzwerk"
-      }
-      style={{
-        display: "flex",
-        flexDirection: "column",
-        alignItems: "center",
-        gap: 4,
-        padding: "8px 0",
-        cursor: "default",
-        userSelect: "none",
-      }}
+      title={connected ? `Verbunden · ${network} · Block #${blockHeight.toLocaleString()}` : "Keine Verbindung"}
+      style={{ display: "flex", alignItems: "center", gap: 6, padding: "0 4px", cursor: "default" }}
     >
-      {/* Status dot */}
-      <div
-        style={{
-          width: 8,
-          height: 8,
-          borderRadius: "50%",
-          background: connected ? "var(--green)" : "rgba(255,255,255,0.18)",
-          boxShadow: connected ? "0 0 6px var(--green)" : "none",
-          animation: connected ? "pulse-glow 2.5s ease-in-out infinite" : "none",
-          transition: "background 0.4s",
-        }}
-      />
-      {/* Block height (compact) */}
+      <div style={{
+        width: 7, height: 7, borderRadius: "50%",
+        background: connected ? "var(--green)" : "rgba(255,255,255,0.18)",
+        boxShadow: connected ? "0 0 5px var(--green)" : "none",
+        animation: connected ? "pulse-glow 2.5s ease-in-out infinite" : "none",
+        flexShrink: 0,
+      }} />
       {connected && blockHeight > 0 && (
-        <span
-          style={{
-            fontSize: 9,
-            fontWeight: 700,
-            fontFamily: "monospace",
-            color: "var(--text-muted)",
-            letterSpacing: "0.01em",
-            lineHeight: 1,
-          }}
-        >
+        <span style={{ fontSize: 10, fontWeight: 600, fontFamily: "monospace", color: "var(--text-muted)" }}>
           #{blockHeight > 9999 ? `${Math.floor(blockHeight / 1000)}k` : blockHeight}
         </span>
       )}
@@ -149,74 +73,569 @@ function NetworkStatus() {
   );
 }
 
-export default function NavRail({ active, onChange, unreadChat }: NavRailProps) {
-  const topItems: NavItem[] = [
-    { id: "chat",          icon: <MessageSquare size={22} strokeWidth={1.8} />, label: "Chat",         badge: unreadChat },
-    { id: "wallet",        icon: <Wallet        size={22} strokeWidth={1.8} />, label: "Wallet" },
-    { id: "explorer",      icon: <Blocks        size={22} strokeWidth={1.8} />, label: "Blockchain" },
-    { id: "files",         icon: <Upload        size={22} strokeWidth={1.8} />, label: "Dateien" },
-    { id: "games",         icon: <Gamepad2      size={22} strokeWidth={1.8} />, label: "Games" },
-    { id: "servers",       icon: <Globe         size={22} strokeWidth={1.8} />, label: "Server" },
-    { id: "announcements", icon: <Megaphone     size={22} strokeWidth={1.8} />, label: "News" },
-    { id: "node",          icon: <Server        size={22} strokeWidth={1.8} />, label: "Node" },
-  ];
+// ── Top Navigation Bar ────────────────────────────────────────────────────────
+
+const topNavItems = [
+  { id: "explorer", icon: <Blocks size={16} />, label: "Blockchain" },
+  { id: "games", icon: <Gamepad2 size={16} />, label: "Spiele" },
+  { id: "node", icon: <Server size={16} />, label: "Node" },
+];
+
+function TopNavBar({ onNavigate }: { onNavigate: (section: string) => void }) {
+  const [collapsed, setCollapsed] = useState(false);
 
   return (
-    <div
-      className="flex flex-col items-center py-3 gap-2 shrink-0"
-      style={{
-        width: "var(--rail-w)",
-        background: "var(--rail-bg)",
-        paddingTop: 52,
-      }}
-    >
-      {/* App icon */}
-      <div
-        className="flex items-center justify-center font-bold mb-2"
-        style={{
-          width: 48,
-          height: 48,
-          borderRadius: 16,
-          background: "var(--accent)",
-          color: "#fff",
-          fontSize: 20,
-          flexShrink: 0,
-        }}
-      >
-        S
+    <div style={{
+      background: "var(--bg-panel)",
+      borderBottom: "1px solid var(--border)",
+      flexShrink: 0,
+      transition: "height 0.2s ease",
+      overflow: "hidden",
+      height: collapsed ? 32 : 40,
+    }}>
+      <div style={{
+        display: "flex", alignItems: "center", gap: 4,
+        padding: "0 12px", height: "100%",
+      }}>
+        {/* Home */}
+        <button
+          onClick={() => onNavigate("home")}
+          title="Startseite"
+          style={{
+            display: "flex", alignItems: "center", gap: 6,
+            padding: "4px 10px", borderRadius: 6,
+            background: "transparent", border: "none",
+            color: "var(--text-secondary)", cursor: "pointer",
+            fontSize: 12, fontWeight: 500,
+            transition: "all 0.12s",
+          }}
+          onMouseEnter={(e) => {
+            (e.currentTarget as HTMLElement).style.background = "rgba(255,255,255,0.05)";
+            (e.currentTarget as HTMLElement).style.color = "var(--text-primary)";
+          }}
+          onMouseLeave={(e) => {
+            (e.currentTarget as HTMLElement).style.background = "transparent";
+            (e.currentTarget as HTMLElement).style.color = "var(--text-secondary)";
+          }}
+        >
+          <HomeIcon size={16} />
+          {!collapsed && "Start"}
+        </button>
+
+        <div style={{ width: 1, height: 18, background: "var(--border)", margin: "0 4px" }} />
+
+        {/* Nav items */}
+        {topNavItems.map((item) => (
+          <button
+            key={item.id}
+            onClick={() => onNavigate(item.id)}
+            title={item.label}
+            style={{
+              display: "flex", alignItems: "center", gap: 6,
+              padding: "4px 10px", borderRadius: 6,
+              background: "transparent", border: "none",
+              color: "var(--text-secondary)", cursor: "pointer",
+              fontSize: 12, fontWeight: 500,
+              transition: "all 0.12s",
+            }}
+            onMouseEnter={(e) => {
+              (e.currentTarget as HTMLElement).style.background = "rgba(255,255,255,0.05)";
+              (e.currentTarget as HTMLElement).style.color = "var(--text-primary)";
+            }}
+            onMouseLeave={(e) => {
+              (e.currentTarget as HTMLElement).style.background = "transparent";
+              (e.currentTarget as HTMLElement).style.color = "var(--text-secondary)";
+            }}
+          >
+            {item.icon}
+            {!collapsed && item.label}
+          </button>
+        ))}
+
+        <div style={{ flex: 1 }} />
+
+        <NetworkStatus />
+
+        {/* Collapse toggle */}
+        <button
+          onClick={() => setCollapsed(!collapsed)}
+          title={collapsed ? "Leiste ausklappen" : "Leiste einklappen"}
+          style={{
+            width: 22, height: 22, borderRadius: 4,
+            background: "rgba(255,255,255,0.04)", border: "none",
+            color: "var(--text-muted)", cursor: "pointer",
+            display: "flex", alignItems: "center", justifyContent: "center",
+            flexShrink: 0,
+          }}
+          onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = "rgba(255,255,255,0.08)"; }}
+          onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = "rgba(255,255,255,0.04)"; }}
+        >
+          {collapsed ? <ChevronDown size={12} /> : <ChevronUp size={12} />}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── DM List Panel ─────────────────────────────────────────────────────────────
+
+function DMPanel({
+  activeConversation,
+  onSelectConversation,
+}: {
+  activeConversation: ActiveConversation | null;
+  onSelectConversation: (conv: ActiveConversation) => void;
+}) {
+  const convQuery = useQuery({
+    queryKey: ["conversations"],
+    queryFn: chat.conversations,
+    refetchInterval: 8_000,
+  });
+  const groupQuery = useQuery({
+    queryKey: ["groups"],
+    queryFn: groups.list,
+    refetchInterval: 30_000,
+  });
+  const conversations = convQuery.data?.conversations ?? [];
+  const grps = groupQuery.data?.groups ?? [];
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>
+      {/* Header */}
+      <div style={{ padding: "10px 10px 6px", borderBottom: "1px solid var(--border)", flexShrink: 0 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <input
+            type="text"
+            placeholder="Gespräche suchen…"
+            style={{
+              flex: 1, background: "var(--bg-input)", border: "1px solid var(--border-default)",
+              borderRadius: 6, padding: "5px 8px", fontSize: 11, color: "var(--text-primary)",
+              outline: "none",
+            }}
+          />
+        </div>
       </div>
 
-      <div className="w-8 my-1" style={{ height: 1, background: "var(--border)" }} />
+      {/* List */}
+      <div style={{ flex: 1, overflowY: "auto", padding: "6px 4px" }}>
+        {/* Groups */}
+        {grps.length > 0 && (
+          <div style={{ marginBottom: 6 }}>
+            <div style={{ fontSize: 10, fontWeight: 700, textTransform: "uppercase", color: "var(--text-muted)", padding: "4px 8px 4px", letterSpacing: "0.04em" }}>
+              Gruppen
+            </div>
+            {grps.map((g: any) => {
+              const isActive = activeConversation?.type === "group" && (activeConversation as SelectedGroup).id === (g.group_id ?? g.id);
+              return (
+                <button
+                  key={g.group_id ?? g.id}
+                  onClick={() => onSelectConversation({ type: "group", id: g.group_id ?? g.id, name: g.name })}
+                  style={{
+                    display: "flex", alignItems: "center", gap: 8,
+                    width: "100%", padding: "5px 8px", borderRadius: 6,
+                    background: isActive ? "rgba(255,255,255,0.07)" : "transparent",
+                    border: "none", color: isActive ? "var(--text-primary)" : "var(--text-secondary)",
+                    cursor: "pointer", fontSize: 12, textAlign: "left",
+                    transition: "all 0.12s",
+                  }}
+                  onMouseEnter={(e) => { if (!isActive) (e.currentTarget as HTMLElement).style.background = "rgba(255,255,255,0.04)"; }}
+                  onMouseLeave={(e) => { if (!isActive) (e.currentTarget as HTMLElement).style.background = "transparent"; }}
+                >
+                  <Hash size={12} style={{ flexShrink: 0, color: "var(--text-muted)" }} />
+                  <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{g.name}</span>
+                  {g.unread_count > 0 && (
+                    <span style={{ fontSize: 10, fontWeight: 700, background: "var(--accent)", color: "#fff", borderRadius: 20, padding: "1px 5px", minWidth: 14, textAlign: "center" }}>
+                      {g.unread_count}
+                    </span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        )}
 
-      {topItems.map((item) => (
-        <RailButton
-          key={item.id}
-          item={item}
-          active={active === item.id}
-          onClick={() => onChange(item.id)}
-        />
-      ))}
+        {/* DMs */}
+        <div>
+          <div style={{ fontSize: 10, fontWeight: 700, textTransform: "uppercase", color: "var(--text-muted)", padding: "4px 8px 4px", letterSpacing: "0.04em" }}>
+            Direktnachrichten
+          </div>
+          {conversations.map((c: any) => {
+            const wallet = c.peer_wallet ?? "";
+            const name = c.peer_name || shortAddr(wallet);
+            const isActive = activeConversation?.type === "dm" && (activeConversation as SelectedDM).wallet === wallet;
+            let preview = c.last_message ?? "";
+            try { preview = decodeURIComponent(escape(atob(preview))); } catch { /* raw */ }
+            return (
+              <button
+                key={wallet}
+                onClick={() => onSelectConversation({ type: "dm", wallet, name })}
+                style={{
+                  display: "flex", alignItems: "center", gap: 8,
+                  width: "100%", padding: "6px 8px", borderRadius: 6,
+                  background: isActive ? "rgba(255,255,255,0.07)" : "transparent",
+                  border: "none", color: "var(--text-primary)", cursor: "pointer",
+                  textAlign: "left", transition: "all 0.12s",
+                }}
+                onMouseEnter={(e) => { if (!isActive) (e.currentTarget as HTMLElement).style.background = "rgba(255,255,255,0.04)"; }}
+                onMouseLeave={(e) => { if (!isActive) (e.currentTarget as HTMLElement).style.background = "transparent"; }}
+              >
+                <div style={{
+                  width: 28, height: 28, borderRadius: "50%",
+                  background: "var(--accent)", display: "flex",
+                  alignItems: "center", justifyContent: "center",
+                  fontSize: 11, fontWeight: 700, color: "#fff",
+                  flexShrink: 0, position: "relative",
+                }}>
+                  {name[0]?.toUpperCase() ?? "?"}
+                  <div style={{
+                    position: "absolute", bottom: -1, right: -1,
+                    width: 9, height: 9, borderRadius: "50%",
+                    background: "var(--bg-panel)",
+                    display: "flex", alignItems: "center", justifyContent: "center",
+                  }}>
+                    <div style={{
+                      width: 5, height: 5, borderRadius: "50%",
+                      background: c.online !== false ? "var(--green)" : "var(--text-muted)",
+                    }} />
+                  </div>
+                </div>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                    <span style={{ fontSize: 12, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {name}
+                    </span>
+                    {c.unread_count > 0 && (
+                      <span style={{ fontSize: 10, fontWeight: 700, background: "var(--accent)", color: "#fff", borderRadius: 20, padding: "1px 5px", marginLeft: 4, minWidth: 14, textAlign: "center" }}>
+                        {c.unread_count}
+                      </span>
+                    )}
+                  </div>
+                  <p style={{ fontSize: 10, color: "var(--text-muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginTop: 1 }}>
+                    {preview || "Keine Nachrichten"}
+                  </p>
+                </div>
+              </button>
+            );
+          })}
+          {conversations.length === 0 && !convQuery.isLoading && (
+            <p style={{ fontSize: 10, padding: "6px 8px", color: "var(--text-muted)" }}>
+              Keine Gespräche — füge Freunde hinzu!
+            </p>
+          )}
+          {convQuery.isLoading && (
+            <div style={{ display: "flex", justifyContent: "center", padding: 12 }}>
+              <Loader2 size={14} style={{ animation: "spin 0.7s linear infinite", color: "var(--text-muted)" }} />
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
 
-      <div className="flex-1" />
+// ── Server List Panel ─────────────────────────────────────────────────────────
 
-      {/* Network status */}
-      <NetworkStatus />
+function ServerPanel({
+  selectedServer, onSelectServer,
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars
+  activeConversation: _activeConversation,
+  onSelectConversation,
+  onCreateServer,
+}: {
+  selectedServer: string | null;
+  onSelectServer: (orgId: string) => void;
+  activeConversation: ActiveConversation | null;
+  onSelectConversation: (conv: ActiveConversation) => void;
+  onCreateServer: () => void;
+}) {
+  const orgsQ = useQuery({
+    queryKey: ["orgs"],
+    queryFn: () => orgs.list(),
+    refetchInterval: 15_000,
+  });
+  const orgsList: Org[] = ((orgsQ.data as any)?.orgs ?? []).map((o: any) => ({
+    org_id: o.id ?? "",
+    name: o.name ?? "",
+    member_count: o.members ?? 0,
+    channel_count: o.channels ?? 0,
+  }));
 
-      <div className="w-8" style={{ height: 1, background: "var(--border)" }} />
+  return (
+    <div style={{ display: "flex", flexDirection: "column", height: "100%", overflow: "hidden" }}>
+      {/* Header */}
+      <div style={{ padding: "10px 10px 6px", borderBottom: "1px solid var(--border)", flexShrink: 0 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+          <span style={{ fontSize: 10, fontWeight: 700, textTransform: "uppercase", color: "var(--text-muted)", flex: 1, letterSpacing: "0.04em" }}>
+            Server
+          </span>
+          <button
+            onClick={onCreateServer}
+            title="Neuen Server erstellen"
+            style={{
+              width: 22, height: 22, borderRadius: 5,
+              background: "rgba(255,255,255,0.04)", border: "1px dashed var(--border-strong)",
+              color: "var(--accent)", cursor: "pointer",
+              display: "flex", alignItems: "center", justifyContent: "center",
+            }}
+          >
+            <Plus size={12} />
+          </button>
+        </div>
+      </div>
 
-      {/* Profile */}
-      <RailButton
-        item={{ id: "profile", icon: <User size={22} strokeWidth={1.8} />, label: "Profil" }}
-        active={active === "profile"}
-        onClick={() => onChange("profile")}
-      />
+      {/* Server list */}
+      <div style={{ flex: 1, overflowY: "auto", padding: "6px 4px", display: "flex", flexDirection: "column", gap: 2 }}>
+        {orgsList.map((org) => {
+          const isActive = selectedServer === org.org_id;
+          return (
+            <button
+              key={org.org_id}
+              onClick={() => {
+                onSelectServer(org.org_id);
+                onSelectConversation({ type: "server", orgId: org.org_id, name: org.name });
+              }}
+              title={org.name}
+              style={{
+                display: "flex", alignItems: "center", gap: 8,
+                width: "100%", padding: "6px 8px", borderRadius: 6,
+                background: isActive ? "rgba(255,255,255,0.07)" : "transparent",
+                border: "none", cursor: "pointer",
+                textAlign: "left", transition: "all 0.12s",
+              }}
+              onMouseEnter={(e) => {
+                if (!isActive) (e.currentTarget as HTMLElement).style.background = "rgba(255,255,255,0.04)";
+              }}
+              onMouseLeave={(e) => {
+                if (!isActive) (e.currentTarget as HTMLElement).style.background = "transparent";
+              }}
+            >
+              <div style={{
+                width: 28, height: 28, borderRadius: isActive ? 10 : 16,
+                background: isActive ? "var(--accent)" : "var(--bg-surface)",
+                display: "flex", alignItems: "center", justifyContent: "center",
+                fontSize: 13, fontWeight: 700,
+                color: isActive ? "var(--text-inverse)" : "var(--text-muted)",
+                flexShrink: 0, transition: "all 0.2s",
+              }}>
+                {org.name[0]?.toUpperCase() ?? "S"}
+              </div>
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 12, fontWeight: 600, color: isActive ? "var(--accent)" : "var(--text-primary)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                  {org.name}
+                </div>
+                <div style={{ fontSize: 10, color: "var(--text-muted)" }}>
+                  {org.member_count} Mitglieder
+                </div>
+              </div>
+            </button>
+          );
+        })}
+        {orgsList.length === 0 && !orgsQ.isLoading && (
+          <p style={{ fontSize: 10, padding: "6px 8px", color: "var(--text-muted)" }}>
+            Noch keine Server
+          </p>
+        )}
+        {orgsQ.isLoading && (
+          <div style={{ display: "flex", justifyContent: "center", padding: 12 }}>
+            <Loader2 size={14} style={{ animation: "spin 0.7s linear infinite", color: "var(--text-muted)" }} />
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
 
-      <style>{`
-        @keyframes pulse-glow {
-          0%, 100% { opacity: 1; box-shadow: 0 0 6px var(--green); }
-          50%       { opacity: 0.6; box-shadow: 0 0 2px var(--green); }
-        }
-      `}</style>
+// ── Bottom User Bar ──────────────────────────────────────────────────────────
+
+type OnlineStatus = "online" | "idle" | "dnd" | "offline";
+
+const statusConfig: Record<OnlineStatus, { icon: ReactNode; label: string; color: string }> = {
+  online:  { icon: <Circle size={9} fill="#22c55e" color="#22c55e" />, label: "Online", color: "#22c55e" },
+  idle:    { icon: <Moon size={9} fill="#eab308" color="#eab308" />, label: "Abwesend", color: "#eab308" },
+  dnd:     { icon: <MinusCircle size={9} fill="#ef4444" color="#ef4444" />, label: "Nicht stören", color: "#ef4444" },
+  offline: { icon: <Circle size={9} fill="transparent" color="var(--text-muted)" />, label: "Offline", color: "var(--text-muted)" },
+};
+
+function UserBar() {
+  const { session, logout } = useAuth();
+  const [showMenu, setShowMenu] = useState(false);
+  const [showStatusMenu, setShowStatusMenu] = useState(false);
+  const [status, setStatus] = useState<OnlineStatus>("online");
+  if (!session) return null;
+
+  const currentStatus = statusConfig[status];
+
+  const navigate = (section: string) => {
+    setShowMenu(false);
+    setShowStatusMenu(false);
+    window.dispatchEvent(new CustomEvent("stone-navigate", { detail: { section } }));
+  };
+
+  return (
+    <div style={{ position: "relative", borderTop: "1px solid var(--border)", background: "rgba(0,0,0,0.15)", flexShrink: 0 }}>
+      <div
+        onClick={() => setShowMenu(!showMenu)}
+        style={{
+          display: "flex", alignItems: "center", gap: 10,
+          padding: "8px 10px", cursor: "pointer",
+          background: showMenu ? "rgba(255,255,255,0.06)" : "transparent",
+          transition: "background 0.15s",
+        }}
+        onMouseEnter={(e) => { if (!showMenu) (e.currentTarget as HTMLElement).style.background = "rgba(255,255,255,0.03)"; }}
+        onMouseLeave={(e) => { if (!showMenu) (e.currentTarget as HTMLElement).style.background = "transparent"; }}
+      >
+        <div style={{
+          width: 28, height: 28, borderRadius: "50%",
+          background: "var(--accent)", display: "flex",
+          alignItems: "center", justifyContent: "center",
+          fontSize: 12, fontWeight: 700, color: "#fff", flexShrink: 0,
+          position: "relative",
+        }}>
+          {session.username?.[0]?.toUpperCase() ?? "?"}
+          <div style={{
+            position: "absolute", bottom: -1, right: -1,
+            width: 13, height: 13, borderRadius: "50%",
+            background: "var(--bg-panel)", display: "flex",
+            alignItems: "center", justifyContent: "center",
+          }}>
+            {currentStatus.icon}
+          </div>
+        </div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{
+            fontSize: 12, fontWeight: 600, color: "var(--text-primary)",
+            overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+          }}>
+            {session.username}
+          </div>
+          <div style={{ fontSize: 10, color: "var(--text-muted)" }}>
+            {currentStatus.label}
+          </div>
+        </div>
+      </div>
+      {showMenu && (
+        <>
+          <div onClick={() => { setShowMenu(false); setShowStatusMenu(false); }} style={{ position: "fixed", inset: 0, zIndex: 98 }} />
+          <div style={{
+            position: "absolute", bottom: "100%", left: 8, right: 8, zIndex: 99,
+            background: "var(--bg-panel)", borderRadius: 12,
+            border: "1px solid var(--border-strong)", padding: "6px 4px",
+            boxShadow: "0 8px 32px rgba(0,0,0,0.5)",
+          }}>
+            {/* Status selector */}
+            <div style={{ position: "relative", marginBottom: 2 }}>
+              <button
+                onClick={() => setShowStatusMenu(!showStatusMenu)}
+                style={{
+                  display: "flex", alignItems: "center", gap: 10,
+                  width: "100%", padding: "8px 10px", borderRadius: 6,
+                  background: showStatusMenu ? "rgba(255,255,255,0.06)" : "transparent",
+                  border: "none", color: currentStatus.color, cursor: "pointer",
+                  fontSize: 13, textAlign: "left",
+                }}
+              >
+                {currentStatus.icon}
+                <span style={{ flex: 1, color: "var(--text-primary)" }}>{currentStatus.label}</span>
+                <span style={{ fontSize: 10, color: "var(--text-muted)" }}>▸</span>
+              </button>
+              {showStatusMenu && (
+                <div style={{ marginLeft: 12, marginBottom: 2, display: "flex", flexDirection: "column", gap: 1 }}>
+                  {(Object.entries(statusConfig) as [OnlineStatus, typeof currentStatus][]).map(([key, cfg]) => (
+                    <button
+                      key={key}
+                      onClick={() => { setStatus(key); setShowStatusMenu(false); }}
+                      style={{
+                        display: "flex", alignItems: "center", gap: 8,
+                        width: "100%", padding: "6px 10px", borderRadius: 4,
+                        background: status === key ? "rgba(255,255,255,0.06)" : "transparent",
+                        border: "none", color: cfg.color, cursor: "pointer",
+                        fontSize: 12, textAlign: "left",
+                      }}
+                    >
+                      {cfg.icon} {cfg.label}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+            <div style={{ height: 1, background: "var(--border)", margin: "2px 8px" }} />
+            <button onClick={() => navigate("profile")} style={{ display: "flex", alignItems: "center", gap: 10, width: "100%", padding: "8px 10px", borderRadius: 6, background: "transparent", border: "none", color: "var(--text-primary)", cursor: "pointer", fontSize: 13, textAlign: "left" }}>
+              <User size={15} /> Profil bearbeiten
+            </button>
+            <button onClick={() => navigate("wallet")} style={{ display: "flex", alignItems: "center", gap: 10, width: "100%", padding: "8px 10px", borderRadius: 6, background: "transparent", border: "none", color: "var(--text-primary)", cursor: "pointer", fontSize: 13, textAlign: "left" }}>
+              <Wallet size={15} /> Wallet anzeigen
+            </button>
+            <div style={{ height: 1, background: "var(--border)", margin: "2px 8px" }} />
+            <button
+              onClick={() => { setShowMenu(false); logout(); }}
+              style={{
+                display: "flex", alignItems: "center", gap: 8,
+                width: "100%", padding: "8px 10px", borderRadius: 6,
+                background: "transparent", border: "none",
+                color: "#ef4444", cursor: "pointer", fontSize: 13, textAlign: "left",
+              }}
+            >
+              <LogOut size={15} /> Abmelden
+            </button>
+          </div>
+        </>
+      )}
+      <style>{`@keyframes pulse-glow { 0%,100%{opacity:1;box-shadow:0 0 5px var(--green)}50%{opacity:0.6;box-shadow:0 0 2px var(--green)} }`}</style>
+    </div>
+  );
+}
+
+// ── Main Layout ──────────────────────────────────────────────────────────────
+
+export default function NavRail(props: NavRailProps) {
+  const { selectedServer, onSelectServer, activeConversation, onSelectConversation, onCreateServer } = props;
+
+  const navigate = (section: string) => {
+    window.dispatchEvent(new CustomEvent("stone-navigate", { detail: { section } }));
+  };
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", height: "100vh", overflow: "hidden" }}>
+      {/* ── Top Navigation Bar ──────────────────────────────── */}
+      <TopNavBar onNavigate={navigate} />
+
+      {/* ── Main area: Server Panel | DM Panel | Content ──── */}
+      <div style={{ display: "flex", flex: 1, overflow: "hidden" }}>
+        {/* Server Panel (left) — scrollable list + collapsible profile */}
+        <div style={{
+          width: 180, flexShrink: 0,
+          background: "var(--rail-bg)",
+          borderRight: "1px solid var(--border)",
+          display: "flex", flexDirection: "column",
+          overflow: "hidden",
+        }}>
+          <ServerPanel
+            selectedServer={selectedServer}
+            onSelectServer={onSelectServer}
+            activeConversation={activeConversation}
+            onSelectConversation={onSelectConversation}
+            onCreateServer={onCreateServer}
+          />
+          {/* Collapsible profile at bottom of server panel */}
+          <UserBar />
+        </div>
+
+        {/* DM Panel (middle) */}
+        <div style={{
+          width: 220, flexShrink: 0,
+          background: "var(--bg-panel)",
+          borderRight: "1px solid var(--border)",
+          display: "flex", flexDirection: "column",
+          overflow: "hidden",
+        }}>
+          <DMPanel
+            activeConversation={activeConversation}
+            onSelectConversation={onSelectConversation}
+          />
+        </div>
+
+        {/* Content area is rendered by App.tsx as sibling */}
+      </div>
     </div>
   );
 }

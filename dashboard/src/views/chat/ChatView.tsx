@@ -3,8 +3,8 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { chat as chatApi, groups as groupsApi } from "../../api/stone";
 import { useAuth } from "../../auth/AuthContext";
 import Avatar from "../../components/ui/Avatar";
-import type { ChatEntry, GroupMessage, ConversationSummary, GroupSummary } from "../../types/api";
-import { Send, Hash, Users, KeyRound, Plus } from "lucide-react";
+import type { ChatEntry, GroupMessage } from "../../types/api";
+import { Send, Hash, KeyRound, Plus, MessageCircle } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 
@@ -97,38 +97,6 @@ function MessageBubble({ msg, isOwn, showSender, senderName }: { msg: ChatEntry 
   );
 }
 
-// ── Conversation list items ───────────────────────────────────────────────────
-
-function ConvItem({ conv, active, onClick }: { conv: ConversationSummary; active: boolean; onClick: () => void }) {
-  const name = conv.peer_name || shortAddr(conv.peer_wallet);
-  let preview = conv.last_message ?? "";
-  try { preview = decodeURIComponent(escape(atob(preview))); } catch {}
-  return (
-    <button onClick={onClick} style={{ display: "flex", alignItems: "center", gap: 10, width: "100%", padding: "8px 10px", borderRadius: 10, textAlign: "left", background: active ? "rgba(255,255,255,0.07)" : "transparent", border: active ? "1px solid rgba(255,255,255,0.08)" : "1px solid transparent", color: "var(--text)", cursor: "pointer", transition: "all 0.12s" }}
-      onMouseEnter={(e) => { if (!active) (e.currentTarget as HTMLElement).style.background = "rgba(255,255,255,0.04)"; }}
-      onMouseLeave={(e) => { if (!active) (e.currentTarget as HTMLElement).style.background = "transparent"; }}>
-      <Avatar name={name} size={34} />
-      <div style={{ flex: 1, minWidth: 0 }}>
-        <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-          <span style={{ fontSize: 13, fontWeight: 600, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{name}</span>
-          {conv.unread_count > 0 && <span style={{ fontSize: 11, fontWeight: 700, background: "var(--accent)", color: "#fff", borderRadius: 20, padding: "1px 7px", marginLeft: 6, minWidth: 18, textAlign: "center" }}>{conv.unread_count}</span>}
-        </div>
-        <p style={{ fontSize: 12, color: "var(--text-muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap", marginTop: 1 }}>{preview}</p>
-      </div>
-    </button>
-  );
-}
-
-function GroupItem({ g, active, onClick }: { g: GroupSummary; active: boolean; onClick: () => void }) {
-  return (
-    <button onClick={onClick} style={{ display: "flex", alignItems: "center", gap: 8, width: "100%", padding: "6px 10px", borderRadius: 10, textAlign: "left", background: active ? "rgba(255,255,255,0.07)" : "transparent", border: active ? "1px solid rgba(255,255,255,0.08)" : "1px solid transparent", fontSize: 13, cursor: "pointer", transition: "all 0.12s", color: active ? "var(--text)" : "var(--text-dim)" }}>
-      <Hash size={13} style={{ flexShrink: 0, color: "var(--text-muted)" }} />
-      <span style={{ flex: 1, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{g.name}</span>
-      {g.unread_count > 0 && <span style={{ fontSize: 11, fontWeight: 700, background: "var(--accent)", color: "#fff", borderRadius: 20, padding: "1px 7px", minWidth: 18, textAlign: "center" }}>{g.unread_count}</span>}
-    </button>
-  );
-}
-
 // ── Message thread ────────────────────────────────────────────────────────────
 
 type ActiveChat = { type: "dm"; wallet: string; name: string } | { type: "group"; id: string; name: string };
@@ -210,7 +178,6 @@ function MessageThread({ active, myWallet }: { active: ActiveChat; myWallet: str
           ok: true,
         });
 
-        // Sende eine Chat-Nachricht mit den File-Infos
         const chatMsg = `📎 Datei gesendet: ${fileName} (${formatSize(result.file_size)})\nDoc: ${result.doc_id ?? "?"}\nBlock: #${result.block_index ?? "?"}\nSHA-256: ${(result.file_hash ?? "").slice(0, 16)}…`;
         if (active.type === "dm") {
           await chatApi.send(active.wallet, chatMsg, phrase);
@@ -235,21 +202,13 @@ function MessageThread({ active, myWallet }: { active: ActiveChat; myWallet: str
         <div><p style={{ fontSize: 14, fontWeight: 600, color: "var(--text)" }}>{active.name}</p>{active.type === "dm" && <p style={{ fontSize: 11, fontFamily: "monospace", color: "var(--text-muted)" }}>{shortAddr(active.wallet)}</p>}</div>
       </div>
 
-      {/* Upload Toast */}
       {uploadToast && (
         <div style={{
-          margin: "0 12px",
-          padding: "10px 14px",
-          borderRadius: 10,
+          margin: "0 12px", padding: "10px 14px", borderRadius: 10,
           background: uploadToast.ok ? "rgba(34,197,94,0.08)" : "rgba(239,68,68,0.08)",
           border: `1px solid ${uploadToast.ok ? "rgba(34,197,94,0.25)" : "rgba(239,68,68,0.25)"}`,
-          fontSize: 12,
-          color: uploadToast.ok ? "#22c55e" : "#ef4444",
-          position: "absolute",
-          top: 56,
-          left: 12,
-          right: 12,
-          zIndex: 10,
+          fontSize: 12, color: uploadToast.ok ? "#22c55e" : "#ef4444",
+          position: "absolute", top: 56, left: 12, right: 12, zIndex: 10,
           backdropFilter: "blur(12px)",
         }}>
           {uploadToast.msg}
@@ -271,32 +230,17 @@ function MessageThread({ active, myWallet }: { active: ActiveChat; myWallet: str
       {sendMutation.isError && !showPhrasePrompt && <div style={{ padding: "0 12px 8px" }}><div style={{ background: "rgba(237,66,69,0.1)", border: "1px solid rgba(237,66,69,0.3)", borderRadius: 10, padding: "7px 12px", fontSize: 12, color: "var(--red)" }}>{sendMutation.error instanceof Error ? sendMutation.error.message : "Fehler beim Senden"}</div></div>}
       <form onSubmit={handleSend} style={{ padding: "0 12px 12px" }}>
         <div style={{ display: "flex", alignItems: "flex-end", gap: 6, background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 14, padding: "6px 8px" }}>
-          {/* Upload-Button */}
           <button
-            type="button"
-            onClick={handleFileUpload}
-            disabled={uploading}
-            title="Datei hochladen"
+            type="button" onClick={handleFileUpload} disabled={uploading} title="Datei hochladen"
             style={{
               width: 32, height: 32, borderRadius: 10,
               background: uploading ? "rgba(34,197,94,0.15)" : "rgba(255,255,255,0.05)",
               color: uploading ? "#22c55e" : "var(--text-muted)",
               border: "none", display: "flex", alignItems: "center", justifyContent: "center",
-              cursor: uploading ? "not-allowed" : "pointer",
-              transition: "all 0.15s", flexShrink: 0,
+              cursor: uploading ? "not-allowed" : "pointer", transition: "all 0.15s", flexShrink: 0,
             }}
-            onMouseEnter={(e) => {
-              if (!uploading) {
-                (e.currentTarget as HTMLElement).style.background = "rgba(34,197,94,0.12)";
-                (e.currentTarget as HTMLElement).style.color = "#22c55e";
-              }
-            }}
-            onMouseLeave={(e) => {
-              if (!uploading) {
-                (e.currentTarget as HTMLElement).style.background = "rgba(255,255,255,0.05)";
-                (e.currentTarget as HTMLElement).style.color = "var(--text-muted)";
-              }
-            }}
+            onMouseEnter={(e) => { if (!uploading) { (e.currentTarget as HTMLElement).style.background = "rgba(34,197,94,0.12)"; (e.currentTarget as HTMLElement).style.color = "#22c55e"; } }}
+            onMouseLeave={(e) => { if (!uploading) { (e.currentTarget as HTMLElement).style.background = "rgba(255,255,255,0.05)"; (e.currentTarget as HTMLElement).style.color = "var(--text-muted)"; } }}
           >
             <Plus size={16} />
           </button>
@@ -310,60 +254,29 @@ function MessageThread({ active, myWallet }: { active: ActiveChat; myWallet: str
 
 // ── Main ChatView ─────────────────────────────────────────────────────────────
 
-export default function ChatView() {
-  const { session } = useAuth();
-  const [active, setActive] = useState<ActiveChat | null>(null);
+interface ChatViewProps {
+  initialActive?: { type: "dm"; wallet: string; name: string } | { type: "group"; id: string; name: string } | null;
+}
 
-  const convQuery = useQuery({ queryKey: ["conversations"], queryFn: chatApi.conversations, refetchInterval: 8_000, enabled: !!session });
-  const groupQuery = useQuery({ queryKey: ["groups"], queryFn: groupsApi.list, refetchInterval: 30_000, enabled: !!session });
-  const conversations = convQuery.data?.conversations ?? [];
-  const grps = groupQuery.data?.groups ?? [];
+export default function ChatView({ initialActive }: ChatViewProps) {
+  const { session } = useAuth();
+
+  if (!initialActive) {
+    return (
+      <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", gap: 12, background: "var(--main-bg)" }}>
+        <div style={{ width: 64, height: 64, borderRadius: 20, background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.07)", display: "flex", alignItems: "center", justifyContent: "center" }}>
+          <MessageCircle size={28} style={{ color: "var(--text-muted)", opacity: 0.5 }} />
+        </div>
+        <p style={{ fontSize: 15, fontWeight: 600, color: "var(--text-dim)" }}>Wähle ein Gespräch</p>
+        <p style={{ fontSize: 12, color: "var(--text-muted)" }}>Klicke links auf einen Kontakt um zu schreiben</p>
+      </div>
+    );
+  }
 
   return (
-    <div style={{ display: "flex", height: "100%" }}>
-      {/* Sidebar panel */}
-      <div style={{ width: "var(--panel-w)", display: "flex", flexDirection: "column", background: "var(--panel-bg)", borderRight: "1px solid var(--border)", flexShrink: 0 }}>
-        {/* Contact list header */}
-        <div style={{ padding: "12px 12px 6px" }}>
-          <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-            <Users size={14} style={{ color: "var(--accent)" }} />
-            <span style={{ fontSize: 12, fontWeight: 700, textTransform: "uppercase", color: "var(--text-muted)" }}>Kontakte ({conversations.length})</span>
-          </div>
-        </div>
-
-        <div style={{ flex: 1, overflowY: "auto", padding: "0 6px 6px" }}>
-          {/* Groups */}
-          {grps.length > 0 && (
-            <div>
-              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "8px 10px 4px" }}><span style={{ fontSize: 11, fontWeight: 600, textTransform: "uppercase", color: "var(--text-muted)" }}>Gruppen</span></div>
-              {grps.map((g) => <GroupItem key={g.group_id} g={g} active={active?.type === "group" && active.id === g.group_id} onClick={() => setActive({ type: "group", id: g.group_id, name: g.name })} />)}
-            </div>
-          )}
-
-          {/* DMs */}
-          <div>
-            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", padding: "8px 10px 4px" }}><span style={{ fontSize: 11, fontWeight: 600, textTransform: "uppercase", color: "var(--text-muted)" }}>Direktnachrichten</span></div>
-            {conversations.map((c) => <ConvItem key={c.peer_wallet} conv={c} active={active?.type === "dm" && active.wallet === c.peer_wallet} onClick={() => setActive({ type: "dm", wallet: c.peer_wallet, name: c.peer_name || shortAddr(c.peer_wallet) })} />)}
-            {conversations.length === 0 && !convQuery.isLoading && <p style={{ fontSize: 12, padding: "8px 10px", color: "var(--text-muted)" }}>Keine Gespräche</p>}
-          </div>
-        </div>
-
-        {session && (
-          <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 12px", borderTop: "1px solid var(--border)", background: "rgba(0,0,0,0.15)" }}>
-            <Avatar name={session.username} size={28} online />
-            <div style={{ minWidth: 0 }}><p style={{ fontSize: 12, fontWeight: 600, color: "var(--text)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{session.username}</p><p style={{ fontSize: 10, fontFamily: "monospace", color: "var(--text-muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{shortAddr(session.walletAddress)}</p></div>
-          </div>
-        )}
-      </div>
-
-      <div style={{ flex: 1, overflow: "hidden", background: "var(--main-bg)" }}>
-        {active ? <MessageThread active={active} myWallet={session?.walletAddress ?? ""} /> : (
-          <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", height: "100%", gap: 12 }}>
-            <div style={{ width: 64, height: 64, borderRadius: 20, background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.07)", display: "flex", alignItems: "center", justifyContent: "center" }}><Users size={28} style={{ color: "var(--text-muted)", opacity: 0.5 }} /></div>
-            <p style={{ fontSize: 15, fontWeight: 600, color: "var(--text-dim)" }}>Wähle ein Gespräch</p>
-            <p style={{ fontSize: 12, color: "var(--text-muted)" }}>Klicke auf einen Kontakt um zu schreiben</p>
-          </div>
-        )}
+    <div style={{ display: "flex", height: "100%", background: "var(--main-bg)" }}>
+      <div style={{ flex: 1, overflow: "hidden" }}>
+        <MessageThread active={initialActive as ActiveChat} myWallet={session?.walletAddress ?? ""} />
       </div>
     </div>
   );
