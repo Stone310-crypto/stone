@@ -5,7 +5,7 @@ import { useAuth } from "../../auth/AuthContext";
 import {
   Blocks, Gamepad2, Server, User, Home as HomeIcon, Wallet,
   ChevronUp, ChevronDown,
-  Plus, Hash,
+  Plus, Hash, UserPlus,
   Loader2, LogOut, Circle, Moon, MinusCircle,
 } from "lucide-react";
 import { useNodeHealth } from "../../hooks/useNodeHealth";
@@ -37,6 +37,7 @@ interface NavRailProps {
   activeConversation: ActiveConversation | null;
   onSelectConversation: (conv: ActiveConversation) => void;
   onCreateServer: () => void;
+  onAddFriend: () => void;
 }
 
 interface Org {
@@ -182,9 +183,11 @@ function TopNavBar({ onNavigate }: { onNavigate: (section: string) => void }) {
 function DMPanel({
   activeConversation,
   onSelectConversation,
+  onAddFriend,
 }: {
   activeConversation: ActiveConversation | null;
   onSelectConversation: (conv: ActiveConversation) => void;
+  onAddFriend: () => void;
 }) {
   const convQuery = useQuery({
     queryKey: ["conversations"],
@@ -213,6 +216,21 @@ function DMPanel({
               outline: "none",
             }}
           />
+          <button
+            onClick={onAddFriend}
+            title="Freunde hinzufügen"
+            style={{
+              width: 26, height: 26, borderRadius: 6,
+              background: "rgba(255,255,255,0.04)", border: "none",
+              color: "var(--text-muted)", cursor: "pointer",
+              display: "flex", alignItems: "center", justifyContent: "center",
+              flexShrink: 0,
+            }}
+            onMouseEnter={(e) => { (e.currentTarget as HTMLElement).style.background = "rgba(255,255,255,0.08)"; (e.currentTarget as HTMLElement).style.color = "var(--accent)"; }}
+            onMouseLeave={(e) => { (e.currentTarget as HTMLElement).style.background = "rgba(255,255,255,0.04)"; (e.currentTarget as HTMLElement).style.color = "var(--text-muted)"; }}
+          >
+            <UserPlus size={14} />
+          </button>
         </div>
       </div>
 
@@ -588,7 +606,7 @@ function UserBar() {
 // ── Main Layout ──────────────────────────────────────────────────────────────
 
 export default function NavRail(props: NavRailProps) {
-  const { selectedServer, onSelectServer, activeConversation, onSelectConversation, onCreateServer } = props;
+  const { selectedServer, onSelectServer, activeConversation, onSelectConversation, onCreateServer, onAddFriend } = props;
 
   const navigate = (section: string) => {
     window.dispatchEvent(new CustomEvent("stone-navigate", { detail: { section } }));
@@ -631,6 +649,7 @@ export default function NavRail(props: NavRailProps) {
           <DMPanel
             activeConversation={activeConversation}
             onSelectConversation={onSelectConversation}
+            onAddFriend={onAddFriend}
           />
         </div>
 

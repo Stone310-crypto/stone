@@ -12,6 +12,7 @@ import ProfileView from "./views/profile/ProfileView";
 import ChatView from "./views/chat/ChatView";
 import WalletView from "./views/wallet/WalletView";
 import ProfileEditOverlay from "./views/profile/ProfileEditOverlay";
+import FriendAddOverlay from "./views/chat/FriendAddOverlay";
 
 declare global {
   interface WindowEventMap {
@@ -85,6 +86,7 @@ function MainApp() {
   const [showCreateServer, setShowCreateServer] = useState(false);
   const [showWalletOverlay, setShowWalletOverlay] = useState(false);
   const [showProfileOverlay, setShowProfileOverlay] = useState(false);
+  const [showFriendOverlay, setShowFriendOverlay] = useState(false);
 
   // Listen for stone-navigate events from UserBar etc.
   useEffect(() => {
@@ -149,6 +151,7 @@ function MainApp() {
           }
         }}
         onCreateServer={() => setShowCreateServer(true)}
+        onAddFriend={() => setShowFriendOverlay(true)}
       />
 
       {/* ── Main Content overlaid to the right of the panels ── */}
@@ -168,6 +171,11 @@ function MainApp() {
       {/* ── Profile Edit Overlay ──────────────────────────── */}
       {showProfileOverlay && (
         <ProfileEditOverlay onClose={() => setShowProfileOverlay(false)} />
+      )}
+
+      {/* ── Friend Add Overlay ───────────────────────────── */}
+      {showFriendOverlay && (
+        <FriendAddOverlay onClose={() => setShowFriendOverlay(false)} />
       )}
     </div>
   );
