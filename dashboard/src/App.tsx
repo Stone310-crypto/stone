@@ -11,6 +11,7 @@ import NodeView from "./views/node/NodeView";
 import ProfileView from "./views/profile/ProfileView";
 import ChatView from "./views/chat/ChatView";
 import WalletView from "./views/wallet/WalletView";
+import ProfileEditOverlay from "./views/profile/ProfileEditOverlay";
 
 declare global {
   interface WindowEventMap {
@@ -83,6 +84,7 @@ function MainApp() {
   const [activeConversation, setActiveConversation] = useState<ActiveConversation | null>(null);
   const [showCreateServer, setShowCreateServer] = useState(false);
   const [showWalletOverlay, setShowWalletOverlay] = useState(false);
+  const [showProfileOverlay, setShowProfileOverlay] = useState(false);
 
   // Listen for stone-navigate events from UserBar etc.
   useEffect(() => {
@@ -92,7 +94,11 @@ function MainApp() {
         setShowWalletOverlay((prev) => !prev);
         return;
       }
-      if (["home", "explorer", "games", "node", "profile"].includes(s)) {
+      if (s === "profile") {
+        setShowProfileOverlay(true);
+        return;
+      }
+      if (["home", "explorer", "games", "node"].includes(s)) {
         setActiveSection(s);
         setActiveConversation(null);
         setSelectedServer(null);
@@ -157,6 +163,11 @@ function MainApp() {
       {/* ── Wallet Overlay ───────────────────────────────── */}
       {showWalletOverlay && (
         <WalletView onClose={() => setShowWalletOverlay(false)} />
+      )}
+
+      {/* ── Profile Edit Overlay ──────────────────────────── */}
+      {showProfileOverlay && (
+        <ProfileEditOverlay onClose={() => setShowProfileOverlay(false)} />
       )}
     </div>
   );
