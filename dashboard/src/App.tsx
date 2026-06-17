@@ -10,6 +10,7 @@ import ServerView from "./views/servers/ServerView";
 import NodeView from "./views/node/NodeView";
 import ProfileView from "./views/profile/ProfileView";
 import ChatView from "./views/chat/ChatView";
+import WalletView from "./views/wallet/WalletView";
 
 declare global {
   interface WindowEventMap {
@@ -81,15 +82,20 @@ function MainApp() {
   const [selectedServer, setSelectedServer] = useState<string | null>(null);
   const [activeConversation, setActiveConversation] = useState<ActiveConversation | null>(null);
   const [showCreateServer, setShowCreateServer] = useState(false);
+  const [showWalletOverlay, setShowWalletOverlay] = useState(false);
 
   // Listen for stone-navigate events from UserBar etc.
   useEffect(() => {
     const handler = (e: CustomEvent<{ section: string }>) => {
       const s = e.detail.section;
-      if (["home", "explorer", "games", "node", "profile", "wallet"].includes(s)) {
-        setActiveSection(s === "wallet" ? "profile" : s);
+      if (s === "wallet") {
+        setShowWalletOverlay((prev) => !prev);
+        return;
+      }
+      if (["home", "explorer", "games", "node", "profile"].includes(s)) {
+        setActiveSection(s);
         setActiveConversation(null);
-        if (s !== "servers") setSelectedServer(null);
+        setSelectedServer(null);
       }
     };
     window.addEventListener("stone-navigate", handler as EventListener);
@@ -147,6 +153,11 @@ function MainApp() {
           <ChatView initialActive={activeConversation} />
         ) : views[activeSection] || <HomeView />}
       </div>
+
+      {/* ── Wallet Overlay ───────────────────────────────── */}
+      {showWalletOverlay && (
+        <WalletView onClose={() => setShowWalletOverlay(false)} />
+      )}
     </div>
   );
 }

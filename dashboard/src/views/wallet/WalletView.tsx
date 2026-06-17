@@ -9,6 +9,10 @@ import {
   Send, QrCode, ArrowLeft, X, Loader2, Package,
 } from "lucide-react";
 
+interface WalletViewProps {
+  onClose: () => void;
+}
+
 function fmtStone(v: string | undefined): string {
   if (!v) return "0.00";
   const n = parseFloat(v);
@@ -144,7 +148,7 @@ function ItemsTab({ walletAddr }: { walletAddr: string }) {
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
-export default function WalletView() {
+export default function WalletView({ onClose }: WalletViewProps) {
   const { session } = useAuth();
   const [panel, setPanel] = useState<Panel>("transactions");
   const [showSend, setShowSend] = useState(false);
@@ -159,54 +163,100 @@ export default function WalletView() {
   const txs: TokenTransaction[] = histQ.data?.transactions ?? [];
   const staker = stkQ.data?.staker;
 
-  if (showSend) return <SendPanel onClose={() => setShowSend(false)} walletAddr={addr} />;
-  if (showReceive) return <ReceivePanel onClose={() => setShowReceive(false)} walletAddr={addr} />;
+  if (showSend) return (
+    <div style={{ position:"fixed", inset:0, zIndex:60, display:"flex", alignItems:"center", justifyContent:"center", background:"rgba(0,0,0,0.6)" }}>
+      <div style={{ background:"var(--bg-panel)", borderRadius:16, padding:24, width:420, maxHeight:"80vh", overflowY:"auto", border:"1px solid var(--border-strong)", boxShadow:"0 16px 48px rgba(0,0,0,0.5)" }}>
+        <SendPanel onClose={() => setShowSend(false)} walletAddr={addr} />
+      </div>
+    </div>
+  );
+  if (showReceive) return (
+    <div style={{ position:"fixed", inset:0, zIndex:60, display:"flex", alignItems:"center", justifyContent:"center", background:"rgba(0,0,0,0.6)" }}>
+      <div style={{ background:"var(--bg-panel)", borderRadius:16, padding:24, width:420, maxHeight:"80vh", overflowY:"auto", border:"1px solid var(--border-strong)", boxShadow:"0 16px 48px rgba(0,0,0,0.5)" }}>
+        <ReceivePanel onClose={() => setShowReceive(false)} walletAddr={addr} />
+      </div>
+    </div>
+  );
 
   return (
-    <div style={{ padding: 24, height: "100%", overflowY: "auto" }}>
-      {/* Balance Card */}
-      <div style={{ background: "linear-gradient(135deg, #1a1c26 0%, #242732 100%)", borderRadius: 16, padding: 24, border: "1px solid var(--border-strong)", marginBottom: 20 }}>
-        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
-          <div><p style={{ fontSize: 12, fontWeight: 500, color: "var(--text-muted)", marginBottom: 4 }}>Gesamtguthaben</p><p style={{ fontSize: 28, fontWeight: 700, fontFamily: "monospace" }}>{fmtStone(balance)} <span style={{ fontSize: 14, color: "var(--accent)" }}>STONE</span></p></div>
-          <div style={{ display: "flex", gap: 8 }}>
-            <button onClick={() => setShowReceive(true)} style={{ background: "var(--accent-bg)", border: "1px solid rgba(212,168,83,0.3)", borderRadius: 8, padding: "8px 14px", color: "var(--accent)", cursor: "pointer", display: "flex", alignItems: "center", gap: 6, fontSize: 13, fontWeight: 500 }}><QrCode size={16} /> Empfangen</button>
-            <button onClick={() => setShowSend(true)} style={{ background: "var(--accent)", border: "none", borderRadius: 8, padding: "8px 14px", color: "var(--text-inverse)", cursor: "pointer", display: "flex", alignItems: "center", gap: 6, fontSize: 13, fontWeight: 600 }}><Send size={16} /> Senden</button>
-          </div>
+    <div style={{ position:"fixed", inset:0, zIndex:55, display:"flex", alignItems:"center", justifyContent:"center", background:"rgba(0,0,0,0.55)" }}
+      onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}>
+      {/* Wallet Card */}
+      <div style={{
+        background: "var(--bg-panel)",
+        borderRadius: 16,
+        width: 460,
+        maxWidth: "94vw",
+        maxHeight: "85vh",
+        overflowY: "auto",
+        border: "1px solid var(--border-strong)",
+        boxShadow: "0 16px 48px rgba(0,0,0,0.5)",
+        padding: 20,
+      }}>
+        {/* Header */}
+        <div style={{ display:"flex", alignItems:"center", gap:10, marginBottom:20 }}>
+          <button onClick={onClose} title="Zurück"
+            style={{ width:30, height:30, borderRadius:8, background:"rgba(255,255,255,0.06)", border:"none", color:"var(--text-muted)", cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center" }}>
+            <ArrowLeft size={16} />
+          </button>
+          <h2 style={{ fontSize:16, fontWeight:700, flex:1 }}>Wallet</h2>
+          <button onClick={onClose} style={{ background:"none", border:"none", color:"var(--text-muted)", cursor:"pointer" }}>
+            <X size={18} />
+          </button>
         </div>
-        {addr && <div style={{ marginTop: 16, display: "flex", alignItems: "center", gap: 8 }}><p className="mono" style={{ fontSize: 11, color: "var(--text-muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{addr}</p><CopyAddr addr={addr} /></div>}
-      </div>
 
-      {/* Tabs */}
-      <div style={{ display: "flex", gap: 4, marginBottom: 16 }}>
-        {PANELS.map(p => (
-          <button key={p.id} onClick={() => setPanel(p.id)} style={{
-            flex: 1, padding: "10px 12px", borderRadius: 10, background: panel === p.id ? "var(--accent-bg)" : "transparent",
-            border: panel === p.id ? "1px solid rgba(212,168,83,0.3)" : "1px solid transparent",
-            color: panel === p.id ? "var(--accent)" : "var(--text-muted)", cursor: "pointer",
-            display: "flex", alignItems: "center", justifyContent: "center", gap: 6, fontSize: 13, fontWeight: 500,
-            transition: "all var(--transition-fast)",
-          }}>{p.icon}{p.label}</button>
-        ))}
-      </div>
-
-      {panel === "transactions" && (
-        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-          {txs.length === 0 && <p style={{ fontSize: 13, color: "var(--text-muted)", textAlign: "center", padding: 24 }}>Keine Transaktionen vorhanden.</p>}
-          {txs.map((tx, i) => <TxRow key={tx.tx_id || i} tx={tx} myWallet={addr} />)}
-        </div>
-      )}
-      {panel === "staking" && (
-        <div style={{ background: "var(--bg-surface)", borderRadius: 14, padding: 20, border: "1px solid var(--border-default)" }}>
-          <h3 style={{ fontSize: 15, fontWeight: 600, marginBottom: 12 }}>Staking</h3>
-          {staker ? (
-            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
-              <div style={{ display: "flex", justifyContent: "space-between" }}><span style={{ color: "var(--text-muted)", fontSize: 13 }}>Eingesetzt</span><span className="mono" style={{ fontSize: 13, fontWeight: 600 }}>{fmtStone(staker.staked_amount)} STONE</span></div>
-              <div style={{ display: "flex", justifyContent: "space-between" }}><span style={{ color: "var(--text-muted)", fontSize: 13 }}>Belohnung</span><span className="mono" style={{ color: "var(--green)", fontSize: 13, fontWeight: 600 }}>{fmtStone(staker.pending_reward)} STONE</span></div>
+        {/* Balance Card */}
+        <div style={{ background:"linear-gradient(135deg, #1a1c26 0%, #242732 100%)", borderRadius:14, padding:20, border:"1px solid var(--border-strong)", marginBottom:16 }}>
+          <div style={{ display:"flex", justifyContent:"space-between", alignItems:"flex-start" }}>
+            <div>
+              <p style={{ fontSize:11, fontWeight:500, color:"var(--text-muted)", marginBottom:4 }}>Gesamtguthaben</p>
+              <p style={{ fontSize:26, fontWeight:700, fontFamily:"monospace" }}>{fmtStone(balance)} <span style={{ fontSize:13, color:"var(--accent)" }}>STONE</span></p>
             </div>
-          ) : <p style={{ color: "var(--text-muted)", fontSize: 13 }}>Kein Staking aktiv.</p>}
+            <div style={{ display:"flex", gap:6 }}>
+              <button onClick={() => setShowReceive(true)} style={{ background:"var(--accent-bg)", border:"1px solid rgba(212,168,83,0.3)", borderRadius:8, padding:"7px 12px", color:"var(--accent)", cursor:"pointer", display:"flex", alignItems:"center", gap:5, fontSize:12, fontWeight:500 }}><QrCode size={14} /> Empfangen</button>
+              <button onClick={() => setShowSend(true)} style={{ background:"var(--accent)", border:"none", borderRadius:8, padding:"7px 12px", color:"var(--text-inverse)", cursor:"pointer", display:"flex", alignItems:"center", gap:5, fontSize:12, fontWeight:600 }}><Send size={14} /> Senden</button>
+            </div>
+          </div>
+          {addr && (
+            <div style={{ marginTop:14, display:"flex", alignItems:"center", gap:8 }}>
+              <p className="mono" style={{ fontSize:10, color:"var(--text-muted)", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{addr}</p>
+              <CopyAddr addr={addr} />
+            </div>
+          )}
         </div>
-      )}
-      {panel === "items" && <ItemsTab walletAddr={addr} />}
+
+        {/* Tabs */}
+        <div style={{ display:"flex", gap:4, marginBottom:14 }}>
+          {PANELS.map(p => (
+            <button key={p.id} onClick={() => setPanel(p.id)} style={{
+              flex:1, padding:"9px 10px", borderRadius:10, background:panel===p.id?"var(--accent-bg)":"transparent",
+              border:panel===p.id?"1px solid rgba(212,168,83,0.3)":"1px solid transparent",
+              color:panel===p.id?"var(--accent)":"var(--text-muted)", cursor:"pointer",
+              display:"flex", alignItems:"center", justifyContent:"center", gap:5, fontSize:12, fontWeight:500,
+              transition:"all var(--transition-fast)",
+            }}>{p.icon}{p.label}</button>
+          ))}
+        </div>
+
+        {panel === "transactions" && (
+          <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
+            {txs.length===0 && <p style={{ fontSize:13, color:"var(--text-muted)", textAlign:"center", padding:24 }}>Keine Transaktionen vorhanden.</p>}
+            {txs.map((tx,i)=><TxRow key={tx.tx_id||i} tx={tx} myWallet={addr} />)}
+          </div>
+        )}
+        {panel === "staking" && (
+          <div style={{ background:"var(--bg-surface)", borderRadius:14, padding:18, border:"1px solid var(--border-default)" }}>
+            <h3 style={{ fontSize:14, fontWeight:600, marginBottom:12 }}>Staking</h3>
+            {staker ? (
+              <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
+                <div style={{ display:"flex", justifyContent:"space-between" }}><span style={{ color:"var(--text-muted)", fontSize:13 }}>Eingesetzt</span><span className="mono" style={{ fontSize:13, fontWeight:600 }}>{fmtStone(staker.staked_amount)} STONE</span></div>
+                <div style={{ display:"flex", justifyContent:"space-between" }}><span style={{ color:"var(--text-muted)", fontSize:13 }}>Belohnung</span><span className="mono" style={{ color:"var(--green)", fontSize:13, fontWeight:600 }}>{fmtStone(staker.pending_reward)} STONE</span></div>
+              </div>
+            ) : <p style={{ color:"var(--text-muted)", fontSize:13 }}>Kein Staking aktiv.</p>}
+          </div>
+        )}
+        {panel === "items" && <ItemsTab walletAddr={addr} />}
+      </div>
     </div>
   );
 }
