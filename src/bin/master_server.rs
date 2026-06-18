@@ -384,10 +384,49 @@ async fn main() {
         }
     }
 
+    // ChatIndex vorab erstellen, damit P2P-Event-Loop + Auto-Sync ihn nutzen können
+    let chat_index_arc: Arc<std::sync::Mutex<stone::chat::ChatIndex>> = {
+        let mut idx = stone::chat::load_chat_index();
+        let chain = node.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let chain_len = chain.blocks.len() as u64;
+        let last_chain_block_idx = chain.blocks.last().map(|b| b.index).unwrap_or(0);
+        if idx.last_indexed_block > 0 && chain_len > 0 && idx.last_indexed_block > last_chain_block_idx {
+            println!("[chat-index] ⚠️ Chain-Reset erkannt beim Start! last_indexed_block={} aber letzter Block ist #{}. Rebuild...", idx.last_indexed_block, last_chain_block_idx);
+            let old_content: std::collections::HashMap<String, (String, String)> = idx.conversations.values()
+                .flat_map(|entries| entries.iter())
+                .filter(|e| !e.encrypted_content.is_empty())
+                .map(|e| (e.msg_id.clone(), (e.encrypted_content.clone(), e.nonce.clone())))
+                .collect();
+            let all_blocks: Vec<_> = chain.blocks.iter().collect();
+            idx = stone::chat::ChatIndex::rebuild_from_chain(&all_blocks, Some(&node.message_pool));
+            if !old_content.is_empty() {
+                for entries in idx.conversations.values_mut() {
+                    for entry in entries.iter_mut() {
+                        if entry.encrypted_content.is_empty() {
+                            if let Some((enc, nc)) = old_content.get(&entry.msg_id) {
+                                entry.encrypted_content = enc.clone();
+                                entry.nonce = nc.clone();
+                            }
+                        }
+                    }
+                }
+            }
+            let _ = stone::chat::save_chat_index(&idx);
+            println!("[chat-index] ✅ Rebuild fertig: {} Konversationen, last_indexed_block={}", idx.conversations.len(), idx.last_indexed_block);
+        } else if chain_len > 0 && last_chain_block_idx > idx.last_indexed_block {
+            let new_blocks: Vec<_> = chain.blocks.iter()
+                .filter(|b| b.index > idx.last_indexed_block)
+                .collect();
+            idx.index_new_blocks(&new_blocks, Some(&node.message_pool));
+            let _ = stone::chat::save_chat_index(&idx);
+        }
+        Arc::new(std::sync::Mutex::new(idx))
+    };
+
     // Hintergrund-Tasks starten
     // master_server ist ein reiner Full-Node (Sync, API, Validierung, Storage).
     MasterNodeState::start_heartbeat(node.clone(), HEARTBEAT_INTERVAL);
-    spawn_auto_sync_task(node.clone(), api_key.clone(), users.clone(), orgs.clone());
+    spawn_auto_sync_task(node.clone(), api_key.clone(), users.clone(), orgs.clone(), chat_index_arc.clone());
 
     // Auto-Block-Timer: produziert nach auto_timeout_secs einen Block, wenn
     // kein CPU-Miner und kein aktiver Minecraft-PoP-Server verbunden ist.
@@ -439,45 +478,6 @@ async fn main() {
             }
         });
     }
-
-    // ChatIndex vorab erstellen, damit der P2P-Event-Loop ihn nutzen kann
-    let chat_index_arc: Arc<std::sync::Mutex<stone::chat::ChatIndex>> = {
-        let mut idx = stone::chat::load_chat_index();
-        let chain = node.chain.lock().unwrap_or_else(|e| e.into_inner());
-        let chain_len = chain.blocks.len() as u64;
-        let last_chain_block_idx = chain.blocks.last().map(|b| b.index).unwrap_or(0);
-        if idx.last_indexed_block > 0 && chain_len > 0 && idx.last_indexed_block > last_chain_block_idx {
-            println!("[chat-index] ⚠️ Chain-Reset erkannt beim Start! last_indexed_block={} aber letzter Block ist #{}. Rebuild...", idx.last_indexed_block, last_chain_block_idx);
-            let old_content: std::collections::HashMap<String, (String, String)> = idx.conversations.values()
-                .flat_map(|entries| entries.iter())
-                .filter(|e| !e.encrypted_content.is_empty())
-                .map(|e| (e.msg_id.clone(), (e.encrypted_content.clone(), e.nonce.clone())))
-                .collect();
-            let all_blocks: Vec<_> = chain.blocks.iter().collect();
-            idx = stone::chat::ChatIndex::rebuild_from_chain(&all_blocks, Some(&node.message_pool));
-            if !old_content.is_empty() {
-                for entries in idx.conversations.values_mut() {
-                    for entry in entries.iter_mut() {
-                        if entry.encrypted_content.is_empty() {
-                            if let Some((enc, nc)) = old_content.get(&entry.msg_id) {
-                                entry.encrypted_content = enc.clone();
-                                entry.nonce = nc.clone();
-                            }
-                        }
-                    }
-                }
-            }
-            let _ = stone::chat::save_chat_index(&idx);
-            println!("[chat-index] ✅ Rebuild fertig: {} Konversationen, last_indexed_block={}", idx.conversations.len(), idx.last_indexed_block);
-        } else if chain_len > 0 && last_chain_block_idx > idx.last_indexed_block {
-            let new_blocks: Vec<_> = chain.blocks.iter()
-                .filter(|b| b.index > idx.last_indexed_block)
-                .collect();
-            idx.index_new_blocks(&new_blocks, Some(&node.message_pool));
-            let _ = stone::chat::save_chat_index(&idx);
-        }
-        Arc::new(std::sync::Mutex::new(idx))
-    };
 
     // GC: Abgelaufene Nachrichten beim Start bereinigen
     {

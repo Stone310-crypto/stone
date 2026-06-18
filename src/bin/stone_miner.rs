@@ -2669,11 +2669,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // ChatIndex vorab erstellen, damit Auto-Sync ihn nutzen kann
+    let chat_index_arc: Arc<std::sync::Mutex<stone::chat::ChatIndex>> = {
+        let mut idx = stone::chat::load_chat_index();
+        let chain = node.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let chain_len = chain.blocks.len() as u64;
+        let last_chain_block_idx = chain.blocks.last().map(|b| b.index).unwrap_or(0);
+        if idx.last_indexed_block > 0 && chain_len > 0 && idx.last_indexed_block > last_chain_block_idx {
+            let old_content: std::collections::HashMap<String, (String, String)> = idx.conversations.values()
+                .flat_map(|entries| entries.iter())
+                .filter(|e| !e.encrypted_content.is_empty())
+                .map(|e| (e.msg_id.clone(), (e.encrypted_content.clone(), e.nonce.clone())))
+                .collect();
+            let all_blocks: Vec<_> = chain.blocks.iter().collect();
+            idx = stone::chat::ChatIndex::rebuild_from_chain(&all_blocks, Some(&node.message_pool));
+            if !old_content.is_empty() {
+                for entries in idx.conversations.values_mut() {
+                    for entry in entries.iter_mut() {
+                        if entry.encrypted_content.is_empty() {
+                            if let Some((enc, nc)) = old_content.get(&entry.msg_id) {
+                                entry.encrypted_content = enc.clone();
+                                entry.nonce = nc.clone();
+                            }
+                        }
+                    }
+                }
+            }
+            let _ = stone::chat::save_chat_index(&idx);
+        } else if chain_len > 0 && last_chain_block_idx > idx.last_indexed_block {
+            let new_blocks: Vec<_> = chain.blocks.iter()
+                .filter(|b| b.index > idx.last_indexed_block)
+                .collect();
+            idx.index_new_blocks(&new_blocks, Some(&node.message_pool));
+            let _ = stone::chat::save_chat_index(&idx);
+        }
+        Arc::new(std::sync::Mutex::new(idx))
+    };
+
     // Hintergrund-Tasks
     MasterNodeState::start_heartbeat(node.clone(), HEARTBEAT_INTERVAL);
     // WICHTIG: Kein lokaler Master-Mining-Loop im Miner-Binary.
     // Der Miner nutzt Remote-Templates + Remote-Submit gegen Master-Nodes.
-    spawn_auto_sync_task(node.clone(), api_key.clone(), users.clone(), orgs.clone());
+    spawn_auto_sync_task(node.clone(), api_key.clone(), users.clone(), orgs.clone(), chat_index_arc.clone());
 
     // Peer-Discovery: Bei Bootstrap-Nodes registrieren & Health-Check starten
     bootstrap_announce(&node).await;
@@ -2727,43 +2764,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let miner_p2p_port = p2p_port_arg
         .or_else(|| std::env::var("STONE_MINER_P2P_PORT").ok()?.parse().ok())
         .unwrap_or_else(default_p2p_port);
-
-    // ChatIndex vorab erstellen, damit der P2P-Event-Loop ihn nutzen kann
-    let chat_index_arc: Arc<std::sync::Mutex<stone::chat::ChatIndex>> = {
-        let mut idx = stone::chat::load_chat_index();
-        let chain = node.chain.lock().unwrap_or_else(|e| e.into_inner());
-        let chain_len = chain.blocks.len() as u64;
-        let last_chain_block_idx = chain.blocks.last().map(|b| b.index).unwrap_or(0);
-        if idx.last_indexed_block > 0 && chain_len > 0 && idx.last_indexed_block > last_chain_block_idx {
-            let old_content: std::collections::HashMap<String, (String, String)> = idx.conversations.values()
-                .flat_map(|entries| entries.iter())
-                .filter(|e| !e.encrypted_content.is_empty())
-                .map(|e| (e.msg_id.clone(), (e.encrypted_content.clone(), e.nonce.clone())))
-                .collect();
-            let all_blocks: Vec<_> = chain.blocks.iter().collect();
-            idx = stone::chat::ChatIndex::rebuild_from_chain(&all_blocks, Some(&node.message_pool));
-            if !old_content.is_empty() {
-                for entries in idx.conversations.values_mut() {
-                    for entry in entries.iter_mut() {
-                        if entry.encrypted_content.is_empty() {
-                            if let Some((enc, nc)) = old_content.get(&entry.msg_id) {
-                                entry.encrypted_content = enc.clone();
-                                entry.nonce = nc.clone();
-                            }
-                        }
-                    }
-                }
-            }
-            let _ = stone::chat::save_chat_index(&idx);
-        } else if chain_len > 0 && last_chain_block_idx > idx.last_indexed_block {
-            let new_blocks: Vec<_> = chain.blocks.iter()
-                .filter(|b| b.index > idx.last_indexed_block)
-                .collect();
-            idx.index_new_blocks(&new_blocks, Some(&node.message_pool));
-            let _ = stone::chat::save_chat_index(&idx);
-        }
-        Arc::new(std::sync::Mutex::new(idx))
-    };
 
     let network_handle: Option<NetworkHandle> =
         if std::env::var("STONE_P2P_DISABLED").as_deref() == Ok("1") {

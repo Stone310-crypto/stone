@@ -72,6 +72,8 @@ pub(super) fn resolve_recipient(identifier: &str, state: &AppState) -> Option<St
     }
 
     let users = state.users.lock().unwrap_or_else(|e| e.into_inner());
+    let user_count = users.len();
+    let users_with_wallet: usize = users.iter().filter(|u| !u.wallet_address.is_empty()).count();
 
     // User-ID (UUID)
     if let Some(u) = users.iter().find(|u| u.id == identifier) {
@@ -82,10 +84,20 @@ pub(super) fn resolve_recipient(identifier: &str, state: &AppState) -> Option<St
 
     // Name (exakter Match, case-insensitive)
     let lower = identifier.to_lowercase();
-    users
+    let result = users
         .iter()
         .find(|u| u.name.to_lowercase() == lower && !u.wallet_address.is_empty())
-        .map(|u| u.wallet_address.clone())
+        .map(|u| u.wallet_address.clone());
+
+    // Debug-Log bei Nicht-Fund, damit man sieht WARUM
+    if result.is_none() {
+        println!(
+            "[chat] 🔍 resolve_recipient: '{}' NICHT gefunden (users={}, users_with_wallet={})",
+            identifier, user_count, users_with_wallet,
+        );
+    }
+
+    result
 }
 
 /// Neue Blöcke in den Chat-Index laden (inkrementell)

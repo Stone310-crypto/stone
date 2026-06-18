@@ -269,12 +269,64 @@ pub async fn handle_chat_send(
         );
     }
 
-    // P2P Gossip: PooledMessage an alle Peers senden (sofortige Zustellung)
+    // ── Zustellung an Empfänger (zweigleisig: P2P-Gossip + REST-Relay) ──
+    // 1. P2P-Gossip: Sofortige libp2p Gossipsub-Zustellung (falls P2P aktiv)
     if let Some(ref net) = state.network {
         if let Ok(data) = serde_json::to_vec(&pool_msg) {
             let net = net.clone();
             tokio::spawn(async move {
                 net.publish_gossip(stone::network::TOPIC_CHAT.as_str(), data).await;
+            });
+        }
+    }
+
+    // 2. REST-Relay: HTTP POST an alle bekannten Peers auf deren Sync-Port.
+    //    Fallback wenn P2P-Gossip durch Firewalls/NAT blockiert wird.
+    //    Der Empfänger speichert die Nachricht sofort in MessagePool + ChatIndex
+    //    und das Dashboard sieht sie ohne auf einen Block warten zu müssen.
+    {
+        let msg_json = match serde_json::to_vec(&pool_msg) {
+            Ok(v) => v,
+            Err(_) => Vec::new(),
+        };
+        if !msg_json.is_empty() {
+            let peers = state.node.get_peers();
+            let msg_clone = pool_msg.clone();
+            tokio::spawn(async move {
+                let client = reqwest::Client::new();
+                for peer in &peers {
+                    if peer.status != stone::master::PeerStatus::Healthy {
+                        continue;
+                    }
+                    let sync_url = crate::server::sync::to_sync_url(&peer.url);
+                    let relay_url = format!("{sync_url}/message-relay");
+                    match client
+                        .post(&relay_url)
+                        .json(&msg_clone)
+                        .timeout(std::time::Duration::from_secs(3))
+                        .send()
+                        .await
+                    {
+                        Ok(resp) if resp.status().is_success() => {
+                            println!(
+                                "[chat] 📤 RELAY → {} – ok ({})",
+                                &peer.url, resp.status(),
+                            );
+                        }
+                        Ok(resp) => {
+                            eprintln!(
+                                "[chat] ⚠ RELAY → {} – HTTP {}",
+                                &peer.url, resp.status(),
+                            );
+                        }
+                        Err(e) => {
+                            // Timeout/Netzwerk-Fehler → normal, nicht jeder Peer erreichbar
+                            if !e.is_timeout() {
+                                eprintln!("[chat] ⚠ RELAY → {} – {e}", &peer.url);
+                            }
+                        }
+                    }
+                }
             });
         }
     }

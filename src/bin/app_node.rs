@@ -124,9 +124,31 @@ async fn main() {
         }
     }
 
+    // ── Chat-Index aufbauen ──────────────────────────────────────────────
+    let chat_index_arc: Arc<std::sync::Mutex<stone::chat::ChatIndex>> = {
+        let mut idx = stone::chat::load_chat_index();
+        let chain = node.chain.lock().unwrap_or_else(|e| e.into_inner());
+        let chain_len = chain.blocks.len() as u64;
+        let last_chain_block_idx = chain.blocks.last().map(|b| b.index).unwrap_or(0);
+        if idx.last_indexed_block > 0 && chain_len > 0
+            && idx.last_indexed_block > last_chain_block_idx
+        {
+            let all_blocks: Vec<_> = chain.blocks.iter().collect();
+            idx = stone::chat::ChatIndex::rebuild_from_chain(&all_blocks, Some(&node.message_pool));
+            let _ = stone::chat::save_chat_index(&idx);
+        } else if chain_len > 0 && last_chain_block_idx > idx.last_indexed_block {
+            let new_blocks: Vec<_> = chain.blocks.iter()
+                .filter(|b| b.index > idx.last_indexed_block)
+                .collect();
+            idx.index_new_blocks(&new_blocks, Some(&node.message_pool));
+            let _ = stone::chat::save_chat_index(&idx);
+        }
+        Arc::new(std::sync::Mutex::new(idx))
+    };
+
     // ── Heartbeat, Auto-Sync, Block-Timer ────────────────────────────────
     MasterNodeState::start_heartbeat(node.clone(), HEARTBEAT_INTERVAL);
-    spawn_auto_sync_task(node.clone(), api_key.clone(), users.clone(), orgs.clone());
+    spawn_auto_sync_task(node.clone(), api_key.clone(), users.clone(), orgs.clone(), chat_index_arc.clone());
 
     let pop_mining_shared = stone::pop_mining::PopMiningState::new();
     MasterNodeState::start_block_timer(node.clone(), pop_mining_shared.clone());
@@ -150,28 +172,6 @@ async fn main() {
             }
         });
     }
-
-    // ── Chat-Index aufbauen ──────────────────────────────────────────────
-    let chat_index_arc: Arc<std::sync::Mutex<stone::chat::ChatIndex>> = {
-        let mut idx = stone::chat::load_chat_index();
-        let chain = node.chain.lock().unwrap_or_else(|e| e.into_inner());
-        let chain_len = chain.blocks.len() as u64;
-        let last_chain_block_idx = chain.blocks.last().map(|b| b.index).unwrap_or(0);
-        if idx.last_indexed_block > 0 && chain_len > 0
-            && idx.last_indexed_block > last_chain_block_idx
-        {
-            let all_blocks: Vec<_> = chain.blocks.iter().collect();
-            idx = stone::chat::ChatIndex::rebuild_from_chain(&all_blocks, Some(&node.message_pool));
-            let _ = stone::chat::save_chat_index(&idx);
-        } else if chain_len > 0 && last_chain_block_idx > idx.last_indexed_block {
-            let new_blocks: Vec<_> = chain.blocks.iter()
-                .filter(|b| b.index > idx.last_indexed_block)
-                .collect();
-            idx.index_new_blocks(&new_blocks, Some(&node.message_pool));
-            let _ = stone::chat::save_chat_index(&idx);
-        }
-        Arc::new(std::sync::Mutex::new(idx))
-    };
 
     // ── Chat-Policy GC ───────────────────────────────────────────────────
     {

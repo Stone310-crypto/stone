@@ -1607,6 +1607,34 @@ impl MasterNodeState {
                             "[auto-mining] 🎯 Block #{}: MEIN Round-Robin-Slot – starte Auto-Block",
                             next_index,
                         );
+                    } else {
+                        // KEIN Validator-Set registriert → Auto-Block nur wenn
+                        // wir designierter Miner sind (STONE_AUTO_MINER=1) oder
+                        // allein im Netz (keine verbundenen Peers).
+                        // Ohne dieses Gate minen ALLE Nodes parallel Blöcke → Forks.
+                        let designated = std::env::var("STONE_AUTO_MINER")
+                            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                            .unwrap_or(false);
+                        if !designated {
+                            let connected_peers = state.peers.read()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .iter()
+                                .filter(|p| p.is_healthy())
+                                .count();
+                            if connected_peers > 0 {
+                                if next_index % 10 == 0 {
+                                    println!(
+                                        "[auto-mining] ⏭️  Block #{}: kein Validator-Set + {connected_peers} Peers — warte auf designierten Miner (STONE_AUTO_MINER=1)",
+                                        next_index,
+                                    );
+                                }
+                                continue;
+                            }
+                        }
+                        println!(
+                            "[auto-mining] 🎯 Block #{}: Bootstrap-Modus (kein Validator-Set) – starte Auto-Block",
+                            next_index,
+                        );
                     }
                 }
 

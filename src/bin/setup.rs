@@ -397,49 +397,7 @@ async fn start_full_node(state: SetupState) {
     // Hintergrund-Tasks
     // HINWEIS: Mining wurde entfernt — nur stone-miner erzeugt neue Blöcke.
     // setup ist ein reiner Full-Node (Sync, API, Validierung, Storage).
-    // Auto-Block-Timer: produziert nach auto_timeout_secs einen Block, wenn
-    // kein externer Miner aktiv ist (Liveness-Garantie für stilles Netz).
-    MasterNodeState::start_heartbeat(node.clone(), HEARTBEAT_INTERVAL);
-    let pop_mining_shared = stone::pop_mining::PopMiningState::new();
-    MasterNodeState::start_block_timer(node.clone(), pop_mining_shared.clone());
-    spawn_auto_sync_task(node.clone(), api_key.clone(), users.clone(), orgs.clone());
-
-    // Peer-Discovery: Bei Bootstrap-Nodes registrieren & Health-Check starten
-    bootstrap_announce(&node).await;
-    spawn_peer_health_task(node.clone());
-
-    // Mempool-Eviction
-    {
-        let node_evict = node.clone();
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
-            let mut gc = 0u64;
-            loop {
-                interval.tick().await;
-                node_evict.mempool.evict_expired();
-                gc += 1;
-                if gc % 5 == 0 { node_evict.mempool.gc_known_ids(); }
-            }
-        });
-    }
-
-    // OTA Update Manager
-    let updater = Arc::new(std::sync::RwLock::new({
-        let mut um = stone::updater::UpdateManager::new(&data_dir());
-        um.load_persisted_update();
-        um
-    }));
-
-    // Post-Update Erfolg bestätigen (nach 120s gesundem Betrieb → Rollback-Marker löschen)
-    {
-        let dd = data_dir();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(120)).await;
-            stone::updater::confirm_update_success(&dd);
-        });
-    }
-
-    // ChatIndex vorab erstellen, damit der P2P-Event-Loop ihn nutzen kann
+    // ChatIndex vorab erstellen, damit Auto-Sync ihn nutzen kann
     let chat_index_arc: Arc<std::sync::Mutex<stone::chat::ChatIndex>> = {
         let mut idx = stone::chat::load_chat_index();
         let chain = node.chain.lock().unwrap_or_else(|e| e.into_inner());
@@ -482,6 +440,45 @@ async fn start_full_node(state: SetupState) {
         }
         Arc::new(std::sync::Mutex::new(idx))
     };
+
+    // Hintergrund-Tasks
+    MasterNodeState::start_heartbeat(node.clone(), HEARTBEAT_INTERVAL);
+    let pop_mining_shared = stone::pop_mining::PopMiningState::new();
+    MasterNodeState::start_block_timer(node.clone(), pop_mining_shared.clone());
+    spawn_auto_sync_task(node.clone(), api_key.clone(), users.clone(), orgs.clone(), chat_index_arc.clone());
+    bootstrap_announce(&node).await;
+    spawn_peer_health_task(node.clone());
+
+    // Mempool-Eviction
+    {
+        let node_evict = node.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            let mut gc = 0u64;
+            loop {
+                interval.tick().await;
+                node_evict.mempool.evict_expired();
+                gc += 1;
+                if gc % 5 == 0 { node_evict.mempool.gc_known_ids(); }
+            }
+        });
+    }
+
+    // OTA Update Manager
+    let updater = Arc::new(std::sync::RwLock::new({
+        let mut um = stone::updater::UpdateManager::new(&data_dir());
+        um.load_persisted_update();
+        um
+    }));
+
+    // Post-Update Erfolg bestätigen (nach 120s)
+    {
+        let dd = data_dir();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(120)).await;
+            stone::updater::confirm_update_success(&dd);
+        });
+    }
 
     // P2P starten
     let network_handle: Option<NetworkHandle> =

@@ -7,8 +7,10 @@ use std::{
 };
 use stone::{
     auth::{save_users, User},
+    chat::ChatIndex,
     consensus::verify_block_signature_standalone,
     master::{MasterNodeState, NodeEvent, PeerStatus},
+    message_pool::PooledMessage,
     organization::{load_orgs, save_orgs, Organization},
     storage::ChunkStore,
 };
@@ -396,6 +398,7 @@ pub fn spawn_auto_sync_task(
     api_key: Arc<String>,
     users: Arc<Mutex<Vec<User>>>,
     orgs: Arc<Mutex<Vec<Organization>>>,
+    chat_idx: Arc<std::sync::Mutex<ChatIndex>>,
 ) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(AUTO_SYNC_INTERVAL);
@@ -421,6 +424,7 @@ pub fn spawn_auto_sync_task(
                     pull_users_from_peer(&peer.url, &api_key, &users).await;
                     pull_game_economy_from_peer(&node, &peer.url).await;
                     pull_organizations_from_peer(&orgs, &peer.url).await;
+                    pull_message_pool_from_peer(&node, &peer.url, &chat_idx).await;
                 }
             }
 
@@ -493,6 +497,50 @@ pub async fn pull_users_from_peer(peer_url: &str, _api_key: &str, users: &Arc<Mu
         added += 1;
     }
     if added > 0 || updated > 0 { save_users(&local); println!("[sync] {added} neue + {updated} aktualisierte Nutzer von {peer_url}"); }
+}
+
+/// Holt pending PooledMessages von einem Peer und fügt sie in den lokalen
+/// MessagePool + ChatIndex ein. Ermöglicht Dashboard-Nodes Nachrichten sofort
+/// anzuzeigen, auch wenn sie nicht direkt vom Sender empfangen wurden.
+pub async fn pull_message_pool_from_peer(
+    node: &Arc<MasterNodeState>,
+    peer_url: &str,
+    chat_idx: &Arc<std::sync::Mutex<ChatIndex>>,
+) {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .danger_accept_invalid_certs(std::env::var("STONE_INSECURE_SSL").map(|v| v == "1").unwrap_or(false))
+        .build()
+    { Ok(c) => c, Err(_) => return };
+
+    let sync_url = to_sync_url(peer_url);
+    let url = format!("{}/message-pool", sync_url);
+    let resp = match client.get(&url).send().await { Ok(r) => r, Err(_) => return };
+    if !resp.status().is_success() { return; }
+    let body: serde_json::Value = match resp.json().await { Ok(v) => v, Err(_) => return };
+    let msgs: Vec<PooledMessage> = match body.get("messages").and_then(|m| serde_json::from_value(m.clone()).ok()) {
+        Some(v) => v,
+        None => return,
+    };
+
+    if msgs.is_empty() { return; }
+
+    let mut added = 0usize;
+    let mut idx = chat_idx.lock().unwrap_or_else(|e| e.into_inner());
+    for msg in &msgs {
+        match node.message_pool.add_message(msg.clone()) {
+            Ok(_) => {
+                if idx.upsert_pool_message(msg) {
+                    added += 1;
+                }
+            }
+            Err(_) => { /* Duplikate sind ok */ }
+        }
+    }
+    if added > 0 {
+        stone::chat::save_chat_index(&idx);
+        println!("[sync] 📬 {} Pending-Nachrichten von {peer_url} synchronisiert", added);
+    }
 }
 
 pub fn sync_chain_accounts_to_users(node: &Arc<MasterNodeState>, users: &Arc<Mutex<Vec<User>>>) {

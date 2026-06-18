@@ -21,15 +21,20 @@ use axum::{
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
+    Json,
 };
 use serde::Deserialize;
 use serde_json::json;
 use sha2::Digest;
 use tower_http::cors::{Any, CorsLayer};
+use stone::message_pool::PooledMessage;
 
 use super::state::AppState;
 
 // ─── Handler ──────────────────────────────────────────────────────────────────
+// Alle Funktionen hier werden von build_sync_router() via Axum .route()
+// registriert. Der Compiler erkennt diese Indirektion nicht → "unused" Warnungen
+// sind Fehlalarme. Die Funktionen sind über den Router auf Port 4002 erreichbar.
 
 /// GET /health
 async fn sync_health(State(state): State<AppState>) -> impl IntoResponse {
@@ -438,6 +443,66 @@ async fn sync_receive_organizations(
     )
 }
 
+/// POST /message-relay – Sofortige Chat-Nachrichten-Zustellung (Peer-to-Peer).
+///
+/// Empfängt eine PooledMessage von einer anderen Node per REST und speichert
+/// sie sofort in MessagePool + ChatIndex — der Empfänger sieht die Nachricht
+/// ohne auf den nächsten Block warten zu müssen (REST-Fallback für P2P-Gossip).
+async fn sync_message_relay(
+    State(state): State<AppState>,
+    Json(msg): Json<PooledMessage>,
+) -> impl IntoResponse {
+    let msg_id = msg.msg_id.clone();
+
+    // In MessagePool einfügen
+    match state.node.message_pool.add_message(msg.clone()) {
+        Ok(seq) => {
+            // Sofort in ChatIndex sichtbar machen (off-chain, block_index=0)
+            let mut idx = state.chat_index.lock().unwrap_or_else(|e| e.into_inner());
+            if idx.upsert_pool_message(&msg) {
+                stone::chat::save_chat_index(&idx);
+            }
+            println!(
+                "[sync-port] 📬 Nachricht relayed: msg_id={} seq={} from={}… to={}…",
+                &msg_id[..12.min(msg_id.len())],
+                seq,
+                &msg.from_wallet[..12.min(msg.from_wallet.len())],
+                &msg.to_wallet[..12.min(msg.to_wallet.len())],
+            );
+            (StatusCode::OK, axum::Json(json!({"ok": true, "sequence": seq}))).into_response()
+        }
+        Err(e) => {
+            // Duplikate sind ok (z. B. wenn P2P-Gossip + REST beide ankommen)
+            let err_str = format!("{e}");
+            if err_str.contains("Duplicate") || err_str.contains("already") {
+                (StatusCode::OK, axum::Json(json!({"ok": true, "duplicate": true}))).into_response()
+            } else {
+                eprintln!("[sync-port] Message-Relay fehlgeschlagen: {e}");
+                (StatusCode::BAD_REQUEST, axum::Json(json!({"ok": false, "error": err_str}))).into_response()
+            }
+        }
+    }
+}
+
+/// GET /message-pool – Alle pending PooledMessages für Peer-Sync.
+///
+/// Erlaubt anderen Nodes, pending Chat-Nachrichten zu pullen und lokal
+/// in MessagePool + ChatIndex einzufügen. Ermöglicht Dashboard-Nodes,
+/// Nachrichten sofort anzuzeigen ohne auf Block-Mining zu warten.
+async fn sync_message_pool(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let all = state.node.message_pool.messages_since(0);
+    (
+        StatusCode::OK,
+        axum::Json(json!({
+            "ok": true,
+            "count": all.len(),
+            "messages": all,
+        })),
+    )
+}
+
 /// GET /chunk/{hash} – Chunk-Daten für Peer-Sync
 async fn sync_chunk(
     Path(hash): Path<String>,
@@ -493,6 +558,8 @@ pub fn build_sync_router(state: AppState) -> Router {
         .route("/organizations", get(sync_organizations))
         .route("/sync-organizations", post(sync_receive_organizations))
         .route("/game-economy", get(sync_game_economy))
+        .route("/message-relay", post(sync_message_relay))
+        .route("/message-pool", get(sync_message_pool))
         .route("/chunk/{hash}", get(sync_chunk))
         .layer(cors)
         .with_state(state)
