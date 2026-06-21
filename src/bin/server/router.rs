@@ -664,12 +664,10 @@ pub fn build_cors() -> CorsLayer {
             .collect();
 
     if allowed_origins.is_empty() {
-        // Security Fix: Default-CORS erlaubt KEINE wildcard Origins mehr.
-        // Setze STONE_CORS_ORIGINS=* explizit um Any zu erlauben (nur Dev).
-        // Im Produktionsbetrieb müssen konkrete Origins gesetzt werden.
-        eprintln!("[cors] WARNUNG: STONE_CORS_ORIGINS nicht gesetzt – CORS restriktiv (keine Origins erlaubt).");
+        // Default: permissives CORS für Dev/Testnet (Dashboard läuft auf anderem Port).
+        // Im Produktionsbetrieb STONE_CORS_ORIGINS auf konkrete Origins setzen.
         CorsLayer::new()
-            .allow_origin(tower_http::cors::AllowOrigin::mirror_request())
+            .allow_origin(Any)
             .allow_methods([
                 Method::GET,
                 Method::POST,

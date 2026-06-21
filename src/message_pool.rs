@@ -715,6 +715,13 @@ impl MessagePool {
         if let Ok(json) = serde_json::to_string(&pending) {
             let _ = fs::write(pending_file(), json);
         }
+
+        // Parallel in SQLite speichern (best-effort)
+        if let Some(db) = crate::database::global_db() {
+            let _ = db.save_sequence_state(&inner.seq_state);
+            let pending: Vec<PooledMessage> = inner.queue.iter().cloned().collect();
+            let _ = db.save_pool_messages(&pending);
+        }
     }
 }
 

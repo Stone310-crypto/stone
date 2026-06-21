@@ -315,6 +315,9 @@ pub struct MasterNodeState {
     /// Bridge Store: Wrapped Token Bridge für Cross-Chain Transfers
     pub bridge_store: RwLock<crate::token::BridgeStore>,
 
+    /// SQLite-Datenbank (ersetzt JSON-Dateien für users, orgs, peers, trust, etc.)
+    pub db: crate::database::Database,
+
     /// Laufzeit-Config für Auto-Mining / BlockTimer.
     pub auto_mining_config: AutoMiningConfig,
     /// Registry aller aktiven externen Miner (Heartbeat-basiert).
@@ -480,6 +483,16 @@ impl MasterNodeState {
         }
         let reputation_registry = ReputationRegistry::load();
         let chat_policy = ChatPolicyStore::load();
+        let db = crate::database::Database::open()
+            .unwrap_or_else(|e| panic!("Datenbank konnte nicht geöffnet werden: {e}"));
+        println!("[db] SQLite-Datenbank geöffnet: stone_data/stone.db");
+
+        // Einmalige Migration von JSON → SQLite
+        db.migrate_from_json_files();
+
+        // Globaler DB-Pointer setzen — alle Persistenz-Funktionen schreiben jetzt parallel
+        crate::database::set_global_db(db.clone());
+
         let state = Arc::new(Self {
             node_id: node_id.clone(),
             role,
@@ -528,6 +541,7 @@ impl MasterNodeState {
             testnet_market: RwLock::new(crate::token::TestnetMarket::load_or_default()),
             htlc_store: RwLock::new(crate::token::HtlcStore::load()),
             bridge_store: RwLock::new(crate::token::BridgeStore::load()),
+            db,
             auto_mining_config: {
                 let c = AutoMiningConfig::load();
                 println!(

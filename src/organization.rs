@@ -264,6 +264,10 @@ pub fn save_orgs(orgs: &[Organization]) {
         let _ = fs::create_dir_all(data_dir());
         let _ = fs::write(orgs_file(), json);
     }
+    // Parallel in SQLite speichern
+    if let Some(db) = crate::database::global_db() {
+        let _ = db.save_organizations(orgs);
+    }
 }
 
 // ─── On-Chain Proof ──────────────────────────────────────────────────────────

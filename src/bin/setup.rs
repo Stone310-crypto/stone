@@ -441,6 +441,28 @@ async fn start_full_node(state: SetupState) {
         Arc::new(std::sync::Mutex::new(idx))
     };
 
+    // ── Pool-Nachrichten beim Start in ChatIndex upserten ─────────────────
+    // Wichtig für Nodes die per P2P Nachrichten empfangen: der MessagePool lädt
+    // pending Nachrichten von Disk, aber sie werden nicht automatisch in den
+    // ChatIndex übertragen. Ohne diesen Schritt zeigt das Dashboard keine
+    // pending Nachrichten an.
+    {
+        let pending_msgs = node.message_pool.messages_since(0);
+        if !pending_msgs.is_empty() {
+            let mut idx = chat_index_arc.lock().unwrap_or_else(|e| e.into_inner());
+            let mut added = 0usize;
+            for msg in &pending_msgs {
+                if idx.upsert_pool_message(msg) {
+                    added += 1;
+                }
+            }
+            if added > 0 {
+                stone::chat::save_chat_index(&idx);
+                println!("[startup] 📬 {} Pool-Nachrichten in ChatIndex aufgenommen", added);
+            }
+        }
+    }
+
     // Hintergrund-Tasks
     MasterNodeState::start_heartbeat(node.clone(), HEARTBEAT_INTERVAL);
     let pop_mining_shared = stone::pop_mining::PopMiningState::new();

@@ -27,6 +27,7 @@ use serde::Deserialize;
 use serde_json::json;
 use sha2::Digest;
 use tower_http::cors::{Any, CorsLayer};
+use stone::database::DbMetadata;
 use stone::message_pool::PooledMessage;
 
 use super::state::AppState;
@@ -503,6 +504,135 @@ async fn sync_message_pool(
     )
 }
 
+/// GET /db-metadata – SQLite-Datenbank-Metadaten für Sync-Entscheidung.
+///
+/// Liefert `DbMetadata` (table_count, oldest_entry, newest_entry, node_id)
+/// damit andere Nodes entscheiden können ob sie von dieser Node synchronisieren
+/// wollen. Die "längste DB gewinnt"-Logik ist in `stone::database` implementiert.
+async fn sync_db_metadata(State(state): State<AppState>) -> impl IntoResponse {
+    match DbMetadata::from_db(&state.node.db, &state.node.node_id) {
+        Ok(meta) => (StatusCode::OK, axum::Json(json!({"ok": true, "db_metadata": meta}))).into_response(),
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"ok": false, "error": format!("{e}")}))).into_response(),
+    }
+}
+
+// ─── SQLite-DB Daten-Endpoints (für DB-Sync zwischen Nodes) ──────────────
+
+/// GET /sync-db-users – Alle User aus der SQLite-DB für DB-Sync.
+async fn sync_db_users(State(state): State<AppState>) -> impl IntoResponse {
+    match state.node.db.load_users() {
+        Ok(users) => {
+            let list: Vec<serde_json::Value> = users.iter().map(|u| {
+                json!({
+                    "id": u.id,
+                    "name": u.name,
+                    "wallet_address": u.wallet_address,
+                    "api_key": u.api_key,
+                    "phrase_hash": u.phrase_hash,
+                })
+            }).collect();
+            (StatusCode::OK, axum::Json(json!({"ok": true, "count": list.len(), "users": list})))
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"ok": false, "error": format!("{e}")}))),
+    }
+}
+
+/// GET /sync-db-organizations – Alle Organisations aus der SQLite-DB für DB-Sync.
+async fn sync_db_organizations(State(state): State<AppState>) -> impl IntoResponse {
+    match state.node.db.load_organizations() {
+        Ok(orgs) => {
+            (StatusCode::OK, axum::Json(json!({"ok": true, "count": orgs.len(), "organizations": orgs})))
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"ok": false, "error": format!("{e}")}))),
+    }
+}
+
+/// GET /sync-db-peers – Alle Peers aus der SQLite-DB für DB-Sync.
+async fn sync_db_peers(State(state): State<AppState>) -> impl IntoResponse {
+    match state.node.db.load_peers() {
+        Ok(peers) => {
+            (StatusCode::OK, axum::Json(json!({"ok": true, "count": peers.len(), "peers": peers})))
+        }
+        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"ok": false, "error": format!("{e}")}))),
+    }
+}
+
+/// POST /qr-approve – QR-Login Approve von anderen Nodes empfangen (Peer-Forward).
+///
+/// Empfängt eine QR-Login-Genehmigung von einer anderen Node, die sie per
+/// `forward_qr_approve_to_peers` weitergeleitet hat. Die Session wird lokal
+/// genehmigt, damit der QR-Poll sie abholen kann.
+#[derive(serde::Deserialize)]
+struct QrApprovePeerRequest {
+    login_token: String,
+    #[serde(default)]
+    phrase: Option<String>,
+    #[serde(default)]
+    wallet_address: Option<String>,
+}
+
+async fn sync_qr_approve(
+    State(state): State<AppState>,
+    axum::Json(req): axum::Json<QrApprovePeerRequest>,
+) -> impl IntoResponse {
+    let login_token = req.login_token.trim().to_string();
+    if login_token.is_empty() || login_token.len() != 64 {
+        return (StatusCode::BAD_REQUEST, axum::Json(json!({"ok": false, "error": "Ungültiger login_token"}))).into_response();
+    }
+
+    // User anhand Wallet-Adresse finden oder Fallback
+    let user = {
+        if let Some(ref wallet) = req.wallet_address {
+            let wallet = wallet.trim();
+            let users = state.users.lock().unwrap_or_else(|e| e.into_inner());
+            users.iter().find(|u| u.wallet_address == wallet).cloned()
+        } else {
+            None
+        }
+    };
+
+    let user = user.unwrap_or_else(|| stone::auth::User {
+        id: format!("u-{}", &login_token[..8]),
+        name: format!("QR-{}", &login_token[..8]),
+        api_key: String::new(),
+        phrase_hash: String::new(),
+        quota_bytes: stone::auth::default_quota_bytes(),
+        wallet_address: req.wallet_address.clone().unwrap_or_default(),
+        account_type: stone::auth::default_account_type(),
+        org_id: String::new(),
+        org_role: String::new(),
+        discord_id: String::new(),
+        discord_username: String::new(),
+    });
+
+    let session_token = stone::auth::generate_session_token(
+        &user.id,
+        &user.wallet_address,
+        &state.api_key,
+        stone::auth::SESSION_TOKEN_TTL_SECS,
+    );
+
+    if state.qr_login_store.approve_session(&login_token, session_token, &user, req.phrase.clone()) {
+        println!("[sync-port] 📱 QR-Forward: Session {} genehmigt", &login_token[..16]);
+        (StatusCode::OK, axum::Json(json!({"ok": true}))).into_response()
+    } else {
+        (StatusCode::NOT_FOUND, axum::Json(json!({"ok": false, "error": "QR-Session nicht gefunden"}))).into_response()
+    }
+}
+
+/// GET /sync-db-trust – Trust-Registry + History aus der SQLite-DB für DB-Sync.
+async fn sync_db_trust(State(state): State<AppState>) -> impl IntoResponse {
+    let registry = state.node.db.load_trust_registry().unwrap_or_default();
+    let history = state.node.db.load_trust_history().unwrap_or_default();
+    (StatusCode::OK, axum::Json(json!({
+        "ok": true,
+        "registry_count": registry.len(),
+        "history_count": history.len(),
+        "registry": registry,
+        "history": history,
+    })))
+}
+
 /// GET /chunk/{hash} – Chunk-Daten für Peer-Sync
 async fn sync_chunk(
     Path(hash): Path<String>,
@@ -560,6 +690,12 @@ pub fn build_sync_router(state: AppState) -> Router {
         .route("/game-economy", get(sync_game_economy))
         .route("/message-relay", post(sync_message_relay))
         .route("/message-pool", get(sync_message_pool))
+        .route("/db-metadata", get(sync_db_metadata))
+        .route("/sync-db-users", get(sync_db_users))
+        .route("/sync-db-organizations", get(sync_db_organizations))
+        .route("/sync-db-peers", get(sync_db_peers))
+        .route("/sync-db-trust", get(sync_db_trust))
+        .route("/qr-approve", post(sync_qr_approve))
         .route("/chunk/{hash}", get(sync_chunk))
         .layer(cors)
         .with_state(state)

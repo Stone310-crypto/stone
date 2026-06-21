@@ -703,6 +703,64 @@ pub async fn handle_verify_challenge(
 
 // ─── QR-Code Login (Cross-Device Authentifizierung) ──────────────────────────
 
+/// Forwardet eine QR-Login-Approve an alle bekannten HTTP-Peers.
+/// Wird verwendet, wenn die QR-Session nicht lokal existiert (weil der QR-Code
+/// auf einer anderen Node erstellt wurde).
+async fn forward_qr_approve_to_peers(
+    state: &AppState,
+    login_token: &str,
+    session_token: &str,
+    user: &User,
+    phrase: Option<String>,
+) -> bool {
+    let peers = state.node.get_peers();
+    if peers.is_empty() {
+        return false;
+    }
+
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .danger_accept_invalid_certs(
+            std::env::var("STONE_INSECURE_SSL").map(|v| v == "1").unwrap_or(false),
+        )
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+
+    let body = serde_json::json!({
+        "login_token": login_token,
+        "phrase": phrase,
+        "wallet_address": user.wallet_address,
+    });
+
+    for peer in &peers {
+        let sync_url = crate::server::sync::to_sync_url(&peer.url);
+        let url = format!("{}/qr-approve", sync_url);
+        match client
+            .post(&url)
+            .json(&body)
+            .timeout(Duration::from_secs(3))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => {
+                println!("[auth] 📱 QR-Forward an {} erfolgreich", peer.url);
+                return true;
+            }
+            Ok(r) => {
+                eprintln!("[auth] 📱 QR-Forward an {} → HTTP {}", peer.url, r.status());
+            }
+            Err(_) => {
+                // Timeout ist normal
+            }
+        }
+    }
+
+    false
+}
+
 #[derive(Deserialize)]
 pub struct QrApproveRequest {
     pub login_token: String,
@@ -871,6 +929,7 @@ pub async fn handle_qr_approve(
                         &user.id, &user.wallet_address, &state.api_key, SESSION_TOKEN_TTL_SECS,
                     );
 
+                    let session_token_clone = session_token.clone();
                     if state.qr_login_store.approve_session(&login_token, session_token, &user, req.phrase.clone()) {
                         println!(
                             "[auth] 📱✅ QR-Login genehmigt von {} (Wallet {}…) via Signature",
@@ -879,6 +938,21 @@ pub async fn handle_qr_approve(
                         return (
                             StatusCode::OK,
                             axum::Json(json!({"ok": true, "message": "QR-Login erfolgreich genehmigt"})),
+                        ).into_response();
+                    }
+                    // Session not found locally → try forwarding to peers
+                    // (the QR code may have been created on a different node)
+                    println!(
+                        "[auth] 📱 QR-Session {} nicht lokal gefunden → forwarde an Peers",
+                        &login_token[..16]
+                    );
+                    let forward_result = forward_qr_approve_to_peers(
+                        &state, &login_token, &session_token_clone, &user, req.phrase.clone()
+                    ).await;
+                    if forward_result {
+                        return (
+                            StatusCode::OK,
+                            axum::Json(json!({"ok": true, "message": "QR-Login via Peer genehmigt"})),
                         ).into_response();
                     }
                     return (

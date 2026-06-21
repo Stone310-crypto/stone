@@ -586,6 +586,10 @@ pub fn save_peers(peers: &[PeerInfo]) {
     if let Ok(json) = serde_json::to_string_pretty(peers) {
         let _ = std::fs::write(peers_file(), json);
     }
+    // Parallel in SQLite speichern
+    if let Some(db) = stone::database::global_db() {
+        let _ = db.save_peers(peers);
+    }
 }
 
 pub fn load_peers_from_disk() -> Vec<PeerInfo> {
@@ -617,6 +621,10 @@ pub fn save_trust(state: &AppState) {
     };
     if let Ok(json) = serde_json::to_string_pretty(&data) {
         let _ = std::fs::write(trust_file(), json);
+    }
+    // Parallel in SQLite speichern
+    if let Some(db) = stone::database::global_db() {
+        let _ = db.save_trust(&data.registry, &data.history);
     }
 }
 

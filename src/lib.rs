@@ -4,6 +4,7 @@ pub mod chat;
 pub mod chat_policy;
 pub mod consensus;
 pub mod crypto;
+pub mod database;
 pub mod game_config;
 pub mod gaming_pool;
 pub mod master;

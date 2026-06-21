@@ -223,11 +223,31 @@ export default function NodeView() {
   );
 }
 
+// ── Log-Filter Kategorien ─────────────────────────────────────────────
+const LOG_CATEGORIES = [
+  { key: "all", label: "Alle", color: "var(--text-muted)" },
+  { key: "chat", label: "Chat", color: "#a78bfa" },
+  { key: "sync", label: "Sync", color: "#60a5fa" },
+  { key: "auto-mining", label: "AutoMining", color: "#fbbf24" },
+  { key: "startup", label: "Startup", color: "#34d399" },
+  { key: "p2p", label: "P2P", color: "#fb923c" },
+  { key: "err", label: "Errors", color: "#ef4444" },
+];
+
+function extractCategory(line: string): string {
+  const m = line.match(/^\[(err|out)\]\s*\[([a-z0-9_-]+)\]/);
+  if (m) return m[2];
+  if (line.startsWith("[err]")) return "err";
+  return "other";
+}
+
 // ── Node Terminal (Live-Console) ─────────────────────────────────────
 function NodeTerminal() {
   const [logs, setLogs] = useState<string[]>([]);
   const [paused, setPaused] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [filterCategory, setFilterCategory] = useState("all");
+  const [filterText, setFilterText] = useState("");
   const bottomRef = useRef<HTMLDivElement>(null);
   const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const pausedRef = useRef(false);
@@ -242,7 +262,7 @@ function NodeTerminal() {
         const { invoke } = await import("@tauri-apps/api/core");
         const newLogs: string[] = await invoke("node_get_logs");
         if (newLogs.length > 0) {
-          setLogs((prev) => [...prev, ...newLogs].slice(-500));
+          setLogs((prev) => [...prev, ...newLogs].slice(-1000));
         }
       } catch {
         // Tauri not available — ignore
@@ -260,16 +280,25 @@ function NodeTerminal() {
     }
   }, [logs, paused]);
 
+  // Filter
+  const filteredLogs = logs.filter((line) => {
+    if (filterCategory !== "all" && extractCategory(line) !== filterCategory) return false;
+    if (filterText && !line.toLowerCase().includes(filterText.toLowerCase())) return false;
+    return true;
+  });
+
+  const categoryCounts: Record<string, number> = {};
+  for (const l of logs) { const c = extractCategory(l); categoryCounts[c] = (categoryCounts[c] || 0) + 1; }
+
   const clearLogs = () => setLogs([]);
 
   const copyLogs = async () => {
-    const text = logs.join("\n");
+    const text = filteredLogs.join("\n");
     try {
       await navigator.clipboard.writeText(text);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     } catch {
-      // Fallback: select + execCommand
       const ta = document.createElement("textarea");
       ta.value = text;
       document.body.appendChild(ta);
@@ -285,7 +314,7 @@ function NodeTerminal() {
     <div className="mt-6">
       <div className="flex items-center justify-between mb-3">
         <p className="text-xs font-semibold uppercase" style={{ color: "var(--text-muted)" }}>
-          Node Console
+          Node Console ({filteredLogs.length}/{logs.length})
         </p>
         <div className="flex items-center gap-2">
           <button
@@ -311,26 +340,66 @@ function NodeTerminal() {
           </button>
         </div>
       </div>
+
+      {/* ── Filter Bar ─────────────────────────────────────────────── */}
+      <div className="flex items-center gap-1.5 mb-2 flex-wrap">
+        {LOG_CATEGORIES.map((cat) => {
+          const count = cat.key === "all" ? logs.length : (categoryCounts[cat.key] || 0);
+          const active = filterCategory === cat.key;
+          return (
+            <button
+              key={cat.key}
+              onClick={() => setFilterCategory(cat.key)}
+              className="text-xs px-2 py-0.5 rounded-full"
+              style={{
+                background: active ? cat.color + "22" : "var(--surface)",
+                color: active ? cat.color : "var(--text-muted)",
+                border: `1px solid ${active ? cat.color + "44" : "var(--border)"}`,
+                fontWeight: active ? 600 : 400,
+              }}
+            >
+              {cat.label}{count > 0 ? <span style={{ marginLeft: 3, opacity: 0.6 }}>{count}</span> : null}
+            </button>
+          );
+        })}
+        <input
+          type="text"
+          value={filterText}
+          onChange={(e) => setFilterText(e.target.value)}
+          placeholder="Filter…"
+          className="text-xs px-2 py-1 rounded flex-1 min-w-[80px]"
+          style={{ background: "var(--surface)", color: "var(--text)", border: "1px solid var(--border)", outline: "none" }}
+        />
+      </div>
+
+      {/* Paused banner */}
       {paused && (
         <div className="text-xs mb-2 px-2 py-1 rounded" style={{ background: "rgba(250,166,26,0.1)", color: "var(--yellow)", border: "1px solid rgba(250,166,26,0.2)" }}>
           ⏸ Pausiert — {logs.length} Zeilen eingefroren
         </div>
       )}
+
+      {/* Console */}
       <div
         className="rounded-lg p-4 overflow-y-auto font-mono text-xs leading-relaxed"
         style={{
           background: "#0a0b0f",
           border: "1px solid var(--border)",
-          height: "calc(100vh - 280px)",
+          height: "calc(100vh - 340px)",
           minHeight: 200,
         }}
       >
-        {logs.length === 0 && (
+        {filteredLogs.length === 0 && logs.length === 0 && (
           <span style={{ color: "var(--text-muted)", opacity: 0.5 }}>
             Warte auf Node-Logs… (Node muss gestartet sein)
           </span>
         )}
-        {logs.map((line, i) => {
+        {filteredLogs.length === 0 && logs.length > 0 && (
+          <span style={{ color: "var(--text-muted)", opacity: 0.5 }}>
+            Keine Logs für diesen Filter
+          </span>
+        )}
+        {filteredLogs.map((line, i) => {
           const isError = line.startsWith("[err]");
           const isOut = line.startsWith("[out]");
           return (

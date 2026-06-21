@@ -491,6 +491,27 @@ async fn main() {
         }
     }
 
+    // ── Pool-Nachrichten beim Start in ChatIndex upserten ─────────────────
+    // Der MessagePool lädt pending Nachrichten von Disk, aber sie werden nicht
+    // automatisch in den ChatIndex übertragen. Ohne diesen Schritt sieht der
+    // Dashboard-User keine pending Nachrichten bis zum nächsten Block-Sync.
+    {
+        let pending_msgs = node.message_pool.messages_since(0);
+        if !pending_msgs.is_empty() {
+            let mut idx = chat_index_arc.lock().unwrap_or_else(|e| e.into_inner());
+            let mut added = 0usize;
+            for msg in &pending_msgs {
+                if idx.upsert_pool_message(msg) {
+                    added += 1;
+                }
+            }
+            if added > 0 {
+                stone::chat::save_chat_index(&idx);
+                println!("[startup] 📬 {} Pool-Nachrichten in ChatIndex aufgenommen", added);
+            }
+        }
+    }
+
     // P2P-Netzwerk starten (optional – deaktivieren via STONE_P2P_DISABLED=1)
     let network_handle: Option<NetworkHandle> =
         if std::env::var("STONE_P2P_DISABLED").as_deref() == Ok("1") {

@@ -964,7 +964,7 @@ impl SwarmTask {
             ranked.sort_by(|a, b| b.1.cmp(&a.1));
             let top: Vec<String> = ranked
                 .into_iter()
-                .take(3)
+                .take(7)
                 .map(|(pid, score)| format!("{}:{}", pid, score))
                 .collect();
             if !top.is_empty() {

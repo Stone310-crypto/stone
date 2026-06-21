@@ -47,6 +47,7 @@ bincode     = { version = "2.0.1", features = ["serde"] }
 
 # Persistenz
 rocksdb     = { version = "0.22", default-features = false, features = ["snappy"] }
+rusqlite    = { version = "0.31", features = ["bundled", "serde_json"] }
 
 # Zeit & Hashing
 sha2    = "0.10"

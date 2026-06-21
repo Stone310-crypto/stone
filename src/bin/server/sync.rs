@@ -9,7 +9,8 @@ use stone::{
     auth::{save_users, User},
     chat::ChatIndex,
     consensus::verify_block_signature_standalone,
-    master::{MasterNodeState, NodeEvent, PeerStatus},
+    database::DbMetadata,
+    master::{MasterNodeState, NodeEvent, PeerStatus, PeerInfo, TrustEntry, TrustVote},
     message_pool::PooledMessage,
     organization::{load_orgs, save_orgs, Organization},
     storage::ChunkStore,
@@ -412,15 +413,18 @@ pub fn spawn_auto_sync_task(
             if !initial_done {
                 if let Some(best) = peers.first() {
                     pull_from_peer(&node, &best.url, &api_key).await;
+                    pull_db_from_peer(&node, &best.url).await;
                     pull_users_from_peer(&best.url, &api_key, &users).await;
                     pull_game_economy_from_peer(&node, &best.url).await;
                     pull_organizations_from_peer(&orgs, &best.url).await;
+                    pull_message_pool_from_peer(&node, &best.url, &chat_idx).await;
                 } else {
                     node.metrics.initial_sync_done.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             } else {
                 for peer in &peers {
                     pull_from_peer(&node, &peer.url, &api_key).await;
+                    pull_db_from_peer(&node, &peer.url).await;
                     pull_users_from_peer(&peer.url, &api_key, &users).await;
                     pull_game_economy_from_peer(&node, &peer.url).await;
                     pull_organizations_from_peer(&orgs, &peer.url).await;
@@ -540,6 +544,183 @@ pub async fn pull_message_pool_from_peer(
     if added > 0 {
         stone::chat::save_chat_index(&idx);
         println!("[sync] 📬 {} Pending-Nachrichten von {peer_url} synchronisiert", added);
+    }
+}
+
+/// Holt die DB-Metadaten von einem Peer und entscheidet via longest-chain-logik
+/// ob die lokale DB von diesem Peer synchronisiert werden muss.
+pub async fn pull_db_from_peer(node: &Arc<MasterNodeState>, peer_url: &str) {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .danger_accept_invalid_certs(std::env::var("STONE_INSECURE_SSL").map(|v| v == "1").unwrap_or(false))
+        .build()
+    { Ok(c) => c, Err(_) => return };
+
+    let sync_url = to_sync_url(peer_url);
+    let url = format!("{}/db-metadata", sync_url);
+    let resp = match client.get(&url).send().await { Ok(r) => r, Err(_) => return };
+    if !resp.status().is_success() { return; }
+    let body: serde_json::Value = match resp.json().await { Ok(v) => v, Err(_) => return };
+    let remote_meta: DbMetadata = match serde_json::from_value(body.get("db_metadata").cloned().unwrap_or(serde_json::Value::Null)) {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+
+    let local_meta = match DbMetadata::from_db(&node.db, &node.node_id) {
+        Ok(m) => m,
+        Err(e) => { eprintln!("[db-sync] Lokale DB-Metadaten Fehler: {e}"); return; }
+    };
+
+    match stone::database::decide_sync_direction(&local_meta, &remote_meta) {
+        stone::database::SyncDecision::SyncFrom { node_id } => {
+            println!(
+                "[db-sync] Node {peer_url} has better DB ({} vs {} entries) — pulling users, orgs, peers, trust…",
+                remote_meta.table_count, local_meta.table_count
+            );
+            sync_users_from_peer(&node, peer_url).await;
+            sync_orgs_from_peer(&node, peer_url).await;
+            sync_peers_from_peer(&node, peer_url).await;
+            sync_trust_from_peer(&node, peer_url).await;
+            println!("[db-sync] ✅ DB sync from {node_id} complete");
+        }
+        stone::database::SyncDecision::KeepLocal => {
+            // Gleichstand — nichts tun
+        }
+        stone::database::SyncDecision::LocalIsBetter => {
+            // Lokale DB ist besser — andere sollten von uns pullen
+        }
+    }
+}
+
+/// Holt die User-Liste von einem Peer und speichert sie in die lokale SQLite-DB.
+async fn sync_users_from_peer(node: &Arc<MasterNodeState>, peer_url: &str) {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .danger_accept_invalid_certs(std::env::var("STONE_INSECURE_SSL").map(|v| v == "1").unwrap_or(false))
+        .build()
+    { Ok(c) => c, Err(_) => return };
+
+    let sync_url = to_sync_url(peer_url);
+    let url = format!("{}/sync-db-users", sync_url);
+    let resp = match client.get(&url).send().await { Ok(r) => r, Err(_) => return };
+    if !resp.status().is_success() { return; }
+    let body: serde_json::Value = match resp.json().await { Ok(v) => v, Err(_) => return };
+    let users_raw = match body.get("users").and_then(|u| u.as_array()) { Some(arr) => arr, None => return };
+
+    let mut users: Vec<User> = Vec::new();
+    for ru in users_raw {
+        let id = ru["id"].as_str().unwrap_or_default().to_string();
+        let name = ru["name"].as_str().unwrap_or_default().to_string();
+        let wallet = ru["wallet_address"].as_str().unwrap_or_default().to_string();
+        let api_key = ru["api_key"].as_str().unwrap_or_default().to_string();
+        let phrase_hash = ru["phrase_hash"].as_str().unwrap_or_default().to_string();
+        if id.is_empty() { continue; }
+        users.push(User {
+            id, name, api_key, phrase_hash,
+            quota_bytes: stone::auth::default_quota_bytes(),
+            wallet_address: wallet, account_type: stone::auth::default_account_type(),
+            org_id: String::new(), org_role: String::new(),
+            discord_id: String::new(), discord_username: String::new(),
+        });
+    }
+
+    if !users.is_empty() {
+        if let Err(e) = node.db.save_users(&users) {
+            eprintln!("[db-sync] Users speichern fehlgeschlagen: {e}");
+        } else {
+            println!("[db-sync] ✅ {} Users von {peer_url} in SQLite gespeichert", users.len());
+        }
+    }
+}
+
+/// Holt die Organisations-Liste und speichert sie in die lokale SQLite-DB.
+async fn sync_orgs_from_peer(node: &Arc<MasterNodeState>, peer_url: &str) {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .danger_accept_invalid_certs(std::env::var("STONE_INSECURE_SSL").map(|v| v == "1").unwrap_or(false))
+        .build()
+    { Ok(c) => c, Err(_) => return };
+
+    let sync_url = to_sync_url(peer_url);
+    let url = format!("{}/sync-db-organizations", sync_url);
+    let resp = match client.get(&url).send().await { Ok(r) => r, Err(_) => return };
+    if !resp.status().is_success() { return; }
+    let body: serde_json::Value = match resp.json().await { Ok(v) => v, Err(_) => return };
+    let orgs_list = match body.get("organizations") { Some(v) => v, None => return };
+    let orgs: Vec<Organization> = match serde_json::from_value(orgs_list.clone()) {
+        Ok(o) => o,
+        Err(_) => return,
+    };
+
+    if !orgs.is_empty() {
+        let count = orgs.len();
+        if let Err(e) = node.db.save_organizations(&orgs) {
+            eprintln!("[db-sync] Orgs speichern fehlgeschlagen: {e}");
+        } else {
+            println!("[db-sync] ✅ {count} Orgs von {peer_url} in SQLite gespeichert");
+        }
+    }
+}
+
+/// Holt die Peer-Liste und speichert sie in die lokale SQLite-DB.
+async fn sync_peers_from_peer(node: &Arc<MasterNodeState>, peer_url: &str) {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .danger_accept_invalid_certs(std::env::var("STONE_INSECURE_SSL").map(|v| v == "1").unwrap_or(false))
+        .build()
+    { Ok(c) => c, Err(_) => return };
+
+    let sync_url = to_sync_url(peer_url);
+    let url = format!("{}/sync-db-peers", sync_url);
+    let resp = match client.get(&url).send().await { Ok(r) => r, Err(_) => return };
+    if !resp.status().is_success() { return; }
+    let body: serde_json::Value = match resp.json().await { Ok(v) => v, Err(_) => return };
+    let peers_raw = match body.get("peers") { Some(v) => v, None => return };
+    let peers: Vec<PeerInfo> = match serde_json::from_value(peers_raw.clone()) {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+
+    if !peers.is_empty() {
+        let count = peers.len();
+        if let Err(e) = node.db.save_peers(&peers) {
+            eprintln!("[db-sync] Peers speichern fehlgeschlagen: {e}");
+        } else {
+            println!("[db-sync] ✅ {count} Peers von {peer_url} in SQLite gespeichert");
+        }
+    }
+}
+
+/// Holt Trust-Registry und -History und speichert sie in die lokale SQLite-DB.
+async fn sync_trust_from_peer(node: &Arc<MasterNodeState>, peer_url: &str) {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .danger_accept_invalid_certs(std::env::var("STONE_INSECURE_SSL").map(|v| v == "1").unwrap_or(false))
+        .build()
+    { Ok(c) => c, Err(_) => return };
+
+    let sync_url = to_sync_url(peer_url);
+    let url = format!("{}/sync-db-trust", sync_url);
+    let resp = match client.get(&url).send().await { Ok(r) => r, Err(_) => return };
+    if !resp.status().is_success() { return; }
+    let body: serde_json::Value = match resp.json().await { Ok(v) => v, Err(_) => return };
+
+    let registry: Vec<TrustEntry> = match body.get("registry").and_then(|v| serde_json::from_value(v.clone()).ok()) {
+        Some(r) => r,
+        None => Vec::new(),
+    };
+    let history: Vec<TrustVote> = match body.get("history").and_then(|v| serde_json::from_value(v.clone()).ok()) {
+        Some(h) => h,
+        None => Vec::new(),
+    };
+
+    if !registry.is_empty() || !history.is_empty() {
+        if let Err(e) = node.db.save_trust(&registry, &history) {
+            eprintln!("[db-sync] Trust speichern fehlgeschlagen: {e}");
+        } else {
+            println!("[db-sync] ✅ {} trust entries + {} votes von {peer_url} in SQLite gespeichert",
+                registry.len(), history.len());
+        }
     }
 }
 

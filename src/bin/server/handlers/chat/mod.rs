@@ -127,6 +127,23 @@ pub(super) fn index_new_blocks_if_needed(state: &AppState) {
         let all_blocks: Vec<_> = chain.blocks.iter().collect();
         *idx = stone::chat::ChatIndex::rebuild_from_chain(&all_blocks, Some(&state.node.message_pool));
 
+        // ── Pool-Nachrichten wieder in den Index upserten ────
+        // Der Chain-Rebuild verarbeitet nur on-chain Daten. Pending
+        // Pool-Nachrichten müssen separat in den Index übertragen werden,
+        // sonst sind sie nach dem Rebuild weg.
+        {
+            let pending = state.node.message_pool.messages_since(0);
+            let mut added = 0usize;
+            for msg in &pending {
+                if idx.upsert_pool_message(msg) {
+                    added += 1;
+                }
+            }
+            if added > 0 {
+                println!("[chat-index] 📬 Rebuild: {} Pool-Nachrichten in Index upsertet", added);
+            }
+        }
+
         if !old_content.is_empty() {
             for entries in idx.conversations.values_mut() {
                 for entry in entries.iter_mut() {
