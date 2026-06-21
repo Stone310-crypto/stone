@@ -93,7 +93,17 @@ async fn main() {
     let users = load_users();
 
     // ── Organisations laden ──────────────────────────────────────────────
-    let orgs = Arc::new(std::sync::Mutex::new(stone::organization::load_orgs()));
+    let mut orgs_list = stone::organization::load_orgs();
+    // Fallback: aus SQLite laden wenn JSON leer ist
+    if orgs_list.is_empty() {
+        if let Ok(sqlite_orgs) = node.db.load_organizations() {
+            if !sqlite_orgs.is_empty() {
+                println!("[app-node] 📦 {} Organisations aus SQLite geladen", sqlite_orgs.len());
+                orgs_list = sqlite_orgs;
+            }
+        }
+    }
+    let orgs = Arc::new(std::sync::Mutex::new(orgs_list));
 
     // ── Gespeicherte Peers laden ─────────────────────────────────────────
     let mut saved_peers = load_peers_from_disk();
@@ -461,7 +471,7 @@ async fn main() {
         network: network_handle,
         rate_limits,
         updater,
-        orgs: Arc::new(std::sync::Mutex::new(stone::organization::load_orgs())),
+        orgs,
         chat_index: chat_index_arc,
         contacts: Arc::new(std::sync::Mutex::new(stone::chat::load_contacts())),
         contact_requests: Arc::new(std::sync::Mutex::new(stone::chat::load_contact_requests())),

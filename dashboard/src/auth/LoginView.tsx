@@ -192,12 +192,11 @@ function RegisterForm() {
   );
 }
 
-// ── QR LOGIN ──────────────────────────────────────────────────────────────────
+// ── STONECHAIN APP LOGIN (QR-Code — kein forge-nomad, lokale Session + VPS-Push) ──
 
-function QrLoginView({ onBack }: { onBack: () => void }) {
+function StonechainAppLoginView({ onBack }: { onBack: () => void }) {
   const { applySession } = useAuth();
   const [qrDataUrl, setQrDataUrl] = useState("");
-  const [_token, setToken] = useState("");
   const [status, setStatus] = useState<"loading" | "waiting" | "approved" | "expired" | "error">("loading");
   const [timeLeft, setTimeLeft] = useState(0);
   const [error, setError] = useState("");
@@ -205,20 +204,18 @@ function QrLoginView({ onBack }: { onBack: () => void }) {
   const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const createSession = useCallback(async () => {
-    setStatus("loading"); setQrDataUrl(""); setToken("");
+    setStatus("loading"); setQrDataUrl(""); setError("");
     if (pollRef.current) clearInterval(pollRef.current);
     if (timerRef.current) clearInterval(timerRef.current);
     try {
       const res = await authApi.qrCreate();
-      const nodes: string[] = [];
       const s = loadSettings();
-      try { const { invoke } = await import("@tauri-apps/api/core"); const ip: string = await invoke("get_local_ip"); nodes.push(`http://${ip}:${new URL(s.nodeUrl).port || "3080"}`); }
-      catch { nodes.push(s.nodeUrl); }
+      const nodes: string[] = [];
+      try { const { invoke } = await import("@tauri-apps/api/core"); const ip: string = await invoke("get_local_ip"); nodes.push(`http://${ip}:${new URL(s.nodeUrl).port || "3080"}`); } catch { nodes.push(s.nodeUrl); }
       nodes.push("http://212.227.54.241:3080");
-      nodes.push("http://69.48.200.255:3080");
       const payload = JSON.stringify({ type: "stone_login", token: res.login_token, nodes });
       const dataUrl = await QRCode.toDataURL(payload, { width: 200, margin: 2, color: { dark: "#e2e8f0", light: "#161920" } });
-      setQrDataUrl(dataUrl); setToken(res.login_token); setTimeLeft(res.expires_in); setStatus("waiting");
+      setQrDataUrl(dataUrl); setTimeLeft(res.expires_in); setStatus("waiting");
       timerRef.current = setInterval(() => setTimeLeft((t) => { if (t <= 1) { clearInterval(timerRef.current!); setStatus("expired"); return 0; } return t - 1; }), 1000);
       pollRef.current = setInterval(async () => {
         try {
@@ -236,16 +233,16 @@ function QrLoginView({ onBack }: { onBack: () => void }) {
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 18 }}>
-      <div style={{ textAlign: "center" }}><p style={{ fontSize: 16, fontWeight: 700, color: "var(--text)", marginBottom: 5 }}>Login mit Stonechain</p><p style={{ fontSize: 12, color: "var(--text-muted)", lineHeight: 1.5 }}>Öffne die <strong style={{ color: "var(--text-dim)" }}>Stonechain App</strong> auf deinem Handy, tippe auf <strong style={{ color: "var(--text-dim)" }}>QR scannen</strong> und scanne diesen Code.</p></div>
+      <div style={{ textAlign: "center" }}><p style={{ fontSize: 16, fontWeight: 700, color: "var(--text)", marginBottom: 5 }}>Login mit Stonechain App</p><p style={{ fontSize: 12, color: "var(--text-muted)", lineHeight: 1.5 }}>Öffne die <strong style={{ color: "var(--text-dim)" }}>Stonechain App</strong> auf deinem Handy und scanne diesen QR-Code. Keine Seed-Phrase nötig.</p></div>
       <div style={{ alignSelf: "center", position: "relative", borderRadius: 16, overflow: "hidden", background: "#161920", border: "1px solid rgba(255,255,255,0.1)", boxShadow: "0 8px 32px rgba(0,0,0,0.4)" }}>
         {status === "loading" && <div style={{ width: 200, height: 200, display: "flex", alignItems: "center", justifyContent: "center" }}><span style={{ width: 28, height: 28, border: "2px solid rgba(91,138,238,0.3)", borderTopColor: "var(--accent)", borderRadius: "50%", display: "block", animation: "spin 0.7s linear infinite" }} /></div>}
-        {qrDataUrl && status !== "loading" && <img src={qrDataUrl} alt="QR Code" style={{ width: 200, height: 200, display: "block", opacity: status === "waiting" ? 1 : 0.2, transition: "opacity 0.3s" }} />}
-        {status === "approved" && <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", background: "rgba(59,165,92,0.92)", gap: 6 }}><span style={{ fontSize: 36 }}>✓</span><p style={{ fontSize: 13, fontWeight: 700, color: "#fff" }}>Angemeldet!</p></div>}
-        {status === "expired" && <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", background: "rgba(20,23,32,0.92)", gap: 10 }}><p style={{ fontSize: 13, color: "var(--text-dim)" }}>Code abgelaufen</p><button onClick={createSession} style={{ padding: "6px 16px", borderRadius: 8, background: "var(--accent)", color: "#fff", fontSize: 12, fontWeight: 600, cursor: "pointer", border: "none" }}>Neu generieren</button></div>}
+        {qrDataUrl &&<img src={qrDataUrl} alt="QR Code" style={{ width: 200, height: 200, display: "block", opacity: status === "waiting" ? 1 : 0.2, transition: "opacity 0.3s" }} />}
+        {status === "approved" && <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", background: "rgba(59,165,92,0.92)", gap: 6 }}><span style={{ fontSize: 36 }}>✓</span><p style={{ fontSize: 13, fontWeight: 700, color: "#fff" }}>Eingeloggt!</p></div>}
+        {status === "expired" && <div style={{ position: "absolute", inset: 0, display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", background: "rgba(20,23,32,0.92)", gap: 10 }}><p style={{ fontSize: 13, color: "var(--text-dim)" }}>Code abgelaufen</p><button onClick={createSession} style={{ padding: "6px 16px", borderRadius: 8, background: "var(--accent)", color: "#fff", fontSize: 12, fontWeight: 600, cursor: "pointer", border: "none" }}>Neu laden</button></div>}
       </div>
       {status === "waiting" && <div style={{ display: "flex", alignItems: "center", justifyContent: "center", gap: 8, fontSize: 12, color: "var(--text-muted)" }}><span style={{ width: 6, height: 6, borderRadius: "50%", background: "var(--accent)", animation: "pulse 1.5s ease-in-out infinite" }} />Warte auf Bestätigung… <span style={{ fontFamily: "monospace", color: timeLeft < 30 ? "var(--yellow)" : "var(--text-dim)" }}>{timeLeft}s</span></div>}
       {status === "error" && <ErrorBox msg={error} />}
-      <button onClick={onBack} style={{ fontSize: 12, color: "var(--text-muted)", textAlign: "center", cursor: "pointer", background: "none", border: "none", textDecoration: "underline", textDecorationColor: "transparent" }} onMouseEnter={(e) => ((e.currentTarget as HTMLElement).style.textDecorationColor = "var(--text-muted)")} onMouseLeave={(e) => ((e.currentTarget as HTMLElement).style.textDecorationColor = "transparent")}>← Zurück zur Anmeldung</button>
+      <button onClick={onBack} style={{ fontSize: 12, color: "var(--text-muted)", textAlign: "center", cursor: "pointer", background: "none", border: "none", textDecoration: "underline", textDecorationColor: "transparent" }} onMouseEnter={(e) => (e.currentTarget.style.textDecorationColor = "var(--text-muted)")} onMouseLeave={(e) => (e.currentTarget.style.textDecorationColor = "transparent")}>← Zurück zur Anmeldung</button>
     </div>
   );
 }
@@ -340,7 +337,7 @@ function AdvancedSettings() {
 
 // ── Root ──────────────────────────────────────────────────────────────────────
 
-type View = "main" | "qr" | "discord";
+type View = "main" | "stonechain" | "discord";
 
 export default function LoginView() {
   const [tab, setTab] = useState<"login" | "register">("login");
@@ -351,8 +348,8 @@ export default function LoginView() {
     <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: "#0a0b0f", position: "relative", paddingTop: 44 }}>
       <Background />
       <Card>
-        {view === "main" && (<><Logo /><Tabs active={tab} onChange={(t) => setTab(t)} />{tab === "login" ? <LoginForm onSwitchToQr={() => setView("qr")} onSwitchToDiscord={() => setView("discord")} /> : <RegisterForm />}</>)}
-        {view === "qr" && <QrLoginView onBack={() => setView("main")} />}
+        {view === "main" && (<><Logo /><Tabs active={tab} onChange={(t) => setTab(t)} />{tab === "login" ? <LoginForm onSwitchToQr={() => setView("stonechain")} onSwitchToDiscord={() => setView("discord")} /> : <RegisterForm />}</>)}
+        {view === "stonechain" && <StonechainAppLoginView onBack={() => setView("main")} />}
         {view === "discord" && <DiscordLoginView onBack={() => setView("main")} />}
         <div style={{ marginTop: 20, textAlign: "center" }}>
           <button onClick={() => setShowAdvanced((v) => !v)} style={{ fontSize: 11, color: "rgba(255,255,255,0.2)", cursor: "pointer", background: "none", border: "none", transition: "color 0.15s" }} onMouseEnter={(e) => ((e.currentTarget as HTMLElement).style.color = "var(--text-muted)")} onMouseLeave={(e) => ((e.currentTarget as HTMLElement).style.color = "rgba(255,255,255,0.2)")}>{showAdvanced ? "▲" : "▼"} Node URL</button>

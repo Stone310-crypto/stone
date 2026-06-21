@@ -557,6 +557,56 @@ async fn sync_db_peers(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
+/// POST /qr-create – QR-Session von Peer empfangen und lokal ablegen.
+///
+/// Der app_node ruft diesen Endpoint auf dem VPS auf, damit die Android-App
+/// die Session dort approven kann.
+async fn sync_qr_create(
+    State(state): State<AppState>,
+    axum::Json(req): axum::Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let login_token = match req.get("login_token").and_then(|v| v.as_str()) {
+        Some(t) if t.len() == 64 => t.to_string(),
+        _ => return (StatusCode::BAD_REQUEST, axum::Json(json!({"ok": false, "error": "Ungültiger token"}))).into_response(),
+    };
+    state.qr_login_store.add_pending_session(&login_token);
+    println!("[sync-port] 📱 QR-Session von Peer empfangen: {}…", &login_token[..16]);
+    (StatusCode::OK, axum::Json(json!({"ok": true}))).into_response()
+}
+
+/// GET /qr-status/{token} – QR-Session-Status für Cross-Node-Polling.
+///
+/// Wird von `poll_peers_for_qr_session` aufgerufen, wenn eine Node eine
+/// QR-Session bei ihren Peers sucht.
+async fn sync_qr_status(
+    State(state): State<AppState>,
+    Path(token): Path<String>,
+) -> impl IntoResponse {
+    match state.qr_login_store.get_status(&token) {
+        Some(session) => {
+            if session.status == stone::auth::QrLoginStatus::Approved {
+                if let Some(approved) = state.qr_login_store.consume_approved(&token) {
+                    return (
+                        StatusCode::OK,
+                        axum::Json(json!({
+                            "status": "approved",
+                            "user_id": approved.approved_user_id,
+                            "user_name": approved.approved_user_name,
+                            "wallet_address": approved.approved_wallet,
+                            "account_type": approved.approved_account_type,
+                            "discord_id": approved.approved_discord_id,
+                            "discord_username": approved.approved_discord_username,
+                            "phrase": approved.approved_phrase,
+                        })),
+                    ).into_response();
+                }
+            }
+            (StatusCode::OK, axum::Json(json!({"status": format!("{:?}", session.status).to_lowercase()}))).into_response()
+        }
+        None => (StatusCode::NOT_FOUND, axum::Json(json!({"status": "not_found"}))).into_response(),
+    }
+}
+
 /// POST /qr-approve – QR-Login Approve von anderen Nodes empfangen (Peer-Forward).
 ///
 /// Empfängt eine QR-Login-Genehmigung von einer anderen Node, die sie per
@@ -695,7 +745,9 @@ pub fn build_sync_router(state: AppState) -> Router {
         .route("/sync-db-organizations", get(sync_db_organizations))
         .route("/sync-db-peers", get(sync_db_peers))
         .route("/sync-db-trust", get(sync_db_trust))
+        .route("/qr-create", post(sync_qr_create))
         .route("/qr-approve", post(sync_qr_approve))
+        .route("/qr-status/{token}", get(sync_qr_status))
         .route("/chunk/{hash}", get(sync_chunk))
         .layer(cors)
         .with_state(state)

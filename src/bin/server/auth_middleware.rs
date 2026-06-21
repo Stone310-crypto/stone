@@ -91,9 +91,9 @@ pub fn resolve_user_by_session_token(
     users: &Arc<Mutex<Vec<User>>>,
     cluster_key: &str,
 ) -> Option<User> {
-    let claims = validate_session_token(token, cluster_key)?;
+    let (_, wallet_addr, _) = validate_session_token(token, cluster_key)?;
     let guard = users.lock().unwrap_or_else(|e| e.into_inner());
-    guard.iter().find(|u| u.wallet_address == claims.wallet_address).cloned()
+    guard.iter().find(|u| u.wallet_address == wallet_addr).cloned()
 }
 
 pub fn require_user(headers: &HeaderMap, state: &AppState) -> Result<User, Response> {
