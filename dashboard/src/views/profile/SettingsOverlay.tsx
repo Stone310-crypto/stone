@@ -13,6 +13,53 @@ interface SettingsOverlayProps {
   onClose: () => void;
 }
 
+function AutoStartToggle() {
+  const [enabled, setEnabled] = useState(false);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    import("@tauri-apps/api/core").then(({ invoke }) => {
+      invoke<boolean>("get_auto_launch")
+        .then(setEnabled)
+        .catch(() => setEnabled(false))
+        .finally(() => setLoading(false));
+    }).catch(() => setLoading(false));
+  }, []);
+
+  async function toggle() {
+    if (loading) return;
+    setLoading(true);
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      const val = await invoke<boolean>("set_auto_launch", { enable: !enabled });
+      setEnabled(val);
+    } catch {}
+    setLoading(false);
+  }
+
+  return (
+    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+      <div>
+        <span style={{ fontSize: 12, color: "var(--text-primary)" }}>Auto-Start</span>
+        <p style={{ fontSize: 10, color: "var(--text-muted)", marginTop: 1 }}>App automatisch beim System-Login starten</p>
+      </div>
+      <button onClick={toggle} disabled={loading}
+        style={{
+          width: 40, height: 22, borderRadius: 11, border: "none", cursor: loading ? "wait" : "pointer",
+          background: enabled ? "var(--accent)" : "rgba(255,255,255,0.12)",
+          position: "relative", transition: "background 0.2s", opacity: loading ? 0.5 : 1,
+        }}>
+        <div style={{
+          width: 18, height: 18, borderRadius: "50%", background: "#fff",
+          position: "absolute", top: 2,
+          left: enabled ? 20 : 2,
+          transition: "left 0.2s",
+        }} />
+      </button>
+    </div>
+  );
+}
+
 function NotificationToggles() {
   const [prefs, setPrefs] = useState(getNotifPrefs());
 
@@ -299,6 +346,13 @@ export default function SettingsOverlay({ onClose }: SettingsOverlayProps) {
                     <span style={{ fontSize: 10, color: "var(--text-muted)" }}>{((sysStats.system_memory_used_mb / sysStats.system_memory_total_mb) * 100).toFixed(1)}%</span>
                   </div>
                 </div>
+              </div>
+            )}
+
+            {/* Auto-Start Toggle */}
+            {hasTauri && (!searchQuery.trim() || "autostart auto start login system".includes(searchQuery.toLowerCase())) && (
+              <div style={{ background: "rgba(255,255,255,0.02)", borderRadius: 10, padding: 12, border: "1px solid rgba(255,255,255,0.05)", marginBottom: 10 }}>
+                <AutoStartToggle />
               </div>
             )}
 

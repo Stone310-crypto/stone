@@ -32,7 +32,7 @@ pub struct NodeConfig {
 impl Default for NodeConfig {
     fn default() -> Self {
         NodeConfig {
-            enabled: false,
+            enabled: true,
             port: 3080,
             cpu_pct: 25,
             binary_path: String::new(),
@@ -637,13 +637,23 @@ fn persist_config(app: &AppHandle, config: &NodeConfig) {
 // ── Load persisted config on startup ─────────────────────────────────────────
 
 pub fn load_config(app: &AppHandle) -> NodeConfig {
+    let default = NodeConfig::default();
     if let Ok(data_dir) = app.path().app_data_dir() {
         let cfg_path = data_dir.join("node_config.json");
         if let Ok(data) = std::fs::read_to_string(&cfg_path) {
             if let Ok(cfg) = serde_json::from_str::<NodeConfig>(&data) {
+                // Always keep the loaded config but ensure enabled matches
+                // the default (user can override via settings)
                 return cfg;
             }
         }
     }
-    NodeConfig::default()
+    // First launch — persist default config with enabled=true
+    if let Ok(data_dir) = app.path().app_data_dir() {
+        let _ = std::fs::create_dir_all(&data_dir);
+        if let Ok(json) = serde_json::to_string_pretty(&default) {
+            let _ = std::fs::write(data_dir.join("node_config.json"), json);
+        }
+    }
+    default
 }

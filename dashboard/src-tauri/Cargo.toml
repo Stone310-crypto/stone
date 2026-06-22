@@ -33,4 +33,5 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "mul
 tokio = { version = "1", features = ["full"] }
 sysinfo = "0.32"
 tauri-plugin-notification = "2"
+auto-launch = "0.5"
 

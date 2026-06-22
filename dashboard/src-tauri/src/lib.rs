@@ -22,6 +22,58 @@ struct SystemStatsResponse {
 }
 
 #[tauri::command]
+fn get_auto_launch() -> Result<bool, String> {
+    let app_path = get_auto_launch_path()?;
+    let auto = auto_launch::AutoLaunchBuilder::new()
+        .set_app_name("Stone Dashboard")
+        .set_app_path(&app_path)
+        .build()
+        .map_err(|e| format!("{e}"))?;
+    Ok(auto.is_enabled().unwrap_or(false))
+}
+
+#[tauri::command]
+fn set_auto_launch(enable: bool) -> Result<bool, String> {
+    let app_path = get_auto_launch_path()?;
+
+    let auto = auto_launch::AutoLaunchBuilder::new()
+        .set_app_name("Stone Dashboard")
+        .set_app_path(&app_path)
+        .build()
+        .map_err(|e| format!("{e}"))?;
+
+    if enable {
+        auto.enable().map_err(|e| format!("{e}"))?;
+    } else {
+        auto.disable().map_err(|e| format!("{e}"))?;
+    }
+    Ok(enable)
+}
+
+fn get_auto_launch_path() -> Result<String, String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let exe_str = exe.to_string_lossy().to_string();
+
+    #[cfg(target_os = "macos")]
+    {
+        // Für macOS: Verwende das .app Bundle wenn wir in einem sind
+        let p = std::path::Path::new(&exe_str);
+        // Pfad: Stone Dashboard.app/Contents/MacOS/binary
+        if let Some(macos_dir) = p.parent() {
+            if let Some(contents) = macos_dir.parent() {
+                if let Some(bundle) = contents.parent() {
+                    if bundle.extension().map(|e| e == "app").unwrap_or(false) {
+                        return Ok(bundle.to_string_lossy().to_string());
+                    }
+                }
+            }
+        }
+        // Fallback: Binary-Pfad (dev mode)
+    }
+    Ok(exe_str)
+}
+
+#[tauri::command]
 fn get_system_stats() -> SystemStatsResponse {
     use sysinfo::{System, ProcessesToUpdate};
     let mut sys = System::new_all();
@@ -165,6 +217,8 @@ pub fn run() {
             node_binary_check_updates,
             node_binary_download_latest,
             get_system_stats,
+            get_auto_launch,
+            set_auto_launch,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
