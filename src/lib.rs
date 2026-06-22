@@ -21,3 +21,4 @@ pub mod token;
 pub mod updater;
 pub mod watchdog;
 pub mod pop_mining;
+pub mod document_pool;

@@ -2,9 +2,10 @@ import { useState, useRef, useEffect, type FormEvent } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { chat as chatApi, groups as groupsApi } from "../../api/stone";
 import { useAuth } from "../../auth/AuthContext";
+import { loadSettings } from "../../store/session";
 import Avatar from "../../components/ui/Avatar";
 import type { ChatEntry, GroupMessage } from "../../types/api";
-import { Send, Hash, KeyRound, Plus, MessageCircle } from "lucide-react";
+import { Send, Hash, KeyRound, Plus, MessageCircle, Download } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 
@@ -20,6 +21,123 @@ function getMsgContent(msg: ChatEntry | GroupMessage): string {
   if ("encrypted_content" in msg && msg.encrypted_content) return decodeMsg(msg as ChatEntry);
   if ("content" in msg && msg.content) return decodeMsg(msg as ChatEntry);
   return "";
+}
+
+// ── File attachment detection ─────────────────────────────────────────────
+
+interface FileAttachmentMeta {
+  fileName: string;
+  fileSize: string;
+  docId: string;
+  blockIndex: string;
+  fileHash: string;
+}
+
+function parseFileAttachment(text: string): FileAttachmentMeta | null {
+  const match = text.match(/📎 Datei gesendet:\s*(.+?)\s*\(([^)]+)\)\nDoc:\s*(\S+)\nBlock:\s*#(\S+)\nSHA-256:\s*(\S+)/);
+  if (!match) return null;
+  return { fileName: match[1], fileSize: match[2], docId: match[3], blockIndex: match[4], fileHash: match[5] };
+}
+
+function getFileExtension(filename: string): string {
+  const parts = filename.split('.');
+  return parts.length > 1 ? parts[parts.length - 1].toLowerCase() : '';
+}
+
+function isImage(filename: string): boolean {
+  return ['png','jpg','jpeg','gif','webp','svg','bmp'].includes(getFileExtension(filename));
+}
+
+function isVideo(filename: string): boolean {
+  return ['mp4','webm','mov','avi','mkv'].includes(getFileExtension(filename));
+}
+
+function isAudio(filename: string): boolean {
+  return ['mp3','wav','ogg','flac','m4a'].includes(getFileExtension(filename));
+}
+
+function getFileIcon(filename: string): string {
+  if (isImage(filename)) return '🖼️';
+  if (isVideo(filename)) return '🎬';
+  if (isAudio(filename)) return '🎵';
+  const ext = getFileExtension(filename);
+  if (['zip','rar','7z','tar','gz'].includes(ext)) return '📦';
+  if (['pdf'].includes(ext)) return '📄';
+  if (['js','ts','rs','py','java','c','cpp','h','json','yaml','toml','xml'].includes(ext)) return '💻';
+  return '📎';
+}
+
+function FileAttachmentCard({ meta, size = 260 }: { meta: FileAttachmentMeta; size?: number }) {
+  const { session } = useAuth();
+  const apiKey = session?.apiKey ?? "";
+  const nodeUrl = loadSettings().nodeUrl;
+  const img = isImage(meta.fileName);
+  const vid = isVideo(meta.fileName);
+  const aud = isAudio(meta.fileName);
+  const pdf = getFileExtension(meta.fileName) === 'pdf';
+  const authParam = `token=${encodeURIComponent(apiKey)}`;
+  const url = `${nodeUrl}/api/v1/documents/${meta.docId}/data?inline=1&${authParam}`;
+
+  function openFile() { window.open(url, '_blank'); }
+
+  // Blob download with Auth
+  async function downloadFile() {
+    try {
+      const resp = await fetch(`${nodeUrl}/api/v1/documents/${meta.docId}/data`, {
+        headers: { "x-api-key": apiKey },
+      });
+      if (!resp.ok) throw new Error("Download fehlgeschlagen");
+      const blob = await resp.blob();
+      const blobUrl = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = blobUrl;
+      a.download = meta.fileName;
+      a.click();
+      URL.revokeObjectURL(blobUrl);
+    } catch (e) {
+      console.error("[download]", e);
+      window.open(url, '_blank');
+    }
+  }
+
+  return (
+    <div style={{ borderRadius: 12, overflow: 'hidden', background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.08)', maxWidth: size, width: '100%' }}>
+      {/* Media preview */}
+      {/* Media / PDF preview */}
+      {(img || vid || aud || pdf) && (
+        <div style={{ background: '#000', display: 'flex', alignItems: 'center', justifyContent: 'center', minHeight: img ? 160 : pdf ? 200 : 80 }}>
+          {img && <img src={url} alt={meta.fileName} style={{ width: '100%', maxHeight: 280, objectFit: 'contain', cursor: 'pointer' }} onClick={openFile} />}
+          {vid && (
+            <video controls preload="metadata" style={{ width: '100%', maxHeight: 280, background: '#000' }}>
+              <source src={url} /> Video nicht verfügbar
+            </video>
+          )}
+          {aud && (
+            <audio controls preload="metadata" style={{ width: '100%', padding: '16px 0' }}>
+              <source src={url} /> Audio nicht verfügbar
+            </audio>
+          )}
+          {pdf && (
+            <iframe src={url} style={{ width: '100%', height: 200, border: 'none', background: '#fff' }} title={meta.fileName} />
+          )}
+        </div>
+      )}
+      {/* Info bar */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '10px 12px', cursor: 'pointer' }} onClick={openFile}>
+        <span style={{ fontSize: 22 }}>{getFileIcon(meta.fileName)}</span>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ fontSize: 12, fontWeight: 600, color: 'var(--text-primary)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{meta.fileName}</div>
+          <div style={{ fontSize: 10, color: 'var(--text-muted)' }}>{meta.fileSize}</div>
+        </div>
+        <button
+          onClick={(e) => { e.stopPropagation(); downloadFile(); }}
+          title="Herunterladen"
+          style={{ width: 28, height: 28, borderRadius: 8, background: 'var(--accent)', border: 'none', color: '#fff', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', flexShrink: 0 }}>
+          <Download size={14} />
+        </button>
+      </div>
+    </div>
+  );
 }
 
 function getSenderWallet(msg: ChatEntry | GroupMessage): string {
@@ -62,26 +180,15 @@ function formatSize(bytes: number): string {
 
 function MessageBubble({ msg, isOwn, showSender, senderName }: { msg: ChatEntry | GroupMessage; isOwn: boolean; showSender: boolean; senderName: string }) {
   const isCoin = "type" in msg && (msg.type === "send_coins" || msg.type === "request_coins");
-  const isFileUpload = (msg as any).type === "file_upload";
   const content = getMsgContent(msg);
+  const fileMeta = parseFileAttachment(content);
   return (
     <div className={`flex gap-3 px-4 py-0.5 group hover:bg-white/[0.02] ${isOwn ? "flex-row-reverse" : ""}`}>
       {showSender ? <Avatar name={senderName} size={34} /> : <div style={{ width: 34, flexShrink: 0 }} />}
       <div className={`flex flex-col max-w-lg ${isOwn ? "items-end" : ""}`}>
         {showSender && <div className="flex items-baseline gap-2 mb-1"><span className="text-sm font-semibold" style={{ color: "var(--text)" }}>{senderName}</span><span className="text-xs" style={{ color: "var(--text-muted)" }}>{fmtTime(msg.timestamp)}</span></div>}
-        {isFileUpload ? (
-          <div style={{ background: "rgba(34,197,94,0.08)", border: "1px solid rgba(34,197,94,0.25)", borderRadius: 14, padding: "10px 14px", fontSize: 13, color: "var(--text)", lineHeight: 1.5 }}>
-            <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-              <span style={{ fontSize: 16 }}>📎</span>
-              <div>
-                <div style={{ fontWeight: 600 }}>{(msg as any).file_name ?? "Datei"}</div>
-                <div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 1 }}>
-                  {(msg as any).file_size ? formatSize((msg as any).file_size) : ""}
-                  {(msg as any).doc_id ? ` · Doc #${(msg as any).doc_id}` : ""}
-                </div>
-              </div>
-            </div>
-          </div>
+        {fileMeta ? (
+          <FileAttachmentCard meta={fileMeta} />
         ) : isCoin ? (
           <div style={{ background: "var(--accent-dim)", border: "1px solid var(--accent)", borderRadius: 14, padding: "8px 14px", fontSize: 13, color: "var(--text)" }}>
             {"type" in msg && msg.type === "send_coins" ? "💸" : "🪙"} <strong>{"amount" in msg ? (msg as ChatEntry).amount : ""} STONE</strong> — {content}
@@ -119,12 +226,18 @@ function PhrasePrompt({ onSave }: { onSave: (p: string) => void }) {
 function MessageThread({ active, myWallet }: { active: ActiveChat; myWallet: string }) {
   const { session, storePhrase } = useAuth();
   const phrase = session?.phrase ?? "";
+  const userApiKey = session?.apiKey ?? "";
+  const userToken = session?.sessionToken ?? "";
+  const nodeUrl = loadSettings().nodeUrl;
+
+  // ═══ Auth-Token für Media-URLs (<img>/<video>/<audio> können keine Headers setzen) ═══
   const qc = useQueryClient();
   const bottomRef = useRef<HTMLDivElement>(null);
   const [input, setInput] = useState("");
   const [showPhrasePrompt, setShowPhrasePrompt] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [uploadToast, setUploadToast] = useState<{ msg: string; ok: boolean } | null>(null);
+  const [dragOver, setDragOver] = useState(false);
 
   const dmQuery = useQuery({ queryKey: ["chat-messages", active.type === "dm" ? active.wallet : null], queryFn: () => active.type === "dm" ? chatApi.messages(active.wallet) : Promise.resolve({ messages: [], peer_name: "" }), enabled: active.type === "dm", refetchInterval: 4_000 });
   const groupQuery = useQuery({ queryKey: ["group-messages", active.type === "group" ? active.id : null], queryFn: () => active.type === "group" ? groupsApi.messages(active.id) : Promise.resolve({ messages: [], group_name: "" }), enabled: active.type === "group", refetchInterval: 4_000 });
@@ -150,6 +263,40 @@ function MessageThread({ active, myWallet }: { active: ActiveChat; myWallet: str
     setShowPhrasePrompt(false); setInput(""); sendMutation.mutate(text);
   }
 
+  function handleDragOver(e: React.DragEvent) { e.preventDefault(); e.stopPropagation(); setDragOver(true); }
+  function handleDragLeave(e: React.DragEvent) { e.preventDefault(); e.stopPropagation(); setDragOver(false); }
+  function handleDrop(e: React.DragEvent) {
+    e.preventDefault(); e.stopPropagation(); setDragOver(false);
+    const file = e.dataTransfer.files?.[0];
+    if (!file) return;
+    uploadFile(file);
+  }
+
+  async function uploadFile(file: File) {
+    setUploading(true);
+    try {
+      const result: any = await invoke("upload_file", {
+        path: (file as any).path ?? file.name,
+        masterUrl: nodeUrl,
+        apiKey: userApiKey,
+        sessionToken: userToken,
+      });
+      if (result?.success) {
+        const fileName = file.name;
+        const docId = result.doc_id ? result.doc_id.slice(0, 8) : "?";
+        const blockInfo = result.block_index != null ? `Block #${result.block_index}` : "";
+        setUploadToast({ msg: `📎 "${fileName}" hochgeladen — Doc #${docId} ${blockInfo}${result.shards_distributed ? " · ✓ Shards verteilt" : ""}`, ok: true });
+        const chatMsg = `📎 Datei gesendet: ${fileName} (${formatSize(result.file_size)})\nDoc: ${result.doc_id ?? "?"}\nBlock: #${result.block_index ?? "?"}\nSHA-256: ${(result.file_hash ?? "").slice(0, 16)}…`;
+        if (active.type === "dm") { await chatApi.send(active.wallet, chatMsg, phrase); }
+        else { await groupsApi.send(active.id, chatMsg); }
+        qc.invalidateQueries({ queryKey: active.type === "dm" ? ["chat-messages", active.wallet] : ["group-messages", active.id] });
+      } else {
+        setUploadToast({ msg: `❌ Upload fehlgeschlagen: ${result?.error ?? "Unbekannter Fehler"}`, ok: false });
+      }
+    } catch (err) { setUploadToast({ msg: `❌ Fehler: ${String(err)}`, ok: false }); }
+    finally { setUploading(false); }
+  }
+
   async function handleFileUpload() {
     try {
       const selected = await open({
@@ -163,9 +310,9 @@ function MessageThread({ active, myWallet }: { active: ActiveChat; myWallet: str
       setUploading(true);
       const result: any = await invoke("upload_file", {
         path: filePath,
-        masterUrl: "http://127.0.0.1:3080",
-        apiKey: "stone-local-dev",
-        sessionToken: null,
+        masterUrl: nodeUrl,
+        apiKey: userApiKey,
+        sessionToken: userToken,
       });
 
       if (result?.success) {
@@ -229,23 +376,42 @@ function MessageThread({ active, myWallet }: { active: ActiveChat; myWallet: str
       {showPhrasePrompt && <PhrasePrompt onSave={(p) => { storePhrase(p); setShowPhrasePrompt(false); }} />}
       {sendMutation.isError && !showPhrasePrompt && <div style={{ padding: "0 12px 8px" }}><div style={{ background: "rgba(237,66,69,0.1)", border: "1px solid rgba(237,66,69,0.3)", borderRadius: 10, padding: "7px 12px", fontSize: 12, color: "var(--red)" }}>{sendMutation.error instanceof Error ? sendMutation.error.message : "Fehler beim Senden"}</div></div>}
       <form onSubmit={handleSend} style={{ padding: "0 12px 12px" }}>
-        <div style={{ display: "flex", alignItems: "flex-end", gap: 6, background: "rgba(255,255,255,0.05)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 14, padding: "6px 8px" }}>
-          <button
-            type="button" onClick={handleFileUpload} disabled={uploading} title="Datei hochladen"
-            style={{
-              width: 32, height: 32, borderRadius: 10,
-              background: uploading ? "rgba(34,197,94,0.15)" : "rgba(255,255,255,0.05)",
-              color: uploading ? "#22c55e" : "var(--text-muted)",
-              border: "none", display: "flex", alignItems: "center", justifyContent: "center",
-              cursor: uploading ? "not-allowed" : "pointer", transition: "all 0.15s", flexShrink: 0,
-            }}
-            onMouseEnter={(e) => { if (!uploading) { (e.currentTarget as HTMLElement).style.background = "rgba(34,197,94,0.12)"; (e.currentTarget as HTMLElement).style.color = "#22c55e"; } }}
-            onMouseLeave={(e) => { if (!uploading) { (e.currentTarget as HTMLElement).style.background = "rgba(255,255,255,0.05)"; (e.currentTarget as HTMLElement).style.color = "var(--text-muted)"; } }}
-          >
-            <Plus size={16} />
-          </button>
-          <textarea value={input} onChange={(e) => { setInput(e.target.value); e.currentTarget.style.height = "auto"; e.currentTarget.style.height = Math.min(e.currentTarget.scrollHeight, 120) + "px"; }} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSend(e as unknown as FormEvent); } }} placeholder={`Nachricht an ${active.name}…`} rows={1} style={{ flex: 1, background: "transparent", border: "none", outline: "none", resize: "none", color: "var(--text)", fontSize: 13, minHeight: 22, maxHeight: 120, paddingTop: 2, lineHeight: 1.5 }} autoComplete="off" spellCheck={false} />
-          <button type="submit" disabled={!input.trim() || sendMutation.isPending} style={{ width: 32, height: 32, borderRadius: 10, background: input.trim() && !sendMutation.isPending ? "var(--accent)" : "rgba(255,255,255,0.05)", color: input.trim() && !sendMutation.isPending ? "#fff" : "var(--text-muted)", border: "none", display: "flex", alignItems: "center", justifyContent: "center", cursor: input.trim() ? "pointer" : "not-allowed", transition: "all 0.15s", flexShrink: 0 }}><Send size={14} /></button>
+        <div
+          onDragOver={handleDragOver}
+          onDragLeave={handleDragLeave}
+          onDrop={handleDrop}
+          style={{
+            display: "flex", flexDirection: "column", gap: 0,
+            background: dragOver ? "rgba(34,197,94,0.08)" : "rgba(255,255,255,0.05)",
+            border: `1px solid ${dragOver ? "rgba(34,197,94,0.4)" : "rgba(255,255,255,0.08)"}`,
+            borderRadius: 14, transition: "all 0.15s",
+          }}>
+          {dragOver && (
+            <div style={{
+              color: "#22c55e", fontSize: 11, fontWeight: 600,
+              padding: "6px 12px 0", textAlign: "center",
+            }}>
+              📁 Datei loslassen zum Hochladen
+            </div>
+          )}
+          <div style={{ display: "flex", alignItems: "flex-end", gap: 6, padding: "6px 8px" }}>
+            <button
+              type="button" onClick={handleFileUpload} disabled={uploading} title="Datei hochladen"
+              style={{
+                width: 32, height: 32, borderRadius: 10,
+                background: uploading ? "rgba(34,197,94,0.15)" : "rgba(255,255,255,0.05)",
+                color: uploading ? "#22c55e" : "var(--text-muted)",
+                border: "none", display: "flex", alignItems: "center", justifyContent: "center",
+                cursor: uploading ? "not-allowed" : "pointer", transition: "all 0.15s", flexShrink: 0,
+              }}
+              onMouseEnter={(e) => { if (!uploading) { (e.currentTarget as HTMLElement).style.background = "rgba(34,197,94,0.12)"; (e.currentTarget as HTMLElement).style.color = "#22c55e"; } }}
+              onMouseLeave={(e) => { if (!uploading) { (e.currentTarget as HTMLElement).style.background = "rgba(255,255,255,0.05)"; (e.currentTarget as HTMLElement).style.color = "var(--text-muted)"; } }}
+            >
+              <Plus size={16} />
+            </button>
+            <textarea value={input} onChange={(e) => { setInput(e.target.value); e.currentTarget.style.height = "auto"; e.currentTarget.style.height = Math.min(e.currentTarget.scrollHeight, 120) + "px"; }} onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); handleSend(e as unknown as FormEvent); } }} placeholder={dragOver ? "Datei loslassen…" : `Nachricht an ${active.name}…`} rows={1} style={{ flex: 1, background: "transparent", border: "none", outline: "none", resize: "none", color: "var(--text)", fontSize: 13, minHeight: 22, maxHeight: 120, paddingTop: 2, lineHeight: 1.5 }} autoComplete="off" spellCheck={false} />
+            <button type="submit" disabled={!input.trim() || sendMutation.isPending} style={{ width: 32, height: 32, borderRadius: 10, background: input.trim() && !sendMutation.isPending ? "var(--accent)" : "rgba(255,255,255,0.05)", color: input.trim() && !sendMutation.isPending ? "#fff" : "var(--text-muted)", border: "none", display: "flex", alignItems: "center", justifyContent: "center", cursor: input.trim() ? "pointer" : "not-allowed", transition: "all 0.15s", flexShrink: 0 }}><Send size={14} /></button>
+          </div>
         </div>
       </form>
     </div>

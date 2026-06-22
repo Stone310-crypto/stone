@@ -512,7 +512,7 @@ pub async fn send_to_master_server(
     let client = client_builder.build().context("HTTP-Client erstellen")?;
 
     let mut req = client
-        .post(format!("{master_url}/api/v1/documents/upload"))
+        .post(format!("{master_url}/api/v1/documents"))
         .header("X-Api-Key", api_key)
         .multipart(form);
 

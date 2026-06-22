@@ -273,6 +273,8 @@ pub struct MasterNodeState {
     pub mempool: Mempool,
     /// Off-Chain Message Pool für Chat-Nachrichten (Batch-Commits statt Einzel-TXs)
     pub message_pool: crate::message_pool::MessagePool,
+    /// Off-Chain Document Pool (pending uploads before block minting)
+    pub document_pool: crate::document_pool::DocumentPool,
     /// StoneCoin Staking-Pool
     pub staking_pool: RwLock<crate::token::StakingPool>,
     /// Shard-Holder-Registry: Wer hält welchen Shard?
@@ -524,6 +526,7 @@ impl MasterNodeState {
             token_ledger: RwLock::new(ledger),
             mempool: Mempool::new(),
             message_pool: crate::message_pool::MessagePool::load(),
+            document_pool: crate::document_pool::DocumentPool::new(),
             staking_pool: RwLock::new(staking_pool),
             shard_registry: ShardHolderRegistry::new(),
             checkpoint_store: RwLock::new(CheckpointStore::load()),

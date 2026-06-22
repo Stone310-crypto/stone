@@ -60,6 +60,9 @@ pub struct DownloadQuery {
     /// → Browser zeigt PDF/Text/Bilder direkt an statt herunterzuladen.
     #[serde(default)]
     pub inline: Option<String>,
+    /// Auth-Token für Media-Tags (<img>/<video>/<audio>) die keine Headers setzen können
+    #[serde(default)]
+    pub token: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -276,6 +279,20 @@ pub async fn handle_get_document(
     Path(doc_id): Path<String>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, Response> {
+    // ═══ Erst Document-Pool prüfen (noch nicht on-chain) ═══
+    if let Some((doc, _by_id, _by_name)) = state.node.document_pool.find_document(&doc_id) {
+        let resp = stone::master::DocumentResponse::from(&doc);
+        return Ok((
+            StatusCode::OK,
+            axum::Json(json!({
+                "document": resp,
+                "block_index": serde_json::Value::Null,
+                "pool": true,
+            })),
+        ));
+    }
+
+    // ═══ Dann Chain prüfen (bereits on-chain) ═══
     let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
     let (doc, block_index) = chain.find_document(&doc_id).ok_or_else(|| {
         (
@@ -338,13 +355,103 @@ pub async fn handle_document_history(
 /// Query-Parameter:
 ///   ?inline=1  → Content-Disposition: inline (Vorschau im Browser)
 ///   (ohne)     → Content-Disposition: attachment (Download erzwingen)
+///   ?token=... → Optionaler API-Key für <img>/<video> Tags (keine Headers möglich)
 pub async fn handle_get_document_data(
     headers: HeaderMap,
     Path(doc_id): Path<String>,
     query: Query<DownloadQuery>,
     State(state): State<AppState>,
 ) -> Result<Response, Response> {
-    let user = require_user(&headers, &state)?;
+    use super::super::auth_middleware::resolve_user_by_key;
+    use super::super::auth_middleware::resolve_user_by_session_token;
+
+    // ═══ Auth: Query-Token zuerst prüfen (für <img>/<video>), dann Header ═══
+    let user = {
+        // 1. Query-Token (?token=...) — für <img>/<video>/<audio> Tags
+        if let Some(ref token) = query.token {
+            resolve_user_by_key(token, &state.users, &state.api_key, &state.admin_key)
+                .or_else(|| resolve_user_by_session_token(token, &state.users, &state.api_key))
+        }
+        // 2. Header-Token (x-api-key / Authorization Bearer)
+        else if let Some(token) = headers.get("x-api-key").and_then(|v| v.to_str().ok()).or_else(|| {
+            headers.get("authorization").and_then(|v| v.to_str().ok()).and_then(|s| s.strip_prefix("Bearer ").or_else(|| s.strip_prefix("bearer ")))
+        }) {
+            resolve_user_by_key(token, &state.users, &state.api_key, &state.admin_key)
+                .or_else(|| resolve_user_by_session_token(token, &state.users, &state.api_key))
+        }
+        // 3. Standard-Header-Auth
+        else {
+            match require_user(&headers, &state) {
+                Ok(u) => Some(u),
+                Err(_) => None,
+            }
+        }
+    };
+    let user = user.ok_or_else(|| {
+        (
+            StatusCode::UNAUTHORIZED,
+            axum::Json(json!({"error": "Authentifizierung erforderlich (x-api-key Header, Authorization Bearer, oder ?token= Query-Parameter)"})),
+        ).into_response()
+    })?;
+
+    // ═══ Erst Document-Pool prüfen (noch nicht on-chain) ═══
+    if let Some((pool_doc, _by_id, _by_name)) = state.node.document_pool.find_document(&doc_id) {
+        let raw_encrypted = state.node.document_pool.read_document_data(&doc_id)
+            .ok_or_else(|| {
+                (StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"error": "Dokument-Daten nicht lesbar"}))).into_response()
+            })?;
+
+        // ═══ Entschlüsselung (falls verschlüsselt) ═══
+        let plaintext = if pool_doc.encrypted && !pool_doc.encryption_meta.is_empty() {
+            let keypair = NodeKeyPair::load(&pool_doc.owner).map_err(|e| {
+                (StatusCode::INTERNAL_SERVER_ERROR,
+                axum::Json(json!({"error": format!("Schlüssel laden: {e}")}))).into_response()
+            })?;
+            match keypair {
+                Some(kp) => {
+                    let mut blob: EncryptedBlob = serde_json::from_str(&pool_doc.encryption_meta)
+                        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR,
+                            axum::Json(json!({"error": "Verschlüsselungs-Metadaten korrupt"}))).into_response())?;
+                    blob.ciphertext = hex::encode(&raw_encrypted);
+                    decrypt_document(&kp, &blob).map_err(|e| {
+                        (StatusCode::INTERNAL_SERVER_ERROR,
+                        axum::Json(json!({"error": format!("Entschlüsselung: {e}")}))).into_response()
+                    })?
+                }
+                None => {
+                    return Err((StatusCode::INTERNAL_SERVER_ERROR,
+                        axum::Json(json!({"error": "Privater Schlüssel nicht gefunden"}))).into_response());
+                }
+            }
+        } else {
+            raw_encrypted
+        };
+
+        let title = pool_doc.title.clone();
+        let content_type = guess_mime_from_filename(&title);
+        let final_ct = if content_type == "application/octet-stream" {
+            guess_mime_from_magic(&plaintext)
+        } else {
+            content_type
+        };
+
+        let disposition = if query.inline.is_some() {
+            format!("inline; filename=\"{title}\"")
+        } else {
+            format!("attachment; filename=\"{title}\"")
+        };
+
+        return Ok(Response::builder()
+            .status(200)
+            .header("content-type", final_ct)
+            .header("content-disposition", disposition)
+            .header("cache-control", "public, max-age=3600")
+            .body(Body::from(plaintext))
+            .unwrap());
+    }
+
+    // ═══ Dann Chain prüfen (bereits on-chain) ═══
     let (doc_owned, content_type) = {
         let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
         let (doc, _) = chain.find_document(&doc_id).ok_or_else(|| {
@@ -368,7 +475,6 @@ pub async fn handle_get_document_data(
     let content_type = if content_type == "application/octet-stream" {
         let guessed = guess_mime_from_filename(&doc_owned.title);
         if guessed == "application/octet-stream" {
-            // Kein Extension-Match → wird später aus Magic-Bytes ermittelt
             guessed
         } else {
             guessed
@@ -378,11 +484,9 @@ pub async fn handle_get_document_data(
     };
 
     // ── Dokument-Daten rekonstruieren ────────────────────────────────────────
-    // Für Erasure-Coded Dokumente mit P2P: fehlende Shards von Peers holen
     let has_ec_shards = doc_owned.chunks.iter().any(|c| !c.shards.is_empty());
 
     let raw_data = if has_ec_shards && state.network.is_some() {
-        // Async-Pfad: Remote-Shards bei Bedarf holen
         let shard_store = stone::shard::ShardStore::new().map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -414,7 +518,6 @@ pub async fn handle_get_document_data(
                 .into_response()
         })?
     } else {
-        // Legacy-Pfad: direkt aus lokalen Chunks
         reconstruct_document_data(&doc_owned).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -434,9 +537,6 @@ pub async fn handle_get_document_data(
                 doc_owned.size,
                 &doc_owned.content_type,
             ) {
-                // Signatur passt nicht zum aktuellen Owner – vermutlich ein
-                // vor dem Re-Sign-Fix übertragenes Dokument.
-                // Warnung loggen, aber Download trotzdem erlauben.
                 eprintln!(
                     "[crypto] ⚠️ Signaturprüfung fehlgeschlagen für {} (owner={}): {e} – Download trotzdem erlaubt",
                     doc_owned.doc_id, doc_owned.owner
@@ -789,45 +889,48 @@ pub async fn handle_upload_document(
         encryption_meta,
     };
 
-    let block = state
-        .node
-        .commit_documents(vec![doc], vec![], user.id.clone(), user.id.clone())
-        .map_err(|e| {
-            (
-                StatusCode::FORBIDDEN,
-                axum::Json(json!({"error": e})),
+    // ── Document Pool statt direktem Commit ─────────────────────────────────
+    // Dokument wird im DocumentPool gespeichert und beim nächsten Block-Minting
+    // vom ausgewählten Validator (VPS-USA) in den Block aufgenommen.
+    // Kein lokaler Block-Commit mehr — vermeidet 403 PoA-Fehler.
+    match state.node.document_pool.add_document(doc, user.id.clone(), user.name.clone()) {
+        Ok(msg) => println!("[doc-pool] {msg}"),
+        Err(e) => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                axum::Json(json!({"error": format!("Document-Pool: {e}")})),
             )
-                .into_response()
-        })?;
-
-    if let Some(ref network) = state.network {
-        let block_clone = block.clone();
-        let network_clone = network.clone();
-        let chain_count = state.node.chain.lock().unwrap_or_else(|e| e.into_inner()).blocks.len() as u64;
-
-        // Block an alle Peers broadcasten (Shards wurden bereits oben verteilt)
-        tokio::spawn(async move {
-            network_clone.broadcast_block(block_clone).await;
-            network_clone.set_chain_count(chain_count).await;
-        });
+                .into_response());
+        }
     }
-
     state
         .node
         .metrics
         .requests_total
         .fetch_add(1, Ordering::Relaxed);
+    state
+        .node
+        .metrics
+        .documents_uploaded
+        .fetch_add(1, Ordering::Relaxed);
+
+    let chain = state.node.chain.lock().unwrap_or_else(|e| e.into_inner());
+    let block_count = chain.blocks.len() as u64;
+    drop(chain);
 
     Ok((
         StatusCode::CREATED,
         axum::Json(json!({
             "doc_id": new_doc_id,
-            "block_index": block.index,
-            "block_hash": block.hash,
+            "block_index": null,
+            "block_hash": null,
             "version": version,
             "title": title,
             "encrypted": encrypted,
             "signed": true,
+            "pool": true,
+            "message": "Dokument im Pool gespeichert – wird beim nächsten Block-Minting vom Validator on-chain geschrieben",
+            "chain_height": block_count,
         })),
     ))
 }

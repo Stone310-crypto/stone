@@ -392,6 +392,14 @@ impl MasterNodeState {
             valid
         };
 
+        // ── Document Pool: Pending Documente für den Block entnehmen ─────
+        let pool_documents = if self.document_pool.has_pending() {
+            self.document_pool.drain_for_block()
+        } else {
+            Vec::new()
+        };
+        let doc_count = pool_documents.len();
+
         // ── Chat-Nachrichten batchen ────────────────────────────────────
         let chat_batches = if self.message_pool.batch_ready() {
             let drained = self.message_pool.drain_for_batch();
@@ -415,7 +423,7 @@ impl MasterNodeState {
         let signer = self.node_id.clone();
         let chain = self.chain.lock().unwrap_or_else(|e| e.into_inner());
         let mut block = chain.prepare_block(
-            Vec::new(),
+            pool_documents,
             Vec::new(),
             pending_txs,
             "system".to_string(),
@@ -953,11 +961,24 @@ impl MasterNodeState {
             Vec::new()
         };
 
+        // ── Document Pool: Pending Documente entnehmen ───────────────────
+        let pool_documents = if self.document_pool.has_pending() {
+            self.document_pool.drain_for_block()
+        } else {
+            Vec::new()
+        };
+        if !pool_documents.is_empty() {
+            println!(
+                "[mining] 📎 {} pending Document(s) aus Document-Pool in Block #{} übernommen",
+                pool_documents.len(), next_index
+            );
+        }
+
         // ── Block vorbereiten (ohne Commit in die Chain) ──────────────────
         let signer = self.node_id.clone();
         let chain = self.chain.lock().unwrap_or_else(|e| e.into_inner());
         let mut block = chain.prepare_block(
-            Vec::new(),
+            pool_documents,
             Vec::new(),
             pending_txs,
             "system".to_string(),
