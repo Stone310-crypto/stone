@@ -526,7 +526,11 @@ impl MasterNodeState {
             token_ledger: RwLock::new(ledger),
             mempool: Mempool::new(),
             message_pool: crate::message_pool::MessagePool::load(),
-            document_pool: crate::document_pool::DocumentPool::new(),
+            document_pool: {
+                let pool = crate::document_pool::DocumentPool::new();
+                let _ = pool.load_from_disk();
+                pool
+            },
             staking_pool: RwLock::new(staking_pool),
             shard_registry: ShardHolderRegistry::new(),
             checkpoint_store: RwLock::new(CheckpointStore::load()),

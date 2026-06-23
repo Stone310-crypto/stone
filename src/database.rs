@@ -129,6 +129,8 @@ impl Database {
         )?;
         let db = Database { conn: Arc::new(Mutex::new(conn)) };
         db.run_migrations()?;
+        // Idempotent: Füge bio + updated_at Spalten hinzu (wird nur beim ersten Start aktiv)
+        let _ = db.add_profile_columns();
         Ok(db)
     }
 
@@ -137,6 +139,7 @@ impl Database {
         conn.execute_batch("PRAGMA foreign_keys=ON;")?;
         let db = Database { conn: Arc::new(Mutex::new(conn)) };
         db.run_migrations()?;
+        let _ = db.add_profile_columns();
         Ok(db)
     }
 
@@ -275,7 +278,8 @@ impl Database {
     }
 
     fn run_migrations(&self) -> Result<(), rusqlite::Error> {
-        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let conn_lock = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        let conn: &Connection = &*conn_lock;
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS db_metadata (
                 key   TEXT PRIMARY KEY,
@@ -388,6 +392,30 @@ impl Database {
         Ok(())
     }
 
+    /// Idempotentes Hinzufügen von bio + updated_at Spalten.
+    /// Wird beim ersten Start nach der Migration einmal ausgeführt.
+    pub fn add_profile_columns(&self) -> Result<(), rusqlite::Error> {
+        let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
+        // Versuche bio-Spalte hinzuzufügen, ignoriere NUR "duplicate column" Fehler
+        for sql in &[
+            "ALTER TABLE users ADD COLUMN bio TEXT NOT NULL DEFAULT ''",
+            "ALTER TABLE users ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0",
+        ] {
+            match conn.execute(sql, []) {
+                Ok(_) => println!("[db] ✅ Spalte hinzugefügt: {sql}"),
+                Err(e) => {
+                    let msg = e.to_string().to_lowercase();
+                    if msg.contains("duplicate column") {
+                        // Spalte existiert bereits → OK
+                    } else {
+                        return Err(e);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     // ─── Metadaten ────────────────────────────────────────────────────
     pub fn set_meta(&self, key: &str, value: &str) -> Result<(), rusqlite::Error> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
@@ -406,10 +434,10 @@ impl Database {
         let now = Utc::now().timestamp();
         for u in users {
             conn.execute(
-                "INSERT INTO users (id, name, wallet_address, api_key, phrase_hash, quota_bytes, account_type, org_id, org_role, discord_id, discord_username, created_at)
-                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)
-                 ON CONFLICT(id) DO UPDATE SET name=excluded.name, wallet_address=excluded.wallet_address, api_key=excluded.api_key, phrase_hash=excluded.phrase_hash, quota_bytes=excluded.quota_bytes, account_type=excluded.account_type, org_id=excluded.org_id, org_role=excluded.org_role, discord_id=excluded.discord_id, discord_username=excluded.discord_username",
-                params![u.id, u.name, u.wallet_address, u.api_key, u.phrase_hash, u.quota_bytes as i64, u.account_type, u.org_id, u.org_role, u.discord_id, u.discord_username, now],
+                "INSERT INTO users (id, name, bio, wallet_address, api_key, phrase_hash, quota_bytes, account_type, org_id, org_role, discord_id, discord_username, created_at, updated_at)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)
+                 ON CONFLICT(id) DO UPDATE SET name=excluded.name, bio=excluded.bio, wallet_address=excluded.wallet_address, api_key=excluded.api_key, phrase_hash=excluded.phrase_hash, quota_bytes=excluded.quota_bytes, account_type=excluded.account_type, org_id=excluded.org_id, org_role=excluded.org_role, discord_id=excluded.discord_id, discord_username=excluded.discord_username, updated_at=excluded.updated_at",
+                params![u.id, u.name, u.bio, u.wallet_address, u.api_key, u.phrase_hash, u.quota_bytes as i64, u.account_type, u.org_id, u.org_role, u.discord_id, u.discord_username, now, u.updated_at],
             )?;
         }
         Ok(())
@@ -418,15 +446,19 @@ impl Database {
     pub fn load_users(&self) -> Result<Vec<crate::auth::User>, rusqlite::Error> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare(
-            "SELECT id, name, wallet_address, api_key, phrase_hash, quota_bytes, account_type, org_id, org_role, discord_id, discord_username FROM users ORDER BY name"
+            "SELECT id, name, wallet_address, api_key, phrase_hash, quota_bytes, account_type, org_id, org_role, discord_id, discord_username, CAST(COALESCE(bio,'') AS TEXT), CAST(COALESCE(updated_at,0) AS INTEGER) FROM users ORDER BY name"
         )?;
         let users = stmt.query_map([], |row| {
+            let bio_val: String = row.get(10).unwrap_or_default();
+            let ts_val: i64 = row.get(11).unwrap_or_default();
             Ok(crate::auth::User {
                 id: row.get(0)?, name: row.get(1)?, wallet_address: row.get(2)?,
                 api_key: row.get(3)?, phrase_hash: row.get(4)?,
                 quota_bytes: row.get::<_, i64>(5).unwrap_or(0) as u64,
                 account_type: row.get(6)?, org_id: row.get(7)?, org_role: row.get(8)?,
-                discord_id: row.get(9)?, discord_username: row.get(10)?,
+                discord_id: row.get(9)?, discord_username: String::new(),
+                bio: bio_val,
+                updated_at: ts_val,
             })
         })?.filter_map(|r| r.ok()).collect();
         Ok(users)

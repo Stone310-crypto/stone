@@ -78,7 +78,7 @@ pub fn resolve_user_by_key(
             org_id: String::new(),
             org_role: String::new(),
             discord_id: String::new(),
-            discord_username: String::new(),
+            discord_username: String::new(), bio: String::new(), updated_at: 0,
         });
     }
     let guard = users.lock().unwrap_or_else(|e| e.into_inner());

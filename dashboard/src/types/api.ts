@@ -222,13 +222,15 @@ export interface ChatMessagesResponse {
 }
 
 export interface ChatResolveResult {
+  user_id: string;
+  name: string;
+  bio: string;
   wallet: string;
-  username: string;
-  user_id?: string;
 }
 
 export interface ChatResolveResponse {
-  result: ChatResolveResult;
+  ok: boolean;
+  results: ChatResolveResult[];
 }
 
 export interface ContactRequestDetail {

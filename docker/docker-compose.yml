@@ -11,6 +11,37 @@
 
 services:
 
+  # ── TURN/STUN Server (Coturn — NAT-Traversal für WebRTC) ────────────────────
+  turn:
+    image: coturn/coturn:4.6
+    container_name: stone-turn
+    restart: unless-stopped
+    network_mode: host  # Coturn braucht direkten Netzwerkzugriff für Port-Mapping
+    environment:
+      - TURN_USER=stone:turn_stone_testnet_2024
+      - TURN_REALM=stonechain.network
+      - TURN_EXTERNAL_IP=auto
+    ports:
+      - "3478:3478"           # STUN/TURN TCP
+      - "3478:3478/udp"       # STUN/TURN UDP
+      - "5349:5349"           # TURN TCP/TLS
+      - "5349:5349/udp"       # TURN UDP/TLS
+      - "49152-65535:49152-65535/udp"  # Relay Ports
+    volumes:
+      - ./coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+    command: >
+      turnserver 
+      --log-file=stdout 
+      --lt-cred-mech 
+      --user=stone:turn_stone_testnet_2024 
+      --realm=stonechain.network 
+      --no-tls 
+      --no-dtls 
+      --listening-port=3478 
+      --min-port=49152 
+      --max-port=49162 
+      --verbose
+
   # ── Testnet Node ────────────────────────────────────────────────────────────
   node-testnet:
     build:

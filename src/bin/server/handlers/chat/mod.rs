@@ -303,6 +303,7 @@ pub(super) fn resolve_local(identifier: &str, state: &AppState) -> Vec<serde_jso
             return vec![json!({
                 "user_id": u.id,
                 "name": u.name,
+                "bio": u.bio,
                 "wallet": u.wallet_address,
             })];
         }
@@ -314,6 +315,7 @@ pub(super) fn resolve_local(identifier: &str, state: &AppState) -> Vec<serde_jso
             return vec![json!({
                 "user_id": u.id,
                 "name": u.name,
+                "bio": u.bio,
                 "wallet": u.wallet_address,
             })];
         }
@@ -322,6 +324,7 @@ pub(super) fn resolve_local(identifier: &str, state: &AppState) -> Vec<serde_jso
             return vec![json!({
                 "user_id": "",
                 "name": "Unbekannt",
+                "bio": "",
                 "wallet": identifier,
             })];
         }
@@ -336,6 +339,7 @@ pub(super) fn resolve_local(identifier: &str, state: &AppState) -> Vec<serde_jso
             json!({
                 "user_id": u.id,
                 "name": u.name,
+                "bio": u.bio,
                 "wallet": u.wallet_address,
             })
         })
@@ -360,6 +364,7 @@ pub(super) fn resolve_local(identifier: &str, state: &AppState) -> Vec<serde_jso
                 matches.push(json!({
                     "user_id": user_id,
                     "name": name,
+                    "bio": "",
                     "wallet": wallet,
                 }));
             }

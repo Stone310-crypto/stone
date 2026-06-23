@@ -193,6 +193,11 @@ pub enum NodeEvent {
         group_id: String,
     },
     // ─── Call-Signaling Events ────────────────────────────────────────────────
+    /// Profil-Update (Name/Bio geändert)
+    ProfileUpdated {
+        user_id: String,
+        name: String,
+    },
     /// WebRTC Call-Signal empfangen (Offer/Answer/ICE/Hangup)
     CallSignalReceived {
         call_id: String,

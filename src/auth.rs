@@ -18,6 +18,8 @@ pub const USERS_FILE_COMPAT: &str = "stone_data/users.json"; // für externe Too
 pub struct User {
     pub id: String,
     pub name: String,
+    #[serde(default)]
+    pub bio: String,
     pub api_key: String,
     pub phrase_hash: String,
     pub quota_bytes: u64,
@@ -33,6 +35,9 @@ pub struct User {
     pub discord_id: String,
     #[serde(default)]
     pub discord_username: String,
+    /// Letztes Profil-Update (Unix-Timestamp) — für Sync-Priorisierung
+    #[serde(default)]
+    pub updated_at: i64,
 }
 
 pub fn default_quota_bytes() -> u64 { 1024 * 1024 * 1024 }
@@ -61,7 +66,7 @@ pub fn create_user_with_phrase(name: &str) -> (User, String) {
     let hash = hex::encode(h.finalize());
     let api_key = format!("sk_{}", hex::encode(&rand::random::<[u8;16]>()));
     let wallet = wallet_address_from_phrase(&phrase);
-    let user = User { id: String::new(), name: name.into(), api_key, phrase_hash: hash, quota_bytes: default_quota_bytes(), wallet_address: wallet, account_type: default_account_type(), org_id: String::new(), org_role: String::new(), discord_id: String::new(), discord_username: String::new() };
+    let user = User { id: String::new(), name: name.into(), bio: String::new(), api_key, phrase_hash: hash, quota_bytes: default_quota_bytes(), wallet_address: wallet, account_type: default_account_type(), org_id: String::new(), org_role: String::new(), discord_id: String::new(), discord_username: String::new(), updated_at: chrono::Utc::now().timestamp() };
     (user, phrase)
 }
 
@@ -245,7 +250,7 @@ pub fn rebuild_users_from_ledger(ledger: &crate::token::TokenLedger, local: &[Us
                 org_id: String::new(),
                 org_role: String::new(),
                 discord_id: String::new(),
-                discord_username: String::new(),
+                discord_username: String::new(), bio: String::new(), updated_at: 0,
             });
         }
     }

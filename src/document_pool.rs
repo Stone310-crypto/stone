@@ -15,12 +15,13 @@
 //! 4. Validator minted Block mit den Dokumenten
 //! 5. Alle Nodes akzeptieren den Block per P2P-Sync
 
-use crate::blockchain::Document;
+use crate::blockchain::{Document, data_dir};
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingDocument {
     pub document: Document,
     pub uploaded_by_id: String,
@@ -47,7 +48,7 @@ impl DocumentPool {
         }
     }
 
-    /// Fügt ein Dokument zum Pool hinzu.
+    /// Fügt ein Dokument zum Pool hinzu und persistiert es auf Disk.
     /// Gibt eine Erfolgsmeldung zurück.
     pub fn add_document(
         &self,
@@ -69,17 +70,35 @@ impl DocumentPool {
 
         inner.pending.push_back(pending);
         let total = inner.pending.len();
+        // ═══ Persist auf Disk (überlebt Node-Neustarts) ═══
+        if let Err(e) = inner.save_to_disk() {
+            eprintln!("[doc-pool] ⚠️ Persist fehlgeschlagen: {e}");
+        }
         Ok(format!("Dokument im Pool gespeichert. Pool-Größe: {total}/{}", inner.max_pending))
     }
 
-    /// Gibt alle pending Dokumente zurück und leert den Pool.
+    /// Gibt alle pending Dokumente zurück, leert den Pool und löscht die Disk-Datei.
     pub fn drain_for_block(&self) -> Vec<Document> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let docs: Vec<Document> = inner.pending
             .drain(..)
             .map(|p| p.document)
             .collect();
+        // Disk-Datei löschen (Pool ist jetzt leer)
+        let _ = std::fs::remove_file(DocumentPool::pool_file_path());
         docs
+    }
+
+    /// Lädt persistierte Dokumente von Disk beim Node-Start.
+    pub fn load_from_disk(&self) -> Result<usize, String> {
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        inner.load_from_disk()
+    }
+
+    fn pool_file_path() -> String {
+        let dir = data_dir();
+        let _ = std::fs::create_dir_all(&format!("{dir}/document_pool"));
+        format!("{dir}/document_pool/pending.json")
     }
 
     /// Anzahl pending Dokumente.
@@ -120,5 +139,36 @@ impl DocumentPool {
 impl Default for DocumentPool {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+// ── Disk-Persistenz ──────────────────────────────────────────────────────────
+
+impl DocumentPoolInner {
+    /// Lädt pending Documents von Disk (existierende Chunks bleiben erhalten).
+    pub fn load_from_disk(&mut self) -> Result<usize, String> {
+        let path = DocumentPool::pool_file_path();
+        if !std::path::Path::new(&path).exists() {
+            return Ok(0);
+        }
+        let data = std::fs::read_to_string(&path)
+            .map_err(|e| format!("Pool-Datei lesen: {e}"))?;
+        let docs: Vec<PendingDocument> = serde_json::from_str(&data)
+            .map_err(|e| format!("Pool-Daten parsen: {e}"))?;
+        let count = docs.len();
+        self.pending.extend(docs);
+        println!("[doc-pool] 📂 {count} pending Documents von Disk geladen");
+        Ok(count)
+    }
+
+    /// Speichert pending Documents auf Disk.
+    fn save_to_disk(&self) -> Result<(), String> {
+        let path = DocumentPool::pool_file_path();
+        let entries: Vec<&PendingDocument> = self.pending.iter().collect();
+        let json = serde_json::to_string_pretty(&entries)
+            .map_err(|e| format!("Pool serialisieren: {e}"))?;
+        std::fs::write(&path, json)
+            .map_err(|e| format!("Pool schreiben: {e}"))?;
+        Ok(())
     }
 }

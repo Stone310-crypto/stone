@@ -496,7 +496,7 @@ pub async fn pull_users_from_peer(peer_url: &str, _api_key: &str, users: &Arc<Mu
             quota_bytes: stone::auth::default_quota_bytes(),
             wallet_address: wallet, account_type: stone::auth::default_account_type(),
             org_id: String::new(), org_role: String::new(),
-            discord_id: String::new(), discord_username: String::new(),
+            discord_id: String::new(), discord_username: String::new(), bio: String::new(), updated_at: 0,
         });
         added += 1;
     }
@@ -620,7 +620,7 @@ async fn sync_users_from_peer(node: &Arc<MasterNodeState>, peer_url: &str) {
             quota_bytes: stone::auth::default_quota_bytes(),
             wallet_address: wallet, account_type: stone::auth::default_account_type(),
             org_id: String::new(), org_role: String::new(),
-            discord_id: String::new(), discord_username: String::new(),
+            discord_id: String::new(), discord_username: String::new(), bio: String::new(), updated_at: 0,
         });
     }
 
@@ -735,7 +735,7 @@ pub fn sync_chain_accounts_to_users(node: &Arc<MasterNodeState>, users: &Arc<Mut
         if exists { continue; }
         let api_key_hash = ledger.account_api_key_hash(wallet).unwrap_or_default().to_string();
         let id = format!("u-{}", uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("0000"));
-        local.push(User { id, name: name.clone(), api_key: api_key_hash.clone(), phrase_hash: api_key_hash, quota_bytes: stone::auth::default_quota_bytes(), wallet_address: wallet.clone(), account_type: stone::auth::default_account_type(), org_id: String::new(), org_role: String::new(), discord_id: String::new(), discord_username: String::new() });
+        local.push(User { id, name: name.clone(), bio: String::new(), api_key: api_key_hash.clone(), phrase_hash: api_key_hash, quota_bytes: stone::auth::default_quota_bytes(), wallet_address: wallet.clone(), account_type: stone::auth::default_account_type(), org_id: String::new(), org_role: String::new(), discord_id: String::new(), discord_username: String::new(), updated_at: chrono::Utc::now().timestamp() });
         added += 1;
     }
     if added > 0 { save_users(&local); println!("[sync] 📋 {added} Chain-Accounts in lokale User-Liste synchronisiert"); }

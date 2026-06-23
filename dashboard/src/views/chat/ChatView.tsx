@@ -4,8 +4,10 @@ import { chat as chatApi, groups as groupsApi } from "../../api/stone";
 import { useAuth } from "../../auth/AuthContext";
 import { loadSettings } from "../../store/session";
 import Avatar from "../../components/ui/Avatar";
+import { useWebRTC } from "../../hooks/useWebRTC";
+import CallUI from "../../components/calls/CallUI";
 import type { ChatEntry, GroupMessage } from "../../types/api";
-import { Send, Hash, KeyRound, Plus, MessageCircle, Download } from "lucide-react";
+import { Send, Hash, KeyRound, Plus, MessageCircle, Download, Phone } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 
@@ -230,6 +232,13 @@ function MessageThread({ active, myWallet }: { active: ActiveChat; myWallet: str
   const userToken = session?.sessionToken ?? "";
   const nodeUrl = loadSettings().nodeUrl;
 
+  // ═══ WebRTC Voice Calling ═══
+  const rtc = useWebRTC({
+    localWallet: myWallet,
+    apiKey: userApiKey,
+    nodeUrl,
+  });
+
   // ═══ Auth-Token für Media-URLs (<img>/<video>/<audio> können keine Headers setzen) ═══
   const qc = useQueryClient();
   const bottomRef = useRef<HTMLDivElement>(null);
@@ -346,7 +355,24 @@ function MessageThread({ active, myWallet }: { active: ActiveChat; myWallet: str
     <div className="flex flex-col h-full">
       <div style={{ display: "flex", alignItems: "center", gap: 12, padding: "10px 16px", borderBottom: "1px solid var(--border)", background: "rgba(255,255,255,0.01)" }}>
         {active.type === "dm" ? <Avatar name={active.name} size={30} /> : <div style={{ width: 30, height: 30, borderRadius: 10, background: "var(--surface-2)", display: "flex", alignItems: "center", justifyContent: "center" }}><Hash size={14} style={{ color: "var(--text-dim)" }} /></div>}
-        <div><p style={{ fontSize: 14, fontWeight: 600, color: "var(--text)" }}>{active.name}</p>{active.type === "dm" && <p style={{ fontSize: 11, fontFamily: "monospace", color: "var(--text-muted)" }}>{shortAddr(active.wallet)}</p>}</div>
+        <div style={{ flex: 1 }}><p style={{ fontSize: 14, fontWeight: 600, color: "var(--text)" }}>{active.name}</p>{active.type === "dm" && <p style={{ fontSize: 11, fontFamily: "monospace", color: "var(--text-muted)" }}>{shortAddr(active.wallet)}</p>}</div>
+        {active.type === "dm" && (
+          <button
+            onClick={() => rtc.startCall(active.wallet, active.name)}
+            title="Anrufen"
+            style={{
+              width: 32, height: 32, borderRadius: 8,
+              background: "rgba(34,197,94,0.1)",
+              border: "1px solid rgba(34,197,94,0.2)",
+              color: "#22c55e",
+              cursor: "pointer",
+              display: "flex", alignItems: "center", justifyContent: "center",
+              transition: "all 0.15s",
+            }}
+          >
+            <Phone size={14} />
+          </button>
+        )}
       </div>
 
       {uploadToast && (
@@ -375,6 +401,20 @@ function MessageThread({ active, myWallet }: { active: ActiveChat; myWallet: str
       </div>
       {showPhrasePrompt && <PhrasePrompt onSave={(p) => { storePhrase(p); setShowPhrasePrompt(false); }} />}
       {sendMutation.isError && !showPhrasePrompt && <div style={{ padding: "0 12px 8px" }}><div style={{ background: "rgba(237,66,69,0.1)", border: "1px solid rgba(237,66,69,0.3)", borderRadius: 10, padding: "7px 12px", fontSize: 12, color: "var(--red)" }}>{sendMutation.error instanceof Error ? sendMutation.error.message : "Fehler beim Senden"}</div></div>}
+      {/* ═══ Voice Call UI ═══ */}
+      <CallUI
+        callState={rtc.callState}
+        callDuration={rtc.formattedDuration}
+        remoteName={rtc.remoteName}
+        isMuted={rtc.isMuted}
+        onAccept={() => {
+          const id = (rtc as any).callId;
+          rtc.acceptCall(id, rtc.remoteWallet, rtc.remoteName);
+        }}
+        onHangup={rtc.hangup}
+        onMute={rtc.toggleMute}
+      />
+
       <form onSubmit={handleSend} style={{ padding: "0 12px 12px" }}>
         <div
           onDragOver={handleDragOver}

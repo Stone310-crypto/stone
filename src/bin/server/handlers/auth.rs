@@ -227,7 +227,7 @@ pub async fn handle_qr_status(State(state): State<AppState>, Path(login_token): 
     }
     // Poll peers
     if let Some(approved) = poll_peers_for_qr_session(&state, &login_token).await {
-        let user = stone::auth::User { id: approved.user_id.clone(), name: approved.user_name.clone(), api_key: String::new(), phrase_hash: String::new(), quota_bytes: stone::auth::default_quota_bytes(), wallet_address: approved.wallet_address.clone(), account_type: approved.account_type.clone(), org_id: String::new(), org_role: String::new(), discord_id: approved.discord_id.clone(), discord_username: approved.discord_username.clone() };
+        let user = stone::auth::User { id: approved.user_id.clone(), name: approved.user_name.clone(), bio: String::new(), api_key: String::new(), phrase_hash: String::new(), quota_bytes: stone::auth::default_quota_bytes(), wallet_address: approved.wallet_address.clone(), account_type: approved.account_type.clone(), org_id: String::new(), org_role: String::new(), discord_id: approved.discord_id.clone(), discord_username: approved.discord_username.clone(), updated_at: chrono::Utc::now().timestamp() };
         let session_token = generate_session_token(&user.id, &user.wallet_address, &state.api_key, SESSION_TOKEN_TTL_SECS);
         let _ = state.qr_login_store.approve_session(&login_token, session_token.clone(), &user, approved.phrase.clone());
         let api_key = { let users = state.users.lock().unwrap_or_else(|e| e.into_inner()); users.iter().find(|u|u.wallet_address==user.wallet_address).map(|u|u.api_key.clone()).unwrap_or_default() };
@@ -273,7 +273,7 @@ pub async fn handle_qr_approve(State(state): State<AppState>, headers: HeaderMap
         let wallet = wallet.trim(); let sig = sig.trim();
         if !wallet.is_empty() && wallet.len()==64 && !sig.is_empty() && sig.len()==128 {
             if verify_challenge_signature(wallet, &login_token, sig) {
-                let user = { let users = state.users.lock().unwrap_or_else(|e| e.into_inner()); users.iter().find(|u|u.wallet_address==wallet).cloned().unwrap_or(stone::auth::User { id: format!("u-{}",&wallet[..8]), name: format!("Wallet-{}",&wallet[..12]), api_key: String::new(), phrase_hash: String::new(), quota_bytes: stone::auth::default_quota_bytes(), wallet_address: wallet.to_string(), account_type: stone::auth::default_account_type(), org_id: String::new(), org_role: String::new(), discord_id: String::new(), discord_username: String::new() }) };
+                let user = { let users = state.users.lock().unwrap_or_else(|e| e.into_inner()); users.iter().find(|u|u.wallet_address==wallet).cloned().unwrap_or(stone::auth::User { id: format!("u-{}",&wallet[..8]), name: format!("Wallet-{}",&wallet[..12]), bio: String::new(), api_key: String::new(), phrase_hash: String::new(), quota_bytes: stone::auth::default_quota_bytes(), wallet_address: wallet.to_string(), account_type: stone::auth::default_account_type(), org_id: String::new(), org_role: String::new(), discord_id: String::new(), discord_username: String::new(), updated_at: chrono::Utc::now().timestamp() }) };
                 let session_token = generate_session_token(&user.id, &user.wallet_address, &state.api_key, SESSION_TOKEN_TTL_SECS);
                 if state.qr_login_store.approve_session(&login_token, session_token.clone(), &user, req.phrase.clone()) {
                     println!("[auth] 📱✅ QR-Login genehmigt: {}", user.name);
@@ -318,12 +318,26 @@ pub async fn handle_verify_challenge(State(state): State<AppState>, axum::Json(r
     (StatusCode::OK, axum::Json(json!({"session_token":token,"user":{"id":user.id,"name":user.name,"wallet_address":user.wallet_address}})))
 }
 
-#[derive(Deserialize)] pub struct UpdateProfileRequest { pub name: Option<String> }
+#[derive(Deserialize)] pub struct UpdateProfileRequest { pub name: Option<String>, pub bio: Option<String> }
 pub async fn handle_profile_update(State(state): State<AppState>, headers: HeaderMap, axum::Json(req): axum::Json<UpdateProfileRequest>) -> impl IntoResponse {
     let user = match require_user(&headers, &state) { Ok(u)=>u, Err(resp)=>return resp.into_response() };
-    let new_name = match req.name { Some(n) if !n.trim().is_empty() => n.trim().to_string(), _=>return (StatusCode::BAD_REQUEST,"Kein Name").into_response() };
-    { let mut users = state.users.lock().unwrap_or_else(|e| e.into_inner()); if let Some(u)=users.iter_mut().find(|u|u.api_key==user.api_key||u.wallet_address==user.wallet_address) { u.name=new_name.clone(); save_users(&users); } }
-    (StatusCode::OK, axum::Json(json!({"name":new_name}))).into_response()
+    let new_name = match req.name { Some(ref n) if !n.trim().is_empty() => n.trim().to_string(), _=>user.name.clone() };
+    let new_bio = req.bio.unwrap_or_default().trim().to_string();
+    {
+        let mut users = state.users.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(u)=users.iter_mut().find(|u|u.api_key==user.api_key||u.wallet_address==user.wallet_address) {
+            u.name = new_name.clone();
+            u.bio = new_bio.clone();
+            u.updated_at = chrono::Utc::now().timestamp();
+            save_users(&users);
+        }
+    }
+    // WebSocket-Live-Update
+    state.node.events.publish(stone::master::NodeEvent::ProfileUpdated {
+        user_id: user.id.clone(),
+        name: new_name.clone(),
+    });
+    (StatusCode::OK, axum::Json(json!({"name":new_name,"bio":new_bio}))).into_response()
 }
 
 #[derive(Deserialize)] pub struct DiscordLoginRequest { pub code: String, pub redirect_uri: String }

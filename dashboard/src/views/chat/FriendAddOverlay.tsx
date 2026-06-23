@@ -2,7 +2,7 @@ import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { chat as chatApi } from "../../api/stone";
 import { apiFetch } from "../../api/client";
-import type { ContactRequestDetail } from "../../types/api";
+import type { ContactRequestDetail, ChatResolveResult } from "../../types/api";
 import { ArrowLeft, X, Search, UserPlus, Check, Loader2, Clock } from "lucide-react";
 
 interface FriendAddOverlayProps {
@@ -15,10 +15,10 @@ function shortAddr(addr: string): string {
 
 export default function FriendAddOverlay({ onClose }: FriendAddOverlayProps) {
   const [query, setQuery] = useState("");
-  const [searchResult, setSearchResult] = useState<{ wallet: string; username: string; user_id?: string } | null>(null);
+  const [searchResults, setSearchResults] = useState<ChatResolveResult[]>([]);
   const [searching, setSearching] = useState(false);
   const [searchError, setSearchError] = useState("");
-  const [requestSent, setRequestSent] = useState(false);
+  const [sentWallets, setSentWallets] = useState<Set<string>>(new Set());
   const qc = useQueryClient();
 
   // Pending contact requests
@@ -44,11 +44,11 @@ export default function FriendAddOverlay({ onClose }: FriendAddOverlayProps) {
     if (!q) return;
     setSearching(true);
     setSearchError("");
-    setSearchResult(null);
-    setRequestSent(false);
+    setSearchResults([]);
     try {
       const res = await chatApi.resolve(q);
-      setSearchResult(res.result);
+      setSearchResults(res.results ?? []);
+      if ((res.results ?? []).length === 0) setSearchError("Kein Nutzer gefunden");
     } catch (e: any) {
       setSearchError(e?.message ?? "Nicht gefunden");
     } finally {
@@ -57,13 +57,12 @@ export default function FriendAddOverlay({ onClose }: FriendAddOverlayProps) {
   };
 
   const handleSendRequest = async (wallet: string) => {
-    setRequestSent(false);
     try {
       await apiFetch("/api/v1/chat/contacts/request", {
         method: "POST",
         body: JSON.stringify({ to: wallet }),
       });
-      setRequestSent(true);
+      setSentWallets(prev => new Set([...prev, wallet]));
     } catch (e: any) {
       setSearchError(e?.message ?? "Fehler beim Senden");
     }
@@ -131,45 +130,54 @@ export default function FriendAddOverlay({ onClose }: FriendAddOverlayProps) {
           </button>
         </div>
 
-        {/* Search Result */}
-        {searchResult && (
-          <div style={{
-            background: "var(--bg-surface)", borderRadius: 12, padding: 14,
-            border: "1px solid var(--border-default)", marginBottom: 16,
-            display: "flex", alignItems: "center", gap: 12,
-          }}>
-            <div style={{
-              width: 40, height: 40, borderRadius: "50%",
-              background: "var(--accent)", display: "flex", alignItems: "center", justifyContent: "center",
-              fontSize: 16, fontWeight: 700, color: "#fff", flexShrink: 0,
-            }}>
-              {searchResult.username?.[0]?.toUpperCase() ?? "?"}
-            </div>
-            <div style={{ flex: 1, minWidth: 0 }}>
-              <p style={{ fontSize: 14, fontWeight: 600, color: "var(--text-primary)" }}>{searchResult.username}</p>
-              <p style={{ fontSize: 11, fontFamily: "monospace", color: "var(--text-muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                {shortAddr(searchResult.wallet)}
-              </p>
-            </div>
-            {requestSent ? (
-              <span style={{ display: "flex", alignItems: "center", gap: 4, fontSize: 12, color: "var(--green)", fontWeight: 600 }}><Check size={14} /> Angesendet</span>
-            ) : (
-              <button
-                onClick={() => handleSendRequest(searchResult.wallet)}
-                style={{
-                  padding: "7px 14px", borderRadius: 8,
-                  background: "var(--accent)", border: "none", color: "var(--text-inverse)",
-                  cursor: "pointer", fontSize: 12, fontWeight: 600,
-                  display: "flex", alignItems: "center", gap: 5,
-                }}
-              >
-                <UserPlus size={14} /> Hinzufügen
-              </button>
-            )}
+        {/* Search Results */}
+        {searchResults.length > 0 && (
+          <div style={{ marginBottom: 16 }}>
+            {searchResults.map((r, idx) => (
+              <div key={r.wallet || idx} style={{
+                background: "var(--bg-surface)", borderRadius: 12, padding: 10,
+                border: "1px solid var(--border-default)", marginBottom: 6,
+                display: "flex", alignItems: "center", gap: 10,
+              }}>
+                <div style={{
+                  width: 36, height: 36, borderRadius: "50%",
+                  background: "var(--accent)", display: "flex", alignItems: "center", justifyContent: "center",
+                  fontSize: 15, fontWeight: 700, color: "#fff", flexShrink: 0,
+                }}>
+                  {(r.name || r.wallet)?.[0]?.toUpperCase() ?? "?"}
+                </div>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <p style={{ fontSize: 13, fontWeight: 600, color: "var(--text-primary)" }}>{r.name || "Unbekannt"}</p>
+                  {r.bio ? (
+                    <p style={{ fontSize: 11, color: "var(--text-muted)", lineHeight: 1.3, marginBottom: 2 }}>{r.bio}</p>
+                  ) : null}
+                  <p style={{ fontSize: 10, fontFamily: "monospace", color: "var(--text-muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    {shortAddr(r.wallet)}
+                  </p>
+                </div>
+                {sentWallets.has(r.wallet) ? (
+                  <span style={{ fontSize: 11, color: "var(--green)", fontWeight: 600, flexShrink: 0, display: "flex", alignItems: "center", gap: 3 }}>
+                    <Check size={12} /> Gesendet
+                  </span>
+                ) : (
+                  <button
+                    onClick={() => handleSendRequest(r.wallet)}
+                    style={{
+                      padding: "6px 12px", borderRadius: 8,
+                      background: "var(--accent)", border: "none", color: "var(--text-inverse)",
+                      cursor: "pointer", fontSize: 11, fontWeight: 600,
+                      display: "flex", alignItems: "center", gap: 4, flexShrink: 0,
+                    }}
+                  >
+                    <UserPlus size={12} /> Anfrage
+                  </button>
+                )}
+              </div>
+            ))}
           </div>
         )}
 
-        {searchError && (
+        {searchError && searchResults.length === 0 && !searching && (
           <div style={{ background: "var(--red-bg)", border: "1px solid rgba(217,91,91,0.3)", borderRadius: 8, padding: "9px 12px", fontSize: 12, color: "var(--red)", marginBottom: 16 }}>
             {searchError}
           </div>
