@@ -3,7 +3,7 @@
 // Handles: Ringing, Connected, Ended states
 // with Mute, Duration, Hangup controls
 
-import { Phone, PhoneOff, Mic, MicOff, XCircle } from "lucide-react";
+import { Phone, PhoneOff, Mic, MicOff } from "lucide-react";
 import type { CallState } from "../../hooks/useWebRTC";
 
 interface CallUIProps {

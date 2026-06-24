@@ -209,8 +209,12 @@ export function useWebRTC({
       // ═══ Fehler unterscheiden ═══
       if (e?.message?.includes("Mikrofon") || e?.name === "NotAllowedError") {
         alert("Mikrofon-Zugriff verweigert. Bitte in den System-Einstellungen das Mikrofon für Stone freigeben.");
-      } else if (e?.message?.includes("not supported") || e?.name === "TypeError") {
-        alert("Anrufe werden in Tauri/Desktop noch nicht unterstützt. Bitte im Browser testen.");
+      } else if (e?.message?.includes("not supported") || e?.name === "TypeError" || e?.message?.includes("not found")) {
+        alert(
+          "⚠️ Anrufe funktionieren nur im Browser (http://localhost:1420).\n\n" +
+          "Tauri Desktop nutzt WebViews, die kein Mikrofon unterstützen.\n" +
+          "Öffne http://localhost:1420 im Chrome/Safari für Sprachanrufe."
+        );
       } else {
         alert(`Anruf konnte nicht gestartet werden: ${e?.message || e}`);
       }
