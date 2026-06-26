@@ -10,7 +10,7 @@
 set -e
 export PATH="/opt/homebrew/opt/zig@0.14/bin:$PATH"
 echo "Zig version: $(zig version)"
-cd /Users/leon/stone-1
+cd /Users/leon/stone
 
 ARCH="${1:-all}"
 BINS="--bin stone-master --bin stone-setup"

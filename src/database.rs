@@ -487,19 +487,16 @@ impl Database {
     pub fn load_organizations(&self) -> Result<Vec<crate::organization::Organization>, rusqlite::Error> {
         let conn = self.conn.lock().unwrap_or_else(|e| e.into_inner());
         let mut stmt = conn.prepare("SELECT full_json FROM organizations ORDER BY name")?;
-        let orgs = stmt.query_map([], |row| {
+        let orgs: Vec<crate::organization::Organization> = stmt.query_map([], |row| {
             let json: String = row.get(0)?;
-            Ok(serde_json::from_str(&json).unwrap_or_else(|_| {
-                crate::organization::Organization {
-                    id: String::new(), name: String::new(), description: String::new(),
-                    owner_id: String::new(), created_at: 0,
-                    members: vec![], channels: vec![], invites: vec![],
-                    chat_messages: vec![], encrypted_org_key: String::new(),
-                    org_key_nonce: String::new(), chain_hash: String::new(),
-                    chain_block_index: 0, chain_block_hash: String::new(),
+            match serde_json::from_str(&json) {
+                Ok(org) => Ok(Some(org)),
+                Err(e) => {
+                    eprintln!("[db] ⚠️ load_organizations: full_json konnte nicht deserialisiert werden: {e}");
+                    Ok(None)
                 }
-            }))
-        })?.filter_map(|r| r.ok()).collect();
+            }
+        })?.filter_map(|r| r.ok().flatten()).collect();
         Ok(orgs)
     }
 

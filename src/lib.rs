@@ -22,3 +22,4 @@ pub mod updater;
 pub mod watchdog;
 pub mod pop_mining;
 pub mod document_pool;
+pub mod public_ip_watchdog;

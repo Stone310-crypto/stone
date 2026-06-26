@@ -266,7 +266,9 @@ pub fn save_orgs(orgs: &[Organization]) {
     }
     // Parallel in SQLite speichern
     if let Some(db) = crate::database::global_db() {
-        let _ = db.save_organizations(orgs);
+        if let Err(e) = db.save_organizations(orgs) {
+            eprintln!("[db] ❌ save_orgs() SQLite-Fehler: {e}");
+        }
     }
 }
 

@@ -718,9 +718,13 @@ impl MessagePool {
 
         // Parallel in SQLite speichern (best-effort)
         if let Some(db) = crate::database::global_db() {
-            let _ = db.save_sequence_state(&inner.seq_state);
+            if let Err(e) = db.save_sequence_state(&inner.seq_state) {
+                eprintln!("[db] ❌ save_sequence_state() SQLite-Fehler: {e}");
+            }
             let pending: Vec<PooledMessage> = inner.queue.iter().cloned().collect();
-            let _ = db.save_pool_messages(&pending);
+            if let Err(e) = db.save_pool_messages(&pending) {
+                eprintln!("[db] ❌ save_pool_messages() SQLite-Fehler: {e}");
+            }
         }
     }
 }

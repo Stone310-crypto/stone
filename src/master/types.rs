@@ -206,6 +206,13 @@ pub enum NodeEvent {
         to_wallet: String,
         timestamp: i64,
     },
+    // ─── Netzwerk-Events ─────────────────────────────────────────────────────
+    /// Öffentliche IPv4-Adresse hat sich geändert
+    PublicIpChanged {
+        old_ip: String,
+        new_ip: String,
+        timestamp: i64,
+    },
 }
 
 // ─── Event-Bus ───────────────────────────────────────────────────────────────

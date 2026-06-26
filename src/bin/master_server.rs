@@ -428,6 +428,9 @@ async fn main() {
     MasterNodeState::start_heartbeat(node.clone(), HEARTBEAT_INTERVAL);
     spawn_auto_sync_task(node.clone(), api_key.clone(), users.clone(), orgs.clone(), chat_index_arc.clone());
 
+    // Public-IP Watchdog: erkennt Änderungen der öffentlichen IPv4 (stündlich)
+    stone::public_ip_watchdog::spawn_ip_watchdog(node.clone());
+
     // Auto-Block-Timer: produziert nach auto_timeout_secs einen Block, wenn
     // kein CPU-Miner und kein aktiver Minecraft-PoP-Server verbunden ist.
     let pop_mining_shared = stone::pop_mining::PopMiningState::new();
@@ -436,6 +439,22 @@ async fn main() {
     // Peer-Discovery: Bei Bootstrap-Nodes registrieren & Health-Check starten
     bootstrap_announce(&node).await;
     spawn_peer_health_task(node.clone());
+
+    // Public-IP-Change-Listener: Bei IP-Änderung Peers neu registrieren
+    {
+        let node_ip = node.clone();
+        tokio::spawn(async move {
+            let mut rx = node_ip.events.subscribe();
+            loop {
+                if let Ok(event) = rx.recv().await {
+                    if matches!(event, stone::master::NodeEvent::PublicIpChanged { .. }) {
+                        println!("[ip-watchdog] 🔄 Registriere Node mit neuer IP bei Bootstrap-Peers...");
+                        bootstrap_announce(&node_ip).await;
+                    }
+                }
+            }
+        });
+    }
 
     // Mempool-Eviction: abgelaufene TXs und known_ids periodisch bereinigen
     {

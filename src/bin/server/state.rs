@@ -588,7 +588,9 @@ pub fn save_peers(peers: &[PeerInfo]) {
     }
     // Parallel in SQLite speichern
     if let Some(db) = stone::database::global_db() {
-        let _ = db.save_peers(peers);
+        if let Err(e) = db.save_peers(peers) {
+            eprintln!("[db] ❌ save_peers() SQLite-Fehler: {e}");
+        }
     }
 }
 
@@ -624,7 +626,9 @@ pub fn save_trust(state: &AppState) {
     }
     // Parallel in SQLite speichern
     if let Some(db) = stone::database::global_db() {
-        let _ = db.save_trust(&data.registry, &data.history);
+        if let Err(e) = db.save_trust(&data.registry, &data.history) {
+            eprintln!("[db] ❌ save_trust() SQLite-Fehler: {e}");
+        }
     }
 }
 

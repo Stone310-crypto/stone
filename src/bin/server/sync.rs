@@ -649,7 +649,10 @@ async fn sync_orgs_from_peer(node: &Arc<MasterNodeState>, peer_url: &str) {
     let orgs_list = match body.get("organizations") { Some(v) => v, None => return };
     let orgs: Vec<Organization> = match serde_json::from_value(orgs_list.clone()) {
         Ok(o) => o,
-        Err(_) => return,
+        Err(e) => {
+            eprintln!("[db-sync] ❌ Orgs-Deserialisierung von {peer_url} fehlgeschlagen: {e}");
+            return;
+        }
     };
 
     if !orgs.is_empty() {
@@ -678,7 +681,10 @@ async fn sync_peers_from_peer(node: &Arc<MasterNodeState>, peer_url: &str) {
     let peers_raw = match body.get("peers") { Some(v) => v, None => return };
     let peers: Vec<PeerInfo> = match serde_json::from_value(peers_raw.clone()) {
         Ok(p) => p,
-        Err(_) => return,
+        Err(e) => {
+            eprintln!("[db-sync] ❌ Peers-Deserialisierung von {peer_url} fehlgeschlagen: {e}");
+            return;
+        }
     };
 
     if !peers.is_empty() {

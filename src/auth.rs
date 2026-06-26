@@ -55,7 +55,11 @@ pub fn save_users(users: &[User]) {
         let _ = fs::create_dir_all(data_dir());
         let _ = fs::write(users_file(), json);
     }
-    if let Some(db) = crate::database::global_db() { let _ = db.save_users(users); }
+    if let Some(db) = crate::database::global_db() {
+        if let Err(e) = db.save_users(users) {
+            eprintln!("[db] ❌ save_users() SQLite-Fehler: {e}");
+        }
+    }
 }
 
 pub fn create_user_with_phrase(name: &str) -> (User, String) {
