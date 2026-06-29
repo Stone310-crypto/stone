@@ -11,6 +11,7 @@ import NodeView from "./views/node/NodeView";
 import ProfileView from "./views/profile/ProfileView";
 import ChatView from "./views/chat/ChatView";
 import WalletView from "./views/wallet/WalletView";
+import ExtensionsView from "./views/extensions/ExtensionsView";
 import ProfileEditOverlay from "./views/profile/ProfileEditOverlay";
 import FriendAddOverlay from "./views/chat/FriendAddOverlay";
 import SettingsOverlay from "./views/profile/SettingsOverlay";
@@ -108,7 +109,7 @@ function MainApp() {
         setShowSettingsOverlay(true);
         return;
       }
-      if (["home", "explorer", "games", "node"].includes(s)) {
+      if (["home", "explorer", "games", "node", "extensions"].includes(s)) {
         setActiveSection(s);
         setActiveConversation(null);
         setSelectedServer(null);
@@ -129,6 +130,7 @@ function MainApp() {
     games: <GamesView />,
     node: <NodeView />,
     profile: <ProfileView />,
+    extensions: <ExtensionsView />,
   };
 
   return (

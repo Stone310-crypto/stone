@@ -1,18 +1,26 @@
 [package]
 name = "tauri-app"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+description = "Stone Dashboard — Modular Blockchain Client"
+authors = ["StoneChain"]
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [lib]
-# The `_lib` suffix may seem redundant but it is necessary
-# to make the lib name unique and wouldn't conflict with the bin name.
-# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "tauri_app_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+# ─── Feature Flags (Modulare Bauweise) ────────────────────────────────────
+[features]
+default = ["messenger", "wallet", "explorer", "node-manager"]
+messenger = []        # Chat + Server + Kontakte
+wallet = []           # Balance + Transaktionen
+explorer = []         # Onchain-Daten
+node-manager = []     # Node-Verbindung
+gaming = ["messenger", "wallet", "gaming-module"]   # + Spiele & Marktplatz
+gaming-module = []    # Nur das Gaming-Modul (ohne Core)
+full-node = ["messenger", "wallet", "node-module"]  # + P2P-Node
+node-module = []      # Nur das Node-Modul (ohne Core)
+all = ["messenger", "wallet", "explorer", "node-manager", "gaming-module", "node-module"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -34,4 +42,5 @@ tokio = { version = "1", features = ["full"] }
 sysinfo = "0.32"
 tauri-plugin-notification = "2"
 auto-launch = "0.5"
+libloading = "0.8"
 

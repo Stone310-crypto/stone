@@ -1,6 +1,8 @@
 mod file_upload;
 mod node_binary_downloader;
 mod node_manager;
+mod modules;
+mod extensions;
 use tauri::{AppHandle, Manager};
 use node_manager::{
     SharedNodeState, NodeState,
@@ -173,6 +175,17 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
         .setup(|app| {
+            // Modules-Verzeichnis erstellen (für optionale Module)
+            let _ = std::fs::create_dir_all(&modules::dirs_next());
+            let mods_dir = std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|p| p.join("modules")))
+                .unwrap_or_else(|| std::path::PathBuf::from("modules"));
+            let _ = std::fs::create_dir_all(&mods_dir);
+
+            // Extensions-Verzeichnis erstellen
+            let _ = std::fs::create_dir_all(&extensions::extensions_dir());
+
             let cfg = load_config(app.handle());
             let enabled = cfg.enabled;
             let mut state = NodeState::new();
@@ -219,6 +232,12 @@ pub fn run() {
             get_system_stats,
             get_auto_launch,
             set_auto_launch,
+            modules::get_modules,
+            modules::is_module_available_cmd,
+            extensions::get_installed_extensions,
+            extensions::get_available_extensions,
+            extensions::cmd_install_extension,
+            extensions::cmd_uninstall_extension,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

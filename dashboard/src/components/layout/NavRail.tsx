@@ -6,9 +6,10 @@ import {
   Blocks, Gamepad2, Server, User, Home as HomeIcon, Wallet,
   ChevronUp, ChevronDown,
   Plus, Hash, UserPlus, Settings,
-  Loader2, LogOut, Circle, Moon, MinusCircle,
+  Loader2, LogOut, Circle, Moon, MinusCircle, Download, Puzzle,
 } from "lucide-react";
 import { useNodeHealth } from "../../hooks/useNodeHealth";
+import { useModules, type ModuleInfo } from "../../hooks/useModules";
 import { chat, groups } from "../../api/stone";
 
 export interface SelectedServer {
@@ -74,16 +75,37 @@ function NetworkStatus() {
   );
 }
 
-// ── Top Navigation Bar ────────────────────────────────────────────────────────
+// ─── Top Navigation Bar (dynamisch, basierend auf Modulen) ──────────────────
 
-const topNavItems = [
-  { id: "explorer", icon: <Blocks size={16} />, label: "Blockchain" },
-  { id: "games", icon: <Gamepad2 size={16} />, label: "Spiele" },
-  { id: "node", icon: <Server size={16} />, label: "Node" },
-];
+const navIcons: Record<string, ReactNode> = {
+  explorer: <Blocks size={16} />,
+  games: <Gamepad2 size={16} />,
+  node: <Server size={16} />,
+  gaming: <Gamepad2 size={16} />,
+};
+
+const navLabels: Record<string, string> = {
+  explorer: "Blockchain",
+  games: "Spiele",
+  node: "Node",
+  gaming: "Gaming",
+};
 
 function TopNavBar({ onNavigate }: { onNavigate: (section: string) => void }) {
   const [collapsed, setCollapsed] = useState(false);
+  const { optionalModules } = useModules();
+
+  // Baue Nav-Items aus verfügbaren Modulen: Core (explorer) + optionals
+  const navItems: { id: string; icon: ReactNode; label: string; available: boolean; mod?: ModuleInfo }[] = [
+    { id: "explorer", icon: <Blocks size={16} />, label: "Blockchain", available: true },
+    ...optionalModules.map((mod) => ({
+      id: mod.name,
+      icon: navIcons[mod.name] ?? <Server size={16} />,
+      label: navLabels[mod.name] ?? mod.display_name,
+      available: mod.available,
+      mod,
+    })),
+  ];
 
   return (
     <div style={{
@@ -125,19 +147,25 @@ function TopNavBar({ onNavigate }: { onNavigate: (section: string) => void }) {
 
         <div style={{ width: 1, height: 18, background: "var(--border)", margin: "0 4px" }} />
 
-        {/* Nav items */}
-        {topNavItems.map((item) => (
+        {/* Nav items (dynamic) */}
+        {navItems.map((item) => (
           <button
             key={item.id}
-            onClick={() => onNavigate(item.id)}
-            title={item.label}
+            onClick={() => {
+              if (item.available) {
+                onNavigate(item.id === "gaming" ? "games" : item.id === "node" ? "node" : item.id);
+              }
+            }}
+            title={item.available ? item.label : `${item.label} — Nicht installiert (klicken zum Herunterladen)`}
             style={{
               display: "flex", alignItems: "center", gap: 6,
               padding: "4px 10px", borderRadius: 6,
               background: "transparent", border: "none",
-              color: "var(--text-secondary)", cursor: "pointer",
+              color: item.available ? "var(--text-secondary)" : "var(--text-muted)",
+              cursor: item.available ? "pointer" : "pointer",
               fontSize: 12, fontWeight: 500,
               transition: "all 0.12s",
+              opacity: item.available ? 1 : 0.55,
             }}
             onMouseEnter={(e) => {
               (e.currentTarget as HTMLElement).style.background = "rgba(255,255,255,0.05)";
@@ -145,15 +173,60 @@ function TopNavBar({ onNavigate }: { onNavigate: (section: string) => void }) {
             }}
             onMouseLeave={(e) => {
               (e.currentTarget as HTMLElement).style.background = "transparent";
-              (e.currentTarget as HTMLElement).style.color = "var(--text-secondary)";
+              (e.currentTarget as HTMLElement).style.color = item.available ? "var(--text-secondary)" : "var(--text-muted)";
             }}
           >
             {item.icon}
-            {!collapsed && item.label}
+            {!collapsed && (
+              <>
+                {item.label}
+                {!item.available && item.mod && (
+                  <span
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      import("../../hooks/useModules").then(({ downloadModule }) => downloadModule(item.mod!));
+                    }}
+                    title={`${item.mod.display_name} herunterladen (${item.mod.size_mb} MB)`}
+                    style={{
+                      display: "inline-flex", alignItems: "center", gap: 2,
+                      padding: "1px 6px", borderRadius: 8,
+                      background: "var(--accent)", color: "var(--text-inverse)",
+                      fontSize: 9, fontWeight: 700, cursor: "pointer",
+                    }}
+                  >
+                    <Download size={10} />
+                    {item.mod.size_mb}MB
+                  </span>
+                )}
+              </>
+            )}
           </button>
         ))}
 
         <div style={{ flex: 1 }} />
+
+        {/* ➕ Erweiterungen-Button */}
+        <button
+          onClick={() => onNavigate("extensions")}
+          title="Erweiterungen"
+          style={{
+            display: "flex", alignItems: "center", gap: 5,
+            padding: "4px 10px", borderRadius: 8,
+            background: "rgba(212,168,83,0.08)", border: "1px solid rgba(212,168,83,0.2)",
+            color: "var(--accent)", cursor: "pointer",
+            fontSize: 12, fontWeight: 600,
+            transition: "all 0.15s",
+          }}
+          onMouseEnter={(e) => {
+            (e.currentTarget as HTMLElement).style.background = "rgba(212,168,83,0.15)";
+          }}
+          onMouseLeave={(e) => {
+            (e.currentTarget as HTMLElement).style.background = "rgba(212,168,83,0.08)";
+          }}
+        >
+          <Puzzle size={14} />
+          {!collapsed && "Erweiterungen"}
+        </button>
 
         <NetworkStatus />
 
