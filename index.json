@@ -1,0 +1,44 @@
+[
+  {
+    "id": "gaming",
+    "name": "Gaming-Modul",
+    "description": "Spiele-Registrierung, Item-Trading, Marktplatz & In-Game-Assets",
+    "version": "1.0.0",
+    "icon": "🎮",
+    "rating": 4.8,
+    "reviews": 42,
+    "downloads": 1230,
+    "size_mb": 10,
+    "repository": "Stone310-crypto/gaming-extension",
+    "permissions": ["network", "storage"],
+    "author": "StoneChain"
+  },
+  {
+    "id": "dashboard",
+    "name": "Dashboard-Modul",
+    "description": "Grafiken, Statistiken & Node-Monitoring",
+    "version": "1.0.0",
+    "icon": "📊",
+    "rating": 4.2,
+    "reviews": 15,
+    "downloads": 890,
+    "size_mb": 8,
+    "repository": "Stone310-crypto/dashboard-extension",
+    "permissions": ["network", "storage"],
+    "author": "StoneChain"
+  },
+  {
+    "id": "2fa",
+    "name": "2FA-Modul",
+    "description": "Zwei-Faktor-Authentifizierung für Wallet-Transaktionen",
+    "version": "1.0.0",
+    "icon": "🔐",
+    "rating": 4.9,
+    "reviews": 8,
+    "downloads": 340,
+    "size_mb": 3,
+    "repository": "Stone310-crypto/2fa-extension",
+    "permissions": ["wallet"],
+    "author": "StoneChain"
+  }
+]
