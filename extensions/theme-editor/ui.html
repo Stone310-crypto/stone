@@ -1,0 +1,141 @@
+<!DOCTYPE html><html lang="de"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Theme Editor v2</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#0f1117;color:#e8e4df;font-size:12px;overflow:hidden;height:100vh;display:flex;flex-direction:column}
+.toolbar{display:flex;align-items:center;gap:8px;padding:8px 12px;background:#1a1c26;border-bottom:1px solid rgba(255,255,255,0.08);flex-shrink:0}
+.toolbar h1{font-size:15px;font-weight:700;margin-right:8px}
+.btn{padding:5px 10px;border-radius:6px;border:none;font-size:11px;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:4px}
+.btn-primary{background:#d4a853;color:#000}.btn-primary:hover{opacity:.9}
+.btn-secondary{background:rgba(255,255,255,0.08);color:#e8e4df}.btn-secondary:hover{background:rgba(255,255,255,0.12)}
+.btn-green{background:#5a9e6f;color:#fff}.btn-green:hover{opacity:.9}
+.btn-danger{background:rgba(239,68,68,0.15);color:#d95b5b}
+.main{display:flex;flex:1;overflow:hidden}
+.left{width:420px;flex-shrink:0;display:flex;flex-direction:column;overflow:hidden}
+.editor-scroll{flex:1;overflow-y:auto;padding:8px;border-right:1px solid rgba(255,255,255,0.08);background:#0f1117}
+.designs-panel{max-height:0;overflow:hidden;transition:max-height .3s;background:#14161f;border-right:1px solid rgba(255,255,255,0.08);font-size:11px}
+.designs-panel.open{max-height:300px;overflow-y:auto}
+.designs-panel .dp-header{display:flex;align-items:center;justify-content:space-between;padding:8px 10px;background:#1a1c26;border-bottom:1px solid rgba(255,255,255,0.08);position:sticky;top:0;z-index:1}
+.designs-panel .dp-item{display:flex;align-items:center;justify-content:space-between;padding:6px 10px;cursor:pointer;border-bottom:1px solid rgba(255,255,255,0.04)}
+.designs-panel .dp-item:hover{background:rgba(255,255,255,0.04)}
+.designs-panel .dp-item.active{background:rgba(212,168,83,0.12);border-left:2px solid #d4a853}
+.right{flex:1;display:flex;flex-direction:column;overflow:hidden}
+.preview-bar{display:flex;align-items:center;gap:8px;padding:6px 10px;background:#1a1c26;border-bottom:1px solid rgba(255,255,255,0.08);font-size:11px;color:#b8b4ae;flex-shrink:0}
+.preview-container{flex:1;overflow:hidden}
+.comp-tabs{display:flex;gap:3px;margin-bottom:10px;flex-wrap:wrap}
+.btn-tab{padding:4px 10px;border-radius:4px;border:1px solid rgba(255,255,255,0.12);background:transparent;color:#b8b4ae;cursor:pointer;font-size:10px;font-weight:500}
+.btn-tab.active,.btn-tab:hover{background:#d4a853;color:#000;border-color:#d4a853}
+.css-editor{width:100%;min-height:100px;background:#2f3342;border:1px solid rgba(255,255,255,0.08);border-radius:6px;padding:10px;font-family:monospace;font-size:11px;color:#e8e4df;resize:vertical;outline:none}
+.vars-scroll{max-height:420px;overflow-y:auto}
+.var-row{display:flex;align-items:center;gap:6px;padding:3px 0}
+.var-label{width:130px;font-size:10px;color:#b8b4ae;font-family:monospace;flex-shrink:0}
+.var-input{flex:1;padding:3px 6px;border-radius:3px;background:#2f3342;border:1px solid rgba(255,255,255,0.08);color:#e8e4df;font-size:11px;font-family:monospace;outline:none}
+.var-input:focus{border-color:#d4a853}
+.var-color{width:22px;height:22px;border-radius:3px;border:1px solid rgba(255,255,255,0.12);cursor:pointer;padding:0;flex-shrink:0}
+.var-swatch{width:14px;height:14px;border-radius:2px;border:1px solid rgba(255,255,255,0.12);flex-shrink:0}
+.var-color::-webkit-color-swatch-wrapper{padding:0}.var-color::-webkit-color-swatch{border:none;border-radius:2px}
+.preview-dash{padding:12px;height:100%;overflow:auto;font-family:-apple-system,BlinkMacSystemFont,sans-serif}
+.preview-dash .nav{display:flex;gap:8px;padding:8px;border-radius:8px;margin-bottom:8px;background:var(--bg-panel)}
+.preview-dash .nav-item{padding:4px 10px;border-radius:4px;font-size:11px;color:var(--text-secondary)}
+.preview-dash .nav-item.active{background:var(--accent);color:var(--text-inverse,#000)}
+.preview-dash .card{border-radius:8px;padding:12px;margin-bottom:8px;background:var(--bg-panel);border:1px solid var(--border-default)}
+.preview-dash .card h3{font-size:12px;margin-bottom:4px;color:var(--text-secondary)}
+.preview-dash .card .val{font-size:20px;font-weight:700;color:var(--text-primary)}
+.preview-dash .wallet-row{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid var(--border-default)}
+.preview-dash .btn-preview{padding:6px 12px;border-radius:6px;color:var(--text-inverse,#000);border:none;font-size:11px;font-weight:600;background:var(--accent)}
+.preview-dash .input-preview{padding:6px 10px;border-radius:6px;font-size:11px;background:var(--bg-input);border:1px solid var(--border-default);color:var(--text-primary)}
+.status{font-size:10px;color:#6e6b65}.status.changed{color:#d4a853;font-weight:600}
+.gr-hd{font-size:11px;font-weight:600;color:#b8b4ae;margin:10px 0 4px}
+.cur-val{font-size:9px;color:#5a9e6f;margin-left:4px}
+.dp-toggle{font-size:10px;color:#b8b4ae;cursor:pointer;display:flex;align-items:center;gap:4px;padding:6px 10px;background:#14161f;border-right:1px solid rgba(255,255,255,0.08);border-top:1px solid rgba(255,255,255,0.08);user-select:none}
+.dp-toggle:hover{color:#e8e4df}
+.toast{position:fixed;bottom:16px;right:16px;padding:10px 16px;border-radius:8px;font-size:12px;font-weight:600;z-index:99;animation:slideUp .3s ease;box-shadow:0 4px 12px rgba(0,0,0,0.3)}
+.toast-ok{background:#5a9e6f;color:#fff}
+.toast-err{background:#d95b5b;color:#fff}
+@keyframes slideUp{from{transform:translateY(20px);opacity:0}to{transform:translateY(0);opacity:1}}
+</style></head><body>
+<div class="toolbar">
+  <h1>🎨 Theme Editor</h1>
+  <span style="flex:1"></span>
+  <button class="btn btn-secondary" onclick="readCurrent()" title="Liest die aktuellen Theme-Werte vom Dashboard">📋 Aktuelle Werte</button>
+  <button class="btn btn-secondary" onclick="resetAll()">🔄 Reset</button>
+  <button class="btn btn-green" onclick="applyTheme()">✅ Übernehmen</button>
+  <button class="btn btn-primary" onclick="saveTheme()">💾 Speichern</button>
+  <span id="changed-count" class="status">Keine Änderungen</span>
+</div>
+<div class="main">
+<div class="left">
+  <div class="editor-scroll">
+    <div style="font-size:10px;color:#6e6b65;margin-bottom:6px">Komponente wählen:</div>
+    <div class="comp-tabs" id="comp-tabs"></div>
+    <div id="panel-global"><div class="vars-scroll" id="vars-container"></div></div>
+    <div id="panel-component" style="display:none">
+      <div style="margin-bottom:6px;font-size:11px;color:#b8b4ae">CSS für <strong id="comp-name">—</strong></div>
+      <textarea class="css-editor" id="comp-css" placeholder="/* Custom CSS für diese Komponente */" oninput="ucc()"></textarea>
+      <div style="margin-top:6px;font-size:10px;color:#6e6b65">Tailwind-Selektoren: <code style="color:#d4a853">.flex</code> <code style="color:#d4a853">button</code> <code style="color:#d4a853">input</code><br>Vorschau nutzt CSS-Variablen → oben bearbeiten.</div>
+    </div>
+    <details style="margin-top:10px"><summary style="font-size:11px;color:#b8b4ae;cursor:pointer">📝 Generiertes CSS</summary><textarea class="css-editor" id="css-output" readonly style="margin-top:4px;min-height:80px"></textarea></details>
+  </div>
+  <!-- My Designs Toggle -->
+  <div class="dp-toggle" onclick="toggleDesigns()" id="dp-toggle-btn">
+    <span id="dp-arrow">▶</span> 🎨 Meine Designs (<span id="dp-count">0</span>)
+  </div>
+  <div class="designs-panel" id="designs-panel">
+    <div class="dp-header">
+      <span>🎨 Meine Designs</span>
+      <button class="btn btn-secondary" onclick="refreshDesigns()" style="font-size:10px;padding:2px 6px" title="Neu laden">🔄</button>
+    </div>
+    <div id="designs-list" style="padding:4px 0">
+      <div style="padding:12px;color:#6e6b65;text-align:center;font-size:11px">Keine Designs gespeichert.<br>Speichere ein Theme mit "💾 Speichern".</div>
+    </div>
+  </div>
+</div>
+<div class="right">
+  <div class="preview-bar"><span>👁️ Live-Vorschau</span><span style="flex:1"></span><span style="font-size:10px;color:#6e6b65" id="preview-mode">Global</span></div>
+  <div class="preview-container"><div class="preview-dash" id="preview" style="background:var(--bg-root);color:var(--text-primary)"></div></div>
+</div></div>
+<div id="toast" style="display:none"></div>
+<script>
+let _id=0;const _p={};window.addEventListener('message',e=>{if(e.data?.id&&_p[e.data.id]){if(e.data.ok)_p[e.data.id].resolve(e.data.result);else _p[e.data.id].reject(new Error(e.data.error));delete _p[e.data.id]}});function invoke(cmd,args){return new Promise((r,j)=>{const id=++_id;_p[id]={resolve:r,reject:j};window.parent.postMessage({type:'tauri-invoke',id,cmd,args},'*')})}
+function toast(msg,ok){var t=document.getElementById('toast');t.textContent=msg;t.className='toast '+(ok?'toast-ok':'toast-err');t.style.display='block';setTimeout(function(){t.style.display='none'},3000)}
+
+const COMPS=[{id:'global',name:'🌐 Global',css:''},{id:'wallet',name:'💰 Wallet',css:''},{id:'chat',name:'💬 Chat',css:''},{id:'settings',name:'⚙️ Settings',css:''},{id:'navbar',name:'🧭 NavBar',css:''},{id:'explorer',name:'🔍 Explorer',css:''},{id:'profile',name:'👤 Profil',css:''}];
+let active='global',cv={},designsOpen=false,loadedDesignName=null;
+const VARS=[{s:'Hintergründe',v:[{n:'--bg-root',d:'#0f1117',l:'Root'},{n:'--bg-panel',d:'#1a1c26',l:'Panel'},{n:'--bg-main',d:'#1e202a',l:'Main'},{n:'--bg-input',d:'#2f3342',l:'Input'}]},{s:'Akzent',v:[{n:'--accent',d:'#d4a853',l:'Primär'},{n:'--accent-hover',d:'#e0b864',l:'Hover'}]},{s:'Farben',v:[{n:'--green',d:'#5a9e6f',l:'Erfolg'},{n:'--red',d:'#d95b5b',l:'Fehler'},{n:'--blue',d:'#6b9cc4',l:'Info'}]},{s:'Text',v:[{n:'--text-primary',d:'#e8e4df',l:'Primär'},{n:'--text-secondary',d:'#b8b4ae',l:'Sekundär'},{n:'--text-muted',d:'#6e6b65',l:'Gedimmt'},{n:'--text-inverse',d:'#0f1117',l:'Invers'}]},{s:'Rahmen',v:[{n:'--border-default',d:'rgba(255,255,255,0.08)',l:'Default'},{n:'--border-strong',d:'rgba(255,255,255,0.12)',l:'Strong'}]}];
+
+function bt(){document.getElementById('comp-tabs').innerHTML=COMPS.map(function(c){return'<button class="btn-tab'+(c.id===active?' active':'')+'" onclick="sc(\''+c.id+'\')">'+c.name+'</button>'}).join('')}
+function sc(id){active=id;bt();document.getElementById('panel-global').style.display=id==='global'?'block':'none';document.getElementById('panel-component').style.display=id==='global'?'none':'block';if(id!=='global'){var c=COMPS.find(function(x){return x.id===id});document.getElementById('comp-name').textContent=c.name;document.getElementById('comp-css').value=c.css;document.getElementById('preview-mode').textContent=c.name}else{document.getElementById('preview-mode').textContent='Global'}up()}
+function bv(){var h='';VARS.forEach(function(s){h+='<div class="gr-hd">'+s.s+'</div>';s.v.forEach(function(v){var val=cv[v.n]!==undefined?cv[v.n]:v.d;var isDef=cv[v.n]===undefined;h+='<div class="var-row"><span class="var-label">'+v.n+(isDef?' <span class="cur-val">(Standard)</span>':' <span class="cur-val" style="color:#d4a853">(geändert)</span>')+'</span><div class="var-swatch" style="background:'+val+'"></div><input type="color" class="var-color" value="'+th(val)+'" onchange="uv(\''+v.n+'\',this.value)"><input type="text" class="var-input" value="'+val+'" onchange="uv(\''+v.n+'\',this.value)" oninput="uvl(\''+v.n+'\',this.value)"><span style="font-size:10px;color:#6e6b65;width:50px">'+v.l+'</span></div>'})});document.getElementById('vars-container').innerHTML=h}
+function th(c){if(c.startsWith('#'))return c;var x=document.createElement('canvas');var ctx=x.getContext('2d');if(!ctx)return'#000';ctx.fillStyle=c;return ctx.fillStyle}
+function fd(n){for(var s of VARS)for(var v of s.v)if(v.n===n)return v.d;return''}
+function uv(n,val){if(val===fd(n)){delete cv[n]}else{cv[n]=val}applyVar(n,cv[n]!==undefined?cv[n]:fd(n));bv();us();up();uco();markDesignModified()}
+function uvl(n,val){applyVar(n,val||fd(n));up()}
+function applyVar(n,val){document.documentElement.style.setProperty(n,val)}
+function applyAllVars(){for(var s of VARS)for(var v of s.v)applyVar(v.n,cv[v.n]!==undefined?cv[v.n]:v.d)}
+function us(){var c=Object.keys(cv).length+COMPS.filter(function(x){return x.css}).length;var el=document.getElementById('changed-count');el.textContent=c?c+' Änderungen':'Keine Änderungen';el.className=c?'status changed':'status'}
+function ucc(){var c=COMPS.find(function(x){return x.id===active});if(c)c.css=document.getElementById('comp-css').value;us();up();uco();markDesignModified()}
+function uco(){var l=[':root {'];for(var s of VARS){l.push('  /* '+s.s+' */');for(var v of s.v)l.push('  '+v.n+': '+(cv[v.n]!==undefined?cv[v.n]:v.d)+';')}l.push('}');for(var c of COMPS){if(c.css){l.push('');l.push('/* '+c.name+' */');l.push(c.css)}}document.getElementById('css-output').value=l.join('\n')}
+function markDesignModified(){if(loadedDesignName){var items=document.querySelectorAll('.dp-item');for(var i=0;i<items.length;i++){if(items[i].dataset.name===loadedDesignName){items[i].querySelector('.dp-name').innerHTML=loadedDesignName+' <span style="color:#d4a853">*</span>';break}}}}
+function up(){var p=document.getElementById('preview');var html='';if(active==='global'){html='<div class="nav"><span class="nav-item">💬 Chat</span><span class="nav-item active">💰 Wallet</span><span class="nav-item">🔍 Explorer</span></div><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px"><div class="card"><h3>💰 Balance</h3><div class="val">1.234 STONE</div></div><div class="card"><h3>🔗 Block</h3><div class="val">#42</div></div></div><div class="card"><h3>TXs</h3><div class="wallet-row"><span>TX abc...</span><span style="color:var(--green)">+50</span></div><div class="wallet-row"><span>TX def...</span><span style="color:var(--red)">-10</span></div></div><div style="display:flex;gap:8px;margin-top:8px"><input class="input-preview" placeholder="Empfänger..." style="flex:1"><button class="btn-preview">Senden</button></div>'}else if(active==='wallet'){html='<h3 style="margin-bottom:8px">💰 Wallet</h3><div class="card"><h3>Balance</h3><div class="val">1.234 STONE</div></div><div class="card"><h3>TXs</h3><div class="wallet-row"><span>TX abc...</span><span style="color:var(--green)">+50</span></div><div class="wallet-row"><span>TX def...</span><span style="color:var(--red)">-10</span></div></div><div style="display:flex;gap:8px"><input class="input-preview" placeholder="Wallet" style="flex:1"><button class="btn-preview">Senden</button></div>'}else if(active==='chat'){html='<h3 style="margin-bottom:8px">💬 Chat</h3><div style="background:var(--bg-panel);border-radius:8px;padding:8px;margin-bottom:4px;border:1px solid var(--border-default)"><span style="color:var(--accent)">User1:</span> Hey!</div><div style="background:var(--bg-panel);border-radius:8px;padding:8px;margin-bottom:4px;border:1px solid var(--border-default)"><span style="color:var(--accent)">User2:</span> Alles gut!</div><div style="display:flex;gap:8px;margin-top:8px"><input class="input-preview" placeholder="Nachricht..." style="flex:1"><button class="btn-preview">Senden</button></div>'}else if(active==='settings'){html='<h3 style="margin-bottom:8px">⚙️ Settings</h3><div class="card"><h3>Profil</h3><div class="wallet-row"><span>Name</span><span style="color:var(--text-primary)">Alice</span></div><div class="wallet-row"><span>Sprache</span><span style="color:var(--text-primary)">Deutsch</span></div></div><div style="display:flex;gap:8px"><input class="input-preview" placeholder="Name" style="flex:1"><button class="btn-preview">Speichern</button></div>'}else if(active==='navbar'){html='<h3 style="margin-bottom:8px">🧭 NavBar</h3><div class="nav"><span class="nav-item">🏠 Home</span><span class="nav-item">💬 Chat</span><span class="nav-item active">💰 Wallet</span><span class="nav-item">🔍 Explorer</span></div><div class="card"><h3>Inhalt</h3><div class="val">Seite: Wallet</div></div>'}else if(active==='explorer'){html='<h3 style="margin-bottom:8px">🔍 Explorer</h3><div class="card"><h3>🔗 Block #42</h3><div class="wallet-row"><span>Hash</span><span style="font-family:monospace;color:var(--text-muted)">0xabc...</span></div><div class="wallet-row"><span>TXs</span><span style="color:var(--green)">12</span></div></div><input class="input-preview" placeholder="Block/Adresse suchen..." style="width:100%">'}else if(active==='profile'){html='<h3 style="margin-bottom:8px">👤 Profil</h3><div class="card"><div class="wallet-row"><span>Name</span><span style="color:var(--text-primary)">Alice</span></div><div class="wallet-row"><span>Rolle</span><span style="color:var(--accent)">Admin</span></div><div class="wallet-row"><span>XP</span><span style="color:var(--green)">1.500</span></div></div><button class="btn-preview">Profil bearbeiten</button>'}p.innerHTML=html}
+
+function resetAll(){cv={};loadedDesignName=null;document.documentElement.style.cssText='';applyAllVars();bv();sc('global');document.getElementById('css-output').value='';up();us();refreshDesigns()}
+
+async function readCurrent(){try{var css=await invoke('get_theme_css',{extensionId:'theme-editor'});if(css){var rootMatch=css.match(/:root\s*\{([^}]+)\}/);if(rootMatch){var block=rootMatch[1];VARS.forEach(function(s){s.v.forEach(function(v){var re=new RegExp(v.n+'\\s*:\\s*([^;]+)');var m=block.match(re);if(m){var val=m[1].trim();if(val!==v.d){cv[v.n]=val;applyVar(v.n,val)}}})});bv();up();us();uco();toast('Aktuelle Theme-Werte geladen!',true)}else{toast('Keine :root-Variablen gefunden.',false)}}else{toast('Kein gespeichertes Theme.',false)}}catch(e){toast('Fehler: '+e,false)}}
+
+async function applyTheme(){try{var css=document.getElementById('css-output').value;if(!css.trim()){toast('Kein CSS zum Übernehmen.',false);return}await invoke('write_theme_css',{extensionId:'theme-editor',css:css});try{window.parent.localStorage.setItem('stone-theme','theme-editor')}catch(e){}toast('Theme übernommen! ✅',true)}catch(e){toast('Fehler: '+e,false)}}
+
+async function saveTheme(){var dname=loadedDesignName||'';var name=prompt('Design-Name:',dname||'Mein-Design');if(!name)return;try{var css=document.getElementById('css-output').value;var path=await invoke('save_theme_file',{name:name,css:css});loadedDesignName=name;toast('Gespeichert: '+name+'.css',true);refreshDesigns();us()}catch(e){toast('Fehler beim Speichern: '+e,false)}}
+
+// ── My Designs ─────────────────────────────────────────────────────
+function toggleDesigns(){designsOpen=!designsOpen;var p=document.getElementById('designs-panel');var a=document.getElementById('dp-arrow');if(designsOpen){p.classList.add('open');a.textContent='▼';refreshDesigns()}else{p.classList.remove('open');a.textContent='▶'}}
+
+async function refreshDesigns(){try{var themes=await invoke('list_saved_themes',{});var list=document.getElementById('designs-list');var count=document.getElementById('dp-count');count.textContent=themes.length;if(!themes.length){list.innerHTML='<div style="padding:12px;color:#6e6b65;text-align:center;font-size:11px">Keine Designs gespeichert.<br>Speichere ein Theme mit "💾 Speichern".</div>';return}var h='';for(var i=0;i<themes.length;i++){var t=themes[i];var isActive=t.name===loadedDesignName;h+='<div class="dp-item'+(isActive?' active':'')+'" data-name="'+t.name+'" onclick="loadDesign(\''+t.name.replace(/'/g,"\\'")+'\')"><span class="dp-name">'+t.name+(isActive?' <span style="color:#d4a853">*</span>':'')+'</span><span style="display:flex;gap:4px;align-items:center"><span style="font-size:10px;color:#6e6b65">'+(t.size/1024).toFixed(1)+' KB</span><button class="btn btn-danger" style="font-size:10px;padding:1px 5px" onclick="event.stopPropagation();deleteDesign(\''+t.name.replace(/'/g,"\\'")+'\')" title="Löschen">🗑</button></span></div>'}list.innerHTML=h}catch(e){console.warn('list_saved_themes failed:',e)}}
+
+async function loadDesign(name){try{var css=await invoke('load_saved_theme',{name:name});if(css){loadedDesignName=name;cv={};COMPS.forEach(function(c){c.css=''});var rootMatch=css.match(/:root\s*\{([^}]+)\}/);if(rootMatch){var block=rootMatch[1];VARS.forEach(function(s){s.v.forEach(function(v){var re=new RegExp(v.n+'\\s*:\\s*([^;]+)');var m=block.match(re);if(m){var val=m[1].trim();if(val!==v.d){cv[v.n]=val;applyVar(v.n,val)}}})})}bv();up();us();uco();sc('global');refreshDesigns();toast('Design geladen: '+name,true)}}catch(e){toast('Fehler: '+e,false)}}
+
+async function deleteDesign(name){if(!confirm('Design "'+name+'" wirklich löschen?'))return;try{await invoke('delete_saved_theme',{name:name});if(loadedDesignName===name)loadedDesignName=null;toast('Gelöscht: '+name,true);refreshDesigns()}catch(e){toast('Fehler: '+e,false)}}
+
+// ── Publish to Store ────────────────────────────────────────────────
+async function publishToStore(){var name=loadedDesignName||'';if(!name){name=prompt('Design-Name für Veröffentlichung:','Mein-Design');if(!name)return}var author=prompt('Dein Name (Autor):','');if(!author)return;var desc=prompt('Beschreibung:','Ein Theme-Design für das Stone Dashboard');if(!desc)return;try{var css=document.getElementById('css-output').value;var result=await invoke('prepare_theme_publish',{name:name,css:css,author:author,description:desc});toast(result||'Bereit zum Hochladen!',true);alert('Theme-Dateien wurden vorbereitet.\n\nAls nächstes:\n1. Repository auf GitHub erstellen\n2. Release mit theme.css und ui.html erstellen\n3. Store index.json updaten\n\nOder manuell die Datei öffnen und pushen.');}catch(e){toast('Fehler: '+e,false)}}
+
+bt();bv();applyAllVars();sc('global');uco();
+</script></body></html>

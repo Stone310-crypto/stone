@@ -3,6 +3,7 @@ mod node_binary_downloader;
 mod node_manager;
 mod modules;
 mod extensions;
+mod gaming_proxy;
 use tauri::{AppHandle, Manager};
 use node_manager::{
     SharedNodeState, NodeState,
@@ -238,6 +239,24 @@ pub fn run() {
             extensions::get_available_extensions,
             extensions::cmd_install_extension,
             extensions::cmd_uninstall_extension,
+            extensions::rate_extension,
+            extensions::get_my_rating,
+            extensions::check_for_updates,
+            extensions::get_extension_ui,
+            extensions::get_theme_css,
+            extensions::list_themes,
+            extensions::write_theme_css,
+            extensions::save_theme_file,
+            extensions::list_saved_themes,
+            extensions::load_saved_theme,
+            extensions::delete_saved_theme,
+            extensions::prepare_theme_publish,
+            gaming_proxy::list_companies,
+            gaming_proxy::create_company,
+            gaming_proxy::list_games,
+            gaming_proxy::register_game,
+            gaming_proxy::company_games,
+            gaming_proxy::check_game_id,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

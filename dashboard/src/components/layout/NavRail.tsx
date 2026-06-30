@@ -6,10 +6,12 @@ import {
   Blocks, Gamepad2, Server, User, Home as HomeIcon, Wallet,
   ChevronUp, ChevronDown,
   Plus, Hash, UserPlus, Settings,
-  Loader2, LogOut, Circle, Moon, MinusCircle, Download, Puzzle,
+  Loader2, LogOut, Circle, Moon, MinusCircle, Download, Puzzle, Palette,
 } from "lucide-react";
 import { useNodeHealth } from "../../hooks/useNodeHealth";
 import { useModules, type ModuleInfo } from "../../hooks/useModules";
+import { useTheme } from "../../hooks/useTheme";
+import { invoke } from "@tauri-apps/api/core";
 import { chat, groups } from "../../api/stone";
 
 export interface SelectedServer {
@@ -82,6 +84,7 @@ const navIcons: Record<string, ReactNode> = {
   games: <Gamepad2 size={16} />,
   node: <Server size={16} />,
   gaming: <Gamepad2 size={16} />,
+  dashboard: <Blocks size={16} />,
 };
 
 const navLabels: Record<string, string> = {
@@ -89,18 +92,23 @@ const navLabels: Record<string, string> = {
   games: "Spiele",
   node: "Node",
   gaming: "Gaming",
+  dashboard: "Dashboard",
 };
 
 function TopNavBar({ onNavigate }: { onNavigate: (section: string) => void }) {
   const [collapsed, setCollapsed] = useState(false);
   const { optionalModules } = useModules();
+  const { activeTheme, applyTheme, loadInstalledThemes } = useTheme();
+  const [showThemeMenu, setShowThemeMenu] = useState(false);
+  const [themes, setThemes] = useState<{ id: string; name: string; icon: string }[]>([]);
+  const [editorInstalled, setEditorInstalled] = useState(false);
 
   // Baue Nav-Items aus verfügbaren Modulen: Core (explorer) + optionals
   const navItems: { id: string; icon: ReactNode; label: string; available: boolean; mod?: ModuleInfo }[] = [
     { id: "explorer", icon: <Blocks size={16} />, label: "Blockchain", available: true },
     ...optionalModules.map((mod) => ({
       id: mod.name,
-      icon: navIcons[mod.name] ?? <Server size={16} />,
+      icon: navIcons[mod.name] ?? <Puzzle size={16} />,
       label: navLabels[mod.name] ?? mod.display_name,
       available: mod.available,
       mod,
@@ -113,8 +121,9 @@ function TopNavBar({ onNavigate }: { onNavigate: (section: string) => void }) {
       borderBottom: "1px solid var(--border)",
       flexShrink: 0,
       transition: "height 0.2s ease",
-      overflow: "hidden",
+      overflow: "visible",
       height: collapsed ? 32 : 40,
+      position: "relative",
     }}>
       <div style={{
         display: "flex", alignItems: "center", gap: 4,
@@ -154,9 +163,12 @@ function TopNavBar({ onNavigate }: { onNavigate: (section: string) => void }) {
             onClick={() => {
               if (item.available) {
                 onNavigate(item.id === "gaming" ? "games" : item.id === "node" ? "node" : item.id);
+              } else {
+                // Nicht installiert → zum Erweiterungen-Tab
+                onNavigate("extensions");
               }
             }}
-            title={item.available ? item.label : `${item.label} — Nicht installiert (klicken zum Herunterladen)`}
+            title={item.available ? item.label : `${item.label} — Nicht installiert (klicken zum Installieren)`}
             style={{
               display: "flex", alignItems: "center", gap: 6,
               padding: "4px 10px", borderRadius: 6,
@@ -227,6 +239,108 @@ function TopNavBar({ onNavigate }: { onNavigate: (section: string) => void }) {
           <Puzzle size={14} />
           {!collapsed && "Erweiterungen"}
         </button>
+
+        {/* 🎨 Theme-Button */}
+        <div style={{ position: "relative" }}>
+          <button
+            onClick={async () => {
+              setShowThemeMenu(!showThemeMenu);
+              if (!showThemeMenu) {
+                const t = await loadInstalledThemes();
+                setThemes(t);
+                const ui = await invoke<string | null>("get_extension_ui", { id: "theme-editor" }).catch(() => null);
+                setEditorInstalled(!!ui);
+              }
+            }}
+            title="Design ändern"
+            style={{
+              display: "flex", alignItems: "center", gap: 5,
+              padding: "4px 10px", borderRadius: 8,
+              background: showThemeMenu ? "rgba(212,168,83,0.15)" : "transparent",
+              border: "1px solid transparent",
+              color: activeTheme ? "var(--accent)" : "var(--text-secondary)",
+              cursor: "pointer", fontSize: 12, fontWeight: 500,
+              transition: "all 0.15s",
+            }}
+            onMouseEnter={(e) => {
+              if (!showThemeMenu) (e.currentTarget as HTMLElement).style.background = "rgba(255,255,255,0.05)";
+            }}
+            onMouseLeave={(e) => {
+              if (!showThemeMenu) (e.currentTarget as HTMLElement).style.background = "transparent";
+            }}
+          >
+            <Palette size={14} />
+          </button>
+          {showThemeMenu && (
+            <div style={{
+              position: "absolute", top: "100%", right: 0, marginTop: 6,
+              background: "var(--bg-panel)", border: "1px solid var(--border)",
+              borderRadius: 10, padding: 8, minWidth: 180, zIndex: 50,
+              boxShadow: "0 8px 24px rgba(0,0,0,0.4)",
+            }}>
+              <div style={{ fontSize: 11, fontWeight: 600, color: "var(--text-muted)", padding: "4px 8px", marginBottom: 4 }}>
+                🎨 Themes
+              </div>
+              <button
+                onClick={() => { applyTheme(null); setShowThemeMenu(false); }}
+                style={{
+                  display: "flex", alignItems: "center", gap: 8, width: "100%",
+                  padding: "6px 8px", borderRadius: 6, border: "none",
+                  background: !activeTheme ? "rgba(255,255,255,0.08)" : "transparent",
+                  color: "var(--text-primary)", cursor: "pointer", fontSize: 12,
+                }}
+              >
+                <span>🌙</span> Standard
+                {!activeTheme && <span style={{ marginLeft: "auto", fontSize: 10, color: "var(--green)" }}>✓</span>}
+              </button>
+              {themes.map((t) => (
+                <button
+                  key={t.id}
+                  onClick={() => { applyTheme(t.id); setShowThemeMenu(false); }}
+                  style={{
+                    display: "flex", alignItems: "center", gap: 8, width: "100%",
+                    padding: "6px 8px", borderRadius: 6, border: "none",
+                    background: activeTheme === t.id ? "rgba(255,255,255,0.08)" : "transparent",
+                    color: "var(--text-primary)", cursor: "pointer", fontSize: 12,
+                  }}
+                >
+                  <span>{t.icon || "🎨"}</span> {t.name}
+                  {activeTheme === t.id && <span style={{ marginLeft: "auto", fontSize: 10, color: "var(--green)" }}>✓</span>}
+                </button>
+              ))}
+              {themes.length === 0 && !editorInstalled && (
+                <div style={{ fontSize: 11, color: "var(--text-muted)", padding: "4px 8px" }}>
+                  Keine Themes installiert
+                </div>
+              )}
+              {editorInstalled && (
+                <button
+                  onClick={() => { onNavigate("theme-editor"); setShowThemeMenu(false); }}
+                  style={{
+                    display: "flex", alignItems: "center", gap: 8, width: "100%",
+                    padding: "6px 8px", borderRadius: 6, border: "none",
+                    background: "rgba(212,168,83,0.1)", color: "var(--accent)",
+                    cursor: "pointer", fontSize: 12, fontWeight: 600,
+                  }}
+                >
+                  🎨 Editor öffnen
+                </button>
+              )}
+              <div style={{ borderTop: "1px solid var(--border)", margin: "4px 0" }} />
+              <button
+                onClick={() => { onNavigate("extensions"); setShowThemeMenu(false); }}
+                style={{
+                  display: "flex", alignItems: "center", gap: 8, width: "100%",
+                  padding: "6px 8px", borderRadius: 6, border: "none",
+                  background: "transparent", color: "var(--text-secondary)",
+                  cursor: "pointer", fontSize: 11,
+                }}
+              >
+                🧩 Mehr im Store…
+              </button>
+            </div>
+          )}
+        </div>
 
         <NetworkStatus />
 

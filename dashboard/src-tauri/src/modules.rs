@@ -50,11 +50,15 @@ pub struct ModuleInfo {
 // ─── Modul-Registry ──────────────────────────────────────────────────────────
 
 /// Gibt die Liste aller bekannten optionalen Module zurück.
+/// Dynamisch: erkennt ALLE installierten Extensions mit ui.html.
 pub fn get_optional_modules() -> Vec<ModuleInfo> {
-    vec![
+    let installed = crate::extensions::get_installed_extensions();
+
+    // Hardcoded Module (immer im Store anzeigbar, auch wenn nicht installiert)
+    let mut modules = vec![
         ModuleInfo {
             name: "gaming".into(),
-            display_name: "Gaming-Modul".into(),
+            display_name: "Gaming".into(),
             description: "Spiele-Registrierung, Item-Trading, Marktplatz & In-Game-Assets".into(),
             available: is_module_available("gaming"),
             built_in: cfg!(feature = "gaming-module"),
@@ -65,8 +69,8 @@ pub fn get_optional_modules() -> Vec<ModuleInfo> {
         },
         ModuleInfo {
             name: "node".into(),
-            display_name: "Node-Modul".into(),
-            description: "Vollständige P2P-Node mit Block-Validierung, Gossip & Mining".into(),
+            display_name: "Node".into(),
+            description: "Node-Status, Mining & Netzwerk".into(),
             available: is_module_available("node"),
             built_in: cfg!(feature = "node-module"),
             file_path: find_module_file("node"),
@@ -74,7 +78,47 @@ pub fn get_optional_modules() -> Vec<ModuleInfo> {
             size_mb: 15,
             icon: "🖥️".into(),
         },
-    ]
+    ];
+
+    // Dynamisch: alle installierten Extensions mit ui.html hinzufügen
+    for ext in &installed {
+        // Nicht doppelt (gaming/node sind schon oben)
+        if modules.iter().any(|m| m.name == ext.id) {
+            // Update available flag
+            if let Some(m) = modules.iter_mut().find(|m| m.name == ext.id) {
+                m.available = true;
+                m.file_path = Some(format!("extensions/{}/ui.html", ext.id));
+            }
+            continue;
+        }
+
+        // Neue Extension → in die NavRail aufnehmen
+        let has_ui = std::path::Path::new(&format!(
+            "{}/{}/ui.html",
+            crate::extensions::extensions_dir().display(),
+            ext.id
+        ))
+        .exists();
+
+        if has_ui {
+            modules.push(ModuleInfo {
+                name: ext.id.clone(),
+                display_name: ext.name.clone(),
+                description: ext.description.clone(),
+                available: true,
+                built_in: false,
+                file_path: Some(format!("extensions/{}/ui.html", ext.id)),
+                download_url: format!(
+                    "https://github.com/{}/releases/latest",
+                    ext.repository
+                ),
+                size_mb: ext.size_mb,
+                icon: ext.icon.clone(),
+            });
+        }
+    }
+
+    modules
 }
 
 /// Gibt die Liste der Core-Features zurück (immer verfügbar).
@@ -129,7 +173,7 @@ pub fn get_core_modules() -> Vec<ModuleInfo> {
 
 // ─── Modul-Verfügbarkeit prüfen ──────────────────────────────────────────────
 
-/// Prüft ob ein Modul verfügbar ist (Build-Feature ODER Runtime-Datei).
+/// Prüft ob ein Modul verfügbar ist (Build-Feature ODER Runtime-Datei ODER Extension).
 fn is_module_available(name: &str) -> bool {
     // 1. Build-time Feature?
     match name {
@@ -139,7 +183,16 @@ fn is_module_available(name: &str) -> bool {
     }
 
     // 2. Runtime-Datei vorhanden?
-    find_module_file(name).is_some()
+    if find_module_file(name).is_some() {
+        return true;
+    }
+
+    // 3. Extension installiert? (Extensions-System)
+    if crate::extensions::is_installed(name) {
+        return true;
+    }
+
+    false
 }
 
 /// Sucht die Modul-Datei im `modules/` Ordner (neben der Binary).

@@ -12,6 +12,9 @@ import ProfileView from "./views/profile/ProfileView";
 import ChatView from "./views/chat/ChatView";
 import WalletView from "./views/wallet/WalletView";
 import ExtensionsView from "./views/extensions/ExtensionsView";
+import ThemeEditorView from "./views/extensions/ThemeEditorView";
+import DashboardExtView from "./views/extensions/DashboardExtView";
+import ExtensionFrame from "./views/extensions/ExtensionFrame";
 import ProfileEditOverlay from "./views/profile/ProfileEditOverlay";
 import FriendAddOverlay from "./views/chat/FriendAddOverlay";
 import SettingsOverlay from "./views/profile/SettingsOverlay";
@@ -97,23 +100,13 @@ function MainApp() {
   useEffect(() => {
     const handler = (e: CustomEvent<{ section: string }>) => {
       const s = e.detail.section;
-      if (s === "wallet") {
-        setShowWalletOverlay((prev) => !prev);
-        return;
-      }
-      if (s === "profile") {
-        setShowProfileOverlay(true);
-        return;
-      }
-      if (s === "settings") {
-        setShowSettingsOverlay(true);
-        return;
-      }
-      if (["home", "explorer", "games", "node", "extensions"].includes(s)) {
-        setActiveSection(s);
-        setActiveConversation(null);
-        setSelectedServer(null);
-      }
+      if (s === "wallet") { setShowWalletOverlay((prev) => !prev); return; }
+      if (s === "profile") { setShowProfileOverlay(true); return; }
+      if (s === "settings") { setShowSettingsOverlay(true); return; }
+      // Alle Sections erlauben (inkl. dynamischer Extensions)
+      setActiveSection(s);
+      setActiveConversation(null);
+      setSelectedServer(null);
     };
     window.addEventListener("stone-navigate", handler as EventListener);
     return () => window.removeEventListener("stone-navigate", handler as EventListener);
@@ -131,7 +124,12 @@ function MainApp() {
     node: <NodeView />,
     profile: <ProfileView />,
     extensions: <ExtensionsView />,
+    "theme-editor": <ThemeEditorView />,
+    dashboard: <DashboardExtView />,
   };
+
+  // Dynamische Extension-View: falls nicht in views, ExtensionFrame rendern
+  const activeView = views[activeSection] ?? <ExtensionFrame extensionId={activeSection} />;
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100vh", overflow: "hidden", background: "var(--main-bg)" }}>
@@ -170,7 +168,7 @@ function MainApp() {
           <ServerView selectedOrg={selectedServer} />
         ) : showDm ? (
           <ChatView initialActive={activeConversation} />
-        ) : views[activeSection] || <HomeView />}
+        ) : activeView}
       </div>
 
       {/* ── Wallet Overlay ───────────────────────────────── */}

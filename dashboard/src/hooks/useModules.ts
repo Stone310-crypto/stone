@@ -13,6 +13,15 @@ export interface ModuleInfo {
   icon: string;
 }
 
+// ─── Globaler Refresh-Callback (von ExtensionsView gesetzt) ──────────────
+type RefreshFn = () => void;
+let _globalModuleRefresh: RefreshFn | null = null;
+
+/** Wird von useModules beim ersten Mount registriert. */
+export function triggerModuleRefresh() {
+  _globalModuleRefresh?.();
+}
+
 /** Hook: Lädt die Modul-Liste vom Rust-Backend. */
 export function useModules() {
   const [modules, setModules] = useState<ModuleInfo[]>([]);
@@ -21,7 +30,6 @@ export function useModules() {
 
   const refresh = useCallback(async () => {
     try {
-      setLoading(true);
       const mods = await invoke<ModuleInfo[]>("get_modules");
       setModules(mods);
       setError(null);
@@ -32,8 +40,19 @@ export function useModules() {
     }
   }, []);
 
+  // Initialer Load + globaler Callback registrieren
   useEffect(() => {
     refresh();
+    _globalModuleRefresh = refresh;
+    return () => {
+      _globalModuleRefresh = null;
+    };
+  }, [refresh]);
+
+  // Polling: alle 3s prüfen (fängt Race-Conditions ab)
+  useEffect(() => {
+    const iv = setInterval(refresh, 3000);
+    return () => clearInterval(iv);
   }, [refresh]);
 
   /** Core-Module (immer verfügbar) */

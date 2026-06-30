@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Node Dashboard</title>
+<style>
+:root{--bg:#0f1117;--panel:#1a1c26;--border:rgba(255,255,255,0.08);--text:#e8e4df;--text2:#b8b4ae;--muted:#6e6b65;--acc:#d4a853;--green:#5a9e6f;--red:#d95b5b;--blue:#6b9cc4;--amber:#e0a845}
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg);color:var(--text);padding:16px;font-size:13px;line-height:1.5}
+h1{font-size:18px;font-weight:700;margin-bottom:2px}
+.sub{color:var(--text2);font-size:11px;margin-bottom:16px}
+
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:8px;margin-bottom:12px}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:14px}
+.card h3{font-size:12px;font-weight:600;color:var(--text2);margin-bottom:6px;display:flex;align-items:center;gap:6px}
+.card .value{font-size:24px;font-weight:700;font-family:monospace}
+.card .label{font-size:10px;color:var(--muted)}
+.card .sub-value{font-size:11px;color:var(--text2);margin-top:4px}
+
+.bar-bg{height:8px;background:rgba(255,255,255,0.06);border-radius:4px;overflow:hidden;margin-top:6px}
+.bar-fill{height:100%;border-radius:4px;transition:width .3s}
+.bar-green{background:var(--green)}
+.bar-amber{background:var(--amber)}
+.bar-red{background:var(--red)}
+.bar-blue{background:var(--blue)}
+
+.logs{background:#0a0a0a;border:1px solid var(--border);border-radius:10px;padding:12px;font-family:'SF Mono',Menlo,monospace;font-size:11px;color:#a0a0a0;max-height:300px;overflow-y:auto;white-space:pre-wrap;line-height:1.4;margin-top:8px}
+
+.settings-row{display:flex;align-items:center;gap:10px;padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.03)}
+.settings-row:last-child{border:none}
+.settings-label{flex:1;font-size:12px;color:var(--text2)}
+.settings-input{width:80px;padding:4px 8px;border-radius:4px;background:rgba(255,255,255,0.06);border:1px solid var(--border);color:var(--text);font-size:12px;text-align:right;outline:none}
+.settings-input:focus{border-color:var(--acc)}
+
+.btn{padding:5px 12px;border-radius:6px;border:none;font-size:11px;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:4px}
+.btn-primary{background:var(--acc);color:#000}
+.btn-secondary{background:var(--border);color:var(--text)}
+.pulse{animation:pulse 2s infinite}@keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
+</style>
+</head>
+<body>
+
+<h1>📊 Node Dashboard</h1>
+<p class="sub">Echtzeit-Statistiken & System-Ressourcen</p>
+
+<!-- Stats-Karten -->
+<div class="grid" id="stats-grid">
+  <div class="card"><h3>🔗 Block Height</h3><div class="value" id="block-height">—</div><div class="label">Aktueller Block</div></div>
+  <div class="card"><h3>👥 Peers</h3><div class="value" id="peers">—</div><div class="label">Verbundene Nodes</div></div>
+  <div class="card"><h3>⏱️ Uptime</h3><div class="value" id="uptime">—</div><div class="label">Node läuft seit</div></div>
+  <div class="card"><h3>📝 Mempool</h3><div class="value" id="mempool">—</div><div class="label">Ausstehende TXs</div></div>
+</div>
+
+<!-- System-Ressourcen -->
+<h2 style="font-size:14px;font-weight:600;margin:12px 0 8px;display:flex;align-items:center;gap:6px">💻 System</h2>
+<div class="grid">
+  <div class="card">
+    <h3>🖥️ CPU Gesamt</h3><div class="value" id="cpu-total">—</div>
+    <div class="bar-bg"><div class="bar-fill bar-blue" id="cpu-bar" style="width:0%"></div></div>
+  </div>
+  <div class="card">
+    <h3>🧠 RAM Gesamt</h3><div class="value" id="ram-total">—</div>
+    <div class="bar-bg"><div class="bar-fill bar-amber" id="ram-bar" style="width:0%"></div></div>
+  </div>
+  <div class="card">
+    <h3>⚡ Stone App CPU</h3><div class="value" id="cpu-app">—</div><div class="label" id="cpu-app-label"></div>
+  </div>
+  <div class="card">
+    <h3>💾 Stone App RAM</h3><div class="value" id="ram-app">—</div><div class="label" id="ram-app-label"></div>
+  </div>
+</div>
+
+<!-- Logs -->
+<div style="display:flex;align-items:center;gap:10px;margin:12px 0 4px">
+  <h2 style="font-size:14px;font-weight:600;margin:0;display:flex;align-items:center;gap:6px">📜 Node Logs</h2>
+  <button class="btn btn-secondary" onclick="refreshLogs()">🔄 Aktualisieren</button>
+  <button class="btn btn-secondary" onclick="toggleAutoRefresh()">
+    <span id="auto-refresh-indicator" class="pulse">⏸</span> Auto
+  </button>
+</div>
+<div class="logs" id="logs">Lade Logs…</div>
+
+<!-- Einstellungen -->
+<h2 style="font-size:14px;font-weight:600;margin:16px 0 8px;display:flex;align-items:center;gap:6px">⚙️ Einstellungen</h2>
+<div class="card">
+  <div class="settings-row">
+    <span class="settings-label">Storage angeboten (GB)</span>
+    <input type="number" class="settings-input" id="cfg-storage" value="100">
+  </div>
+  <div class="settings-row">
+    <span class="settings-label">Auto-Mining</span>
+    <select id="cfg-mining" style="padding:4px 8px;border-radius:4px;background:rgba(255,255,255,0.06);border:1px solid var(--border);color:var(--text);font-size:12px;outline:none">
+      <option value="true">An</option><option value="false">Aus</option>
+    </select>
+  </div>
+  <div class="settings-row">
+    <span class="settings-label">Reward pro Tag</span>
+    <input type="number" class="settings-input" id="cfg-reward" value="0" step="0.1">
+  </div>
+  <button class="btn btn-primary" onclick="saveConfig()" style="margin-top:8px">💾 Speichern</button>
+  <span id="cfg-saved" style="font-size:11px;color:var(--green);margin-left:8px;display:none">✓ Gespeichert</span>
+</div>
+
+<script>
+// ─── Tauri Bridge ──────────────────────────────────────────────────
+let _id=0;const _p={};
+window.addEventListener('message',e=>{if(e.data?.id&&_p[e.data.id]){if(e.data.ok)_p[e.data.id].resolve(e.data.result);else _p[e.data.id].reject(new Error(e.data.error));delete _p[e.data.id]}});
+function invoke(cmd,args){return new Promise((resolve,reject)=>{const id=++_id;_p[id]={resolve,reject};window.parent.postMessage({type:'tauri-invoke',id,cmd,args},'*')})}
+
+let autoRefresh = true;
+
+// ─── Polling ────────────────────────────────────────────────────────
+async function refreshAll() {
+  try {
+    // Node Status
+    const status = await invoke('node_get_status');
+    document.getElementById('block-height').textContent = status?.block_height ?? '—';
+    document.getElementById('peers').textContent = status?.peer_count ?? '—';
+    document.getElementById('uptime').textContent = formatUptime(status?.uptime_secs ?? 0);
+    document.getElementById('mempool').textContent = status?.mempool_size ?? '—';
+  } catch(e) { /* Node offline */ }
+
+  try {
+    // System Stats
+    const stats = await invoke('get_system_stats');
+    document.getElementById('cpu-total').textContent = (stats?.system_cpu_pct ?? 0).toFixed(1) + '%';
+    document.getElementById('cpu-bar').style.width = Math.min(100, stats?.system_cpu_pct ?? 0) + '%';
+    document.getElementById('ram-total').textContent = formatMB(stats?.system_memory_used_mb) + ' / ' + formatMB(stats?.system_memory_total_mb);
+    document.getElementById('ram-bar').style.width = Math.min(100, ((stats?.system_memory_used_mb||0)/(stats?.system_memory_total_mb||1))*100) + '%';
+    document.getElementById('cpu-app').textContent = (stats?.app_cpu_pct ?? 0).toFixed(1) + '%';
+    document.getElementById('cpu-app-label').textContent = 'Stone Dashboard';
+    document.getElementById('ram-app').textContent = formatMB(stats?.app_memory_mb);
+    document.getElementById('ram-app-label').textContent = 'Stone Dashboard';
+  } catch(e) {}
+
+  try {
+    // Config laden
+    const cfg = await invoke('node_get_config');
+    if (cfg) {
+      document.getElementById('cfg-storage').value = cfg.storage_offered_gb ?? 100;
+      document.getElementById('cfg-mining').value = String(cfg.auto_mining_enabled ?? true);
+      document.getElementById('cfg-reward').value = cfg.reward_per_day ?? 0;
+    }
+  } catch(e) {}
+}
+
+async function refreshLogs() {
+  try {
+    const logs = await invoke('node_get_logs', { count: 100 });
+    document.getElementById('logs').textContent = (logs || []).join('\n') || 'Keine Logs';
+    document.getElementById('logs').scrollTop = document.getElementById('logs').scrollHeight;
+  } catch(e) {
+    document.getElementById('logs').textContent = 'Node nicht erreichbar';
+  }
+}
+
+async function saveConfig() {
+  try {
+    await invoke('node_set_config', {
+      config: {
+        storage_offered_gb: parseInt(document.getElementById('cfg-storage').value) || 100,
+        auto_mining_enabled: document.getElementById('cfg-mining').value === 'true',
+        reward_per_day: parseFloat(document.getElementById('cfg-reward').value) || 0,
+      }
+    });
+    document.getElementById('cfg-saved').style.display = 'inline';
+    setTimeout(() => document.getElementById('cfg-saved').style.display = 'none', 2000);
+  } catch(e) {
+    alert('Fehler beim Speichern: ' + e);
+  }
+}
+
+function toggleAutoRefresh() {
+  autoRefresh = !autoRefresh;
+  document.getElementById('auto-refresh-indicator').textContent = autoRefresh ? '⏸' : '▶';
+  document.getElementById('auto-refresh-indicator').className = autoRefresh ? 'pulse' : '';
+}
+
+// ─── Helpers ────────────────────────────────────────────────────────
+function formatUptime(secs) {
+  if (secs < 60) return secs + 's';
+  if (secs < 3600) return Math.floor(secs/60) + 'm ' + (secs%60) + 's';
+  const h = Math.floor(secs/3600), m = Math.floor((secs%3600)/60);
+  return h + 'h ' + m + 'm';
+}
+function formatMB(mb) {
+  if (mb === undefined || mb === null) return '—';
+  if (mb > 1024) return (mb/1024).toFixed(1) + ' GB';
+  return mb.toFixed(0) + ' MB';
+}
+
+// ─── Init ───────────────────────────────────────────────────────────
+refreshAll();
+refreshLogs();
+setInterval(refreshAll, 3000);
+setInterval(() => { if (autoRefresh) refreshLogs(); }, 5000);
+</script>
+</body>
+</html>

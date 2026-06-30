@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
+import { invoke } from "@tauri-apps/api/core";
 import { useQuery } from "@tanstack/react-query";
 import { games as gamesApi } from "../../api/stone";
 import { useAuth } from "../../auth/AuthContext";
@@ -152,13 +153,14 @@ export default function GamesView() {
   const { session } = useAuth();
   const [verifiedOnly, setVerifiedOnly] = useState(false);
   const [selected, setSelected] = useState<OnChainGame | null>(null);
+  const [extUI, setExtUI] = useState<string | null>(null);
 
+  // ALLE Hooks MÜSSEN vor conditional returns stehen!
   const allQ = useQuery({
     queryKey: ["games-all"],
     queryFn: gamesApi.list,
     refetchInterval: 60_000,
   });
-
   const verifiedQ = useQuery({
     queryKey: ["games-verified"],
     queryFn: gamesApi.verified,
@@ -166,6 +168,60 @@ export default function GamesView() {
     refetchInterval: 60_000,
   });
 
+  // Prüfe ob die Gaming-Extension eine eigene UI mitbringt
+  useEffect(() => {
+    invoke<string | null>("get_extension_ui", { id: "gaming" })
+      .then((html) => setExtUI(html))
+      .catch(() => setExtUI(null));
+
+    // Silent: prüfe auf Extension-Updates und installiere sie automatisch
+    invoke<[string, string, string][]>("check_for_updates")
+      .then(async (updates) => {
+        const gamingUpdate = updates.find(([id]) => id === "gaming");
+        if (gamingUpdate) {
+          console.log("[games] Update verfügbar:", gamingUpdate[1], "→", gamingUpdate[2]);
+          try {
+            await invoke("cmd_install_extension", { id: "gaming" });
+            // UI neu laden
+            const newUI = await invoke<string | null>("get_extension_ui", { id: "gaming" });
+            setExtUI(newUI);
+            console.log("[games] ✅ Gaming-Extension aktualisiert auf", gamingUpdate[2]);
+          } catch (e) {
+            console.warn("[games] Auto-Update fehlgeschlagen:", e);
+          }
+        }
+      })
+      .catch(() => {}); // Still bei Fehlern
+  }, []);
+
+  // Message-Proxy für iframe↔Tauri Kommunikation
+  useEffect(() => {
+    const handler = async (e: MessageEvent) => {
+      if (e.data?.type !== "tauri-invoke") return;
+      try {
+        const result = await invoke(e.data.cmd, e.data.args);
+        (e.source as WindowProxy).postMessage({ id: e.data.id, ok: true, result }, { targetOrigin: "*" });
+      } catch (err: any) {
+        (e.source as WindowProxy).postMessage({ id: e.data.id, ok: false, error: String(err) }, { targetOrigin: "*" });
+      }
+    };
+    window.addEventListener("message", handler);
+    return () => window.removeEventListener("message", handler);
+  }, []);
+
+  // Extension-UI anzeigen, falls verfügbar
+  if (extUI) {
+    return (
+      <iframe
+        srcDoc={extUI}
+        style={{ width: "100%", height: "100%", border: "none", background: "var(--main-bg)" }}
+        title="Gaming Extension"
+        sandbox="allow-scripts"
+      />
+    );
+  }
+
+  // Fallback: Standard GamesView
   const gameList = (verifiedOnly ? verifiedQ.data?.games : allQ.data?.games) ?? [];
 
   return (
