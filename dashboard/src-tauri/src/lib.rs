@@ -1,5 +1,6 @@
 mod file_upload;
 mod node_binary_downloader;
+mod node_config_db;
 mod node_manager;
 mod modules;
 mod extensions;
@@ -10,6 +11,7 @@ use node_manager::{
     get_local_ip,
     node_get_logs,
     node_get_status, node_get_config, node_set_config, node_start, node_stop,
+    switch_node_network,
     load_config,
 };
 use std::sync::{Arc, Mutex};
@@ -224,6 +226,7 @@ pub fn run() {
             node_set_config,
             node_start,
             node_stop,
+            switch_node_network,
             plugin_open_window,
             validate_upload_file,
             upload_file,
@@ -251,6 +254,9 @@ pub fn run() {
             extensions::load_saved_theme,
             extensions::delete_saved_theme,
             extensions::prepare_theme_publish,
+            extensions::get_network_status,
+            extensions::get_node_config,
+            extensions::read_node_config_db,
             gaming_proxy::list_companies,
             gaming_proxy::create_company,
             gaming_proxy::list_games,

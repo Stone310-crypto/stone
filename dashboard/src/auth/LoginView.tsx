@@ -211,8 +211,8 @@ function StonechainAppLoginView({ onBack }: { onBack: () => void }) {
       const res = await authApi.qrCreate();
       const s = loadSettings();
       const nodes: string[] = [];
-      try { const { invoke } = await import("@tauri-apps/api/core"); const ip: string = await invoke("get_local_ip"); nodes.push(`http://${ip}:${new URL(s.nodeUrl).port || "3080"}`); } catch { nodes.push(s.nodeUrl); }
-      nodes.push("http://212.227.54.241:3080");
+      try { const { invoke } = await import("@tauri-apps/api/core"); const ip: string = await invoke("get_local_ip"); nodes.push(`http://${ip}:${new URL(s.nodeUrl).port || "3180"}`); } catch { nodes.push(s.nodeUrl); }
+      nodes.push("http://212.227.54.241:3180");
       const payload = JSON.stringify({ type: "stone_login", token: res.login_token, nodes });
       const dataUrl = await QRCode.toDataURL(payload, { width: 200, margin: 2, color: { dark: "#e2e8f0", light: "#161920" } });
       setQrDataUrl(dataUrl); setTimeLeft(res.expires_in); setStatus("waiting");
@@ -282,9 +282,28 @@ function DiscordLoginView({ onBack }: { onBack: () => void }) {
 function AdvancedSettings() {
   const s = loadSettings();
   const [url, setUrl] = useState(s.nodeUrl);
+  const [network, setNetwork] = useState((s as any).network || "mainnet");
   const [saved, setSaved] = useState(false);
   const [nodeStatus, setNodeStatus] = useState<string>("");
   const [nodeLoading, setNodeLoading] = useState(false);
+
+  function switchNetwork(net: string) {
+    setNetwork(net);
+    const newUrl = net === "mainnet" ? "http://127.0.0.1:3180" : "http://127.0.0.1:3080";
+    setUrl(newUrl);
+    // Persist immediately so the setting survives tab switches
+    try { localStorage.setItem("stone-network-mode", net); } catch {}
+    saveSettings({ ...loadSettings(), nodeUrl: newUrl, network: net } as any);
+    setSaved(true); setTimeout(() => setSaved(false), 1500);
+    // Install testnet-mode extension when switching to testnet
+    if (net === "testnet") {
+      try {
+        import("@tauri-apps/api/core").then(({ invoke }) => {
+          invoke("cmd_install_extension", { id: "testnet-mode" }).catch(() => {});
+        });
+      } catch {}
+    }
+  }
 
   useEffect(() => {
     let i: ReturnType<typeof setInterval>;
@@ -309,20 +328,28 @@ function AdvancedSettings() {
     return () => clearInterval(i);
   }, []);
 
-  function save() { saveSettings({ ...s, nodeUrl: url }); setSaved(true); setTimeout(() => setSaved(false), 1500); }
+  function save() { saveSettings({ ...loadSettings(), nodeUrl: url, network } as any); setSaved(true); setTimeout(() => setSaved(false), 1500); }
 
   async function toggleNode() {
     setNodeLoading(true);
     try {
       const { invoke } = await import("@tauri-apps/api/core");
       if (nodeStatus.startsWith("Running")) await invoke("node_stop");
-      else { const result: string = await invoke("node_start"); setUrl(result); saveSettings({ ...s, nodeUrl: result }); setSaved(true); setTimeout(() => setSaved(false), 1500); }
+      else { const result: string = await invoke("node_start"); setUrl(result); saveSettings({ ...loadSettings(), nodeUrl: result } as any); setSaved(true); setTimeout(() => setSaved(false), 1500); }
     } catch (e: unknown) { setNodeStatus(`Error: ${e instanceof Error ? e.message : String(e)}`); }
     setNodeLoading(false);
   }
 
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+        <label style={{ fontSize: 11, color: "var(--text-muted)", whiteSpace: "nowrap" }}>🌐 Netzwerk:</label>
+        <select value={network} onChange={(e) => switchNetwork(e.target.value)}
+          style={{ flex: 1, background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 8, padding: "7px 10px", fontSize: 11, color: "var(--text)", outline: "none", cursor: "pointer" }}>
+          <option value="mainnet">✅ Mainnet (Port 3180)</option>
+          <option value="testnet">🧪 Testnet (Port 3080)</option>
+        </select>
+      </div>
       <div style={{ display: "flex", gap: 8 }}>
         <input type="text" value={url} onChange={(e) => { setUrl(e.target.value); setSaved(false); }} style={{ flex: 1, background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 8, padding: "8px 10px", fontSize: 11, color: "var(--text)", outline: "none", fontFamily: "monospace" }} />
         <button onClick={save} style={{ padding: "8px 12px", borderRadius: 8, background: saved ? "rgba(59,165,92,0.25)" : "rgba(91,138,238,0.25)", color: saved ? "var(--green)" : "var(--accent)", fontSize: 12, fontWeight: 600, cursor: "pointer", border: "none", transition: "all 0.15s" }}>{saved ? "✓" : "OK"}</button>

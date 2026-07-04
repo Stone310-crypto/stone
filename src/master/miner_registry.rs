@@ -494,7 +494,7 @@ impl Default for AutoMiningConfig {
 }
 
 impl AutoMiningConfig {
-    /// Liest die Config aus `node_config.json` im Workspace-Root.
+    /// Liest die Config aus `node_config.db` (SQLite) mit Fallback auf `node_config.json`.
     /// Umgebungsvariablen überschreiben Dateiwerte:
     /// - `STONE_AUTO_MINING_ENABLED`
     /// - `STONE_AUTO_MINING_TIMEOUT`
@@ -502,33 +502,45 @@ impl AutoMiningConfig {
     /// - `STONE_MINER_PARTIAL_DELTA`
     pub fn load() -> Self {
         let mut cfg = Self::default();
-        if let Ok(raw) = std::fs::read_to_string("node_config.json") {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) {
-                if let Some(v) = json.get("auto_mining_enabled").and_then(|x| x.as_bool()) {
-                    cfg.enabled = v;
-                }
-                // Wenn auto_mining_enabled nicht in der Config steht, bleibt der Default (false).
-                // Kein implizites Auto-Enable mehr — das muss explizit gesetzt werden.
-                // Sonst minen alle Nodes parallel Blöcke ohne Miner → Fork-Kaskade.
-                // Zum Aktivieren: "auto_mining_enabled": true in node_config.json
-                // oder STONE_AUTO_MINING_ENABLED=1
-                if let Some(v) = json.get("auto_mining_timeout_secs").and_then(|x| x.as_u64()) {
-                    cfg.auto_timeout_secs = v.max(5);
-                }
-                if let Some(v) = json
-                    .get("miner_heartbeat_timeout_secs")
-                    .and_then(|x| x.as_u64())
-                {
-                    cfg.heartbeat_timeout_secs = v.max(5);
-                }
-                if let Some(v) = json
-                    .get("miner_heartbeat_partial_delta")
-                    .and_then(|x| x.as_u64())
-                {
-                    cfg.heartbeat_partial_delta = v as u32;
+
+        // 1) Versuche node_config.db (SQLite)
+        let db_loaded = if let Ok(db) = crate::node_config_db::NodeConfigDB::open_default() {
+            cfg.enabled = db.auto_mining_enabled();
+            cfg.auto_timeout_secs = db.auto_mining_timeout_secs();
+            cfg.heartbeat_timeout_secs = db.miner_heartbeat_timeout_secs();
+            cfg.heartbeat_partial_delta = db.miner_heartbeat_partial_delta();
+            true
+        } else {
+            false
+        };
+
+        // 2) Fallback: node_config.json
+        if !db_loaded {
+            if let Ok(raw) = std::fs::read_to_string("node_config.json") {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&raw) {
+                    if let Some(v) = json.get("auto_mining_enabled").and_then(|x| x.as_bool()) {
+                        cfg.enabled = v;
+                    }
+                    if let Some(v) = json.get("auto_mining_timeout_secs").and_then(|x| x.as_u64()) {
+                        cfg.auto_timeout_secs = v.max(5);
+                    }
+                    if let Some(v) = json
+                        .get("miner_heartbeat_timeout_secs")
+                        .and_then(|x| x.as_u64())
+                    {
+                        cfg.heartbeat_timeout_secs = v.max(5);
+                    }
+                    if let Some(v) = json
+                        .get("miner_heartbeat_partial_delta")
+                        .and_then(|x| x.as_u64())
+                    {
+                        cfg.heartbeat_partial_delta = v as u32;
+                    }
                 }
             }
         }
+
+        // Env-Vars überschreiben alles
         if let Ok(v) = std::env::var("STONE_AUTO_MINING_ENABLED") {
             cfg.enabled = matches!(v.as_str(), "1" | "true" | "yes" | "on");
         }
@@ -550,10 +562,13 @@ impl AutoMiningConfig {
         cfg
     }
 
-    /// Schreibt `auto_mining_enabled` zurück in die `node_config.json`.
-    /// Überschreibt den Wert nur wenn die Datei bereits existiert und
-    /// gültiges JSON enthält.
+    /// Schreibt `auto_mining_enabled` zurück in `node_config.db` (und `node_config.json` für Abwärtskompatibilität).
     fn patch_config_enabled(enabled: bool) {
+        // Primär: SQLite-DB
+        if let Ok(db) = crate::node_config_db::NodeConfigDB::open_default() {
+            let _ = db.set_auto_mining_enabled(enabled);
+        }
+        // Sekundär: JSON (Abwärtskompatibilität)
         let path = "node_config.json";
         let raw = match std::fs::read_to_string(path) {
             Ok(s) => s,

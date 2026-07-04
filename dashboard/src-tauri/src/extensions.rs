@@ -23,6 +23,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use tauri::Manager;
 
 // ─── Extension-Manifest ──────────────────────────────────────────────────────
 
@@ -663,6 +664,143 @@ fn enrich_with_real_ratings(mut manifests: Vec<ExtensionManifest>) -> Vec<Extens
         }
     }
     manifests
+}
+
+// ─── Fallback-Store (Offline / Dev) ──────────────────────────────────────────
+
+// ─── Network / Testnet Support ─────────────────────────────────────────────
+
+/// Network status info returned to the dashboard.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NetworkStatus {
+    pub chain_id: String,
+    pub network: String,
+    pub block_height: u64,
+    pub peer_count: u32,
+    pub node_url: String,
+    pub testnet_url: String,
+}
+
+/// Returns the current network status by querying the connected Stone node.
+#[tauri::command]
+pub async fn get_network_status() -> Result<NetworkStatus, String> {
+    // Try to read the actual node URL from the saved settings (via env or fallback)
+    let mainnet_url = std::env::var("STONE_NODE_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:3180".into());
+    let testnet_url = std::env::var("STONE_TESTNET_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:3080".into());
+    let api_key = std::env::var("STONE_API_KEY").unwrap_or_default();
+
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|e| format!("Client: {e}"))?;
+
+    // Try both mainnet and testnet URLs — the first one that responds wins
+    let urls_to_try = [&mainnet_url, &testnet_url];
+
+    for node_url in &urls_to_try {
+        let status_url = format!("{}/api/v1/status", node_url);
+        let resp = client
+            .get(&status_url)
+            .header("x-api-key", &api_key)
+            .send()
+            .await;
+
+        match resp {
+            Ok(r) if r.status().is_success() => {
+                let body: serde_json::Value = r.json().await.unwrap_or_default();
+                let chain_id = body["chain_id"].as_str().unwrap_or("unknown").to_string();
+                let network = body["network"].as_str().unwrap_or("testnet").to_string();
+                let block_height = body["block_height"].as_u64().unwrap_or(0);
+                let peer_count = body["peer_count"].as_u64().unwrap_or(0) as u32;
+
+                return Ok(NetworkStatus {
+                    chain_id,
+                    network,
+                    block_height,
+                    peer_count,
+                    node_url: node_url.to_string(),
+                    testnet_url: testnet_url.clone(),
+                });
+            }
+            _ => continue,
+        }
+    }
+
+    // Fallback: return defaults if node is not reachable
+    Ok(NetworkStatus {
+        chain_id: "unknown".into(),
+        network: "unknown".into(),
+        block_height: 0,
+        peer_count: 0,
+        node_url: mainnet_url,
+        testnet_url,
+    })
+}
+
+/// Returns the configured mainnet and testnet API URLs.
+#[tauri::command]
+pub fn get_node_config() -> serde_json::Value {
+    serde_json::json!({
+        "mainnet_url": std::env::var("STONE_NODE_URL").unwrap_or_else(|_| "http://127.0.0.1:3180".into()),
+        "testnet_url": std::env::var("STONE_TESTNET_URL").unwrap_or_else(|_| "http://127.0.0.1:4180".into()),
+        "network": std::env::var("STONE_NETWORK").unwrap_or_else(|_| "mainnet".into()),
+    })
+}
+
+/// Reads the current network configuration directly from node_config.db (SQLite).
+/// This reflects the ACTUAL persisted config, not env vars or localStorage.
+#[tauri::command]
+pub fn read_node_config_db(app: tauri::AppHandle) -> serde_json::Value {
+    let data_dir = app
+        .path()
+        .app_data_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."));
+
+    // Try both network-specific data directories
+    let dirs = [
+        data_dir.join("node_data_mainnet"),
+        data_dir.join("node_data_testnet"),
+        data_dir.clone(),
+    ];
+
+    for dir in &dirs {
+        let db_path = dir.join("node_config.db");
+        if db_path.exists() {
+            match crate::node_config_db::NodeConfigDB::open(dir) {
+                Ok(db) => {
+                    let network = db.get("network").unwrap_or_else(|| "unknown".into());
+                    let port = db.get("http_port").unwrap_or_else(|| "3180".into());
+                    let node_name = db.get("node_name").unwrap_or_else(|| "StoneDesktopNode".into());
+                    let setup_complete = db.get("setup_complete").unwrap_or_else(|| "false".into());
+                    return serde_json::json!({
+                        "ok": true,
+                        "network": network,
+                        "port": port.parse::<u16>().unwrap_or(3180),
+                        "node_name": node_name,
+                        "setup_complete": setup_complete == "true",
+                        "db_path": db_path.to_string_lossy(),
+                    });
+                }
+                Err(e) => {
+                    return serde_json::json!({
+                        "ok": false,
+                        "error": format!("DB-Fehler: {e}"),
+                        "db_path": db_path.to_string_lossy(),
+                    });
+                }
+            }
+        }
+    }
+
+    // No DB found anywhere — return defaults
+    serde_json::json!({
+        "ok": false,
+        "error": "node_config.db nicht gefunden. Node wurde noch nicht gestartet.",
+        "network": "unknown",
+        "port": 3180,
+    })
 }
 
 // ─── Fallback-Store (Offline / Dev) ──────────────────────────────────────────

@@ -1,4 +1,4 @@
-import { useState, type ReactElement, useEffect } from "react";
+import React, { useState, type ReactElement, useEffect } from "react";
 import { AuthProvider, useAuth } from "./auth/AuthContext";
 import LoginView from "./auth/LoginView";
 import NavRail, { type ActiveConversation } from "./components/layout/NavRail";
@@ -15,6 +15,7 @@ import ExtensionsView from "./views/extensions/ExtensionsView";
 import ThemeEditorView from "./views/extensions/ThemeEditorView";
 import DashboardExtView from "./views/extensions/DashboardExtView";
 import ExtensionFrame from "./views/extensions/ExtensionFrame";
+import TestnetBanner from "./components/TestnetBanner";
 import ProfileEditOverlay from "./views/profile/ProfileEditOverlay";
 import FriendAddOverlay from "./views/chat/FriendAddOverlay";
 import SettingsOverlay from "./views/profile/SettingsOverlay";
@@ -128,8 +129,10 @@ function MainApp() {
     dashboard: <DashboardExtView />,
   };
 
-  // Dynamische Extension-View: falls nicht in views, ExtensionFrame rendern
-  const activeView = views[activeSection] ?? <ExtensionFrame extensionId={activeSection} />;
+  // Dynamische Extension-View: key sorgt für Remounting bei Nav-Wechsel
+  const activeView = views[activeSection]
+    ? React.cloneElement(views[activeSection], { key: activeSection })
+    : <ExtensionFrame key={activeSection} extensionId={activeSection} />;
 
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100vh", overflow: "hidden", background: "var(--main-bg)" }}>
@@ -163,12 +166,15 @@ function MainApp() {
       />
 
       {/* ── Main Content overlaid to the right of the panels ── */}
-      <div style={{ position: "absolute", top: 40, left: 400, right: 0, bottom: 0, overflow: "hidden" }}>
+      <div style={{ position: "absolute", top: 40, left: 400, right: 0, bottom: 0, overflow: "hidden", display: "flex", flexDirection: "column" }}>
+        <TestnetBanner />
+        <div style={{ flex: 1, overflow: "hidden", minHeight: 0 }}>
         {showServer ? (
           <ServerView selectedOrg={selectedServer} />
         ) : showDm ? (
           <ChatView initialActive={activeConversation} />
         ) : activeView}
+        </div>
       </div>
 
       {/* ── Wallet Overlay ───────────────────────────────── */}

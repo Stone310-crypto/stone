@@ -1,0 +1,18 @@
+/* ── Testnet Theme CSS ───────────────────────────────────────────── */
+/* Wird vom TestnetBanner und der Extension geladen */
+
+:root {
+  --testnet-warning: #f59e0b;
+  --testnet-warning-bg: rgba(245, 158, 11, 0.08);
+  --testnet-warning-border: rgba(245, 158, 11, 0.25);
+  --testnet-badge: #f59e0b;
+  --testnet-badge-bg: rgba(245, 158, 11, 0.12);
+  --testnet-accent: #f59e0b;
+  --testnet-accent-hover: #fbbf24;
+}
+
+/* Optional: farbliche Akzentänderung wenn Testnet aktiv */
+[data-network="testnet"] {
+  --accent: var(--testnet-accent, #f59e0b);
+  --accent-hover: var(--testnet-accent-hover, #fbbf24);
+}

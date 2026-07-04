@@ -20,6 +20,7 @@ gcp-*.json
 node_config.json
 node_config.*.json
 !node_config.example.json
+node_config.db
 
 # ─── Laufzeit-Daten (generiert vom Node, nicht versioniert) ──────────────────
 /stone_data/

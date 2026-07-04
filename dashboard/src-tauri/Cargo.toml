@@ -27,6 +27,7 @@ tauri-build = { version = "2", features = [] }
 
 [dependencies]
 tauri = { version = "2", features = [] }
+tauri-macros = "2"
 tauri-plugin-opener = "2"
 tauri-plugin-shell = "2"
 tauri-plugin-deep-link = "2"
@@ -44,4 +45,6 @@ tauri-plugin-notification = "2"
 auto-launch = "0.5"
 libloading = "0.8"
 chrono = "0.4"
+rusqlite = { version = "0.31", features = ["bundled-sqlcipher-vendored-openssl", "serde_json"] }
+hostname = "0.4"
 

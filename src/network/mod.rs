@@ -173,6 +173,43 @@ pub fn is_mainnet() -> bool {
     mode == "mainnet" || mode == "main"
 }
 
+/// Prüft ob eine IPv4-Adresse öffentlich routbar ist (kein Docker, kein CGNAT, kein Localhost).
+/// Erlaubt: public IPs, private LAN (192.168.x.x, 10.x.x.x), Tailscale (100.x.x.x), IPv6.
+/// Blockiert: Docker-Bridge (172.17.0.0/16, 172.18.0.0/16 etc.), Localhost, Unspecified.
+pub fn is_routable_ipv4(ip: &str) -> bool {
+    let parts: Vec<&str> = ip.split('.').collect();
+    if parts.len() != 4 { return false; }
+    let octets: Vec<u32> = parts.iter().filter_map(|p| p.parse().ok()).collect();
+    if octets.len() != 4 { return false; }
+
+    let o0 = octets[0];
+    let o1 = octets[1];
+
+    // Localhost
+    if o0 == 127 { return false; }
+    // Unspecified
+    if o0 == 0 { return false; }
+    // Link-local
+    if o0 == 169 && o1 == 254 { return false; }
+    // Docker default bridge (172.17.0.0/16)
+    if o0 == 172 && o1 == 17 { return false; }
+    // Docker compose / custom bridge (172.18.0.0/16 through 172.31.0.0/16)
+    // EXCEPT: private 172.16.0.0/12 range — allow 172.16.x.x but block 172.17-31.x.x
+    if o0 == 172 && o1 >= 17 && o1 <= 31 { return false; }
+
+    true
+}
+
+/// Prüft ob eine IP (IPv4 oder IPv6) routbar ist.
+pub fn is_routable_ip(ip: &str) -> bool {
+    if ip.contains(':') {
+        // IPv6: accept all except loopback
+        ip != "::1" && ip != "::"
+    } else {
+        is_routable_ipv4(ip)
+    }
+}
+
 // ─── Built-in Seed-Nodes ──────────────────────────────────────────────────────
 //
 // Mainnet und Testnet haben **getrennte** Seed-Nodes und Ports.
@@ -199,18 +236,18 @@ const SEED_NODES_TESTNET: &[&str] = &[
     "/ip6/2607:f1c0:f074:4300::1/tcp/4001/p2p/12D3KooWFkXVx4zBFMmsdC6Qr5pAn5FdPLbeyCFTsFhsn2CW39Tw",
 ];
 
-/// Mainnet Seed-Nodes (Port 5001) – Produktionsnetzwerk.
+/// Mainnet Seed-Nodes (Port 5003) – Produktionsnetzwerk.
 /// Dieselben VPS, aber auf separaten Ports → komplette Netzwerk-Isolation.
 const SEED_NODES_MAINNET: &[&str] = &[
     // ── VPS1 (212.227.54.241) – primärer Mainnet-Bootstrap + Relay ───
     // NUR TCP (siehe Begründung bei SEED_NODES_TESTNET).
     // HINWEIS: PeerIds hier sind noch die ALTEN – bei Mainnet-Reaktivierung
     //          mit den aktuellen PeerIds der Mainnet-Nodes ersetzen.
-    "/ip4/212.227.54.241/tcp/5001/p2p/12D3KooWJvLC6jmFoHr5JFbH4XFomdGMCGHnFWKGgEmMSS4KcSjN",
-    "/ip6/2a02:2479:a0:fa00::1/tcp/5001/p2p/12D3KooWJvLC6jmFoHr5JFbH4XFomdGMCGHnFWKGgEmMSS4KcSjN",
+    "/ip4/212.227.54.241/tcp/5003/p2p/12D3KooWJvLC6jmFoHr5JFbH4XFomdGMCGHnFWKGgEmMSS4KcSjN",
+    "/ip6/2a02:2479:a0:fa00::1/tcp/5003/p2p/12D3KooWJvLC6jmFoHr5JFbH4XFomdGMCGHnFWKGgEmMSS4KcSjN",
     // ── VPS2 (69.48.200.255) – sekundärer Mainnet-Bootstrap + Relay ───
-    "/ip4/69.48.200.255/tcp/5001/p2p/12D3KooWJ1VKWsboQB5mf8w4iLCSJYCB1xxGTUPySm2tAwN4Uwyz",
-    "/ip6/2607:f1c0:f074:4300::1/tcp/5001/p2p/12D3KooWJ1VKWsboQB5mf8w4iLCSJYCB1xxGTUPySm2tAwN4Uwyz",
+    "/ip4/69.48.200.255/tcp/5003/p2p/12D3KooWJ1VKWsboQB5mf8w4iLCSJYCB1xxGTUPySm2tAwN4Uwyz",
+    "/ip6/2607:f1c0:f074:4300::1/tcp/5003/p2p/12D3KooWJ1VKWsboQB5mf8w4iLCSJYCB1xxGTUPySm2tAwN4Uwyz",
 ];
 
 /// Gibt die Seed-Nodes für das aktive Netzwerk zurück.

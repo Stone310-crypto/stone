@@ -57,6 +57,8 @@ use server::{
 };
 
 const CONFIG_FILE: &str = "node_config.json";
+/// DB-Datei für die neue SQLite-basierte Konfiguration.
+const CONFIG_DB_FILE: &str = "node_config.db";
 static STAGE4_RECOVERY_RUNNING: AtomicBool = AtomicBool::new(false);
 
 // ─── Config ─────────────────────────────────────────────────────────────────
@@ -95,7 +97,7 @@ impl Default for NodeConfig {
             mnemonic_once: String::new(),
             seed_peers: Vec::new(),
             http_port: 8080,
-            p2p_port: 4001,
+            p2p_port: 5003,
             data_dir: "./stone_data".into(),
             api_key: String::new(),
             created_at: String::new(),
@@ -108,7 +110,40 @@ impl Default for NodeConfig {
 }
 
 impl NodeConfig {
+    /// Lädt die Konfiguration – priorisiert node_config.db, fällt zurück auf node_config.json.
     fn load() -> Self {
+        // 1) Versuche SQLite-DB (node_config.db)
+        if Path::new(CONFIG_DB_FILE).exists() {
+            if let Ok(db) = stone::node_config_db::NodeConfigDB::open(Path::new(".")) {
+                let mut cfg = Self::default();
+                cfg.setup_complete = db.setup_complete();
+                cfg.password_hash = db.password_hash();
+                cfg.node_name = db.node_name();
+                cfg.wallet_address = db.wallet_address();
+                cfg.mnemonic_once = db.mnemonic_once();
+                cfg.seed_peers = db.seed_peers();
+                cfg.http_port = db.http_port();
+                cfg.p2p_port = db.p2p_port();
+                cfg.data_dir = db.data_dir();
+                cfg.api_key = db.api_key();
+                cfg.created_at = db.created_at();
+                cfg.storage_offered_gb = db.storage_offered_gb();
+                cfg.reward_per_day = db.reward_per_day();
+                cfg.public_ip = db.public_ip();
+                cfg.wallet_balance = db.wallet_balance();
+
+                // Env-Var-Override für Secrets
+                if let Ok(k) = std::env::var("STONE_API_KEY") {
+                    if !k.trim().is_empty() { cfg.api_key = k.trim().to_string(); }
+                }
+                if let Ok(h) = std::env::var("STONE_ADMIN_PASSWORD_HASH") {
+                    if !h.trim().is_empty() { cfg.password_hash = h.trim().to_string(); }
+                }
+                return cfg;
+            }
+        }
+
+        // 2) Fallback: node_config.json (alte Config-Datei)
         let mut cfg: Self = if Path::new(CONFIG_FILE).exists() {
             let data = std::fs::read_to_string(CONFIG_FILE).unwrap_or_default();
             serde_json::from_str(&data).unwrap_or_default()
@@ -117,10 +152,6 @@ impl NodeConfig {
         };
 
         // ── Env-Var-Override für Secrets (Phase 1.3) ────────────────────────
-        // Reihenfolge: ENV > File > leer.
-        // Wenn STONE_API_KEY / STONE_ADMIN_PASSWORD_HASH gesetzt sind,
-        // überschreiben sie File-Werte. So können Secrets aus dem JSON entfernt
-        // und über Env-Vars / .env eingespeist werden, ohne in Git zu landen.
         if let Ok(k) = std::env::var("STONE_API_KEY") {
             if !k.trim().is_empty() {
                 cfg.api_key = k.trim().to_string();
@@ -148,7 +179,27 @@ impl NodeConfig {
         cfg
     }
 
+    /// Speichert sowohl in node_config.db als auch in node_config.json (Abwärtskompatibilität).
     fn save(&self) -> anyhow::Result<()> {
+        // Primär: SQLite-DB
+        if let Ok(db) = stone::node_config_db::NodeConfigDB::open(Path::new(".")) {
+            let _ = db.set_setup_complete(self.setup_complete);
+            let _ = db.set_password_hash(&self.password_hash);
+            let _ = db.set_node_name(&self.node_name);
+            let _ = db.set_wallet_address(&self.wallet_address);
+            let _ = db.set_mnemonic_once(&self.mnemonic_once);
+            let _ = db.set_seed_peers(&self.seed_peers);
+            let _ = db.set_http_port(self.http_port);
+            let _ = db.set_p2p_port(self.p2p_port);
+            let _ = db.set_data_dir(&self.data_dir);
+            let _ = db.set_api_key(&self.api_key);
+            let _ = db.set_created_at(&self.created_at);
+            let _ = db.set_storage_offered_gb(self.storage_offered_gb);
+            let _ = db.set_reward_per_day(self.reward_per_day);
+            let _ = db.set_public_ip(&self.public_ip);
+            let _ = db.set_wallet_balance(self.wallet_balance);
+        }
+        // Sekundär: JSON (für Abwärtskompatibilität mit älteren Nodes)
         let json = serde_json::to_string_pretty(self)?;
         std::fs::write(CONFIG_FILE, json)?;
         Ok(())
@@ -1494,7 +1545,7 @@ async fn handle_p2p_event(
                 for (i, part) in parts.iter().enumerate() {
                     if *part == "ip4" {
                         if let Some(found_ip) = parts.get(i + 1) {
-                            if *found_ip != "127.0.0.1" && *found_ip != "0.0.0.0" {
+                            if stone::network::is_routable_ipv4(found_ip) {
                                 ip = Some(found_ip.to_string());
                                 break;
                             }

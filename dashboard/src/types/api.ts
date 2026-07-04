@@ -359,4 +359,5 @@ export interface Session {
 export interface NodeSettings {
   nodeUrl: string;
   label?: string;
+  network?: string;
 }

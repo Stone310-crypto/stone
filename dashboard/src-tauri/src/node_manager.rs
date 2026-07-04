@@ -27,17 +27,23 @@ pub struct NodeConfig {
     /// API-Key for node-to-node sync. Empty = auto-generated.
     #[serde(default)]
     pub api_key: String,
+    /// Network mode: "testnet" or "mainnet"
+    #[serde(default = "default_network")]
+    pub network: String,
 }
+
+fn default_network() -> String { "mainnet".into() }
 
 impl Default for NodeConfig {
     fn default() -> Self {
         NodeConfig {
             enabled: true,
-            port: 3080,
+            port: 3180,
             cpu_pct: 25,
             binary_path: String::new(),
             api_key: String::new(),
-            seed_peers: "/ip4/212.227.54.241/tcp/4001/p2p/12D3KooWLqikBBCRhCZ2MgSYG3R579BNUgrN5E6dZnYSEYdmAKTd,/ip4/69.48.200.255/tcp/4001/p2p/12D3KooWLqikBBCRhCZ2MgSYG3R579BNUgrN5E6dZnYSEYdmAKTd".to_string(),
+            network: "mainnet".into(),
+            seed_peers: "/ip4/212.227.54.241/tcp/5003/p2p/12D3KooWLqikBBCRhCZ2MgSYG3R579BNUgrN5E6dZnYSEYdmAKTd,/ip4/69.48.200.255/tcp/5003/p2p/12D3KooWLqikBBCRhCZ2MgSYG3R579BNUgrN5E6dZnYSEYdmAKTd".to_string(),
         }
     }
 }
@@ -196,14 +202,14 @@ fn find_binary(app: &AppHandle, override_path: &str) -> Option<PathBuf> {
         #[cfg(unix)]
         if let Some(home) = std::env::var_os("HOME") {
             let home = PathBuf::from(home);
-            v.push(home.join("stone-1/target/release/stone-app-node"));
-            v.push(home.join("stone-1/target/release/stone-master"));
+            v.push(home.join("stone/target/release/stone-app-node"));
+            v.push(home.join("stone/target/release/stone-master"));
         }
         #[cfg(target_os = "windows")]
         if let Ok(userprofile) = std::env::var("USERPROFILE") {
             let profile = PathBuf::from(userprofile);
-            v.push(profile.join("stone-1/target/release/stone-app-node.exe"));
-            v.push(profile.join("stone-1/target/release/stone-master.exe"));
+            v.push(profile.join("stone/target/release/stone-app-node.exe"));
+            v.push(profile.join("stone/target/release/stone-master.exe"));
         }
 
         // 4. PATH lookup
@@ -241,10 +247,40 @@ fn find_binary(app: &AppHandle, override_path: &str) -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.exists())
 }
 
-// ── node_config.json writer ───────────────────────────────────────────────────
+// ── node_config.db writer ─────────────────────────────────────────────────────
 
-/// Write a minimal node_config.json that stone-master will read on startup.
+/// Write config to node_config.db (and node_config.json for backward compat).
 fn write_node_config(data_dir: &PathBuf, cfg: &NodeConfig) -> Result<(), String> {
+    // Primär: SQLite-DB
+    if let Ok(db) = crate::node_config_db::NodeConfigDB::open(data_dir) {
+        let _ = db.set("setup_complete", "true");
+        let _ = db.set("node_name", "StoneDesktopNode");
+        let _ = db.set("wallet_address", "");
+        let _ = db.set_u16("http_port", cfg.port);
+        let _ = db.set_u16("p2p_port", 5003);
+        let _ = db.set("data_dir", &data_dir.to_string_lossy());
+        let _ = db.set("auto_mining_enabled", "true");
+        let _ = db.set("auto_mining_timeout_secs", "120");
+        let _ = db.set("miner_heartbeat_timeout_secs", "30");
+        let _ = db.set("api_key", &cfg.api_key);
+        let _ = db.set("network", &cfg.network);
+
+        // seed_peers als JSON-Array
+        let seed_peers_json: Vec<String> = cfg
+            .seed_peers
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let json = serde_json::to_string(&seed_peers_json).map_err(|e| format!("serialize: {e}"))?;
+        let _ = db.set("seed_peers", &json);
+
+        // Bootstrap-Nodes
+        let net = if cfg.network == "mainnet" { "mainnet" } else { "testnet" };
+        let _ = db.replace_bootstrap_nodes(&seed_peers_json, net);
+    }
+
+    // Sekundär: JSON (Abwärtskompatibilität)
     let seed_peers_json: Vec<serde_json::Value> = cfg
         .seed_peers
         .split(',')
@@ -258,7 +294,7 @@ fn write_node_config(data_dir: &PathBuf, cfg: &NodeConfig) -> Result<(), String>
         "wallet_address": "",
         "seed_peers": seed_peers_json,
         "http_port": cfg.port,
-        "p2p_port": 4001,
+        "p2p_port": 5003,
         "data_dir": data_dir.to_string_lossy(),
         "auto_mining_enabled": true,
         "auto_mining_timeout_secs": 120,
@@ -288,7 +324,7 @@ pub fn get_local_ip() -> Result<String, String> {
     // Finde die lokale LAN-IP (erste non-loopback IPv4)
     use std::net::UdpSocket;
     let socket = UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("{e}"))?;
-    socket.connect("212.227.54.241:3080").map_err(|e| format!("{e}"))?;
+    socket.connect("212.227.54.241:3180").map_err(|e| format!("{e}"))?;
     let addr = socket.local_addr().map_err(|e| format!("{e}"))?;
     Ok(addr.ip().to_string())
 }
@@ -356,6 +392,50 @@ pub fn node_start(
 pub fn node_stop(state: tauri::State<'_, SharedNodeState>) -> Result<(), String> {
     let shared = state.inner().clone();
     node_stop_internal(&shared)
+}
+
+/// Restart the node with a different network (testnet ↔ mainnet).
+/// Stops the current process and restarts with the opposite network.
+/// The new port is auto-determined: 3080 for testnet, 3180 for mainnet.
+#[tauri::command]
+pub fn switch_node_network(
+    state: tauri::State<'_, SharedNodeState>,
+    app: AppHandle,
+) -> Result<String, String> {
+    let current_network;
+    let cpu_pct;
+    {
+        let s = state.lock().unwrap_or_else(|e| e.into_inner());
+        current_network = s.config.network.clone();
+        cpu_pct = s.config.cpu_pct;
+    }
+
+    // Toggle network
+    let new_network = if current_network == "mainnet" { "testnet" } else { "mainnet" };
+    let new_port: u16 = if new_network == "mainnet" { 3180 } else { 3080 };
+
+    // Stop current node
+    node_stop_internal(&state.inner().clone())?;
+
+    // Wait for port to be released
+    std::thread::sleep(std::time::Duration::from_millis(800));
+
+    // Update config and persist
+    {
+        let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+        s.config.network = new_network.to_string();
+        s.config.port = new_port;
+    }
+    persist_config(&app, &state.lock().unwrap_or_else(|e| e.into_inner()).config.clone());
+
+    // Kill anything still on the new port
+    kill_process_on_port(new_port);
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    // Start with new network
+    let url = node_start_internal(&app, &state.inner().clone())?;
+
+    Ok(format!("{}|{}", new_network, url))
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
@@ -491,12 +571,13 @@ pub fn node_start_internal(
     let cfg = s.config.clone();
     drop(s);
 
-    // Prepare data directory
+    // Prepare data directory (network-specific: node_data_testnet / node_data_mainnet)
+    let data_dir_name = if cfg.network == "mainnet" { "node_data_mainnet" } else { "node_data_testnet" };
     let data_dir = app
         .path()
         .app_data_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
-        .join("node_data");
+        .join(data_dir_name);
     std::fs::create_dir_all(&data_dir)
         .map_err(|e| format!("Datenverzeichnis erstellen: {e}"))?;
 
@@ -531,7 +612,7 @@ pub fn node_start_internal(
     let mut cmd = Command::new(&binary);
     cmd.env("STONE_PORT", port.to_string())
         .env("STONE_DATA_DIR", data_dir.to_string_lossy().as_ref())
-        .env("STONE_NETWORK", "testnet")
+        .env("STONE_NETWORK", cfg.network.as_str())
         .env("MINING_THROTTLE_PCT", cpu_pct.to_string())
         .env("STONE_BOOTSTRAP_NODES", &bootstrap_nodes)
         .env("STONE_P2P_DISABLED", "0");
@@ -628,6 +709,30 @@ fn node_stop_internal(shared: &SharedNodeState) -> Result<(), String> {
 fn persist_config(app: &AppHandle, config: &NodeConfig) {
     if let Ok(data_dir) = app.path().app_data_dir() {
         let _ = std::fs::create_dir_all(&data_dir);
+
+        // Primär: SQLite-DB (node_config.db)
+        if let Ok(db) = crate::node_config_db::NodeConfigDB::open(&data_dir) {
+            let _ = db.set("enabled", if config.enabled { "true" } else { "false" });
+            let _ = db.set_u16("http_port", config.port);
+            let _ = db.set("cpu_pct", &config.cpu_pct.to_string());
+            let _ = db.set("seed_peers", &config.seed_peers);
+            let _ = db.set("api_key", &config.api_key);
+            let _ = db.set("network", &config.network);
+
+            // Bootstrap-Nodes aus seed_peers extrahieren
+            let net = if config.network == "mainnet" { "mainnet" } else { "testnet" };
+            let peers: Vec<String> = config.seed_peers
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            let _ = db.replace_bootstrap_nodes(&peers, net);
+
+            // Migration von node_config.json (einmalig)
+            db.migrate_json_if_needed(&data_dir);
+        }
+
+        // Sekundär: JSON (Abwärtskompatibilität)
         if let Ok(json) = serde_json::to_string_pretty(config) {
             let _ = std::fs::write(data_dir.join("node_config.json"), json);
         }
@@ -639,18 +744,44 @@ fn persist_config(app: &AppHandle, config: &NodeConfig) {
 pub fn load_config(app: &AppHandle) -> NodeConfig {
     let default = NodeConfig::default();
     if let Ok(data_dir) = app.path().app_data_dir() {
+        let _ = std::fs::create_dir_all(&data_dir);
+
+        // Versuche SQLite-DB (node_config.db)
+        if let Ok(db) = crate::node_config_db::NodeConfigDB::open(&data_dir) {
+            // Migration von JSON → DB (einmalig)
+            db.migrate_json_if_needed(&data_dir);
+
+            let mut cfg = default.clone();
+            if let Some(v) = db.get("enabled") { cfg.enabled = v == "true"; }
+            if let Some(v) = db.get("http_port") { if let Ok(p) = v.parse() { cfg.port = p; } }
+            if let Some(v) = db.get("cpu_pct") { if let Ok(p) = v.parse() { cfg.cpu_pct = p; } }
+            if let Some(v) = db.get("binary_path") { cfg.binary_path = v; }
+            if let Some(v) = db.get("seed_peers") { cfg.seed_peers = v; }
+            if let Some(v) = db.get("api_key") { cfg.api_key = v; }
+            if let Some(v) = db.get("network") { cfg.network = v; }
+            return cfg;
+        }
+
+        // Fallback: node_config.json
         let cfg_path = data_dir.join("node_config.json");
         if let Ok(data) = std::fs::read_to_string(&cfg_path) {
             if let Ok(cfg) = serde_json::from_str::<NodeConfig>(&data) {
-                // Always keep the loaded config but ensure enabled matches
-                // the default (user can override via settings)
                 return cfg;
             }
         }
     }
-    // First launch — persist default config with enabled=true
+    // First launch — persist default config
     if let Ok(data_dir) = app.path().app_data_dir() {
         let _ = std::fs::create_dir_all(&data_dir);
+        if let Ok(db) = crate::node_config_db::NodeConfigDB::open(&data_dir) {
+            let _ = db.set("enabled", "true");
+            let _ = db.set_u16("http_port", default.port);
+            let _ = db.set("cpu_pct", &default.cpu_pct.to_string());
+            let _ = db.set("seed_peers", &default.seed_peers);
+            let _ = db.set("api_key", &default.api_key);
+            let _ = db.set("network", &default.network);
+        }
+        // Auch JSON für Abwärtskompatibilität
         if let Ok(json) = serde_json::to_string_pretty(&default) {
             let _ = std::fs::write(data_dir.join("node_config.json"), json);
         }

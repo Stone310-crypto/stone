@@ -226,7 +226,8 @@ async fn main() {
     // ── Bootstrap-Nodes laden ─────────────────────────────────────────────────
     // Quellen (in Priorität):
     //   1) STONE_BOOTSTRAP_NODES env (komma-separiert: "http://1.2.3.4:3080,http://5.6.7.8:3080")
-    //   2) node_config.json → "bootstrap_nodes": ["http://..."]
+    //   2) node_config.db → bootstrap_nodes table
+    //   3) node_config.json → "bootstrap_nodes": ["http://..."]
     // Bootstrap-Nodes werden als Peers hinzugefügt (falls nicht schon vorhanden)
     {
         let mut bootstrap: Vec<String> = Vec::new();
@@ -298,22 +299,60 @@ async fn main() {
             }
         }
 
-        // Aus node_config.json
+        // Aus node_config.db (SQLite) oder node_config.json (JSON-Fallback)
         if bootstrap.is_empty() {
-            let config_path = format!("{}/../../node_config.json", stone::blockchain::data_dir());
-            let config_path2 = "node_config.json".to_string();
-            for path in &[&config_path, &config_path2] {
-                if let Ok(data) = std::fs::read_to_string(path) {
-                    if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&data) {
-                        if let Some(nodes) = cfg.get("bootstrap_nodes").and_then(|v| v.as_array()) {
-                            for n in nodes {
-                                if let Some(url) = n.as_str() {
-                                    bootstrap.push(normalize_bootstrap_url(url));
+            // 1) Versuche node_config.db
+            let db_tried = if let Ok(db) = stone::node_config_db::NodeConfigDB::open_default() {
+                let network = if stone::network::is_mainnet() { "mainnet" } else { "testnet" };
+                let db_nodes = db.bootstrap_nodes(network);
+                if !db_nodes.is_empty() {
+                    for url in &db_nodes {
+                        bootstrap.push(normalize_bootstrap_url(url));
+                    }
+                    true
+                } else {
+                    // Fallback: alle bootstrap_nodes (wenn keine netzwerk-spezifischen)
+                    let all = db.all_bootstrap_nodes();
+                    if !all.is_empty() {
+                        for url in &all {
+                            bootstrap.push(normalize_bootstrap_url(url));
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+
+            // 2) Fallback: node_config.json
+            if !db_tried || bootstrap.is_empty() {
+                let config_path = format!("{}/../../node_config.json", stone::blockchain::data_dir());
+                let config_path2 = "node_config.json".to_string();
+                for path in &[&config_path, &config_path2] {
+                    if let Ok(data) = std::fs::read_to_string(path) {
+                        if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&data) {
+                            if let Some(nodes) = cfg.get("bootstrap_nodes").and_then(|v| v.as_array()) {
+                                for n in nodes {
+                                    if let Some(url) = n.as_str() {
+                                        bootstrap.push(normalize_bootstrap_url(url));
+                                    }
+                                }
+                            }
+                            // Auch seed_peers aus JSON lesen
+                            if bootstrap.is_empty() {
+                                if let Some(peers) = cfg.get("seed_peers").and_then(|v| v.as_array()) {
+                                    for p in peers {
+                                        if let Some(url) = p.as_str() {
+                                            bootstrap.push(normalize_bootstrap_url(url));
+                                        }
+                                    }
                                 }
                             }
                         }
+                        break;
                     }
-                    break;
                 }
             }
         }
@@ -960,7 +999,7 @@ async fn main() {
                                         for (i, part) in parts.iter().enumerate() {
                                             if *part == "ip4" {
                                                 if let Some(found_ip) = parts.get(i + 1) {
-                                                    if *found_ip != "127.0.0.1" && *found_ip != "0.0.0.0" {
+                                                    if stone::network::is_routable_ipv4(found_ip) {
                                                         ip = Some(found_ip.to_string());
                                                         break;
                                                     }

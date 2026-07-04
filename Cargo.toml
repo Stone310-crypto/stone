@@ -38,6 +38,10 @@ path = "src/bin/stone_miner.rs"
 name = "stone-app-node"
 path = "src/bin/app_node.rs"
 
+[[bin]]
+name = "stone-discover"
+path = "src/bin/stone_discover.rs"
+
 # ─── Abhängigkeiten ───────────────────────────────────────────────────────────
 [dependencies]
 # Serialisierung
@@ -47,7 +51,7 @@ bincode     = { version = "2.0.1", features = ["serde"] }
 
 # Persistenz
 rocksdb     = { version = "0.22", default-features = false, features = ["snappy"] }
-rusqlite    = { version = "0.31", features = ["bundled", "serde_json"] }
+rusqlite    = { version = "0.31", features = ["bundled-sqlcipher-vendored-openssl", "serde_json"] }
 
 # Zeit & Hashing
 sha2    = "0.10"
@@ -155,3 +159,7 @@ sysinfo     = "0.33"
 # echte Funktionsnamen+Zeilen. Performance bleibt (Optimierungen aktiv).
 [profile.release]
 strip = false
+
+# ─── Dev-Dependencies (Tests) ─────────────────────────────────────────────────
+[dev-dependencies]
+tempfile = "3"

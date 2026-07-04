@@ -1,0 +1,15 @@
+{
+  "id": "testnet-mode",
+  "name": "Testnet Mode",
+  "description": "Schaltet das Dashboard zwischen Mainnet und Testnet um. Warnt vor experimentellen Features.",
+  "version": "1.0.0",
+  "icon": "🧪",
+  "rating": 0.0,
+  "reviews": 0,
+  "downloads": 0,
+  "size_mb": 1,
+  "repository": "Stone310-crypto/testnet-mode-extension",
+  "permissions": ["storage"],
+  "category": "utility",
+  "author": "StoneChain"
+}

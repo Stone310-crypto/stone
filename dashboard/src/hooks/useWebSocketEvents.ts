@@ -33,7 +33,7 @@ export function useWebSocketEvents() {
     if (!session) return;
 
     const settings = loadSettings();
-    const nodeUrl = (settings as any)?.nodeUrl ?? "http://127.0.0.1:3080";
+    const nodeUrl = (settings as any)?.nodeUrl ?? "http://127.0.0.1:3180";
     const wsUrl = nodeUrl
       .replace(/^http/, "ws")
       .replace(/\/$/, "") + `/ws?token=${encodeURIComponent(session.apiKey)}`;

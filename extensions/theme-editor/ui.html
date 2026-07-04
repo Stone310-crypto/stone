@@ -2,33 +2,38 @@
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#0f1117;color:#e8e4df;font-size:12px;overflow:hidden;height:100vh;display:flex;flex-direction:column}
-.toolbar{display:flex;align-items:center;gap:8px;padding:8px 12px;background:#1a1c26;border-bottom:1px solid rgba(255,255,255,0.08);flex-shrink:0}
-.toolbar h1{font-size:15px;font-weight:700;margin-right:8px}
-.btn{padding:5px 10px;border-radius:6px;border:none;font-size:11px;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:4px}
-.btn-primary{background:#d4a853;color:#000}.btn-primary:hover{opacity:.9}
-.btn-secondary{background:rgba(255,255,255,0.08);color:#e8e4df}.btn-secondary:hover{background:rgba(255,255,255,0.12)}
-.btn-green{background:#5a9e6f;color:#fff}.btn-green:hover{opacity:.9}
+.toolbar{display:flex;align-items:center;gap:8px;padding:8px 12px;background:#1a1c26;border-bottom:1px solid rgba(255,255,255,0.08);flex-shrink:0;min-height:40px}
+.toolbar h1{font-size:15px;font-weight:700;margin-right:8px;white-space:nowrap}
+.btn{padding:5px 10px;border-radius:6px;border:none;font-size:11px;font-weight:600;cursor:pointer;display:inline-flex;align-items:center;gap:4px;white-space:nowrap}
+.btn:disabled{opacity:.5;cursor:not-allowed}
+.btn-primary{background:#d4a853;color:#000}.btn-primary:hover:not(:disabled){opacity:.9}
+.btn-secondary{background:rgba(255,255,255,0.08);color:#e8e4df}.btn-secondary:hover:not(:disabled){background:rgba(255,255,255,0.12)}
+.btn-green{background:#5a9e6f;color:#fff}.btn-green:hover:not(:disabled){opacity:.9}
 .btn-danger{background:rgba(239,68,68,0.15);color:#d95b5b}
-.main{display:flex;flex:1;overflow:hidden}
-.left{width:420px;flex-shrink:0;display:flex;flex-direction:column;overflow:hidden}
-.editor-scroll{flex:1;overflow-y:auto;padding:8px;border-right:1px solid rgba(255,255,255,0.08);background:#0f1117}
-.designs-panel{max-height:0;overflow:hidden;transition:max-height .3s;background:#14161f;border-right:1px solid rgba(255,255,255,0.08);font-size:11px}
-.designs-panel.open{max-height:300px;overflow-y:auto}
-.designs-panel .dp-header{display:flex;align-items:center;justify-content:space-between;padding:8px 10px;background:#1a1c26;border-bottom:1px solid rgba(255,255,255,0.08);position:sticky;top:0;z-index:1}
-.designs-panel .dp-item{display:flex;align-items:center;justify-content:space-between;padding:6px 10px;cursor:pointer;border-bottom:1px solid rgba(255,255,255,0.04)}
+.sel-target{background:#2f3342;border:1px solid rgba(255,255,255,0.12);border-radius:6px;color:#e8e4df;font-size:11px;padding:4px 8px;outline:none;cursor:pointer;font-weight:600;min-width:160px}
+.sel-target:focus{border-color:#d4a853}
+.sel-target option{background:#1e202a;color:#e8e4df}
+.main{display:flex;flex:1;overflow:hidden;min-height:0}
+.left{width:420px;flex-shrink:0;display:flex;flex-direction:column;overflow:hidden;min-height:0}
+.editor-scroll{flex:1 1 0;overflow-y:auto;padding:8px;border-right:1px solid rgba(255,255,255,0.08);background:#0f1117;min-height:0}
+.designs-panel{background:#14161f;border-right:1px solid rgba(255,255,255,0.08);font-size:11px;flex-shrink:0;border-top:1px solid rgba(255,255,255,0.08)}
+.designs-panel.open{max-height:260px;overflow-y:auto}
+.designs-panel.closed{max-height:34px;overflow:hidden}
+.designs-panel .dp-header{display:flex;align-items:center;justify-content:space-between;padding:7px 10px;background:#1a1c26;border-bottom:1px solid rgba(255,255,255,0.08);cursor:pointer;user-select:none;position:sticky;top:0;z-index:1}
+.designs-panel .dp-header:hover{background:#1e202a}
+.designs-panel .dp-item{display:flex;align-items:center;justify-content:space-between;padding:5px 10px;cursor:pointer;border-bottom:1px solid rgba(255,255,255,0.04)}
 .designs-panel .dp-item:hover{background:rgba(255,255,255,0.04)}
 .designs-panel .dp-item.active{background:rgba(212,168,83,0.12);border-left:2px solid #d4a853}
-.right{flex:1;display:flex;flex-direction:column;overflow:hidden}
+.right{flex:1;display:flex;flex-direction:column;overflow:hidden;min-height:0}
 .preview-bar{display:flex;align-items:center;gap:8px;padding:6px 10px;background:#1a1c26;border-bottom:1px solid rgba(255,255,255,0.08);font-size:11px;color:#b8b4ae;flex-shrink:0}
-.preview-container{flex:1;overflow:hidden}
-.comp-tabs{display:flex;gap:3px;margin-bottom:10px;flex-wrap:wrap}
+.preview-container{flex:1;overflow:hidden;min-height:0}
+.comp-tabs{display:flex;gap:3px;margin-bottom:8px;flex-wrap:wrap}
 .btn-tab{padding:4px 10px;border-radius:4px;border:1px solid rgba(255,255,255,0.12);background:transparent;color:#b8b4ae;cursor:pointer;font-size:10px;font-weight:500}
 .btn-tab.active,.btn-tab:hover{background:#d4a853;color:#000;border-color:#d4a853}
-.css-editor{width:100%;min-height:100px;background:#2f3342;border:1px solid rgba(255,255,255,0.08);border-radius:6px;padding:10px;font-family:monospace;font-size:11px;color:#e8e4df;resize:vertical;outline:none}
-.vars-scroll{max-height:420px;overflow-y:auto}
-.var-row{display:flex;align-items:center;gap:6px;padding:3px 0}
-.var-label{width:130px;font-size:10px;color:#b8b4ae;font-family:monospace;flex-shrink:0}
-.var-input{flex:1;padding:3px 6px;border-radius:3px;background:#2f3342;border:1px solid rgba(255,255,255,0.08);color:#e8e4df;font-size:11px;font-family:monospace;outline:none}
+.css-editor{width:100%;min-height:80px;background:#2f3342;border:1px solid rgba(255,255,255,0.08);border-radius:6px;padding:10px;font-family:monospace;font-size:11px;color:#e8e4df;resize:vertical;outline:none}
+.var-row{display:flex;align-items:center;gap:6px;padding:2px 0}
+.var-label{width:125px;font-size:10px;color:#b8b4ae;font-family:monospace;flex-shrink:0}
+.var-input{flex:1;padding:3px 6px;border-radius:3px;background:#2f3342;border:1px solid rgba(255,255,255,0.08);color:#e8e4df;font-size:11px;font-family:monospace;outline:none;min-width:0}
 .var-input:focus{border-color:#d4a853}
 .var-color{width:22px;height:22px;border-radius:3px;border:1px solid rgba(255,255,255,0.12);cursor:pointer;padding:0;flex-shrink:0}
 .var-swatch{width:14px;height:14px;border-radius:2px;border:1px solid rgba(255,255,255,0.12);flex-shrink:0}
@@ -44,98 +49,126 @@ body{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#0f1117;
 .preview-dash .btn-preview{padding:6px 12px;border-radius:6px;color:var(--text-inverse,#000);border:none;font-size:11px;font-weight:600;background:var(--accent)}
 .preview-dash .input-preview{padding:6px 10px;border-radius:6px;font-size:11px;background:var(--bg-input);border:1px solid var(--border-default);color:var(--text-primary)}
 .status{font-size:10px;color:#6e6b65}.status.changed{color:#d4a853;font-weight:600}
-.gr-hd{font-size:11px;font-weight:600;color:#b8b4ae;margin:10px 0 4px}
+.gr-hd{font-size:11px;font-weight:600;color:#b8b4ae;margin:8px 0 3px}
 .cur-val{font-size:9px;color:#5a9e6f;margin-left:4px}
-.dp-toggle{font-size:10px;color:#b8b4ae;cursor:pointer;display:flex;align-items:center;gap:4px;padding:6px 10px;background:#14161f;border-right:1px solid rgba(255,255,255,0.08);border-top:1px solid rgba(255,255,255,0.08);user-select:none}
-.dp-toggle:hover{color:#e8e4df}
-.toast{position:fixed;bottom:16px;right:16px;padding:10px 16px;border-radius:8px;font-size:12px;font-weight:600;z-index:99;animation:slideUp .3s ease;box-shadow:0 4px 12px rgba(0,0,0,0.3)}
+.empty-designs{padding:12px;color:#6e6b65;text-align:center;font-size:11px;line-height:1.5}
+.empty-designs .big-icon{font-size:24px;display:block;margin-bottom:4px;opacity:.5}
+.toast{position:fixed;bottom:16px;right:16px;padding:10px 16px;border-radius:8px;font-size:12px;font-weight:600;z-index:99;animation:slideUp .3s ease;box-shadow:0 4px 12px rgba(0,0,0,0.3);pointer-events:none}
 .toast-ok{background:#5a9e6f;color:#fff}
 .toast-err{background:#d95b5b;color:#fff}
+.modal-overlay{position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.6);z-index:100;display:flex;align-items:center;justify-content:center;animation:fadeIn .15s ease}
+.modal-box{background:#1e202a;border:1px solid rgba(255,255,255,0.12);border-radius:12px;padding:20px;min-width:300px;max-width:400px;box-shadow:0 8px 32px rgba(0,0,0,0.4)}
+.modal-box h2{font-size:15px;margin-bottom:12px;font-weight:700}
+.modal-box p{font-size:12px;color:#b8b4ae;margin-bottom:12px}
+.modal-box input{margin-bottom:12px;width:100%;padding:8px 10px;border-radius:6px;background:#2f3342;border:1px solid rgba(255,255,255,0.12);color:#e8e4df;font-size:13px;outline:none}
+.modal-box input:focus{border-color:#d4a853}
+.modal-btns{display:flex;gap:8px;justify-content:flex-end}
+.target-badge{font-size:10px;padding:2px 8px;border-radius:10px;background:rgba(212,168,83,0.15);color:#d4a853;font-weight:600}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
 @keyframes slideUp{from{transform:translateY(20px);opacity:0}to{transform:translateY(0);opacity:1}}
+@keyframes spin{from{transform:rotate(0)}to{transform:rotate(360deg)}}
+.spin{animation:spin 1s linear infinite}
 </style></head><body>
 <div class="toolbar">
   <h1>🎨 Theme Editor</h1>
+  <span style="color:#6e6b65;font-size:10px">🎯</span>
+  <select class="sel-target" id="target-ext" onchange="switchTarget(this.value)">
+    <option value="__dashboard__">🌐 Dashboard (Global)</option>
+  </select>
   <span style="flex:1"></span>
-  <button class="btn btn-secondary" onclick="readCurrent()" title="Liest die aktuellen Theme-Werte vom Dashboard">📋 Aktuelle Werte</button>
+  <button class="btn btn-secondary" onclick="readCurrent()">📋 Werte laden</button>
   <button class="btn btn-secondary" onclick="resetAll()">🔄 Reset</button>
-  <button class="btn btn-green" onclick="applyTheme()">✅ Übernehmen</button>
-  <button class="btn btn-primary" onclick="saveTheme()">💾 Speichern</button>
+  <button class="btn btn-green" id="btn-apply" onclick="applyTheme()">✅ Übernehmen</button>
+  <button class="btn btn-primary" id="btn-save" onclick="saveTheme()">💾 Speichern</button>
   <span id="changed-count" class="status">Keine Änderungen</span>
 </div>
 <div class="main">
 <div class="left">
-  <div class="editor-scroll">
-    <div style="font-size:10px;color:#6e6b65;margin-bottom:6px">Komponente wählen:</div>
+  <div class="editor-scroll" id="editor-scroll">
+    <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+      <span style="font-size:10px;color:#6e6b65">Komponente:</span>
+      <span class="target-badge" id="target-badge">🌐 Dashboard</span>
+    </div>
     <div class="comp-tabs" id="comp-tabs"></div>
-    <div id="panel-global"><div class="vars-scroll" id="vars-container"></div></div>
+    <div id="panel-global"><div id="vars-container"></div></div>
     <div id="panel-component" style="display:none">
       <div style="margin-bottom:6px;font-size:11px;color:#b8b4ae">CSS für <strong id="comp-name">—</strong></div>
-      <textarea class="css-editor" id="comp-css" placeholder="/* Custom CSS für diese Komponente */" oninput="ucc()"></textarea>
-      <div style="margin-top:6px;font-size:10px;color:#6e6b65">Tailwind-Selektoren: <code style="color:#d4a853">.flex</code> <code style="color:#d4a853">button</code> <code style="color:#d4a853">input</code><br>Vorschau nutzt CSS-Variablen → oben bearbeiten.</div>
+      <textarea class="css-editor" id="comp-css" placeholder="/* Custom CSS */" oninput="ucc()"></textarea>
+      <div style="margin-top:4px;font-size:10px;color:#6e6b65">Selektoren: <code style="color:#d4a853">.flex</code> <code style="color:#d4a853">button</code> <code style="color:#d4a853">input</code></div>
     </div>
-    <details style="margin-top:10px"><summary style="font-size:11px;color:#b8b4ae;cursor:pointer">📝 Generiertes CSS</summary><textarea class="css-editor" id="css-output" readonly style="margin-top:4px;min-height:80px"></textarea></details>
+    <details style="margin-top:8px"><summary style="font-size:11px;color:#b8b4ae;cursor:pointer">📝 Generiertes CSS</summary><textarea class="css-editor" id="css-output" readonly style="margin-top:4px;min-height:60px"></textarea></details>
   </div>
-  <!-- My Designs Toggle -->
-  <div class="dp-toggle" onclick="toggleDesigns()" id="dp-toggle-btn">
-    <span id="dp-arrow">▶</span> 🎨 Meine Designs (<span id="dp-count">0</span>)
-  </div>
-  <div class="designs-panel" id="designs-panel">
-    <div class="dp-header">
-      <span>🎨 Meine Designs</span>
-      <button class="btn btn-secondary" onclick="refreshDesigns()" style="font-size:10px;padding:2px 6px" title="Neu laden">🔄</button>
+  <div class="designs-panel open" id="designs-panel">
+    <div class="dp-header" onclick="toggleDesigns()">
+      <span>🎨 <strong>Meine Designs</strong> <span style="color:#6e6b65;font-weight:400" id="dp-count">(0)</span></span>
+      <span style="display:flex;gap:4px;align-items:center">
+        <button class="btn btn-secondary" onclick="event.stopPropagation();refreshDesigns()" style="font-size:10px;padding:2px 6px">🔄</button>
+        <span id="dp-arrow" style="font-size:10px">▼</span>
+      </span>
     </div>
     <div id="designs-list" style="padding:4px 0">
-      <div style="padding:12px;color:#6e6b65;text-align:center;font-size:11px">Keine Designs gespeichert.<br>Speichere ein Theme mit "💾 Speichern".</div>
+      <div class="empty-designs"><span class="big-icon">🎨</span>Keine Designs.<br><strong>💾 Speichern</strong> klicken.</div>
     </div>
   </div>
 </div>
 <div class="right">
-  <div class="preview-bar"><span>👁️ Live-Vorschau</span><span style="flex:1"></span><span style="font-size:10px;color:#6e6b65" id="preview-mode">Global</span></div>
+  <div class="preview-bar"><span>👁️ Live-Vorschau</span><span style="flex:1"></span><span style="font-size:10px;color:#6e6b65" id="preview-mode">Global</span><span style="font-size:10px;color:#d4a853" id="preview-target"></span></div>
   <div class="preview-container"><div class="preview-dash" id="preview" style="background:var(--bg-root);color:var(--text-primary)"></div></div>
 </div></div>
 <div id="toast" style="display:none"></div>
+<div id="modal-container"></div>
 <script>
-let _id=0;const _p={};window.addEventListener('message',e=>{if(e.data?.id&&_p[e.data.id]){if(e.data.ok)_p[e.data.id].resolve(e.data.result);else _p[e.data.id].reject(new Error(e.data.error));delete _p[e.data.id]}});function invoke(cmd,args){return new Promise((r,j)=>{const id=++_id;_p[id]={resolve:r,reject:j};window.parent.postMessage({type:'tauri-invoke',id,cmd,args},'*')})}
-function toast(msg,ok){var t=document.getElementById('toast');t.textContent=msg;t.className='toast '+(ok?'toast-ok':'toast-err');t.style.display='block';setTimeout(function(){t.style.display='none'},3000)}
+// ─── Tauri Bridge ──────────────────────────────────────────────
+var _id=0,_p={};window.addEventListener('message',function(e){if(e.data&&e.data.id&&_p[e.data.id]){if(e.data.ok)_p[e.data.id].resolve(e.data.result);else _p[e.data.id].reject(new Error(e.data.error));delete _p[e.data.id]}});
+function invoke(cmd,args){return new Promise(function(r,j){var id=++_id;_p[id]={resolve:r,reject:j};window.parent.postMessage({type:'tauri-invoke',id:id,cmd:cmd,args:args||{}},'*')})}
+function toast(msg,ok){var t=document.getElementById('toast');t.textContent=msg;t.className='toast '+(ok?'toast-ok':'toast-err');t.style.display='block';clearTimeout(t._tid);t._tid=setTimeout(function(){t.style.display='none'},3000)}
+function modal(title,msg,opts,cb){opts=opts||{};var o=document.createElement('div');o.className='modal-overlay';var b='';if(opts.input)b+='<input id="mi" value="'+(opts.value||'').replace(/"/g,'&quot;')+'" placeholder="'+(opts.ph||'')+'" autofocus>';b+='<div class="modal-btns">';if(opts.cancel!==false)b+='<button class="btn btn-secondary" id="mc">Abbrechen</button>';if(opts.ok)b+='<button class="btn btn-primary" id="mok">'+opts.ok+'</button>';if(opts.danger)b+='<button class="btn btn-danger" id="md">'+opts.danger+'</button>';b+='</div>';o.innerHTML='<div class="modal-box"><h2>'+title+'</h2>'+(msg?'<p>'+msg+'</p>':'')+b+'</div>';document.getElementById('modal-container').appendChild(o);var inp=document.getElementById('mi'),close=function(r){o.remove();if(cb)cb(r)};if(document.getElementById('mc'))document.getElementById('mc').onclick=function(){close(null)};if(document.getElementById('mok'))document.getElementById('mok').onclick=function(){close(inp?inp.value:'ok')};if(document.getElementById('md'))document.getElementById('md').onclick=function(){close(inp?inp.value:'danger')};if(inp){inp.onkeydown=function(e){if(e.key==='Enter')close(inp.value);if(e.key==='Escape')close(null)};setTimeout(function(){inp.focus();inp.select()},50)}o.onclick=function(e){if(e.target===o)close(null)}}
 
-const COMPS=[{id:'global',name:'🌐 Global',css:''},{id:'wallet',name:'💰 Wallet',css:''},{id:'chat',name:'💬 Chat',css:''},{id:'settings',name:'⚙️ Settings',css:''},{id:'navbar',name:'🧭 NavBar',css:''},{id:'explorer',name:'🔍 Explorer',css:''},{id:'profile',name:'👤 Profil',css:''}];
-let active='global',cv={},designsOpen=false,loadedDesignName=null;
-const VARS=[{s:'Hintergründe',v:[{n:'--bg-root',d:'#0f1117',l:'Root'},{n:'--bg-panel',d:'#1a1c26',l:'Panel'},{n:'--bg-main',d:'#1e202a',l:'Main'},{n:'--bg-input',d:'#2f3342',l:'Input'}]},{s:'Akzent',v:[{n:'--accent',d:'#d4a853',l:'Primär'},{n:'--accent-hover',d:'#e0b864',l:'Hover'}]},{s:'Farben',v:[{n:'--green',d:'#5a9e6f',l:'Erfolg'},{n:'--red',d:'#d95b5b',l:'Fehler'},{n:'--blue',d:'#6b9cc4',l:'Info'}]},{s:'Text',v:[{n:'--text-primary',d:'#e8e4df',l:'Primär'},{n:'--text-secondary',d:'#b8b4ae',l:'Sekundär'},{n:'--text-muted',d:'#6e6b65',l:'Gedimmt'},{n:'--text-inverse',d:'#0f1117',l:'Invers'}]},{s:'Rahmen',v:[{n:'--border-default',d:'rgba(255,255,255,0.08)',l:'Default'},{n:'--border-strong',d:'rgba(255,255,255,0.12)',l:'Strong'}]}];
+// ─── Data ───────────────────────────────────────────────────────
+var COMPS=[{id:'global',name:'🌐 Global',css:''},{id:'wallet',name:'💰 Wallet',css:''},{id:'chat',name:'💬 Chat',css:''},{id:'settings',name:'⚙️ Settings',css:''},{id:'navbar',name:'🧭 NavBar',css:''},{id:'explorer',name:'🔍 Explorer',css:''},{id:'profile',name:'👤 Profil',css:''}];
+var active='global',cv={},designsOpen=true,loadedDesignName=null,targetExt='__dashboard__',installedExts=[];
+var VARS=[{s:'Hintergründe',v:[{n:'--bg-root',d:'#0f1117',l:'Root'},{n:'--bg-panel',d:'#1a1c26',l:'Panel'},{n:'--bg-main',d:'#1e202a',l:'Main'},{n:'--bg-input',d:'#2f3342',l:'Input'}]},{s:'Akzent',v:[{n:'--accent',d:'#d4a853',l:'Primär'},{n:'--accent-hover',d:'#e0b864',l:'Hover'}]},{s:'Farben',v:[{n:'--green',d:'#5a9e6f',l:'Erfolg'},{n:'--red',d:'#d95b5b',l:'Fehler'},{n:'--blue',d:'#6b9cc4',l:'Info'}]},{s:'Text',v:[{n:'--text-primary',d:'#e8e4df',l:'Primär'},{n:'--text-secondary',d:'#b8b4ae',l:'Sekundär'},{n:'--text-muted',d:'#6e6b65',l:'Gedimmt'},{n:'--text-inverse',d:'#0f1117',l:'Invers'}]},{s:'Rahmen',v:[{n:'--border-default',d:'rgba(255,255,255,0.08)',l:'Default'},{n:'--border-strong',d:'rgba(255,255,255,0.12)',l:'Strong'}]}];
 
+// ─── Render ─────────────────────────────────────────────────────
 function bt(){document.getElementById('comp-tabs').innerHTML=COMPS.map(function(c){return'<button class="btn-tab'+(c.id===active?' active':'')+'" onclick="sc(\''+c.id+'\')">'+c.name+'</button>'}).join('')}
 function sc(id){active=id;bt();document.getElementById('panel-global').style.display=id==='global'?'block':'none';document.getElementById('panel-component').style.display=id==='global'?'none':'block';if(id!=='global'){var c=COMPS.find(function(x){return x.id===id});document.getElementById('comp-name').textContent=c.name;document.getElementById('comp-css').value=c.css;document.getElementById('preview-mode').textContent=c.name}else{document.getElementById('preview-mode').textContent='Global'}up()}
-function bv(){var h='';VARS.forEach(function(s){h+='<div class="gr-hd">'+s.s+'</div>';s.v.forEach(function(v){var val=cv[v.n]!==undefined?cv[v.n]:v.d;var isDef=cv[v.n]===undefined;h+='<div class="var-row"><span class="var-label">'+v.n+(isDef?' <span class="cur-val">(Standard)</span>':' <span class="cur-val" style="color:#d4a853">(geändert)</span>')+'</span><div class="var-swatch" style="background:'+val+'"></div><input type="color" class="var-color" value="'+th(val)+'" onchange="uv(\''+v.n+'\',this.value)"><input type="text" class="var-input" value="'+val+'" onchange="uv(\''+v.n+'\',this.value)" oninput="uvl(\''+v.n+'\',this.value)"><span style="font-size:10px;color:#6e6b65;width:50px">'+v.l+'</span></div>'})});document.getElementById('vars-container').innerHTML=h}
-function th(c){if(c.startsWith('#'))return c;var x=document.createElement('canvas');var ctx=x.getContext('2d');if(!ctx)return'#000';ctx.fillStyle=c;return ctx.fillStyle}
-function fd(n){for(var s of VARS)for(var v of s.v)if(v.n===n)return v.d;return''}
+function bv(){var h='';for(var si=0;si<VARS.length;si++){var s=VARS[si];h+='<div class="gr-hd">'+s.s+'</div>';for(var vi=0;vi<s.v.length;vi++){var v=s.v[vi],val=cv[v.n]!==undefined?cv[v.n]:v.d,isDef=cv[v.n]===undefined;h+='<div class="var-row"><span class="var-label" title="'+v.l+'">'+v.n+(isDef?' <span class="cur-val">(Std)</span>':' <span class="cur-val" style="color:#d4a853">(geänd.)</span>')+'</span><div class="var-swatch" style="background:'+val+'"></div><input type="color" class="var-color" value="'+th(val)+'" onchange="uv(\''+v.n+'\',this.value)"><input type="text" class="var-input" value="'+val+'" onchange="uv(\''+v.n+'\',this.value)" oninput="uvl(\''+v.n+'\',this.value)"><span style="font-size:10px;color:#6e6b65;width:45px">'+v.l+'</span></div>'}}document.getElementById('vars-container').innerHTML=h}
+function th(c){if(!c||c.startsWith('#'))return c||'#000';try{var x=document.createElement('canvas'),ctx=x.getContext('2d');ctx.fillStyle=c;return ctx.fillStyle||'#000'}catch(e){return'#000'}}
+function fd(n){for(var si=0;si<VARS.length;si++)for(var vi=0;vi<VARS[si].v.length;vi++)if(VARS[si].v[vi].n===n)return VARS[si].v[vi].d;return''}
 function uv(n,val){if(val===fd(n)){delete cv[n]}else{cv[n]=val}applyVar(n,cv[n]!==undefined?cv[n]:fd(n));bv();us();up();uco();markDesignModified()}
 function uvl(n,val){applyVar(n,val||fd(n));up()}
 function applyVar(n,val){document.documentElement.style.setProperty(n,val)}
-function applyAllVars(){for(var s of VARS)for(var v of s.v)applyVar(v.n,cv[v.n]!==undefined?cv[v.n]:v.d)}
-function us(){var c=Object.keys(cv).length+COMPS.filter(function(x){return x.css}).length;var el=document.getElementById('changed-count');el.textContent=c?c+' Änderungen':'Keine Änderungen';el.className=c?'status changed':'status'}
-function ucc(){var c=COMPS.find(function(x){return x.id===active});if(c)c.css=document.getElementById('comp-css').value;us();up();uco();markDesignModified()}
-function uco(){var l=[':root {'];for(var s of VARS){l.push('  /* '+s.s+' */');for(var v of s.v)l.push('  '+v.n+': '+(cv[v.n]!==undefined?cv[v.n]:v.d)+';')}l.push('}');for(var c of COMPS){if(c.css){l.push('');l.push('/* '+c.name+' */');l.push(c.css)}}document.getElementById('css-output').value=l.join('\n')}
-function markDesignModified(){if(loadedDesignName){var items=document.querySelectorAll('.dp-item');for(var i=0;i<items.length;i++){if(items[i].dataset.name===loadedDesignName){items[i].querySelector('.dp-name').innerHTML=loadedDesignName+' <span style="color:#d4a853">*</span>';break}}}}
-function up(){var p=document.getElementById('preview');var html='';if(active==='global'){html='<div class="nav"><span class="nav-item">💬 Chat</span><span class="nav-item active">💰 Wallet</span><span class="nav-item">🔍 Explorer</span></div><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px"><div class="card"><h3>💰 Balance</h3><div class="val">1.234 STONE</div></div><div class="card"><h3>🔗 Block</h3><div class="val">#42</div></div></div><div class="card"><h3>TXs</h3><div class="wallet-row"><span>TX abc...</span><span style="color:var(--green)">+50</span></div><div class="wallet-row"><span>TX def...</span><span style="color:var(--red)">-10</span></div></div><div style="display:flex;gap:8px;margin-top:8px"><input class="input-preview" placeholder="Empfänger..." style="flex:1"><button class="btn-preview">Senden</button></div>'}else if(active==='wallet'){html='<h3 style="margin-bottom:8px">💰 Wallet</h3><div class="card"><h3>Balance</h3><div class="val">1.234 STONE</div></div><div class="card"><h3>TXs</h3><div class="wallet-row"><span>TX abc...</span><span style="color:var(--green)">+50</span></div><div class="wallet-row"><span>TX def...</span><span style="color:var(--red)">-10</span></div></div><div style="display:flex;gap:8px"><input class="input-preview" placeholder="Wallet" style="flex:1"><button class="btn-preview">Senden</button></div>'}else if(active==='chat'){html='<h3 style="margin-bottom:8px">💬 Chat</h3><div style="background:var(--bg-panel);border-radius:8px;padding:8px;margin-bottom:4px;border:1px solid var(--border-default)"><span style="color:var(--accent)">User1:</span> Hey!</div><div style="background:var(--bg-panel);border-radius:8px;padding:8px;margin-bottom:4px;border:1px solid var(--border-default)"><span style="color:var(--accent)">User2:</span> Alles gut!</div><div style="display:flex;gap:8px;margin-top:8px"><input class="input-preview" placeholder="Nachricht..." style="flex:1"><button class="btn-preview">Senden</button></div>'}else if(active==='settings'){html='<h3 style="margin-bottom:8px">⚙️ Settings</h3><div class="card"><h3>Profil</h3><div class="wallet-row"><span>Name</span><span style="color:var(--text-primary)">Alice</span></div><div class="wallet-row"><span>Sprache</span><span style="color:var(--text-primary)">Deutsch</span></div></div><div style="display:flex;gap:8px"><input class="input-preview" placeholder="Name" style="flex:1"><button class="btn-preview">Speichern</button></div>'}else if(active==='navbar'){html='<h3 style="margin-bottom:8px">🧭 NavBar</h3><div class="nav"><span class="nav-item">🏠 Home</span><span class="nav-item">💬 Chat</span><span class="nav-item active">💰 Wallet</span><span class="nav-item">🔍 Explorer</span></div><div class="card"><h3>Inhalt</h3><div class="val">Seite: Wallet</div></div>'}else if(active==='explorer'){html='<h3 style="margin-bottom:8px">🔍 Explorer</h3><div class="card"><h3>🔗 Block #42</h3><div class="wallet-row"><span>Hash</span><span style="font-family:monospace;color:var(--text-muted)">0xabc...</span></div><div class="wallet-row"><span>TXs</span><span style="color:var(--green)">12</span></div></div><input class="input-preview" placeholder="Block/Adresse suchen..." style="width:100%">'}else if(active==='profile'){html='<h3 style="margin-bottom:8px">👤 Profil</h3><div class="card"><div class="wallet-row"><span>Name</span><span style="color:var(--text-primary)">Alice</span></div><div class="wallet-row"><span>Rolle</span><span style="color:var(--accent)">Admin</span></div><div class="wallet-row"><span>XP</span><span style="color:var(--green)">1.500</span></div></div><button class="btn-preview">Profil bearbeiten</button>'}p.innerHTML=html}
+function applyAllVars(){for(var si=0;si<VARS.length;si++)for(var vi=0;vi<VARS[si].v.length;vi++)applyVar(VARS[si].v[vi].n,cv[VARS[si].v[vi].n]!==undefined?cv[VARS[si].v[vi].n]:VARS[si].v[vi].d)}
+function us(){var c=Object.keys(cv).length;for(var i=0;i<COMPS.length;i++){if(COMPS[i].css)c++}var el=document.getElementById('changed-count');el.textContent=c?c+' Änderungen':'Keine Änderungen';el.className=c?'status changed':'status'}
+function ucc(){for(var i=0;i<COMPS.length;i++){if(COMPS[i].id===active){COMPS[i].css=document.getElementById('comp-css').value;break}}us();up();uco();markDesignModified()}
+function uco(){var l=['/* Ziel: '+(targetExt==='__dashboard__'?'Dashboard':targetExt)+' */',':root {'];for(var si=0;si<VARS.length;si++){l.push('  /* '+VARS[si].s+' */');for(var vi=0;vi<VARS[si].v.length;vi++)l.push('  '+VARS[si].v[vi].n+': '+(cv[VARS[si].v[vi].n]!==undefined?cv[VARS[si].v[vi].n]:VARS[si].v[vi].d)+';')}l.push('}');for(var i=0;i<COMPS.length;i++){if(COMPS[i].css){l.push('');l.push('/* '+COMPS[i].name+' */');l.push(COMPS[i].css)}}document.getElementById('css-output').value=l.join('\n')}
+function markDesignModified(){if(!loadedDesignName)return;var items=document.querySelectorAll('.dp-item');for(var i=0;i<items.length;i++){if(items[i].dataset.name===loadedDesignName){items[i].querySelector('.dp-name').innerHTML=loadedDesignName+' <span style="color:#d4a853">*</span>';break}}}
+function up(){var p=document.getElementById('preview'),g=active==='global',w=active==='wallet',c=active==='chat',s=active==='settings',n=active==='navbar',e=active==='explorer',pr=active==='profile',html='';if(g)html='<div class="nav"><span class="nav-item">💬 Chat</span><span class="nav-item active">💰 Wallet</span><span class="nav-item">🔍 Explorer</span></div><div style="display:grid;grid-template-columns:1fr 1fr;gap:8px"><div class="card"><h3>💰 Balance</h3><div class="val">1.234 STONE</div></div><div class="card"><h3>🔗 Block</h3><div class="val">#42</div></div></div><div class="card"><h3>TXs</h3><div class="wallet-row"><span>TX abc...</span><span style="color:var(--green)">+50</span></div><div class="wallet-row"><span>TX def...</span><span style="color:var(--red)">-10</span></div></div><div style="display:flex;gap:8px;margin-top:8px"><input class="input-preview" placeholder="Empfänger..." style="flex:1"><button class="btn-preview">Senden</button></div>';else if(w)html='<h3 style="margin-bottom:8px">💰 Wallet</h3><div class="card"><h3>Balance</h3><div class="val">1.234 STONE</div></div><div class="card"><h3>TXs</h3><div class="wallet-row"><span>TX abc...</span><span style="color:var(--green)">+50</span></div><div class="wallet-row"><span>TX def...</span><span style="color:var(--red)">-10</span></div></div><div style="display:flex;gap:8px"><input class="input-preview" placeholder="Wallet" style="flex:1"><button class="btn-preview">Senden</button></div>';else if(c)html='<h3 style="margin-bottom:8px">💬 Chat</h3><div style="background:var(--bg-panel);border-radius:8px;padding:8px;margin-bottom:4px;border:1px solid var(--border-default)"><span style="color:var(--accent)">User1:</span> Hey!</div><div style="background:var(--bg-panel);border-radius:8px;padding:8px;margin-bottom:4px;border:1px solid var(--border-default)"><span style="color:var(--accent)">User2:</span> Alles gut!</div><div style="display:flex;gap:8px;margin-top:8px"><input class="input-preview" placeholder="Nachricht..." style="flex:1"><button class="btn-preview">Senden</button></div>';else if(s)html='<h3 style="margin-bottom:8px">⚙️ Settings</h3><div class="card"><h3>Profil</h3><div class="wallet-row"><span>Name</span><span style="color:var(--text-primary)">Alice</span></div><div class="wallet-row"><span>Sprache</span><span style="color:var(--text-primary)">Deutsch</span></div></div><div style="display:flex;gap:8px"><input class="input-preview" placeholder="Name" style="flex:1"><button class="btn-preview">Speichern</button></div>';else if(n)html='<h3 style="margin-bottom:8px">🧭 NavBar</h3><div class="nav"><span class="nav-item">🏠 Home</span><span class="nav-item">💬 Chat</span><span class="nav-item active">💰 Wallet</span><span class="nav-item">🔍 Explorer</span></div><div class="card"><h3>Inhalt</h3><div class="val">Seite: Wallet</div></div>';else if(e)html='<h3 style="margin-bottom:8px">🔍 Explorer</h3><div class="card"><h3>🔗 Block #42</h3><div class="wallet-row"><span>Hash</span><span style="font-family:monospace;color:var(--text-muted)">0xabc...</span></div><div class="wallet-row"><span>TXs</span><span style="color:var(--green)">12</span></div></div><input class="input-preview" placeholder="Block/Adresse suchen..." style="width:100%">';else if(pr)html='<h3 style="margin-bottom:8px">👤 Profil</h3><div class="card"><div class="wallet-row"><span>Name</span><span style="color:var(--text-primary)">Alice</span></div><div class="wallet-row"><span>Rolle</span><span style="color:var(--accent)">Admin</span></div><div class="wallet-row"><span>XP</span><span style="color:var(--green)">1.500</span></div></div><button class="btn-preview">Profil bearbeiten</button>';p.innerHTML=html}
 
+// ─── Actions ────────────────────────────────────────────────────
+function setBtn(el,t,d){el.textContent=t;el.disabled=!!d}
 function resetAll(){cv={};loadedDesignName=null;document.documentElement.style.cssText='';applyAllVars();bv();sc('global');document.getElementById('css-output').value='';up();us();refreshDesigns()}
 
-async function readCurrent(){try{var css=await invoke('get_theme_css',{extensionId:'theme-editor'});if(css){var rootMatch=css.match(/:root\s*\{([^}]+)\}/);if(rootMatch){var block=rootMatch[1];VARS.forEach(function(s){s.v.forEach(function(v){var re=new RegExp(v.n+'\\s*:\\s*([^;]+)');var m=block.match(re);if(m){var val=m[1].trim();if(val!==v.d){cv[v.n]=val;applyVar(v.n,val)}}})});bv();up();us();uco();toast('Aktuelle Theme-Werte geladen!',true)}else{toast('Keine :root-Variablen gefunden.',false)}}else{toast('Kein gespeichertes Theme.',false)}}catch(e){toast('Fehler: '+e,false)}}
+async function readCurrent(){var btn=event.target;setBtn(btn,'⏳...',true);try{var css=await invoke('get_theme_css',{extensionId:targetExt});if(css){var m=css.match(/:root\s*\{([^}]+)\}/);if(m){var b=m[1];for(var si=0;si<VARS.length;si++)for(var vi=0;vi<VARS[si].v.length;vi++){var v=VARS[si].v[vi],re=new RegExp(v.n+'\\s*:\\s*([^;]+)'),mm=b.match(re);if(mm){var val=mm[1].trim();if(val!==v.d){cv[v.n]=val;applyVar(v.n,val)}}}bv();up();us();uco();toast('Geladen!',true)}else{toast('Keine Variablen.',false)}}else{toast('Kein Theme.',false)}}catch(e){toast('Fehler: '+e,false)}setBtn(btn,'📋 Werte laden',false)}
 
-async function applyTheme(){try{var css=document.getElementById('css-output').value;if(!css.trim()){toast('Kein CSS zum Übernehmen.',false);return}await invoke('write_theme_css',{extensionId:'theme-editor',css:css});try{window.parent.localStorage.setItem('stone-theme','theme-editor')}catch(e){}toast('Theme übernommen! ✅',true)}catch(e){toast('Fehler: '+e,false)}}
+async function applyTheme(){var btn=document.getElementById('btn-apply');setBtn(btn,'⏳...',true);try{var css=document.getElementById('css-output').value;if(!css.trim()){toast('Kein CSS.',false);setBtn(btn,'✅ Übernehmen',false);return}await invoke('write_theme_css',{extensionId:targetExt,css:css});try{window.parent.localStorage.setItem('stone-theme',targetExt)}catch(e){}toast('Übernommen! ✅',true)}catch(e){toast('Fehler: '+e,false)}setBtn(btn,'✅ Übernehmen',false)}
 
-async function saveTheme(){var dname=loadedDesignName||'';var name=prompt('Design-Name:',dname||'Mein-Design');if(!name)return;try{var css=document.getElementById('css-output').value;var path=await invoke('save_theme_file',{name:name,css:css});loadedDesignName=name;toast('Gespeichert: '+name+'.css',true);refreshDesigns();us()}catch(e){toast('Fehler beim Speichern: '+e,false)}}
+async function saveTheme(){var btn=document.getElementById('btn-save');setBtn(btn,'⏳...',true);var dname=loadedDesignName||'';modal('💾 Design speichern','Name:',{input:true,value:dname,ph:'z.B. Dark-Gold',ok:'Speichern'},async function(name){if(!name){setBtn(btn,'💾 Speichern',false);return}setBtn(btn,'⏳...',true);try{await invoke('save_theme_file',{name:name,css:document.getElementById('css-output').value});loadedDesignName=name;toast('Gespeichert: '+name+'.css',true);refreshDesigns();us()}catch(e){toast('Fehler: '+e,false)}setBtn(btn,'💾 Speichern',false)})}
 
-// ── My Designs ─────────────────────────────────────────────────────
-function toggleDesigns(){designsOpen=!designsOpen;var p=document.getElementById('designs-panel');var a=document.getElementById('dp-arrow');if(designsOpen){p.classList.add('open');a.textContent='▼';refreshDesigns()}else{p.classList.remove('open');a.textContent='▶'}}
+// ─── Extension Targets ──────────────────────────────────────────
+async function loadExtensions(){try{var exts=await invoke('get_installed_extensions',{});installedExts=exts;var sel=document.getElementById('target-ext'),h='<option value="__dashboard__">🌐 Dashboard (Global)</option>';for(var i=0;i<exts.length;i++)h+='<option value="'+exts[i].id+'">'+exts[i].icon+' '+exts[i].name+'</option>';sel.innerHTML=h;var saved=null;try{saved=window.parent.localStorage.getItem('stone-theme-target')}catch(e){}if(saved&&sel.querySelector('option[value="'+saved+'"]')){targetExt=saved;sel.value=saved}updateBadge();loadTargetTheme()}catch(e){console.warn('ext load:',e)}}
+function switchTarget(id){targetExt=id;updateBadge();try{window.parent.localStorage.setItem('stone-theme-target',id)}catch(e){}cv={};for(var i=0;i<COMPS.length;i++)COMPS[i].css='';applyAllVars();bv();sc('global');document.getElementById('css-output').value='';up();us();loadedDesignName=null;loadTargetTheme();refreshDesigns()}
+function updateBadge(){var b=document.getElementById('target-badge'),p=document.getElementById('preview-target');if(targetExt==='__dashboard__'){b.innerHTML='🌐 Dashboard';p.textContent='(Dashboard)'}else{var ext=null;for(var i=0;i<installedExts.length;i++){if(installedExts[i].id===targetExt){ext=installedExts[i];break}}b.innerHTML=ext?ext.icon+' '+ext.name:'📦 '+targetExt;p.textContent='('+(ext?ext.name:targetExt)+')'}}
+async function loadTargetTheme(){try{var css=await invoke('get_theme_css',{extensionId:targetExt});if(!css)return;var m=css.match(/:root\s*\{([^}]+)\}/);if(!m)return;var b=m[1];for(var si=0;si<VARS.length;si++)for(var vi=0;vi<VARS[si].v.length;vi++){var v=VARS[si].v[vi],re=new RegExp(v.n+'\\s*:\\s*([^;]+)'),mm=b.match(re);if(mm){var val=mm[1].trim();if(val!==v.d){cv[v.n]=val;applyVar(v.n,val)}}}bv();up();us();uco()}catch(e){}}
 
-async function refreshDesigns(){try{var themes=await invoke('list_saved_themes',{});var list=document.getElementById('designs-list');var count=document.getElementById('dp-count');count.textContent=themes.length;if(!themes.length){list.innerHTML='<div style="padding:12px;color:#6e6b65;text-align:center;font-size:11px">Keine Designs gespeichert.<br>Speichere ein Theme mit "💾 Speichern".</div>';return}var h='';for(var i=0;i<themes.length;i++){var t=themes[i];var isActive=t.name===loadedDesignName;h+='<div class="dp-item'+(isActive?' active':'')+'" data-name="'+t.name+'" onclick="loadDesign(\''+t.name.replace(/'/g,"\\'")+'\')"><span class="dp-name">'+t.name+(isActive?' <span style="color:#d4a853">*</span>':'')+'</span><span style="display:flex;gap:4px;align-items:center"><span style="font-size:10px;color:#6e6b65">'+(t.size/1024).toFixed(1)+' KB</span><button class="btn btn-danger" style="font-size:10px;padding:1px 5px" onclick="event.stopPropagation();deleteDesign(\''+t.name.replace(/'/g,"\\'")+'\')" title="Löschen">🗑</button></span></div>'}list.innerHTML=h}catch(e){console.warn('list_saved_themes failed:',e)}}
+// ─── My Designs ─────────────────────────────────────────────────
+function toggleDesigns(){designsOpen=!designsOpen;var p=document.getElementById('designs-panel'),a=document.getElementById('dp-arrow');if(designsOpen){p.classList.remove('closed');p.classList.add('open');a.textContent='▼'}else{p.classList.remove('open');p.classList.add('closed');a.textContent='▶'}}
+async function refreshDesigns(){try{var themes=await invoke('list_saved_themes',{}),list=document.getElementById('designs-list');document.getElementById('dp-count').textContent='('+themes.length+')';if(!themes.length){list.innerHTML='<div class="empty-designs"><span class="big-icon">🎨</span>Keine Designs.<br><strong>💾 Speichern</strong> klicken.</div>';return}var h='';for(var i=0;i<themes.length;i++){var t=themes[i],ac=t.name===loadedDesignName?' active':'';h+='<div class="dp-item'+ac+'" data-name="'+t.name.replace(/'/g,'&#39;')+'" onclick="loadDesign(\''+t.name.replace(/'/g,'\\\'')+'\')"><span class="dp-name">'+t.name+(t.name===loadedDesignName?' <span style="color:#d4a853">*</span>':'')+'</span><span style="display:flex;gap:4px;align-items:center"><span style="font-size:10px;color:#6e6b65">'+(t.size/1024).toFixed(1)+' KB</span><button class="btn btn-danger" style="font-size:10px;padding:1px 5px" onclick="event.stopPropagation();deleteDesign(\''+t.name.replace(/'/g,'\\\'')+'\')" title="Löschen">🗑</button></span></div>'}list.innerHTML=h}catch(e){}}
+async function loadDesign(name){var old=loadedDesignName;loadedDesignName=name;try{var css=await invoke('load_saved_theme',{name:name});if(!css)return;cv={};for(var i=0;i<COMPS.length;i++)COMPS[i].css='';var m=css.match(/:root\s*\{([^}]+)\}/);if(m){var b=m[1];for(var si=0;si<VARS.length;si++)for(var vi=0;vi<VARS[si].v.length;vi++){var v=VARS[si].v[vi],re=new RegExp(v.n+'\\s*:\\s*([^;]+)'),mm=b.match(re);if(mm){var val=mm[1].trim();if(val!==v.d){cv[v.n]=val;applyVar(v.n,val)}}}}bv();up();us();uco();sc('global');refreshDesigns();toast('Geladen: '+name,true)}catch(e){loadedDesignName=old;toast('Fehler: '+e,false)}}
+async function deleteDesign(name){modal('🗑 Löschen?','"'+name+'" wirklich löschen?',{danger:'Löschen'},async function(r){if(r!=='danger')return;try{await invoke('delete_saved_theme',{name:name});if(loadedDesignName===name)loadedDesignName=null;toast('Gelöscht: '+name,true);refreshDesigns()}catch(e){toast('Fehler: '+e,false)}})}
 
-async function loadDesign(name){try{var css=await invoke('load_saved_theme',{name:name});if(css){loadedDesignName=name;cv={};COMPS.forEach(function(c){c.css=''});var rootMatch=css.match(/:root\s*\{([^}]+)\}/);if(rootMatch){var block=rootMatch[1];VARS.forEach(function(s){s.v.forEach(function(v){var re=new RegExp(v.n+'\\s*:\\s*([^;]+)');var m=block.match(re);if(m){var val=m[1].trim();if(val!==v.d){cv[v.n]=val;applyVar(v.n,val)}}})})}bv();up();us();uco();sc('global');refreshDesigns();toast('Design geladen: '+name,true)}}catch(e){toast('Fehler: '+e,false)}}
-
-async function deleteDesign(name){if(!confirm('Design "'+name+'" wirklich löschen?'))return;try{await invoke('delete_saved_theme',{name:name});if(loadedDesignName===name)loadedDesignName=null;toast('Gelöscht: '+name,true);refreshDesigns()}catch(e){toast('Fehler: '+e,false)}}
-
-// ── Publish to Store ────────────────────────────────────────────────
-async function publishToStore(){var name=loadedDesignName||'';if(!name){name=prompt('Design-Name für Veröffentlichung:','Mein-Design');if(!name)return}var author=prompt('Dein Name (Autor):','');if(!author)return;var desc=prompt('Beschreibung:','Ein Theme-Design für das Stone Dashboard');if(!desc)return;try{var css=document.getElementById('css-output').value;var result=await invoke('prepare_theme_publish',{name:name,css:css,author:author,description:desc});toast(result||'Bereit zum Hochladen!',true);alert('Theme-Dateien wurden vorbereitet.\n\nAls nächstes:\n1. Repository auf GitHub erstellen\n2. Release mit theme.css und ui.html erstellen\n3. Store index.json updaten\n\nOder manuell die Datei öffnen und pushen.');}catch(e){toast('Fehler: '+e,false)}}
-
+// ─── Init ───────────────────────────────────────────────────────
 bt();bv();applyAllVars();sc('global');uco();
+// Extension-Liste asynchron laden (blockiert UI nicht)
+setTimeout(function(){loadExtensions()},200);
 </script></body></html>

@@ -124,7 +124,7 @@ async fn main() {
         }
         // Fallback: hardcoded testnet seed
         if bootstrap.is_empty() {
-            bootstrap.push("http://212.227.54.241:3080".to_string());
+            bootstrap.push("http://212.227.54.241:3180".to_string());
         }
         let existing = node.get_peers();
         for url in bootstrap {
@@ -378,6 +378,10 @@ async fn main() {
                                             for (i, part) in parts.iter().enumerate() {
                                                 if *part == "ip4" {
                                                     if let Some(ip) = parts.get(i + 1) {
+                                                        // Filter: keine Docker-Bridge, kein Localhost, kein CGNAT
+                                                        if !stone::network::is_routable_ipv4(ip) {
+                                                            continue;
+                                                        }
                                                         if *ip != "127.0.0.1" && *ip != "0.0.0.0"
                                                             && !ip.starts_with("172.")
                                                             && !ip.starts_with("10.")

@@ -981,7 +981,7 @@ async fn handle_p2p_event(
                 for (i, part) in parts.iter().enumerate() {
                     if *part == "ip4" {
                         if let Some(found) = parts.get(i + 1) {
-                            if *found != "127.0.0.1" && *found != "0.0.0.0" && ipv4.is_none() {
+                            if stone::network::is_routable_ipv4(found) && ipv4.is_none() {
                                 ipv4 = Some(found.to_string());
                             }
                         }

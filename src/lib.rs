@@ -11,6 +11,7 @@ pub mod master;
 pub mod merkle_batch;
 pub mod message_pool;
 pub mod network;
+pub mod node_config_db;
 pub mod organization;
 pub mod push;
 pub mod shard;
