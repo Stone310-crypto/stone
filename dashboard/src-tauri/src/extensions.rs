@@ -194,18 +194,8 @@ pub async fn fetch_available_extensions() -> Result<Vec<ExtensionManifest>, Stri
 pub async fn install_extension(id: &str) -> Result<ExtensionManifest, String> {
     eprintln!("[extensions] 📥 Installiere '{id}'...");
 
-    // 1. Manifest vom Store laden (mit Fallback)
-    let manifests = match fetch_available_extensions().await {
-        Ok(list) if !list.is_empty() => list,
-        Ok(_) => {
-            eprintln!("[extensions] Store leer → verwende Fallback");
-            fallback_extensions()
-        }
-        Err(e) => {
-            eprintln!("[extensions] Store-Fehler: {e} → verwende Fallback");
-            fallback_extensions()
-        }
-    };
+    // 1. Manifest vom Store laden (remote + fallback merge)
+    let manifests = fetch_store_with_fallback().await;
 
     let manifest = manifests
         .iter()
@@ -339,23 +329,37 @@ pub fn get_installed_extensions() -> Vec<ExtensionManifest> {
     installed
 }
 
+/// Holt die Store-Liste und merged Fallback-Extensions ein (die nicht im Store sind).
+async fn fetch_store_with_fallback() -> Vec<ExtensionManifest> {
+    let remote = match fetch_available_extensions().await {
+        Ok(list) if !list.is_empty() => list,
+        Ok(_) => {
+            eprintln!("[extensions] Store lieferte leere Liste, verwende Fallback");
+            return fallback_extensions();
+        }
+        Err(e) => {
+            eprintln!("[extensions] Store nicht erreichbar: {e} — verwende Fallback");
+            return fallback_extensions();
+        }
+    };
+
+    // Merge: Fallback-Extensions hinzufügen, die NICHT im Remote-Store sind
+    let mut merged = remote;
+    let remote_ids: std::collections::HashSet<String> = merged.iter().map(|m| m.id.clone()).collect();
+    for fb in fallback_extensions() {
+        if !remote_ids.contains(&fb.id) {
+            merged.push(fb);
+        }
+    }
+    merged
+}
+
 /// Gibt die Liste aller verfügbaren Extensions vom Store zurück.
 /// Falls der Store nicht erreichbar ist, wird der lokale Fallback verwendet.
 /// Bewertungen werden mit echten Nutzer-Bewertungen angereichert.
 #[tauri::command]
 pub async fn get_available_extensions() -> Result<Vec<ExtensionManifest>, String> {
-    let manifests = match fetch_available_extensions().await {
-        Ok(exts) if !exts.is_empty() => exts,
-        Ok(_) => {
-            eprintln!("[extensions] Store lieferte leere Liste, verwende Fallback");
-            fallback_extensions()
-        }
-        Err(e) => {
-            eprintln!("[extensions] Store nicht erreichbar: {e} — verwende Fallback");
-            fallback_extensions()
-        }
-    };
-
+    let manifests = fetch_store_with_fallback().await;
     Ok(enrich_with_real_ratings(manifests))
 }
 
@@ -462,11 +466,7 @@ pub async fn check_for_updates() -> Result<Vec<(String, String, String)>, String
         return Ok(vec![]);
     }
 
-    let store = match fetch_available_extensions().await {
-        Ok(list) if !list.is_empty() => list,
-        Ok(_) => fallback_extensions(),
-        Err(_) => fallback_extensions(),
-    };
+    let store = fetch_store_with_fallback().await;
 
     let mut updates = Vec::new();
     for inst in &installed {
@@ -684,7 +684,6 @@ pub struct NetworkStatus {
 /// Returns the current network status by querying the connected Stone node.
 #[tauri::command]
 pub async fn get_network_status() -> Result<NetworkStatus, String> {
-    // Try to read the actual node URL from the saved settings (via env or fallback)
     let mainnet_url = std::env::var("STONE_NODE_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:3180".into());
     let testnet_url = std::env::var("STONE_TESTNET_URL")
@@ -696,24 +695,37 @@ pub async fn get_network_status() -> Result<NetworkStatus, String> {
         .build()
         .map_err(|e| format!("Client: {e}"))?;
 
-    // Try both mainnet and testnet URLs — the first one that responds wins
     let urls_to_try = [&mainnet_url, &testnet_url];
 
     for node_url in &urls_to_try {
-        let status_url = format!("{}/api/v1/status", node_url);
-        let resp = client
-            .get(&status_url)
+        // /api/v1/health has: status, node_id, role, block_height, latest_hash, network, chain_id
+        let health_url = format!("{}/api/v1/health", node_url);
+        let health_resp = client
+            .get(&health_url)
             .header("x-api-key", &api_key)
             .send()
             .await;
 
-        match resp {
+        match health_resp {
             Ok(r) if r.status().is_success() => {
                 let body: serde_json::Value = r.json().await.unwrap_or_default();
                 let chain_id = body["chain_id"].as_str().unwrap_or("unknown").to_string();
-                let network = body["network"].as_str().unwrap_or("testnet").to_string();
+                let network = body["network"].as_str().unwrap_or("unknown").to_string();
                 let block_height = body["block_height"].as_u64().unwrap_or(0);
-                let peer_count = body["peer_count"].as_u64().unwrap_or(0) as u32;
+
+                // Try /api/v1/status for peer count (peers is an array)
+                let peer_count = match client
+                    .get(format!("{}/api/v1/status", node_url))
+                    .header("x-api-key", &api_key)
+                    .send()
+                    .await
+                {
+                    Ok(r2) if r2.status().is_success() => {
+                        let sbody: serde_json::Value = r2.json().await.unwrap_or_default();
+                        sbody["peers"].as_array().map(|a| a.len() as u32).unwrap_or(0)
+                    }
+                    _ => 0,
+                };
 
                 return Ok(NetworkStatus {
                     chain_id,
@@ -728,7 +740,7 @@ pub async fn get_network_status() -> Result<NetworkStatus, String> {
         }
     }
 
-    // Fallback: return defaults if node is not reachable
+    // Fallback: node not reachable — return unknown
     Ok(NetworkStatus {
         chain_id: "unknown".into(),
         network: "unknown".into(),
@@ -807,7 +819,23 @@ pub fn read_node_config_db(app: tauri::AppHandle) -> serde_json::Value {
 
 /// Gibt einen leeren Fallback zurück (keine Demo-Daten mehr).
 pub fn fallback_extensions() -> Vec<ExtensionManifest> {
-    vec![]
+    vec![
+        ExtensionManifest {
+            id: "testnet-mode".into(),
+            name: "Testnet Mode".into(),
+            description: "Schaltet das Dashboard zwischen Mainnet und Testnet um. Warnt vor experimentellen Features.".into(),
+            version: "1.0.0".into(),
+            icon: "🧪".into(),
+            rating: 0.0,
+            reviews: 0,
+            downloads: 0,
+            size_mb: 1,
+            repository: "Stone310-crypto/testnet-mode-extension".into(),
+            permissions: vec!["storage".into()],
+            category: "utility".into(),
+            author: "StoneChain".into(),
+        },
+    ]
 }
 
 #[cfg(test)]
@@ -817,10 +845,8 @@ mod tests {
     #[test]
     fn test_fallback_has_extensions() {
         let exts = fallback_extensions();
-        assert_eq!(exts.len(), 3);
-        assert_eq!(exts[0].id, "gaming");
-        assert_eq!(exts[1].id, "dashboard");
-        assert_eq!(exts[2].id, "2fa");
+        assert_eq!(exts.len(), 1);
+        assert_eq!(exts[0].id, "testnet-mode");
     }
 
     #[test]

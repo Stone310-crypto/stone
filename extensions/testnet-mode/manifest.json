@@ -2,7 +2,7 @@
   "id": "testnet-mode",
   "name": "Testnet Mode",
   "description": "Schaltet das Dashboard zwischen Mainnet und Testnet um. Warnt vor experimentellen Features.",
-  "version": "1.0.0",
+  "version": "1.1.2",
   "icon": "🧪",
   "rating": 0.0,
   "reviews": 0,

@@ -7,7 +7,7 @@ import HomeView from "./views/home/HomeView";
 import ExplorerView from "./views/explorer/ExplorerView";
 import GamesView from "./views/games/GamesView";
 import ServerView from "./views/servers/ServerView";
-import NodeView from "./views/node/NodeView";
+//import NodeView from "./views/node/NodeView";
 import ProfileView from "./views/profile/ProfileView";
 import ChatView from "./views/chat/ChatView";
 import WalletView from "./views/wallet/WalletView";
@@ -19,6 +19,7 @@ import TestnetBanner from "./components/TestnetBanner";
 import ProfileEditOverlay from "./views/profile/ProfileEditOverlay";
 import FriendAddOverlay from "./views/chat/FriendAddOverlay";
 import SettingsOverlay from "./views/profile/SettingsOverlay";
+import PowerUserPanel from "./views/miner/PowerUserPanel";
 import { useWebSocketEvents } from "./hooks/useWebSocketEvents";
 
 declare global {
@@ -96,6 +97,7 @@ function MainApp() {
   const [showProfileOverlay, setShowProfileOverlay] = useState(false);
   const [showFriendOverlay, setShowFriendOverlay] = useState(false);
   const [showSettingsOverlay, setShowSettingsOverlay] = useState(false);
+  const [showPowerUser, setShowPowerUser] = useState(false);
 
   // Listen for stone-navigate events from UserBar etc.
   useEffect(() => {
@@ -122,7 +124,7 @@ function MainApp() {
     home: <HomeView />,
     explorer: <ExplorerView />,
     games: <GamesView />,
-    node: <NodeView />,
+    //node: <NodeView />,
     profile: <ProfileView />,
     extensions: <ExtensionsView />,
     "theme-editor": <ThemeEditorView />,
@@ -163,6 +165,7 @@ function MainApp() {
         }}
         onCreateServer={() => setShowCreateServer(true)}
         onAddFriend={() => setShowFriendOverlay(true)}
+        onPowerUser={() => setShowPowerUser(true)}
       />
 
       {/* ── Main Content overlaid to the right of the panels ── */}
@@ -189,12 +192,24 @@ function MainApp() {
 
       {/* ── Friend Add Overlay ───────────────────────────── */}
       {showFriendOverlay && (
-        <FriendAddOverlay onClose={() => setShowFriendOverlay(false)} />
+        <FriendAddOverlay
+          onClose={() => setShowFriendOverlay(false)}
+          onStartDM={(wallet, name) => {
+            setActiveConversation({ type: "dm", wallet, name });
+            setSelectedServer(null);
+            setShowFriendOverlay(false);
+          }}
+        />
       )}
 
       {/* ── Settings Overlay ──────────────────────────────── */}
       {showSettingsOverlay && (
         <SettingsOverlay onClose={() => setShowSettingsOverlay(false)} />
+      )}
+
+      {/* ── PowerUser Panel ─────────────────────────────── */}
+      {showPowerUser && (
+        <PowerUserPanel onClose={() => setShowPowerUser(false)} />
       )}
     </div>
   );

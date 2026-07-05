@@ -112,12 +112,12 @@ let autoRefresh = true;
 // ─── Polling ────────────────────────────────────────────────────────
 async function refreshAll() {
   try {
-    // Node Status
-    const status = await invoke('node_get_status');
-    document.getElementById('block-height').textContent = status?.block_height ?? '—';
-    document.getElementById('peers').textContent = status?.peer_count ?? '—';
-    document.getElementById('uptime').textContent = formatUptime(status?.uptime_secs ?? 0);
-    document.getElementById('mempool').textContent = status?.mempool_size ?? '—';
+    // Node Health (block height, peers, uptime, mempool)
+    const health = await invoke('get_node_health');
+    document.getElementById('block-height').textContent = health?.block_height ?? '—';
+    document.getElementById('peers').textContent = health?.peer_count ?? '—';
+    document.getElementById('uptime').textContent = formatUptime(health?.uptime_secs ?? 0);
+    document.getElementById('mempool').textContent = health?.mempool_size ?? '—';
   } catch(e) { /* Node offline */ }
 
   try {

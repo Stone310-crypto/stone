@@ -5,6 +5,7 @@ mod node_manager;
 mod modules;
 mod extensions;
 mod gaming_proxy;
+mod miner_manager;
 use tauri::{AppHandle, Manager};
 use node_manager::{
     SharedNodeState, NodeState,
@@ -13,6 +14,12 @@ use node_manager::{
     node_get_status, node_get_config, node_set_config, node_start, node_stop,
     switch_node_network,
     load_config,
+    get_node_health,
+};
+use miner_manager::{
+    SharedMinerState, MinerState,
+    miner_start, miner_stop, miner_status, miner_set_autostart,
+    miner_set_payout_wallet, miner_get_config,
 };
 use std::sync::{Arc, Mutex};
 use serde::Serialize;
@@ -216,6 +223,12 @@ pub fn run() {
             }
 
             app.manage(shared);
+
+            // Miner state
+            let miner_state = MinerState::new();
+            let shared_miner: SharedMinerState = Arc::new(Mutex::new(miner_state));
+            app.manage(shared_miner);
+
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -227,6 +240,7 @@ pub fn run() {
             node_start,
             node_stop,
             switch_node_network,
+            get_node_health,
             plugin_open_window,
             validate_upload_file,
             upload_file,
@@ -263,6 +277,12 @@ pub fn run() {
             gaming_proxy::register_game,
             gaming_proxy::company_games,
             gaming_proxy::check_game_id,
+            miner_start,
+            miner_stop,
+            miner_status,
+            miner_set_autostart,
+            miner_set_payout_wallet,
+            miner_get_config,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

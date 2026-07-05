@@ -1,4 +1,4 @@
-import { useState, type ReactNode } from "react";
+import { useState, useRef, useEffect, type ReactNode } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { orgs } from "../../api/stone";
 import { useAuth } from "../../auth/AuthContext";
@@ -41,6 +41,7 @@ interface NavRailProps {
   onSelectConversation: (conv: ActiveConversation) => void;
   onCreateServer: () => void;
   onAddFriend: () => void;
+  onPowerUser?: () => void;
 }
 
 interface Org {
@@ -54,12 +55,34 @@ function shortAddr(addr: string): string {
   return addr.length > 12 ? `${addr.slice(0, 6)}…${addr.slice(-4)}` : addr;
 }
 
-function NetworkStatus() {
+function NetworkStatus({ onPowerUser }: { onPowerUser?: () => void }) {
   const { connected, blockHeight, network } = useNodeHealth();
+  const [clickCount, setClickCount] = useState(0);
+  const clickTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const handleClick = () => {
+    if (!connected || blockHeight <= 0) return;
+    const next = clickCount + 1;
+    setClickCount(next);
+    if (clickTimer.current) clearTimeout(clickTimer.current);
+    if (next >= 5) {
+      setClickCount(0);
+      onPowerUser?.();
+    } else {
+      clickTimer.current = setTimeout(() => setClickCount(0), 1500);
+    }
+  };
+
+  // Cleanup timer on unmount
+  useEffect(() => {
+    return () => { if (clickTimer.current) clearTimeout(clickTimer.current); };
+  }, []);
+
   return (
     <div
-      title={connected ? `Verbunden · ${network} · Block #${blockHeight.toLocaleString()}` : "Keine Verbindung"}
-      style={{ display: "flex", alignItems: "center", gap: 6, padding: "0 4px", cursor: "default" }}
+      onClick={handleClick}
+      title={connected ? `Verbunden · ${network} · Block #${blockHeight.toLocaleString()}${clickCount > 0 ? ` (${5 - clickCount}× bis PowerUser)` : ""}` : "Keine Verbindung"}
+      style={{ display: "flex", alignItems: "center", gap: 6, padding: "0 4px", cursor: connected && blockHeight > 0 ? "pointer" : "default", userSelect: "none" }}
     >
       <div style={{
         width: 7, height: 7, borderRadius: "50%",
@@ -69,7 +92,7 @@ function NetworkStatus() {
         flexShrink: 0,
       }} />
       {connected && blockHeight > 0 && (
-        <span style={{ fontSize: 10, fontWeight: 600, fontFamily: "monospace", color: "var(--text-muted)" }}>
+        <span style={{ fontSize: 10, fontWeight: 600, fontFamily: "monospace", color: clickCount > 0 ? "var(--accent)" : "var(--text-muted)", transition: "color 0.2s" }}>
           #{blockHeight > 9999 ? `${Math.floor(blockHeight / 1000)}k` : blockHeight}
         </span>
       )}
@@ -95,7 +118,7 @@ const navLabels: Record<string, string> = {
   dashboard: "Dashboard",
 };
 
-function TopNavBar({ onNavigate }: { onNavigate: (section: string) => void }) {
+function TopNavBar({ onNavigate, onPowerUser }: { onNavigate: (section: string) => void; onPowerUser?: () => void }) {
   const [collapsed, setCollapsed] = useState(false);
   const { optionalModules } = useModules();
   const { activeTheme, applyTheme, loadInstalledThemes } = useTheme();
@@ -342,7 +365,7 @@ function TopNavBar({ onNavigate }: { onNavigate: (section: string) => void }) {
           )}
         </div>
 
-        <NetworkStatus />
+        <NetworkStatus onPowerUser={onPowerUser} />
 
         {/* Collapse toggle */}
         <button
@@ -797,7 +820,7 @@ function UserBar() {
 // ── Main Layout ──────────────────────────────────────────────────────────────
 
 export default function NavRail(props: NavRailProps) {
-  const { selectedServer, onSelectServer, activeConversation, onSelectConversation, onCreateServer, onAddFriend } = props;
+  const { selectedServer, onSelectServer, activeConversation, onSelectConversation, onCreateServer, onAddFriend, onPowerUser } = props;
 
   const navigate = (section: string) => {
     window.dispatchEvent(new CustomEvent("stone-navigate", { detail: { section } }));
@@ -806,7 +829,7 @@ export default function NavRail(props: NavRailProps) {
   return (
     <div style={{ display: "flex", flexDirection: "column", height: "100vh", overflow: "hidden" }}>
       {/* ── Top Navigation Bar ──────────────────────────────── */}
-      <TopNavBar onNavigate={navigate} />
+      <TopNavBar onNavigate={navigate} onPowerUser={onPowerUser} />
 
       {/* ── Main area: Server Panel | DM Panel | Content ──── */}
       <div style={{ display: "flex", flex: 1, overflow: "hidden" }}>

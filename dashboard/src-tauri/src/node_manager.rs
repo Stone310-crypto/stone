@@ -11,6 +11,7 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
+use chrono::Utc;
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -313,10 +314,83 @@ fn write_node_config(data_dir: &PathBuf, cfg: &NodeConfig) -> Result<(), String>
 
 #[tauri::command]
 pub fn node_get_logs(state: tauri::State<'_, SharedNodeState>) -> Vec<String> {
-    let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
-    let logs = s.take_logs();
-    drop(s);
-    logs
+    let s = state.lock().unwrap_or_else(|e| e.into_inner());
+    s.peek_logs(200)
+}
+
+/// Ruft Blockchain-Netzwerkdaten von der lokalen Node ab.
+/// Gibt block_height, peer_count, uptime_secs, mempool_size zurück.
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeHealthResponse {
+    pub block_height: u64,
+    pub peer_count: u64,
+    pub uptime_secs: u64,
+    pub mempool_size: u64,
+    pub network: String,
+    pub node_id: String,
+}
+
+#[tauri::command]
+pub async fn get_node_health(
+    state: tauri::State<'_, SharedNodeState>,
+) -> Result<NodeHealthResponse, String> {
+    let cfg = {
+        let s = state.lock().unwrap_or_else(|e| e.into_inner());
+        s.config.clone()
+    };
+    let base_url = format!("http://127.0.0.1:{}", cfg.port);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|e| format!("Client-Fehler: {e}"))?;
+
+    let health: serde_json::Value = client
+        .get(format!("{}/api/v1/health", base_url))
+        .send()
+        .await
+        .map_err(|e| format!("Node nicht erreichbar: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("Health-Parse: {e}"))?;
+
+    // /api/v1/status liefert NodeStatusResponse:
+    //   { node_id, role, chain: { block_height, .. }, metrics: { mempool_size, .. },
+    //     peers: [...], started_at: <unix-timestamp>, trust: {..} }
+    let status: serde_json::Value = client
+        .get(format!("{}/api/v1/status", base_url))
+        .send()
+        .await
+        .map_err(|e| format!("Status nicht erreichbar: {e}"))?
+        .json()
+        .await
+        .map_err(|e| format!("Status-Parse: {e}"))?;
+
+    let peer_count = status["peers"]
+        .as_array()
+        .map(|a| a.len() as u64)
+        .unwrap_or(0);
+
+    let started_at = status["started_at"].as_i64().unwrap_or(0);
+    let now = chrono::Utc::now().timestamp();
+    let uptime_secs = if started_at > 0 && now > started_at {
+        (now - started_at) as u64
+    } else {
+        0
+    };
+
+    let mempool_size = status["metrics"]["mempool_size"]
+        .as_u64()
+        .or_else(|| status["mempool_size"].as_u64())
+        .unwrap_or(0);
+
+    Ok(NodeHealthResponse {
+        block_height: health["block_height"].as_u64().unwrap_or(0),
+        node_id: health["node_id"].as_str().unwrap_or("?").to_string(),
+        network: health["network"].as_str().unwrap_or("?").to_string(),
+        peer_count,
+        uptime_secs,
+        mempool_size,
+    })
 }
 
 #[tauri::command]

@@ -77,7 +77,7 @@ p{color:#b8b4ae;line-height:1.5;margin-bottom:12px}
 <div id="toast" style="display:none"></div>
 
 <script>
-var isTestnet=false,status=null,config=null,restarting=false;
+var isTestnet=localStorage.getItem('stone-network-mode')==='testnet',status=null,config=null,restarting=false;
 var _id=0,_p={};
 window.addEventListener('message',function(e){
   if(e.data&&e.data.id&&_p[e.data.id]){

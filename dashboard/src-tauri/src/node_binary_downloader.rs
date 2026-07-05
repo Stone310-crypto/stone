@@ -296,6 +296,30 @@ pub async fn install_or_update_binaries(app: &AppHandle) -> Result<Vec<(String, 
     let dest_dir = data_dir.join("binaries");
     std::fs::create_dir_all(&dest_dir).context("binaries/ Ordner konnte nicht erstellt werden")?;
 
+    // Wenn bereits ein Binary existiert, NICHT überschreiben.
+    // (Erlaubt manuelles Deployment von Dev-Builds mit Fixes.)
+    #[cfg(target_os = "windows")]
+    let already_exists = dest_dir.join("stone-app-node.exe").exists()
+        || dest_dir.join("stone-master.exe").exists();
+    #[cfg(not(target_os = "windows"))]
+    let already_exists = dest_dir.join("stone-app-node").exists()
+        || dest_dir.join("stone-master").exists();
+
+    if already_exists {
+        println!("[binary-dl] Binary bereits vorhanden – überspringe Auto-Update");
+        let mut results = Vec::new();
+        for name in BINARY_NAMES {
+            #[cfg(target_os = "windows")]
+            let local = dest_dir.join(format!("{}.exe", name));
+            #[cfg(not(target_os = "windows"))]
+            let local = dest_dir.join(*name);
+            if local.exists() {
+                results.push((name.to_string(), local));
+            }
+        }
+        return Ok(results);
+    }
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
         .build()

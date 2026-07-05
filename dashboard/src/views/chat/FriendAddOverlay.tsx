@@ -3,20 +3,20 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { chat as chatApi } from "../../api/stone";
 import { apiFetch } from "../../api/client";
 import type { ContactRequestDetail, ChatResolveResult } from "../../types/api";
-import { ArrowLeft, X, Search, UserPlus, Check, Loader2, Clock } from "lucide-react";
+import { ArrowLeft, X, Search, UserPlus, Check, Loader2, Clock, MessageCircle } from "lucide-react";
 
 interface FriendAddOverlayProps {
   onClose: () => void;
+  onStartDM?: (wallet: string, name: string) => void;
 }
 
 function shortAddr(addr: string): string {
   return addr.length > 14 ? `${addr.slice(0, 8)}…${addr.slice(-6)}` : addr;
 }
 
-export default function FriendAddOverlay({ onClose }: FriendAddOverlayProps) {
+export default function FriendAddOverlay({ onClose, onStartDM }: FriendAddOverlayProps) {
   const [query, setQuery] = useState("");
   const [searchResults, setSearchResults] = useState<ChatResolveResult[]>([]);
-  const [searching, setSearching] = useState(false);
   const [searchError, setSearchError] = useState("");
   const [sentWallets, setSentWallets] = useState<Set<string>>(new Set());
   const qc = useQueryClient();
@@ -27,7 +27,7 @@ export default function FriendAddOverlay({ onClose }: FriendAddOverlayProps) {
     queryFn: () => chatApi.contactRequests(),
     refetchInterval: 10_000,
   });
-  const pendingRequests: ContactRequestDetail[] = requestsQ.data?.requests ?? [];
+  const pendingRequests: ContactRequestDetail[] = requestsQ.data?.incoming ?? [];
 
   // Accept / Decline mutations
   const acceptMt = useMutation({
@@ -39,21 +39,25 @@ export default function FriendAddOverlay({ onClose }: FriendAddOverlayProps) {
     onSuccess: () => { qc.invalidateQueries({ queryKey: ["contact-requests"] }); },
   });
 
-  const handleSearch = async () => {
+  // --- User search via react-query mutation (avoids React 19 async closure issue) ---
+  const searchMt = useMutation({
+    mutationFn: (q: string) => chatApi.resolve(q),
+    onSuccess: (data) => {
+      const results = Array.isArray(data?.results) ? data.results : [];
+      setSearchResults(results);
+      if (results.length === 0) setSearchError("Kein Nutzer gefunden");
+    },
+    onError: (e: any) => {
+      setSearchError(e?.message ?? "Nicht gefunden");
+    },
+  });
+
+  const handleSearch = () => {
     const q = query.trim();
     if (!q) return;
-    setSearching(true);
     setSearchError("");
     setSearchResults([]);
-    try {
-      const res = await chatApi.resolve(q);
-      setSearchResults(res.results ?? []);
-      if ((res.results ?? []).length === 0) setSearchError("Kein Nutzer gefunden");
-    } catch (e: any) {
-      setSearchError(e?.message ?? "Nicht gefunden");
-    } finally {
-      setSearching(false);
-    }
+    searchMt.mutate(q);
   };
 
   const handleSendRequest = async (wallet: string) => {
@@ -118,15 +122,15 @@ export default function FriendAddOverlay({ onClose }: FriendAddOverlayProps) {
           />
           <button
             onClick={handleSearch}
-            disabled={!query.trim() || searching}
+            disabled={!query.trim() || searchMt.isPending}
             style={{
               width: 42, height: 42, borderRadius: 10,
               background: "var(--accent)", border: "none", color: "var(--text-inverse)",
               cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center",
-              opacity: (!query.trim() || searching) ? 0.5 : 1,
+              opacity: (!query.trim() || searchMt.isPending) ? 0.5 : 1,
             }}
           >
-            {searching ? <Loader2 size={16} style={{ animation: "spin 0.7s linear infinite" }} /> : <Search size={16} />}
+            {searchMt.isPending ? <Loader2 size={16} style={{ animation: "spin 0.7s linear infinite" }} /> : <Search size={16} />}
           </button>
         </div>
 
@@ -160,24 +164,38 @@ export default function FriendAddOverlay({ onClose }: FriendAddOverlayProps) {
                     <Check size={12} /> Gesendet
                   </span>
                 ) : (
-                  <button
-                    onClick={() => handleSendRequest(r.wallet)}
-                    style={{
-                      padding: "6px 12px", borderRadius: 8,
-                      background: "var(--accent)", border: "none", color: "var(--text-inverse)",
-                      cursor: "pointer", fontSize: 11, fontWeight: 600,
-                      display: "flex", alignItems: "center", gap: 4, flexShrink: 0,
-                    }}
-                  >
-                    <UserPlus size={12} /> Anfrage
-                  </button>
+                  <div style={{ display: "flex", gap: 4, flexShrink: 0 }}>
+                    <button
+                      onClick={() => onStartDM?.(r.wallet, r.name || "Unbekannt")}
+                      title="Direkt schreiben"
+                      style={{
+                        padding: "6px 10px", borderRadius: 8,
+                        background: "rgba(255,255,255,0.08)", border: "1px solid var(--border-default)",
+                        color: "var(--text-secondary)", cursor: "pointer", fontSize: 11, fontWeight: 600,
+                        display: "flex", alignItems: "center", gap: 4,
+                      }}
+                    >
+                      <MessageCircle size={12} /> Schreiben
+                    </button>
+                    <button
+                      onClick={() => handleSendRequest(r.wallet)}
+                      style={{
+                        padding: "6px 12px", borderRadius: 8,
+                        background: "var(--accent)", border: "none", color: "var(--text-inverse)",
+                        cursor: "pointer", fontSize: 11, fontWeight: 600,
+                        display: "flex", alignItems: "center", gap: 4,
+                      }}
+                    >
+                      <UserPlus size={12} /> Anfrage
+                    </button>
+                  </div>
                 )}
               </div>
             ))}
           </div>
         )}
 
-        {searchError && searchResults.length === 0 && !searching && (
+        {searchError && searchResults.length === 0 && !searchMt.isPending && (
           <div style={{ background: "var(--red-bg)", border: "1px solid rgba(217,91,91,0.3)", borderRadius: 8, padding: "9px 12px", fontSize: 12, color: "var(--red)", marginBottom: 16 }}>
             {searchError}
           </div>

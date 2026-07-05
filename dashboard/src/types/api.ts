@@ -237,11 +237,24 @@ export interface ContactRequestDetail {
   id: string;
   from_wallet: string;
   from_name: string;
+  from_user_id?: string;
+  status?: string;
+  created_at: number;
+}
+
+export interface ContactRequestOutgoing {
+  id: string;
+  to_wallet: string;
+  to_name: string;
+  to_user_id?: string;
+  status?: string;
   created_at: number;
 }
 
 export interface ContactRequestsResponse {
-  requests: ContactRequestDetail[];
+  ok: boolean;
+  incoming: ContactRequestDetail[];
+  outgoing: ContactRequestOutgoing[];
 }
 
 // ── Groups ────────────────────────────────────────────────────────────────────

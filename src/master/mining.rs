@@ -1162,6 +1162,9 @@ impl MasterNodeState {
                 ));
             }
             chain.commit_block(block.clone());
+            // Persistiere den Block sofort nach RocksDB, damit er einen
+            // Neustart überlebt und nicht beim nächsten Sync verloren geht.
+            chain.persist_last_block();
         }
 
         // ── Token-TXs im Ledger verarbeiten ──────────────────────────────
