@@ -500,6 +500,7 @@ pub async fn send_to_master_server(
         .part("file", part)
         .text("title", file_name);
 
+    #[allow(unused_mut)]
     let mut client_builder = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300)); // 5 Min für große Dateien
 
