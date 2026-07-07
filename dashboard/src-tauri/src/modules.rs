@@ -281,6 +281,7 @@ pub fn is_module_available_cmd(name: String) -> bool {
 ///
 /// Lädt natives Code aus einer externen Datei.
 /// Nur signierte Module von vertrauenswürdigen Quellen laden!
+#[allow(dead_code)]
 pub unsafe fn load_module(name: &str) -> Result<libloading::Library, String> {
     let path = find_module_file(name)
         .ok_or_else(|| format!("Modul '{name}' nicht gefunden"))?;

@@ -1,4 +1,4 @@
-name: Build Dashboard + Node Binaries (macOS + Windows)
+name: Build Dashboard + Node Binaries (All Platforms)
 on:
   push:
     branches: [main, master]
@@ -21,7 +21,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # ── Build Node Binaries (stone-app-node, stone-master) ──────────────────────
+  # ── Node Binaries (all platforms) ──────────────────────────────────────
   build-node-binaries:
     strategy:
       fail-fast: false
@@ -29,94 +29,75 @@ jobs:
         include:
           - os: macos-latest
             target: aarch64-apple-darwin
-            asset_suffix: macos-aarch64
+            suffix: macos-aarch64
           - os: macos-latest
             target: x86_64-apple-darwin
-            asset_suffix: macos-x86_64
+            suffix: macos-x86_64
           - os: windows-latest
             target: x86_64-pc-windows-msvc
-            asset_suffix: windows-x86_64
+            suffix: windows-x86_64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            suffix: linux-x86_64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
+      - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Build stone-app-node (${{ matrix.target }})
+      - name: Build stone-app-node
         run: cargo build --release --bin stone-app-node --target ${{ matrix.target }}
 
-      - name: Build stone-master (${{ matrix.target }})
+      - name: Build stone-master
         run: cargo build --release --bin stone-master --target ${{ matrix.target }}
 
-      - name: Prepare asset names
-        shell: bash
-        run: |
-          echo "NODE_ASSET=stone-app-node-${{ matrix.asset_suffix }}" >> $GITHUB_ENV
-          echo "NODE_SHA=stone-app-node-${{ matrix.asset_suffix }}.sha256" >> $GITHUB_ENV
-          echo "MASTER_ASSET=stone-master-${{ matrix.asset_suffix }}" >> $GITHUB_ENV
-          echo "MASTER_SHA=stone-master-${{ matrix.asset_suffix }}.sha256" >> $GITHUB_ENV
-
-      # On Windows, the actual binary has .exe extension — we strip it for the asset name
-      - name: Rename binaries (standardize asset names)
+      - name: Prepare & rename binaries
         shell: bash
         run: |
           cd target/${{ matrix.target }}/release
-          if [ -f stone-app-node.exe ]; then cp stone-app-node.exe "$NODE_ASSET"; else cp stone-app-node "$NODE_ASSET"; fi
-          if [ -f stone-master.exe ]; then cp stone-master.exe "$MASTER_ASSET"; else cp stone-master "$MASTER_ASSET"; fi
-
-      - name: Generate SHA256 checksums
-        shell: bash
-        run: |
-          cd target/${{ matrix.target }}/release
+          NODE="stone-app-node-${{ matrix.suffix }}"
+          MASTER="stone-master-${{ matrix.suffix }}"
+          if [ -f stone-app-node.exe ]; then cp stone-app-node.exe "$NODE"; else cp stone-app-node "$NODE"; fi
+          if [ -f stone-master.exe ]; then cp stone-master.exe "$MASTER"; else cp stone-master "$MASTER"; fi
           if [ "$(uname)" = "Darwin" ]; then
-            shasum -a 256 "$NODE_ASSET" | awk '{print $1}' > "$NODE_SHA"
-            shasum -a 256 "$MASTER_ASSET" | awk '{print $1}' > "$MASTER_SHA"
+            shasum -a 256 "$NODE" | awk '{print $1}' > "$NODE.sha256"
+            shasum -a 256 "$MASTER" | awk '{print $1}' > "$MASTER.sha256"
           else
-            sha256sum "$NODE_ASSET" | awk '{print $1}' > "$NODE_SHA"
-            sha256sum "$MASTER_ASSET" | awk '{print $1}' > "$MASTER_SHA"
+            sha256sum "$NODE" | awk '{print $1}' > "$NODE.sha256"
+            sha256sum "$MASTER" | awk '{print $1}' > "$MASTER.sha256"
           fi
 
-      - name: Upload node binary artifact (${{ matrix.asset_suffix }})
+      - name: Upload node binaries
         uses: actions/upload-artifact@v4
         with:
-          name: node-binaries-${{ matrix.asset_suffix }}
+          name: node-binaries-${{ matrix.suffix }}
           path: |
-            target/${{ matrix.target }}/release/${{ env.NODE_ASSET }}
-            target/${{ matrix.target }}/release/${{ env.NODE_SHA }}
-            target/${{ matrix.target }}/release/${{ env.MASTER_ASSET }}
-            target/${{ matrix.target }}/release/${{ env.MASTER_SHA }}
+            target/${{ matrix.target }}/release/stone-app-node-${{ matrix.suffix }}
+            target/${{ matrix.target }}/release/stone-app-node-${{ matrix.suffix }}.sha256
+            target/${{ matrix.target }}/release/stone-master-${{ matrix.suffix }}
+            target/${{ matrix.target }}/release/stone-master-${{ matrix.suffix }}.sha256
 
-  # ─── macOS Dashboard (.dmg) ────────────────────────────────────────────────
+  # ── Dashboard macOS ──────────────────────────────────────────────────
   build-dashboard-macos:
     needs: build-node-binaries
     strategy:
-      fail-fast: false
       matrix:
-        target:
-          - aarch64-apple-darwin
-          - x86_64-apple-darwin
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
-        with:
-          node-version: 20
+        with: { node-version: 20 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: ${{ matrix.target }} }
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+      - name: Install deps
+        run: cd dashboard && npm ci
 
-      - name: Install dependencies
-        run: |
-          cd dashboard
-          npm ci
-
-      - name: Build Tauri (macOS ${{ matrix.target }})
+      - name: Build Tauri (macOS)
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -127,49 +108,30 @@ jobs:
       - name: Upload macOS artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Stone-Dashboard-macOS-${{ matrix.target }}
+          name: dashboard-macos-${{ matrix.target }}
           path: |
             dashboard/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
-            dashboard/src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app
+            dashboard/src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app.tar.gz
+            dashboard/src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app.tar.gz.sig
 
-  # ─── Windows Dashboard (.msi + .exe) ───────────────────────────────────────
+  # ── Dashboard Windows ────────────────────────────────────────────────
   build-dashboard-windows:
     needs: build-node-binaries
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
-        with:
-          node-version: 20
+        with: { node-version: 20 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: x86_64-pc-windows-msvc }
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-msvc
+      - name: Install deps
+        run: cd dashboard && npm ci
 
-      - name: Cache Cargo registry + build artifacts
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            dashboard/src-tauri/target
-          key: ${{ runner.os }}-cargo-windows-${{ hashFiles('dashboard/src-tauri/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-cargo-windows-
-
-      - name: Install dependencies
-        run: |
-          cd dashboard
-          npm ci
-
-      - name: Build Tauri (Windows x86_64)
+      - name: Build Tauri (Windows)
         uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          CARGO_NET_RETRY: "10"
-          CARGO_HTTP_TIMEOUT: "240"
         with:
           projectPath: dashboard
           args: --target x86_64-pc-windows-msvc
@@ -177,7 +139,43 @@ jobs:
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Stone-Dashboard-Windows-x86_64
+          name: dashboard-windows-x86_64
           path: |
             dashboard/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
             dashboard/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+
+  # ── Dashboard Linux ──────────────────────────────────────────────────
+  build-dashboard-linux:
+    needs: build-node-binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev
+
+      - name: Install deps
+        run: cd dashboard && npm ci
+
+      - name: Build Tauri (Linux)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: dashboard
+          args: --target x86_64-unknown-linux-gnu
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-linux-x86_64
+          path: |
+            dashboard/src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb
+            dashboard/src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage
+            dashboard/src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage.tar.gz
+            dashboard/src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage.tar.gz.sig

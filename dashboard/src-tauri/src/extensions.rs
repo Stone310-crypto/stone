@@ -109,10 +109,6 @@ pub fn is_installed(id: &str) -> bool {
 }
 
 /// Gibt die installierte Version einer Extension zurück.
-pub fn installed_version(id: &str) -> Option<String> {
-    read_manifest(id).map(|m| m.version)
-}
-
 /// Vergleicht zwei SemVer-Strings (simpel: lexikografisch).
 fn is_newer_version(installed: &str, available: &str) -> bool {
     let parse = |v: &str| -> Vec<u32> {

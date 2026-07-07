@@ -11,7 +11,6 @@ use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
-use chrono::Utc;
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -91,10 +90,6 @@ impl NodeState {
         if self.log_lines.len() > 500 {
             self.log_lines.remove(0);
         }
-    }
-
-    pub fn take_logs(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.log_lines)
     }
 
     pub fn peek_logs(&self, count: usize) -> Vec<String> {
@@ -477,11 +472,11 @@ pub fn switch_node_network(
     app: AppHandle,
 ) -> Result<String, String> {
     let current_network;
-    let cpu_pct;
+    let _cpu_pct;
     {
         let s = state.lock().unwrap_or_else(|e| e.into_inner());
         current_network = s.config.network.clone();
-        cpu_pct = s.config.cpu_pct;
+        _cpu_pct = s.config.cpu_pct;
     }
 
     // Toggle network
@@ -577,7 +572,7 @@ fn repair_token_db(data_dir: &PathBuf) {
         return;
     }
     // Check for corrupt MANIFEST files (most common RocksDB failure)
-    let manifest_pattern = token_db.join("MANIFEST-*");
+    let _manifest_pattern = token_db.join("MANIFEST-*");
     if let Ok(entries) = std::fs::read_dir(&token_db) {
         for entry in entries.flatten() {
             let name = entry.file_name();

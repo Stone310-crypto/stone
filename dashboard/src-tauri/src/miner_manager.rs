@@ -139,6 +139,7 @@ struct TemplateData {
     difficulty: u32,
     effective_difficulty: u32,
     validator_pubkey: String,
+    #[allow(dead_code)]
     miner_wallet: String,
 }
 
@@ -358,7 +359,7 @@ pub async fn miner_start(
 
 #[tauri::command]
 pub fn miner_stop(state: tauri::State<'_, SharedMinerState>) -> Result<(), String> {
-    let mut s = state.lock().unwrap_or_else(|e| e.into_inner());
+    let s = state.lock().unwrap_or_else(|e| e.into_inner());
     if !s.stats.active {
         return Err("Miner läuft nicht".into());
     }

@@ -79,24 +79,12 @@ impl NodeConfigDB {
             .optional().ok().flatten()
     }
 
-    pub fn set_bool(&self, key: &str, v: bool) -> Result<(), String> {
-        self.set(key, if v { "true" } else { "false" })
-    }
-
     pub fn set_u16(&self, key: &str, v: u16) -> Result<(), String> {
         self.set(key, &v.to_string())
     }
 
     // ── Bootstrap Nodes ──────────────────────────────────────────────────
 
-    pub fn add_bootstrap_node(&self, url: &str, network: &str) -> Result<(), String> {
-        let conn = self.conn.lock().map_err(|e| format!("lock: {e}"))?;
-        conn.execute(
-            "INSERT OR IGNORE INTO bootstrap_nodes (url, network) VALUES (?1, ?2)",
-            params![url, network],
-        ).map_err(|e| format!("bootstrap add: {e}"))?;
-        Ok(())
-    }
 
     pub fn replace_bootstrap_nodes(&self, nodes: &[String], network: &str) -> Result<(), String> {
         let conn = self.conn.lock().map_err(|e| format!("lock: {e}"))?;
