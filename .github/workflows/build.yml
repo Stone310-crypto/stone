@@ -54,7 +54,7 @@ jobs:
       - name: Build stone-master
         run: cargo build --release --bin stone-master --target ${{ matrix.target }}
 
-      - name: Prepare & rename binaries
+      - name: Prepare and rename binaries
         shell: bash
         run: |
           cd target/${{ matrix.target }}/release
@@ -84,17 +84,25 @@ jobs:
   build-dashboard-macos:
     needs: build-node-binaries
     strategy:
+      fail-fast: false
       matrix:
-        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+        target:
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: 20 }
-      - uses: dtolnay/rust-toolchain@stable
-        with: { targets: ${{ matrix.target }} }
 
-      - name: Install deps
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install npm deps
         run: cd dashboard && npm ci
 
       - name: Build Tauri (macOS)
@@ -120,12 +128,17 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with: { node-version: 20 }
-      - uses: dtolnay/rust-toolchain@stable
-        with: { targets: x86_64-pc-windows-msvc }
 
-      - name: Install deps
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Install npm deps
         run: cd dashboard && npm ci
 
       - name: Build Tauri (Windows)
@@ -150,16 +163,20 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-node@v4
-        with: { node-version: 20 }
-      - uses: dtolnay/rust-toolchain@stable
+        with:
+          node-version: 20
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
 
       - name: Install system deps
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev
 
-      - name: Install deps
+      - name: Install npm deps
         run: cd dashboard && npm ci
 
       - name: Build Tauri (Linux)
