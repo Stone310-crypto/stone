@@ -1,0 +1,15 @@
+{
+  "id": "dashboard",
+  "name": "Dashboard-Modul",
+  "description": "Grafiken, Statistiken & Node-Monitoring",
+  "version": "1.0.0",
+  "icon": "📊",
+  "rating": 4.2,
+  "reviews": 15,
+  "downloads": 890,
+  "size_mb": 8,
+  "repository": "Stone310-crypto/dashboard-extension",
+  "permissions": ["network", "storage"],
+  "category": "extension",
+  "author": "StoneChain"
+}

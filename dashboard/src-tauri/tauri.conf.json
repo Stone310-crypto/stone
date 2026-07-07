@@ -31,11 +31,22 @@
     },
     "shell": {
       "open": true
+    },
+    "updater": {
+      "active": true,
+      "endpoints": [
+        "https://github.com/Stone310-crypto/stone/releases/latest/download/versions.json"
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEFDN0Q1ODREMTdDMkVCNkEKUldScTY4SVhUVmg5ckgrVVpBK1N3TWxqNVJnT0ZXMmt6YVNzeW9VNStJWGJGRFdqTnNKUHlBTjcK",
+      "windows": {
+        "installMode": "passive"
+      }
     }
   },
   "bundle": {
     "active": true,
     "targets": "all",
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
@@ -45,6 +56,15 @@
     ],
     "macOS": {
       "minimumSystemVersion": "12.0"
+    },
+    "resources": {
+      "resources/extensions/dashboard/ui.html": "extensions/dashboard/ui.html",
+      "resources/extensions/dashboard/manifest.json": "extensions/dashboard/manifest.json",
+      "resources/extensions/dashboard/module.wasm": "extensions/dashboard/module.wasm",
+      "resources/extensions/testnet-mode/ui.html": "extensions/testnet-mode/ui.html",
+      "resources/extensions/testnet-mode/theme.css": "extensions/testnet-mode/theme.css",
+      "resources/extensions/testnet-mode/manifest.json": "extensions/testnet-mode/manifest.json",
+      "resources/extensions/testnet-mode/module.wasm": "extensions/testnet-mode/module.wasm"
     }
   }
 }

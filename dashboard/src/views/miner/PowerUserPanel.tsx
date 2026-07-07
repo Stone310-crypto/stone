@@ -60,7 +60,7 @@ function formatEarned(s: string): string {
 }
 
 export default function PowerUserPanel({ onClose }: Props) {
-  const { connected, blockHeight } = useNodeHealth();
+  const { blockHeight } = useNodeHealth();
   const { session } = useAuth();
   const network = getStoredNetwork();
   const isTestnet = network === "testnet";

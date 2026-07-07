@@ -184,6 +184,7 @@ pub fn run() {
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         .setup(|app| {
             // Modules-Verzeichnis erstellen (für optionale Module)
             let _ = std::fs::create_dir_all(&modules::dirs_next());
@@ -196,7 +197,13 @@ pub fn run() {
             // Extensions-Verzeichnis erstellen
             let _ = std::fs::create_dir_all(&extensions::extensions_dir());
 
-            let cfg = load_config(app.handle());
+            // Bundled Extensions aus den App-Ressourcen extrahieren (Production-Build)
+            extract_bundled_extensions(app.handle());
+
+            let mut cfg = load_config(app.handle());
+            // Immer Mainnet/3180 als Standard – kein automatischer Testnet-Start
+            cfg.network = "mainnet".to_string();
+            cfg.port = 3180;
             let enabled = cfg.enabled;
             let mut state = NodeState::new();
             state.config = cfg;
@@ -306,4 +313,62 @@ async fn node_binary_download_latest(app: AppHandle) -> Result<Vec<(String, Stri
         .into_iter()
         .map(|(name, path)| (name, path.to_string_lossy().to_string()))
         .collect())
+}
+
+// ─── Bundled Extensions (Production Build) ───────────────────────────────────
+
+/// Kopiert gebundelte Extension-Dateien aus dem App-Bundle ins
+/// App-Datenverzeichnis, falls sie dort noch nicht existieren.
+/// Dadurch funktionieren Dashboard- und Testnet-Extension auch
+/// im Production-Build ohne GitHub-Download.
+fn extract_bundled_extensions(app: &AppHandle) {
+    let Ok(resource_dir) = app.path().resource_dir() else {
+        eprintln!("[extensions] Resource-Dir nicht verfügbar – überspringe Bundle-Extraktion");
+        return;
+    };
+
+    let bundled_ext_dir = resource_dir.join("extensions");
+    if !bundled_ext_dir.exists() {
+        // Keine gebundelten Extensions (Development-Modus)
+        return;
+    }
+
+    let target_dir = extensions::extensions_dir();
+    let _ = std::fs::create_dir_all(&target_dir);
+
+    // Liste der Extensions die gebundelt sind (werden bei jedem Start
+    // überschrieben, damit sie immer der App-Version entsprechen).
+    let ext_ids = ["dashboard", "testnet-mode"];
+    for id in &ext_ids {
+        let src = bundled_ext_dir.join(id);
+        if !src.exists() {
+            continue;
+        }
+        let dst = target_dir.join(id);
+        // Alte Version löschen, dann neu kopieren
+        if dst.exists() {
+            let _ = std::fs::remove_dir_all(&dst);
+        }
+        if let Err(e) = copy_dir_recursive(&src, &dst) {
+            eprintln!("[extensions] Konnte '{id}' nicht extrahieren: {e}");
+        } else {
+            println!("[extensions] 📦 '{id}' aus App-Bundle extrahiert");
+        }
+    }
+}
+
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<(), String> {
+    std::fs::create_dir_all(dst).map_err(|e| format!("mkdir: {e}"))?;
+    let entries = std::fs::read_dir(src).map_err(|e| format!("read_dir: {e}"))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("entry: {e}"))?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if src_path.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else {
+            std::fs::copy(&src_path, &dst_path).map_err(|e| format!("copy: {e}"))?;
+        }
+    }
+    Ok(())
 }

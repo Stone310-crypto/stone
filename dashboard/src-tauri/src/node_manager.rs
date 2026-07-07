@@ -155,7 +155,7 @@ fn prepare_binary(path: &PathBuf) -> Result<(), String> {
 /// 3. Next to our own executable (inside .app bundle on macOS / next to .exe on Windows)
 /// 4. Rust build output (`target/release/`) — developer shortcut
 /// 5. `$PATH` / `%PATH%` lookup
-fn find_binary(app: &AppHandle, override_path: &str) -> Option<PathBuf> {
+pub fn find_binary(app: &AppHandle, override_path: &str) -> Option<PathBuf> {
     #[cfg(target_os = "windows")]
     let exe_suffix = ".exe";
     #[cfg(not(target_os = "windows"))]

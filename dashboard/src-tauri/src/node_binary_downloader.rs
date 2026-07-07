@@ -38,6 +38,13 @@ pub struct BinaryVersion {
 /// Wird von `node_start_internal` aufgerufen, bevor die Binary-Suche startet.
 /// Nutzt `reqwest::blocking` um Konflikte mit der vorhandenen Tauri-Tokio-Runtime zu vermeiden.
 pub fn ensure_binaries_available(app: &AppHandle) -> Result<(), String> {
+    // Erst prüfen ob find_binary die Binary IRGENDWO findet
+    // (binaries/, next to exe, project dir, PATH, ...)
+    if crate::node_manager::find_binary(app, "").is_some() {
+        return Ok(());
+    }
+
+    // Binary nirgends gefunden → binaries/ Ordner vorbereiten und von GitHub laden
     let data_dir = app
         .path()
         .app_data_dir()
@@ -45,18 +52,6 @@ pub fn ensure_binaries_available(app: &AppHandle) -> Result<(), String> {
     let binaries_dir = data_dir.join("binaries");
     std::fs::create_dir_all(&binaries_dir)
         .map_err(|e| format!("binaries/ Ordner konnte nicht erstellt werden: {e}"))?;
-
-    // Prüfen ob mindestens eine Binary schon da ist
-    #[cfg(target_os = "windows")]
-    let node_exists = binaries_dir.join("stone-app-node.exe").exists()
-        || binaries_dir.join("stone-master.exe").exists();
-    #[cfg(not(target_os = "windows"))]
-    let node_exists = binaries_dir.join("stone-app-node").exists()
-        || binaries_dir.join("stone-master").exists();
-
-    if node_exists {
-        return Ok(()); // Schon vorhanden — nichts tun
-    }
 
     // Keine Binary lokal → von GitHub holen (synchron mit blocking-Client)
     eprintln!("[binary-dl] Keine lokale Binary gefunden, lade von GitHub Release…");

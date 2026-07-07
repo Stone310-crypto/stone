@@ -9,7 +9,7 @@ import {
 import QRCode from "qrcode";
 import { useAuth } from "./AuthContext";
 import { auth as authApi } from "../api/stone";
-import { loadSettings, saveSettings } from "../store/session";
+import { loadSettings } from "../store/session";
 
 async function openExternal(url: string) {
   try {
@@ -279,31 +279,10 @@ function DiscordLoginView({ onBack }: { onBack: () => void }) {
 
 // ── Advanced ──────────────────────────────────────────────────────────────────
 
-function AdvancedSettings() {
-  const s = loadSettings();
-  const [url, setUrl] = useState(s.nodeUrl);
-  const [network, setNetwork] = useState((s as any).network || "mainnet");
-  const [saved, setSaved] = useState(false);
+// Einfache Node-Status-Anzeige (ohne Netzwerk-Wechsel – immer Mainnet/3180)
+function NodeStatusBar() {
   const [nodeStatus, setNodeStatus] = useState<string>("");
   const [nodeLoading, setNodeLoading] = useState(false);
-
-  function switchNetwork(net: string) {
-    setNetwork(net);
-    const newUrl = net === "mainnet" ? "http://127.0.0.1:3180" : "http://127.0.0.1:3080";
-    setUrl(newUrl);
-    // Persist immediately so the setting survives tab switches
-    try { localStorage.setItem("stone-network-mode", net); } catch {}
-    saveSettings({ ...loadSettings(), nodeUrl: newUrl, network: net } as any);
-    setSaved(true); setTimeout(() => setSaved(false), 1500);
-    // Install testnet-mode extension when switching to testnet
-    if (net === "testnet") {
-      try {
-        import("@tauri-apps/api/core").then(({ invoke }) => {
-          invoke("cmd_install_extension", { id: "testnet-mode" }).catch(() => {});
-        });
-      } catch {}
-    }
-  }
 
   useEffect(() => {
     let i: ReturnType<typeof setInterval>;
@@ -328,36 +307,31 @@ function AdvancedSettings() {
     return () => clearInterval(i);
   }, []);
 
-  function save() { saveSettings({ ...loadSettings(), nodeUrl: url, network } as any); setSaved(true); setTimeout(() => setSaved(false), 1500); }
-
   async function toggleNode() {
     setNodeLoading(true);
     try {
       const { invoke } = await import("@tauri-apps/api/core");
       if (nodeStatus.startsWith("Running")) await invoke("node_stop");
-      else { const result: string = await invoke("node_start"); setUrl(result); saveSettings({ ...loadSettings(), nodeUrl: result } as any); setSaved(true); setTimeout(() => setSaved(false), 1500); }
+      else await invoke("node_start");
     } catch (e: unknown) { setNodeStatus(`Error: ${e instanceof Error ? e.message : String(e)}`); }
     setNodeLoading(false);
   }
 
   return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-        <label style={{ fontSize: 11, color: "var(--text-muted)", whiteSpace: "nowrap" }}>🌐 Netzwerk:</label>
-        <select value={network} onChange={(e) => switchNetwork(e.target.value)}
-          style={{ flex: 1, background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 8, padding: "7px 10px", fontSize: 11, color: "var(--text)", outline: "none", cursor: "pointer" }}>
-          <option value="mainnet">✅ Mainnet (Port 3180)</option>
-          <option value="testnet">🧪 Testnet (Port 3080)</option>
-        </select>
+    <div style={{ display: "flex", gap: 8, alignItems: "center", marginTop: 12 }}>
+      <div style={{ flex: 1, fontSize: 11, color: nodeStatus.startsWith("Running") ? "var(--green)" : "var(--text-muted)" }}>
+        ⚡ Node: {nodeStatus || "Kein Node-Manager"}
       </div>
-      <div style={{ display: "flex", gap: 8 }}>
-        <input type="text" value={url} onChange={(e) => { setUrl(e.target.value); setSaved(false); }} style={{ flex: 1, background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 8, padding: "8px 10px", fontSize: 11, color: "var(--text)", outline: "none", fontFamily: "monospace" }} />
-        <button onClick={save} style={{ padding: "8px 12px", borderRadius: 8, background: saved ? "rgba(59,165,92,0.25)" : "rgba(91,138,238,0.25)", color: saved ? "var(--green)" : "var(--accent)", fontSize: 12, fontWeight: 600, cursor: "pointer", border: "none", transition: "all 0.15s" }}>{saved ? "✓" : "OK"}</button>
-      </div>
-      <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-        <div style={{ flex: 1, fontSize: 11, color: nodeStatus.startsWith("Running") ? "var(--green)" : "var(--text-muted)" }}>Node: {nodeStatus || "Kein Node-Manager"}</div>
-        <button onClick={toggleNode} disabled={nodeLoading || !nodeStatus} style={{ padding: "6px 14px", borderRadius: 8, background: nodeStatus.startsWith("Running") ? "rgba(237,66,69,0.2)" : "rgba(59,165,92,0.2)", color: nodeStatus.startsWith("Running") ? "var(--red)" : "var(--green)", fontSize: 11, fontWeight: 600, cursor: "pointer", border: "none", opacity: nodeLoading ? 0.5 : 1 }}>{nodeLoading ? "⏳" : nodeStatus.startsWith("Running") ? "Stop Node" : "Start Node"}</button>
-      </div>
+      <button onClick={toggleNode} disabled={nodeLoading || !nodeStatus}
+        style={{
+          padding: "4px 12px", borderRadius: 6,
+          background: nodeStatus.startsWith("Running") ? "rgba(237,66,69,0.2)" : "rgba(59,165,92,0.2)",
+          color: nodeStatus.startsWith("Running") ? "var(--red)" : "var(--green)",
+          fontSize: 11, fontWeight: 600, cursor: "pointer", border: "none",
+          opacity: nodeLoading ? 0.5 : 1,
+        }}>
+        {nodeLoading ? "⏳" : nodeStatus.startsWith("Running") ? "Stop" : "Start"}
+      </button>
     </div>
   );
 }
@@ -369,7 +343,6 @@ type View = "main" | "stonechain" | "discord";
 export default function LoginView() {
   const [tab, setTab] = useState<"login" | "register">("login");
   const [view, setView] = useState<View>("main");
-  const [showAdvanced, setShowAdvanced] = useState(false);
 
   return (
     <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center", background: "#0a0b0f", position: "relative", paddingTop: 44 }}>
@@ -379,8 +352,7 @@ export default function LoginView() {
         {view === "stonechain" && <StonechainAppLoginView onBack={() => setView("main")} />}
         {view === "discord" && <DiscordLoginView onBack={() => setView("main")} />}
         <div style={{ marginTop: 20, textAlign: "center" }}>
-          <button onClick={() => setShowAdvanced((v) => !v)} style={{ fontSize: 11, color: "rgba(255,255,255,0.2)", cursor: "pointer", background: "none", border: "none", transition: "color 0.15s" }} onMouseEnter={(e) => ((e.currentTarget as HTMLElement).style.color = "var(--text-muted)")} onMouseLeave={(e) => ((e.currentTarget as HTMLElement).style.color = "rgba(255,255,255,0.2)")}>{showAdvanced ? "▲" : "▼"} Node URL</button>
-          {showAdvanced && <div style={{ marginTop: 8 }}><AdvancedSettings /></div>}
+          <NodeStatusBar />
           <button onClick={() => { localStorage.clear(); window.location.reload(); }} style={{ fontSize: 10, color: "rgba(237,66,69,0.3)", cursor: "pointer", background: "none", border: "none", marginTop: 14, transition: "color 0.15s" }} onMouseEnter={(e) => ((e.currentTarget as HTMLElement).style.color = "var(--red)")} onMouseLeave={(e) => ((e.currentTarget as HTMLElement).style.color = "rgba(237,66,69,0.3)")}>Session löschen (bei Login-Problemen)</button>
         </div>
       </Card>

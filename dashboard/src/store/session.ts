@@ -27,21 +27,25 @@ const defaultSettings: NodeSettings = {
   network: "mainnet",
 };
 
-/** Load settings, syncing network from stone-network-mode if present. */
+/** Load settings, syncing network from stone-network-mode if present.
+ *  IMPORTANT: Der Port wird NICHT automatisch umgeschaltet.
+ *  stone-network-mode dient nur als Hinweis für die UI (Banner etc.).
+ *  Der tatsächliche Port kommt aus den gespeicherten Settings oder dem Default (3180). */
 export function loadSettings(): NodeSettings {
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);
     const stored = raw ? { ...defaultSettings, ...JSON.parse(raw) } : { ...defaultSettings };
 
-    // Sync network from the dedicated stone-network-mode key (set by extension/testnet banner)
+    // Sync network label from the dedicated stone-network-mode key (for UI only, not port)
     const networkMode = localStorage.getItem(NETWORK_MODE_KEY);
     if (networkMode === "testnet" || networkMode === "mainnet") {
       stored.network = networkMode;
-      if (networkMode === "testnet" && stored.nodeUrl === defaultSettings.nodeUrl) {
-        stored.nodeUrl = "http://127.0.0.1:3080";
-      } else if (networkMode === "mainnet" && stored.nodeUrl === "http://127.0.0.1:3080") {
-        stored.nodeUrl = "http://127.0.0.1:3180";
-      }
+    }
+
+    // Falls der User EXPLIZIT eine testnet-URL gespeichert hat (Port 3080), diese respektieren.
+    // Ansonsten IMMER mainnet-Default (3180) verwenden.
+    if (stored.nodeUrl.includes(":3080") && networkMode !== "testnet" && !raw) {
+      stored.nodeUrl = defaultSettings.nodeUrl;
     }
 
     return stored;

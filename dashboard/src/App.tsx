@@ -13,7 +13,8 @@ import ChatView from "./views/chat/ChatView";
 import WalletView from "./views/wallet/WalletView";
 import ExtensionsView from "./views/extensions/ExtensionsView";
 import ThemeEditorView from "./views/extensions/ThemeEditorView";
-import DashboardExtView from "./views/extensions/DashboardExtView";
+import DashboardView from "./views/node/DashboardView";
+import TestnetModeView from "./views/node/TestnetModeView";
 import ExtensionFrame from "./views/extensions/ExtensionFrame";
 import TestnetBanner from "./components/TestnetBanner";
 import ProfileEditOverlay from "./views/profile/ProfileEditOverlay";
@@ -128,7 +129,8 @@ function MainApp() {
     profile: <ProfileView />,
     extensions: <ExtensionsView />,
     "theme-editor": <ThemeEditorView />,
-    dashboard: <DashboardExtView />,
+    dashboard: <DashboardView />,
+    "testnet-mode": <TestnetModeView />,
   };
 
   // Dynamische Extension-View: key sorgt für Remounting bei Nav-Wechsel

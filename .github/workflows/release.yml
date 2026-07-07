@@ -1,16 +1,19 @@
-name: Create Release (Binaries)
+name: Create Release (Binaries + Dashboard)
 on:
   push:
-    tags:
-      - 'v*'
+    tags: ['v*']
   workflow_dispatch:
     inputs:
       tag:
         description: 'Release tag (z.B. v0.1.0)'
         required: true
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  build-and-release:
+  # ── Node Binaries (stone-app-node, stone-master) ─────────────────────
+  build-node-binaries:
     strategy:
       fail-fast: false
       matrix:
@@ -24,6 +27,9 @@ jobs:
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             asset_suffix: windows-x86_64
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            asset_suffix: linux-x86_64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -47,14 +53,14 @@ jobs:
           echo "MASTER_ASSET=stone-master-${{ matrix.asset_suffix }}" >> $GITHUB_ENV
           echo "MASTER_SHA=stone-master-${{ matrix.asset_suffix }}.sha256" >> $GITHUB_ENV
 
-      - name: Rename binaries (standardize asset names)
+      - name: Rename binaries
         shell: bash
         run: |
           cd target/${{ matrix.target }}/release
           if [ -f stone-app-node.exe ]; then cp stone-app-node.exe "$NODE_ASSET"; else cp stone-app-node "$NODE_ASSET"; fi
           if [ -f stone-master.exe ]; then cp stone-master.exe "$MASTER_ASSET"; else cp stone-master "$MASTER_ASSET"; fi
 
-      - name: Generate SHA256 checksums
+      - name: Generate SHA256
         shell: bash
         run: |
           cd target/${{ matrix.target }}/release
@@ -66,30 +72,98 @@ jobs:
             sha256sum "$MASTER_ASSET" | awk '{print $1}' > "$MASTER_SHA"
           fi
 
-      - name: Upload artifacts
+      - name: Upload node binaries
         uses: actions/upload-artifact@v4
         with:
-          name: binaries-${{ matrix.asset_suffix }}
+          name: node-binaries-${{ matrix.asset_suffix }}
           path: |
             target/${{ matrix.target }}/release/${{ env.NODE_ASSET }}
             target/${{ matrix.target }}/release/${{ env.NODE_SHA }}
             target/${{ matrix.target }}/release/${{ env.MASTER_ASSET }}
             target/${{ matrix.target }}/release/${{ env.MASTER_SHA }}
 
+  # ── Dashboard (macOS) ─────────────────────────────────────────────
+  build-dashboard-macos:
+    needs: build-node-binaries
+    strategy:
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: ${{ matrix.target }} }
+
+      - name: Install deps
+        run: cd dashboard && npm ci
+
+      - name: Build Tauri (macOS)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_UPDATER_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_UPDATER_KEY_PASSWORD }}
+        with:
+          projectPath: dashboard
+          args: --target ${{ matrix.target }}
+
+      - name: Upload macOS bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-macos-${{ matrix.target }}
+          path: |
+            dashboard/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
+            dashboard/src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app.tar.gz
+            dashboard/src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app.tar.gz.sig
+
+  # ── Dashboard (Windows) ───────────────────────────────────────────
+  build-dashboard-windows:
+    needs: build-node-binaries
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: x86_64-pc-windows-msvc }
+
+      - name: Install deps
+        run: cd dashboard && npm ci
+
+      - name: Build Tauri (Windows)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_UPDATER_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_UPDATER_KEY_PASSWORD }}
+        with:
+          projectPath: dashboard
+          args: --target x86_64-pc-windows-msvc
+
+      - name: Upload Windows bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: dashboard-windows-x86_64
+          path: |
+            dashboard/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/msi/*.msi
+            dashboard/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+
+  # ── Create GitHub Release ─────────────────────────────────────────
   create-release:
-    needs: build-and-release
+    needs: [build-node-binaries, build-dashboard-macos, build-dashboard-windows]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v4
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
           path: assets
           merge-multiple: true
-
-      - name: List assets
-        run: ls -la assets/
 
       - name: Determine tag
         id: tag
@@ -99,6 +173,22 @@ jobs:
           else
             echo "TAG=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
           fi
+
+      - name: Generate versions.json for Tauri Updater
+        run: |
+          TAG="${{ steps.tag.outputs.TAG }}"
+          cat > assets/versions.json << JSON
+          {
+            "version": "${TAG#v}",
+            "notes": "Release ${TAG} — See https://github.com/Stone310-crypto/stone/releases/tag/${TAG}",
+            "pub_date": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
+            "platforms": {
+              "darwin-aarch64": { "signature": "", "url": "https://github.com/Stone310-crypto/stone/releases/download/${TAG}/Stone-Dashboard-macos-aarch64.dmg" },
+              "darwin-x86_64": { "signature": "", "url": "https://github.com/Stone310-crypto/stone/releases/download/${TAG}/Stone-Dashboard-macos-x86_64.dmg" },
+              "windows-x86_64": { "signature": "", "url": "https://github.com/Stone310-crypto/stone/releases/download/${TAG}/Stone-Dashboard-windows-x86_64.msi" }
+            }
+          }
+          JSON
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { Loader2 } from "lucide-react";
 
@@ -9,6 +9,7 @@ interface Props {
 export default function ExtensionFrame({ extensionId }: Props) {
   const [ui, setUI] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const iframeRef = useRef<HTMLIFrameElement>(null);
 
   useEffect(() => {
     setLoading(true);
@@ -18,25 +19,14 @@ export default function ExtensionFrame({ extensionId }: Props) {
       .finally(() => setLoading(false));
   }, [extensionId]);
 
-  // Message-Proxy
-  useEffect(() => {
-    const handler = async (e: MessageEvent) => {
-      if (e.data?.type !== "tauri-invoke") return;
-      try {
-        const result = await invoke(e.data.cmd, e.data.args);
-        (e.source as WindowProxy).postMessage(
-          { id: e.data.id, ok: true, result },
-          { targetOrigin: "*" }
-        );
-      } catch (err: any) {
-        (e.source as WindowProxy).postMessage(
-          { id: e.data.id, ok: false, error: String(err) },
-          { targetOrigin: "*" }
-        );
-      }
-    };
-    window.addEventListener("message", handler);
-    return () => window.removeEventListener("message", handler);
+  const handleLoad = useCallback(() => {
+    const iframe = iframeRef.current;
+    if (!iframe?.contentWindow) return;
+    try {
+      (iframe.contentWindow as any).__stone_invoke = async (cmd: string, args: any) => {
+        return await invoke(cmd, args);
+      };
+    } catch (e) {}
   }, []);
 
   if (loading) {
@@ -59,10 +49,12 @@ export default function ExtensionFrame({ extensionId }: Props) {
 
   return (
     <iframe
+      ref={iframeRef}
       srcDoc={ui}
+      onLoad={handleLoad}
       style={{ width: "100%", height: "100%", border: "none", background: "var(--main-bg)" }}
       title={`Extension: ${extensionId}`}
-      sandbox="allow-scripts allow-same-origin allow-modals allow-forms"
+      sandbox="allow-scripts allow-same-origin"
     />
   );
 }
