@@ -509,6 +509,7 @@ pub fn switch_node_network(
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
 
+#[allow(unused_variables)]
 fn kill_process_on_port(port: u16) -> bool {
     #[cfg(target_os = "macos")]
     {
