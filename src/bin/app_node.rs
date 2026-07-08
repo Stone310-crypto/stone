@@ -260,6 +260,10 @@ async fn main() {
                                                             node_bg.message_pool.store_batch_record(
                                                                 &batch.merkle_root, &batch.messages, idx,
                                                             );
+                                                            // Mark messages as confirmed so sequence state
+                                                            // and /message-pool endpoint stay up-to-date.
+                                                            let msg_ids: Vec<String> = batch.messages.iter().map(|m| m.msg_id.clone()).collect();
+                                                            node_bg.message_pool.mark_confirmed(&msg_ids, idx);
                                                         }
                                                     }
                                                     {
