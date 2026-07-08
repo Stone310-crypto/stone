@@ -41,6 +41,7 @@
       "windows": {
         "installMode": "passive"
       }
+    }
   },
   "bundle": {
     "active": true,
