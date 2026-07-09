@@ -12,7 +12,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # ── Node Binaries (all platforms) ──────────────────────────────────────
+  # ── Node Binaries ────────────────────────────────────────────────────
   build-node-binaries:
     strategy:
       fail-fast: false
@@ -33,19 +33,16 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
 
-      - name: Build stone-app-node
-        run: cargo build --release --bin stone-app-node --target ${{ matrix.target }}
+      - name: Build binaries
+        run: |
+          cargo build --release --bin stone-app-node --target ${{ matrix.target }}
+          cargo build --release --bin stone-master --target ${{ matrix.target }}
 
-      - name: Build stone-master
-        run: cargo build --release --bin stone-master --target ${{ matrix.target }}
-
-      - name: Prepare and rename binaries
+      - name: Prepare and upload
         shell: bash
         run: |
           cd target/${{ matrix.target }}/release
@@ -53,16 +50,10 @@ jobs:
           MASTER="stone-master-${{ matrix.suffix }}"
           if [ -f stone-app-node.exe ]; then cp stone-app-node.exe "$NODE"; else cp stone-app-node "$NODE"; fi
           if [ -f stone-master.exe ]; then cp stone-master.exe "$MASTER"; else cp stone-master "$MASTER"; fi
-          if [ "$(uname)" = "Darwin" ]; then
-            shasum -a 256 "$NODE" | awk '{print $1}' > "$NODE.sha256"
-            shasum -a 256 "$MASTER" | awk '{print $1}' > "$MASTER.sha256"
-          else
-            sha256sum "$NODE" | awk '{print $1}' > "$NODE.sha256"
-            sha256sum "$MASTER" | awk '{print $1}' > "$MASTER.sha256"
-          fi
+          if [ "$(uname)" = "Darwin" ]; then shasum -a 256 "$NODE" | awk '{print $1}' > "$NODE.sha256"; shasum -a 256 "$MASTER" | awk '{print $1}' > "$MASTER.sha256"
+          else sha256sum "$NODE" | awk '{print $1}' > "$NODE.sha256"; sha256sum "$MASTER" | awk '{print $1}' > "$MASTER.sha256"; fi
 
-      - name: Upload node binaries
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: node-binaries-${{ matrix.suffix }}
           path: |
@@ -77,27 +68,22 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target:
-          - aarch64-apple-darwin
-          - x86_64-apple-darwin
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
-        with:
-          node-version: 20
+        with: { node-version: 20 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: ${{ matrix.target }} }
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: ${{ matrix.target }}
+      - name: Enable updater artifacts
+        run: |
+          cd dashboard/src-tauri
+          sed -i '' 's/"createUpdaterArtifacts": false/"createUpdaterArtifacts": true/' tauri.conf.json
 
-      - name: Install npm deps
-        run: cd dashboard && npm ci
-
-      - name: Build Tauri (macOS)
-        uses: tauri-apps/tauri-action@v0
+      - run: cd dashboard && npm ci
+      - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_UPDATER_PRIVATE_KEY }}
@@ -106,14 +92,23 @@ jobs:
           projectPath: dashboard
           args: --target ${{ matrix.target }}
 
-      - name: Upload macOS artifact
-        uses: actions/upload-artifact@v4
+      - name: Rename updater artifacts (include arch)
+        shell: bash
+        run: |
+          cd dashboard/src-tauri/target/${{ matrix.target }}/release/bundle/macos
+          TAR="Stone Dashboard.app.tar.gz"
+          SIG="Stone Dashboard.app.tar.gz.sig"
+          DMG=$(ls *.dmg 2>/dev/null | head -1)
+          if [ -f "$TAR" ]; then mv "$TAR" "Stone-Dashboard-${{ matrix.target }}.app.tar.gz"; fi
+          if [ -f "$SIG" ]; then mv "$SIG" "Stone-Dashboard-${{ matrix.target }}.app.tar.gz.sig"; fi
+
+      - uses: actions/upload-artifact@v4
         with:
           name: dashboard-macos-${{ matrix.target }}
           path: |
-            dashboard/src-tauri/target/${{ matrix.target }}/release/bundle/dmg/*.dmg
-            dashboard/src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app.tar.gz
-            dashboard/src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.app.tar.gz.sig
+            dashboard/src-tauri/target/${{ matrix.target }}/release/bundle/macos/*.dmg
+            dashboard/src-tauri/target/${{ matrix.target }}/release/bundle/macos/Stone-Dashboard-*.app.tar.gz
+            dashboard/src-tauri/target/${{ matrix.target }}/release/bundle/macos/Stone-Dashboard-*.app.tar.gz.sig
 
   # ── Dashboard Windows ────────────────────────────────────────────────
   build-dashboard-windows:
@@ -121,21 +116,19 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
-        with:
-          node-version: 20
+        with: { node-version: 20 }
+      - uses: dtolnay/rust-toolchain@stable
+        with: { targets: x86_64-pc-windows-msvc }
 
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-msvc
+      - name: Enable updater artifacts
+        shell: bash
+        run: |
+          cd dashboard/src-tauri
+          sed -i 's/"createUpdaterArtifacts": false/"createUpdaterArtifacts": true/' tauri.conf.json
 
-      - name: Install npm deps
-        run: cd dashboard && npm ci
-
-      - name: Build Tauri (Windows)
-        uses: tauri-apps/tauri-action@v0
+      - run: cd dashboard && npm ci
+      - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_UPDATER_PRIVATE_KEY }}
@@ -144,8 +137,7 @@ jobs:
           projectPath: dashboard
           args: --target x86_64-pc-windows-msvc
 
-      - name: Upload Windows artifact
-        uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v4
         with:
           name: dashboard-windows-x86_64
           path: |
@@ -158,24 +150,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        with: { node-version: 20 }
+      - uses: dtolnay/rust-toolchain@stable
 
       - name: Install system deps
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libgtk-3-dev libsoup-3.0-dev libjavascriptcoregtk-4.1-dev
 
-      - name: Install npm deps
-        run: cd dashboard && npm ci
+      - name: Enable updater artifacts
+        run: |
+          cd dashboard/src-tauri
+          sed -i 's/"createUpdaterArtifacts": false/"createUpdaterArtifacts": true/' tauri.conf.json
 
-      - name: Build Tauri (Linux)
-        uses: tauri-apps/tauri-action@v0
+      - run: cd dashboard && npm ci
+      - uses: tauri-apps/tauri-action@v0
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_UPDATER_PRIVATE_KEY }}
@@ -184,15 +174,23 @@ jobs:
           projectPath: dashboard
           args: --target x86_64-unknown-linux-gnu
 
-      - name: Upload Linux artifact
-        uses: actions/upload-artifact@v4
+      - name: Rename updater artifacts (include arch)
+        run: |
+          cd dashboard/src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage
+          TAR="Stone Dashboard.AppImage.tar.gz"
+          SIG="Stone Dashboard.AppImage.tar.gz.sig"
+          if [ -f "$TAR" ]; then mv "$TAR" "Stone-Dashboard-x86_64-unknown-linux-gnu.AppImage.tar.gz"; fi
+          if [ -f "$SIG" ]; then mv "$SIG" "Stone-Dashboard-x86_64-unknown-linux-gnu.AppImage.tar.gz.sig"; fi
+
+      - uses: actions/upload-artifact@v4
         with:
           name: dashboard-linux-x86_64
           path: |
             dashboard/src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/deb/*.deb
+            dashboard/src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/rpm/*.rpm
             dashboard/src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage
-            dashboard/src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage.tar.gz
-            dashboard/src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/*.AppImage.tar.gz.sig
+            dashboard/src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/Stone-Dashboard-*.AppImage.tar.gz
+            dashboard/src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/appimage/Stone-Dashboard-*.AppImage.tar.gz.sig
 
   # ── Create GitHub Release ──────────────────────────────────────────
   create-release:
@@ -222,39 +220,55 @@ jobs:
             echo "TAG=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
           fi
 
+      - name: List assets for debugging
+        run: find assets -type f | sort
+
       - name: Generate versions.json
         run: |
           TAG="${{ steps.tag.outputs.TAG }}"
           VERSION="${TAG#v}"
-          cat > assets/versions.json << 'JSONEOF'
+          DATE=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+          BASE="https://github.com/Stone310-crypto/stone/releases/download/${TAG}"
+
+          # macOS signatures
+          MAC_AARCH64_SIG=""
+          MAC_X86_64_SIG=""
+          if [ -f "assets/Stone-Dashboard-aarch64-apple-darwin.app.tar.gz.sig" ]; then
+            MAC_AARCH64_SIG=$(cat "assets/Stone-Dashboard-aarch64-apple-darwin.app.tar.gz.sig")
+          fi
+          if [ -f "assets/Stone-Dashboard-x86_64-apple-darwin.app.tar.gz.sig" ]; then
+            MAC_X86_64_SIG=$(cat "assets/Stone-Dashboard-x86_64-apple-darwin.app.tar.gz.sig")
+          fi
+          LINUX_SIG=""
+          if [ -f "assets/Stone-Dashboard-x86_64-unknown-linux-gnu.AppImage.tar.gz.sig" ]; then
+            LINUX_SIG=$(cat "assets/Stone-Dashboard-x86_64-unknown-linux-gnu.AppImage.tar.gz.sig")
+          fi
+
+          cat > assets/versions.json << JSONEOF
           {
-            "version": "VERSION_PLACEHOLDER",
-            "notes": "Release TAG_PLACEHOLDER",
-            "pub_date": "DATE_PLACEHOLDER",
+            "version": "${VERSION}",
+            "notes": "Release ${TAG} — https://github.com/Stone310-crypto/stone/releases/tag/${TAG}",
+            "pub_date": "${DATE}",
             "platforms": {
               "darwin-aarch64": {
-                "signature": "",
-                "url": "https://github.com/Stone310-crypto/stone/releases/download/TAG_PLACEHOLDER/Stone-Dashboard-macos-aarch64.app.tar.gz"
+                "signature": "${MAC_AARCH64_SIG}",
+                "url": "${BASE}/Stone-Dashboard-aarch64-apple-darwin.app.tar.gz"
               },
               "darwin-x86_64": {
-                "signature": "",
-                "url": "https://github.com/Stone310-crypto/stone/releases/download/TAG_PLACEHOLDER/Stone-Dashboard-macos-x86_64.app.tar.gz"
+                "signature": "${MAC_X86_64_SIG}",
+                "url": "${BASE}/Stone-Dashboard-x86_64-apple-darwin.app.tar.gz"
               },
               "windows-x86_64": {
                 "signature": "",
-                "url": "https://github.com/Stone310-crypto/stone/releases/download/TAG_PLACEHOLDER/Stone-Dashboard-windows-x86_64.msi"
+                "url": "${BASE}/Stone-Dashboard_${VERSION}_x64-setup.exe"
               },
               "linux-x86_64": {
-                "signature": "",
-                "url": "https://github.com/Stone310-crypto/stone/releases/download/TAG_PLACEHOLDER/Stone-Dashboard-linux-x86_64.AppImage.tar.gz"
+                "signature": "${LINUX_SIG}",
+                "url": "${BASE}/Stone-Dashboard-x86_64-unknown-linux-gnu.AppImage.tar.gz"
               }
             }
           }
           JSONEOF
-          # Replace placeholders
-          sed -i "s/VERSION_PLACEHOLDER/${VERSION}/g" assets/versions.json
-          sed -i "s/TAG_PLACEHOLDER/${TAG}/g" assets/versions.json
-          sed -i "s/DATE_PLACEHOLDER/$(date -u +"%Y-%m-%dT%H:%M:%SZ")/g" assets/versions.json
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
