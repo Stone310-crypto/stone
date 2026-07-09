@@ -689,6 +689,13 @@ function UserBar() {
   const [showMenu, setShowMenu] = useState(false);
   const [showStatusMenu, setShowStatusMenu] = useState(false);
   const [status, setStatus] = useState<OnlineStatus>("online");
+  const [version, setVersion] = useState("0.1.0");
+
+  useEffect(() => {
+    import("@tauri-apps/api/app").then(({ getVersion }) => {
+      getVersion().then(v => setVersion(v)).catch(() => {});
+    }).catch(() => {});
+  }, []);
   if (!session) return null;
 
   const currentStatus = statusConfig[status];
@@ -809,6 +816,10 @@ function UserBar() {
             >
               <LogOut size={15} /> Abmelden
             </button>
+            <div style={{ height: 1, background: "var(--border)", margin: "2px 8px" }} />
+            <div style={{ padding: "4px 10px", fontSize: 10, color: "var(--text-muted)", fontFamily: "monospace", textAlign: "center" }}>
+              Stone Dashboard v{version}
+            </div>
           </div>
         </>
       )}
