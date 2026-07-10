@@ -5,619 +5,225 @@ import { useSystemStats } from "../../hooks/useSystemStats";
 import { getNotifPrefs, saveNotifPrefs } from "../../hooks/useWebSocketEvents";
 import { nodeManager, type NodeConfig, type NodeStatus } from "../../api/node";
 import {
-  ArrowLeft, X, Search, Play, Square, RefreshCw,
-  Wifi, WifiOff, Server, Palette, Globe, Shield, ChevronRight,
-  Download, AlertTriangle,
+  ArrowLeft, X, Play, Square, RefreshCw, Download, AlertTriangle,
+  Wifi, WifiOff, Server, Palette, Shield, ChevronRight,
 } from "lucide-react";
 
-interface SettingsOverlayProps {
-  onClose: () => void;
-}
+type SettingsPage = "main" | "system" | "personalization" | "privacy" | "updates";
+interface SettingsOverlayProps { onClose: () => void; }
 
-function AutoStartToggle() {
-  const [enabled, setEnabled] = useState(false);
-  const [loading, setLoading] = useState(true);
+const card: React.CSSProperties = { background: "rgba(255,255,255,0.02)", borderRadius: 10, padding: 12, border: "1px solid rgba(255,255,255,0.05)", marginBottom: 10 };
+const secHdr: React.CSSProperties = { fontSize: 12, fontWeight: 500, color: "var(--text-secondary)", display: "block", marginBottom: 10 };
+const spin: React.CSSProperties = { animation: "spin 1s linear infinite" };
+const btnSm: React.CSSProperties = { padding: "5px 10px", borderRadius: 6, border: "1px solid rgba(255,255,255,0.1)", background: "rgba(255,255,255,0.04)", color: "var(--text-muted)", fontSize: 11, cursor: "pointer", display: "flex", alignItems: "center", gap: 4, whiteSpace: "nowrap" as const };
+const banner = (rgb: string): React.CSSProperties => ({ background: `rgba(${rgb},0.08)`, border: `1px solid rgba(${rgb},0.2)`, borderRadius: 8, padding: "10px 12px" });
 
-  useEffect(() => {
-    import("@tauri-apps/api/core").then(({ invoke }) => {
-      invoke<boolean>("get_auto_launch")
-        .then(setEnabled)
-        .catch(() => setEnabled(false))
-        .finally(() => setLoading(false));
-    }).catch(() => setLoading(false));
-  }, []);
-
-  async function toggle() {
-    if (loading) return;
-    setLoading(true);
-    try {
-      const { invoke } = await import("@tauri-apps/api/core");
-      const val = await invoke<boolean>("set_auto_launch", { enable: !enabled });
-      setEnabled(val);
-    } catch {}
-    setLoading(false);
-  }
-
+// ── ToggleRow ───────────────────────────────────────────────────
+function ToggleRow({ label, sub, checked, loading, onToggle }: { label: string; sub: string; checked: boolean; loading?: boolean; onToggle: () => void }) {
   return (
     <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-      <div>
-        <span style={{ fontSize: 12, color: "var(--text-primary)" }}>Auto-Start</span>
-        <p style={{ fontSize: 10, color: "var(--text-muted)", marginTop: 1 }}>App automatisch beim System-Login starten</p>
-      </div>
-      <button onClick={toggle} disabled={loading}
-        style={{
-          width: 40, height: 22, borderRadius: 11, border: "none", cursor: loading ? "wait" : "pointer",
-          background: enabled ? "var(--accent)" : "rgba(255,255,255,0.12)",
-          position: "relative", transition: "background 0.2s", opacity: loading ? 0.5 : 1,
-        }}>
-        <div style={{
-          width: 18, height: 18, borderRadius: "50%", background: "#fff",
-          position: "absolute", top: 2,
-          left: enabled ? 20 : 2,
-          transition: "left 0.2s",
-        }} />
+      <div><span style={{ fontSize: 12, color: "var(--text-primary)" }}>{label}</span><p style={{ fontSize: 10, color: "var(--text-muted)", marginTop: 1 }}>{sub}</p></div>
+      <button onClick={onToggle} disabled={loading} style={{ width: 40, height: 22, borderRadius: 11, border: "none", cursor: loading ? "wait" : "pointer", background: checked ? "var(--accent)" : "rgba(255,255,255,0.12)", position: "relative", transition: "background 0.2s", opacity: loading ? 0.5 : 1, flexShrink: 0 }}>
+        <div style={{ width: 18, height: 18, borderRadius: "50%", background: "#fff", position: "absolute", top: 2, left: checked ? 20 : 2, transition: "left 0.2s" }} />
       </button>
     </div>
   );
 }
 
+// ── AutoStartToggle ─────────────────────────────────────────────
+function AutoStartToggle() {
+  const [on, setOn] = useState(false); const [ld, setLd] = useState(true);
+  useEffect(() => { import("@tauri-apps/api/core").then(({ invoke }) => { invoke<boolean>("get_auto_launch").then(setOn).catch(() => {}).finally(() => setLd(false)); }).catch(() => setLd(false)); }, []);
+  async function toggle() { if (ld) return; setLd(true); try { const { invoke } = await import("@tauri-apps/api/core"); setOn(await invoke<boolean>("set_auto_launch", { enable: !on })); } catch {} setLd(false); }
+  return <ToggleRow label="Auto-Start" sub="App automatisch beim System-Login starten" checked={on} loading={ld} onToggle={toggle} />;
+}
+
+// ── NotificationToggles ─────────────────────────────────────────
 function NotificationToggles() {
   const [prefs, setPrefs] = useState(getNotifPrefs());
-
-  function toggle(key: keyof typeof prefs) {
-    const next = { ...prefs, [key]: !prefs[key] };
-    setPrefs(next);
-    saveNotifPrefs(next);
-  }
-
+  const toggle = (k: keyof typeof prefs) => { const n = { ...prefs, [k]: !prefs[k] }; setPrefs(n); saveNotifPrefs(n); };
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-        <div>
-          <span style={{ fontSize: 12, color: "var(--text-primary)" }}>Nachrichten</span>
-          <p style={{ fontSize: 10, color: "var(--text-muted)", marginTop: 1 }}>Benachrichtigung bei neuen Direktnachrichten</p>
-        </div>
-        <button onClick={() => toggle("messages")}
-          style={{
-            width: 40, height: 22, borderRadius: 11, border: "none", cursor: "pointer",
-            background: prefs.messages ? "var(--accent)" : "rgba(255,255,255,0.12)",
-            position: "relative", transition: "background 0.2s",
-          }}>
-          <div style={{
-            width: 18, height: 18, borderRadius: "50%", background: "#fff",
-            position: "absolute", top: 2,
-            left: prefs.messages ? 20 : 2,
-            transition: "left 0.2s",
-          }} />
-        </button>
-      </div>
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-        <div>
-          <span style={{ fontSize: 12, color: "var(--text-primary)" }}>Anrufe</span>
-          <p style={{ fontSize: 10, color: "var(--text-muted)", marginTop: 1 }}>Benachrichtigung bei eingehenden Anrufen</p>
-        </div>
-        <button onClick={() => toggle("calls")}
-          style={{
-            width: 40, height: 22, borderRadius: 11, border: "none", cursor: "pointer",
-            background: prefs.calls ? "var(--accent)" : "rgba(255,255,255,0.12)",
-            position: "relative", transition: "background 0.2s",
-          }}>
-          <div style={{
-            width: 18, height: 18, borderRadius: "50%", background: "#fff",
-            position: "absolute", top: 2,
-            left: prefs.calls ? 20 : 2,
-            transition: "left 0.2s",
-          }} />
-        </button>
-      </div>
+      <ToggleRow label="Nachrichten" sub="Benachrichtigung bei neuen Direktnachrichten" checked={prefs.messages} onToggle={() => toggle("messages")} />
+      <ToggleRow label="Anrufe" sub="Benachrichtigung bei eingehenden Anrufen" checked={prefs.calls} onToggle={() => toggle("calls")} />
     </div>
   );
 }
 
-function UpdatePanel() {
-  const [appVersion, setAppVersion] = useState("…");
-  const [updateState, setUpdateState] = useState<"idle" | "checking" | "available" | "downloading" | "ready" | "error">("idle");
-  const [updateInfo, setUpdateInfo] = useState<{ version: string; body: string } | null>(null);
-  const [updateError, setUpdateError] = useState("");
-  const [downloadProgress, setDownloadProgress] = useState(0);
-
-  useEffect(() => {
-    import("@tauri-apps/api/app").then(({ getVersion }) => {
-      getVersion().then(v => setAppVersion(v)).catch(() => setAppVersion("?"));
-    }).catch(() => setAppVersion("?"));
-  }, []);
-
-  async function checkForUpdate() {
-    setUpdateState("checking");
-    setUpdateError("");
-    try {
-      const { check } = await import("@tauri-apps/plugin-updater");
-      const update = await check({ timeout: 15000 });
-      if (update) {
-        setUpdateInfo({ version: update.version, body: update.body || "" });
-        setUpdateState("available");
-      } else {
-        setUpdateState("idle");
-      }
-    } catch (e: any) {
-      setUpdateError(e?.message || String(e));
-      setUpdateState("error");
-    }
-  }
-
-  async function downloadAndInstall() {
-    setUpdateState("downloading");
-    setUpdateError("");
-    setDownloadProgress(0);
-    try {
-      const { check } = await import("@tauri-apps/plugin-updater");
-      const update = await check({ timeout: 15000 });
-      if (!update) { setUpdateState("idle"); return; }
-      setUpdateInfo({ version: update.version, body: update.body || "" });
-
-      await update.downloadAndInstall((event) => {
-        if (event.event === "Progress") setDownloadProgress(p => Math.min(99, p + 5));
-        else if (event.event === "Finished") { setDownloadProgress(100); setUpdateState("ready"); }
-      }, { timeout: 120000 });
-
-      try {
-        const { relaunch } = await import("@tauri-apps/plugin-process");
-        await relaunch();
-      } catch {}
-    } catch (e: any) {
-      setUpdateError(e?.message || String(e));
-      setUpdateState("error");
-    }
-  }
-
-  return (
-    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-      {/* Version info */}
-      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
-        <div>
-          <span style={{ fontSize: 12, color: "var(--text-primary)" }}>Updates</span>
-          <p style={{ fontSize: 10, color: "var(--text-muted)", marginTop: 1 }}>
-            Installierte Version: v{appVersion}
-          </p>
-        </div>
-        {updateState === "idle" && (
-          <button onClick={checkForUpdate}
-            style={{
-              padding: "5px 10px", borderRadius: 6, border: "1px solid rgba(255,255,255,0.1)",
-              background: "rgba(255,255,255,0.04)", color: "var(--text-muted)",
-              fontSize: 11, cursor: "pointer", display: "flex", alignItems: "center", gap: 4,
-            }}>
-            <RefreshCw size={12} /> Prüfen
-          </button>
-        )}
-        {updateState === "checking" && (
-          <span style={{ fontSize: 11, color: "var(--text-muted)", display: "flex", alignItems: "center", gap: 4 }}>
-            <RefreshCw size={12} style={{ animation: "spin 1s linear infinite" }} /> Suche…
-          </span>
-        )}
-      </div>
-
-      {/* Available */}
-      {updateState === "available" && updateInfo && (
-        <div style={{
-          background: "rgba(59,130,246,0.08)", border: "1px solid rgba(59,130,246,0.2)",
-          borderRadius: 8, padding: "10px 12px",
-        }}>
-          <div style={{ fontWeight: 600, fontSize: 12, color: "#3b82f6", marginBottom: 4 }}>
-            🆕 Update v{updateInfo.version} verfügbar
-          </div>
-          {updateInfo.body && (
-            <div style={{ fontSize: 10, color: "var(--text-muted)", lineHeight: 1.4, maxHeight: 40, overflow: "hidden", marginBottom: 8 }}>
-              {updateInfo.body.slice(0, 250)}
-            </div>
-          )}
-          <button onClick={downloadAndInstall}
-            style={{
-              padding: "6px 12px", borderRadius: 6, border: "none",
-              background: "#3b82f6", color: "#fff", fontSize: 11, fontWeight: 600,
-              cursor: "pointer", display: "flex", alignItems: "center", gap: 4,
-            }}>
-            <Download size={12} /> Jetzt installieren
-          </button>
-        </div>
-      )}
-
-      {/* Downloading */}
-      {updateState === "downloading" && (
-        <div style={{
-          background: "rgba(59,130,246,0.06)", border: "1px solid rgba(59,130,246,0.15)",
-          borderRadius: 8, padding: "10px 12px",
-        }}>
-          <div style={{ fontSize: 12, color: "#3b82f6", display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
-            <RefreshCw size={12} style={{ animation: "spin 1s linear infinite" }} />
-            Download {downloadProgress}%
-          </div>
-          <div style={{ height: 4, borderRadius: 2, background: "rgba(59,130,246,0.15)", overflow: "hidden" }}>
-            <div style={{ height: "100%", width: `${downloadProgress}%`, background: "#3b82f6", borderRadius: 2, transition: "width 0.3s" }} />
-          </div>
-        </div>
-      )}
-
-      {/* Ready */}
-      {updateState === "ready" && (
-        <div style={{
-          background: "rgba(34,197,94,0.08)", border: "1px solid rgba(34,197,94,0.2)",
-          borderRadius: 8, padding: "10px 12px", fontSize: 12, color: "#22c55e",
-          display: "flex", alignItems: "center", gap: 6,
-        }}>
-          <Download size={12} /> Installiert – App startet neu…
-        </div>
-      )}
-
-      {/* Error */}
-      {updateState === "error" && (
-        <div style={{
-          background: "rgba(239,68,68,0.08)", border: "1px solid rgba(239,68,68,0.2)",
-          borderRadius: 8, padding: "10px 12px",
-        }}>
-          <div style={{ fontSize: 11, color: "#ef4444", display: "flex", alignItems: "center", gap: 4, marginBottom: 6 }}>
-            <AlertTriangle size={12} /> {updateError}
-          </div>
-          <button onClick={checkForUpdate}
-            style={{
-              padding: "4px 10px", borderRadius: 6, border: "1px solid rgba(239,68,68,0.3)",
-              background: "transparent", color: "#ef4444", fontSize: 10, cursor: "pointer",
-            }}>
-            Wiederholen
-          </button>
-        </div>
-      )}
-    </div>
-  );
-}
-
+// ── NodeBadge ───────────────────────────────────────────────────
 function NodeBadge({ status }: { status: NodeStatus | null }) {
   if (!status) return null;
-  const map: Record<string, { color: string; bg: string; label: string }> = {
-    stopped:          { color: "var(--text-muted)", bg: "rgba(255,255,255,0.05)", label: "Gestoppt" },
-    starting:         { color: "#eab308",           bg: "rgba(250,166,26,0.1)",   label: "Startet…" },
-    running:          { color: "var(--green)",       bg: "rgba(59,165,92,0.1)",    label: "Läuft" },
-    error:            { color: "var(--red)",         bg: "rgba(237,66,69,0.1)",    label: "Fehler" },
-    binary_not_found: { color: "var(--red)",         bg: "rgba(237,66,69,0.08)",   label: "Binary fehlt" },
-  };
-  const s = status.status;
-  const cfg = map[s] ?? map.stopped;
+  const m: Record<string, { c: string; bg: string; l: string }> = { stopped: { c: "var(--text-muted)", bg: "rgba(255,255,255,0.05)", l: "Gestoppt" }, starting: { c: "#eab308", bg: "rgba(250,166,26,0.1)", l: "Startet…" }, running: { c: "var(--green)", bg: "rgba(59,165,92,0.1)", l: "Läuft" }, error: { c: "var(--red)", bg: "rgba(237,66,69,0.1)", l: "Fehler" }, binary_not_found: { c: "var(--red)", bg: "rgba(237,66,69,0.08)", l: "Binary fehlt" } };
+  const x = m[status.status] ?? m.stopped;
+  return <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "4px 10px", borderRadius: 8, background: x.bg, fontSize: 11, fontWeight: 600, color: x.c }}><div style={{ width: 6, height: 6, borderRadius: "50%", background: status.status === "running" ? "var(--green)" : status.status === "starting" ? "#eab308" : "var(--text-muted)", animation: status.status === "starting" ? "pulse 1.2s ease-in-out infinite" : "none" }} />{x.l}</div>;
+}
+
+// ── AppUpdatePanel ──────────────────────────────────────────────
+function AppUpdatePanel() {
+  const [v, sv] = useState("…"); const [st, sst] = useState<"idle"|"checking"|"available"|"downloading"|"ready"|"error">("idle"); const [inf, si] = useState<{version:string;body:string}|null>(null); const [err, se] = useState(""); const [pct, sp] = useState(0);
+  useEffect(() => { import("@tauri-apps/api/app").then(({getVersion})=>getVersion().then(sv).catch(()=>sv("?"))).catch(()=>sv("?")); }, []);
+  async function check() { sst("checking"); se(""); try { const {check} = await import("@tauri-apps/plugin-updater"); const u = await check({timeout:15000}); if(u){si({version:u.version,body:u.body||""});sst("available");}else sst("idle"); } catch(e:any){se(e?.message||String(e));sst("error");} }
+  async function install() { sst("downloading"); se(""); sp(0); try { const {check} = await import("@tauri-apps/plugin-updater"); const u = await check({timeout:15000}); if(!u){sst("idle");return;} si({version:u.version,body:u.body||""}); await u.downloadAndInstall((e)=>{if(e.event==="Progress")sp(p=>Math.min(99,p+5));else if(e.event==="Finished"){sp(100);sst("ready");}},{timeout:120000}); try{const {relaunch}=await import("@tauri-apps/plugin-process");await relaunch();}catch{} } catch(e:any){se(e?.message||String(e));sst("error");} }
   return (
-    <div style={{ display: "flex", alignItems: "center", gap: 6, padding: "4px 10px", borderRadius: 8, background: cfg.bg, fontSize: 11, fontWeight: 600, color: cfg.color }}>
-      <div style={{
-        width: 6, height: 6, borderRadius: "50%",
-        background: s === "running" ? "var(--green)" : s === "starting" ? "#eab308" : "var(--text-muted)",
-        animation: s === "starting" ? "pulse 1.2s ease-in-out infinite" : "none",
-      }} />
-      {cfg.label}
+    <div style={{display:"flex",flexDirection:"column",gap:8}}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+        <div><span style={{fontSize:12,color:"var(--text-primary)"}}>Dashboard</span><p style={{fontSize:10,color:"var(--text-muted)",marginTop:1}}>Installiert: v{v}</p></div>
+        {st==="idle"&&<button onClick={check} style={btnSm}><RefreshCw size={12}/> Prüfen</button>}
+        {st==="checking"&&<span style={{fontSize:11,color:"var(--text-muted)",display:"flex",alignItems:"center",gap:4}}><RefreshCw size={12} style={spin}/> Suche…</span>}
+      </div>
+      {st==="available"&&inf&&<div style={banner("59,130,246")}><div style={{fontWeight:600,fontSize:12,color:"#3b82f6",marginBottom:2}}>🆕 v{inf.version} verfügbar</div>{inf.body&&<div style={{fontSize:10,color:"var(--text-muted)",lineHeight:1.4,maxHeight:36,overflow:"hidden",marginBottom:8}}>{inf.body.slice(0,200)}</div>}<button onClick={install} style={{...btnSm,background:"#3b82f6",color:"#fff",border:"none"}}><Download size={12}/> Installieren</button></div>}
+      {st==="downloading"&&<div style={banner("59,130,246")}><div style={{fontSize:12,color:"#3b82f6",display:"flex",alignItems:"center",gap:6,marginBottom:6}}><RefreshCw size={12} style={spin}/> Download {pct}%</div><div style={{height:4,borderRadius:2,background:"rgba(59,130,246,0.15)",overflow:"hidden"}}><div style={{height:"100%",width:`${pct}%`,background:"#3b82f6",borderRadius:2,transition:"width 0.3s"}}/></div></div>}
+      {st==="ready"&&<div style={banner("34,197,94")}><span style={{fontSize:12,color:"#22c55e",display:"flex",alignItems:"center",gap:6}}><Download size={12}/> Installiert – App startet neu…</span></div>}
+      {st==="error"&&<div style={banner("239,68,68")}><div style={{fontSize:11,color:"#ef4444",display:"flex",alignItems:"center",gap:4,marginBottom:6}}><AlertTriangle size={12}/> {err}</div><button onClick={check} style={{...btnSm,border:"1px solid rgba(239,68,68,0.3)",background:"transparent",color:"#ef4444"}}>Wiederholen</button></div>}
     </div>
   );
 }
 
-type SettingsCategory = "system" | "personalization" | "notifications" | "privacy";
-
-interface SettingsSection {
-  id: string;
-  category: SettingsCategory;
-  label: string;
-  icon: React.ReactNode;
-  keywords: string[];
+// ── NodeBinaryPanel ─────────────────────────────────────────────
+function NodeBinaryPanel() {
+  const [tag, st] = useState<string|null>(null); const [chk, sc] = useState(false); const [dld, sd] = useState(false); const [err, se] = useState(""); const [done, sdone] = useState(false);
+  async function check() { sc(true); se(""); sdone(false); try { const {invoke}=await import("@tauri-apps/api/core"); st(await invoke<string|null>("node_binary_check_updates")); } catch(e:any){se(e?.message||String(e));} sc(false); }
+  async function download() { sd(true); se(""); try { const {invoke}=await import("@tauri-apps/api/core"); await invoke("node_binary_download_latest"); sdone(true); st(null); } catch(e:any){se(e?.message||String(e));} sd(false); }
+  return (
+    <div style={{display:"flex",flexDirection:"column",gap:8}}>
+      <div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
+        <div><span style={{fontSize:12,color:"var(--text-primary)"}}>Node-Binaries</span><p style={{fontSize:10,color:"var(--text-muted)",marginTop:1}}>stone-app-node & stone-master</p></div>
+        {!tag&&!done&&<button onClick={check} disabled={chk} style={btnSm}><RefreshCw size={12} style={chk?spin:undefined}/> {chk?"Prüfe…":"Prüfen"}</button>}
+        {done&&<span style={{fontSize:11,color:"#22c55e",fontWeight:600}}>✅ Aktuell</span>}
+      </div>
+      {tag&&<div style={banner("59,130,246")}><div style={{fontWeight:600,fontSize:12,color:"#3b82f6",marginBottom:8}}>🆕 Neue Version: {tag}</div><button onClick={download} disabled={dld} style={{...btnSm,background:"#3b82f6",color:"#fff",border:"none"}}><Download size={12}/> {dld?"Download…":"Herunterladen"}</button></div>}
+      {err&&<div style={banner("239,68,68")}><div style={{fontSize:11,color:"#ef4444",display:"flex",alignItems:"center",gap:4,marginBottom:6}}><AlertTriangle size={12}/> {err}</div><button onClick={check} style={{...btnSm,border:"1px solid rgba(239,68,68,0.3)",background:"transparent",color:"#ef4444"}}>Wiederholen</button></div>}
+    </div>
+  );
 }
 
-const sections: SettingsSection[] = [
-  { id: "node", category: "system", label: "Lokale Node", icon: <Server size={16} />, keywords: ["node", "start", "stop", "cpu", "leistung", "mining"] },
-  { id: "appearance", category: "personalization", label: "Erscheinungsbild", icon: <Palette size={16} />, keywords: ["theme", "farbe", "dark", "light", "aussehen", "design"] },
-  { id: "language", category: "personalization", label: "Sprache", icon: <Globe size={16} />, keywords: ["sprache", "language", "deutsch", "english", "übersetzung"] },
-  { id: "privacy", category: "privacy", label: "Datenschutz", icon: <Shield size={16} />, keywords: ["privacy", "datenschutz", "daten", "tracking", "telemetrie"] },
+// ── StatBar ─────────────────────────────────────────────────────
+function StatBar({ label, value, total, max, color }: { label: string; value: number; total?: number; max: number; color?: string }) {
+  const dm = total ?? max; const pct = Math.min((value / dm) * 100, 100);
+  const bc = color ?? (value > 80 ? "var(--red)" : value > 50 ? "var(--accent)" : "var(--green)");
+  return (
+    <div style={{ marginBottom: 10 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3 }}>
+        <span style={{ fontSize: 11, color: "var(--text-muted)" }}>{label}</span>
+        <span style={{ fontSize: 11, fontWeight: 600, color: "var(--text-primary)", fontFamily: "monospace" }}>{value}{total ? ` / ${total} MB` : "%"}</span>
+      </div>
+      <div style={{ height: 5, borderRadius: 3, background: "rgba(255,255,255,0.06)", overflow: "hidden" }}>
+        <div style={{ height: "100%", borderRadius: 3, background: bc, width: `${pct}%`, transition: "width 0.5s" }} />
+      </div>
+    </div>
+  );
+}
+
+// ── Categories ──────────────────────────────────────────────────
+const categories = [
+  { id: "system" as const, icon: <Server size={20}/>, label: "System", desc: "Node, Netzwerk, Auto-Start" },
+  { id: "personalization" as const, icon: <Palette size={20}/>, label: "Personalisierung", desc: "Theme, Sprache, Benachrichtigungen" },
+  { id: "privacy" as const, icon: <Shield size={20}/>, label: "Datenschutz", desc: "Tracking, Telemetrie, Daten" },
+  { id: "updates" as const, icon: <Download size={20}/>, label: "Updates", desc: "Dashboard & Node-Binaries aktualisieren" },
 ];
 
-const categoryLabels: Record<SettingsCategory, string> = {
-  system: "System",
-  personalization: "Personalisierung",
-  notifications: "Benachrichtigungen",
-  privacy: "Datenschutz",
-};
-
+// ── Main ────────────────────────────────────────────────────────
 export default function SettingsOverlay({ onClose }: SettingsOverlayProps) {
-  const [searchQuery, setSearchQuery] = useState("");
-  const health = useNodeHealth();
-  const sysStats = useSystemStats(3000);
-  const qc = useQueryClient();
-
-  // ── Node state ──────────────────────────────────────────────
-  const [config, setConfig] = useState<NodeConfig>({
-    enabled: false, port: 3080, cpu_pct: 25, binary_path: "", seed_peers: "",
-  });
+  const [page, setPage] = useState<SettingsPage>("main");
+  const health = useNodeHealth(); const sys = useSystemStats(3000); const qc = useQueryClient();
+  const [cfg, setCfg] = useState<NodeConfig>({ enabled: false, port: 3080, cpu_pct: 25, binary_path: "", seed_peers: "" });
   const [status, setStatus] = useState<NodeStatus | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [error, setError] = useState("");
-  const [hasTauri, setHasTauri] = useState(false);
+  const [nl, snl] = useState(false); const [ne, sne] = useState("");
+  const [hasTauri, sht] = useState(false);
 
-  useEffect(() => {
-    import("@tauri-apps/api/core").then(() => setHasTauri(true)).catch(() => {});
-  }, []);
+  useEffect(() => { import("@tauri-apps/api/core").then(() => sht(true)).catch(() => {}); }, []);
+  useEffect(() => { if (!hasTauri) return; nodeManager.getConfig().then(setCfg).catch(()=>{}); nodeManager.getStatus().then(setStatus).catch(()=>{}); const id = setInterval(async () => { try { setStatus(await nodeManager.getStatus()); } catch {} }, 3000); return () => clearInterval(id); }, [hasTauri]);
 
-  useEffect(() => {
-    if (!hasTauri) return;
-    nodeManager.getConfig().then(setConfig).catch(() => {});
-    nodeManager.getStatus().then(setStatus).catch(() => {});
-    const id = setInterval(async () => {
-      try { const s = await nodeManager.getStatus(); setStatus(s); } catch {}
-    }, 3_000);
-    return () => clearInterval(id);
-  }, [hasTauri]);
+  async function toggleNode() { snl(true); sne(""); try { if (status?.status === "running") await nodeManager.stop(); else await nodeManager.start(); setStatus(await nodeManager.getStatus()); qc.invalidateQueries({ queryKey: ["node-health"] }); } catch (e) { sne(String(e)); } snl(false); }
+  const isRunning = status?.status === "running";
 
-  async function toggleNode() {
-    setLoading(true); setError("");
-    try {
-      if (status?.status === "running") { await nodeManager.stop(); }
-      else { await nodeManager.start(); }
-      const s = await nodeManager.getStatus(); setStatus(s);
-      qc.invalidateQueries({ queryKey: ["node-health"] });
-    } catch (e) { setError(String(e)); }
-    finally { setLoading(false); }
+  function back() { setPage("main"); }
+  const title = page === "main" ? "Einstellungen" : categories.find(c => c.id === page)?.label ?? "Einstellungen";
+
+  function header(showBack: boolean) {
+    return (
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 16 }}>
+        <button onClick={showBack ? back : onClose} style={{ width: 30, height: 30, borderRadius: 8, background: "rgba(255,255,255,0.06)", border: "none", color: "var(--text-muted)", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}><ArrowLeft size={16}/></button>
+        <h2 style={{ fontSize: 16, fontWeight: 700, flex: 1 }}>{title}</h2>
+        <button onClick={onClose} style={{ background: "none", border: "none", color: "var(--text-muted)", cursor: "pointer" }}><X size={18}/></button>
+      </div>
+    );
   }
 
-  const isRunning = status?.status === "running";
-  const filtered = searchQuery.trim()
-    ? sections.filter(s => s.keywords.some(kw => kw.includes(searchQuery.toLowerCase())) || s.label.toLowerCase().includes(searchQuery.toLowerCase()))
-    : sections;
-
   return (
-    <div
-      style={{
-        position: "fixed", inset: 0, zIndex: 56,
-        display: "flex", alignItems: "center", justifyContent: "center",
-        background: "rgba(0,0,0,0.55)",
-      }}
-      onClick={(e) => { if (e.target === e.currentTarget) onClose(); }}
-    >
-      <div style={{
-        background: "var(--bg-panel)",
-        borderRadius: 16,
-        width: 480,
-        maxWidth: "94vw",
-        maxHeight: "85vh",
-        overflowY: "auto",
-        border: "1px solid var(--border-strong)",
-        boxShadow: "0 16px 48px rgba(0,0,0,0.5)",
-        padding: 20,
-      }}>
-        {/* Header */}
-        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 16 }}>
-          <button onClick={onClose} title="Zurück"
-            style={{ width: 30, height: 30, borderRadius: 8, background: "rgba(255,255,255,0.06)", border: "none", color: "var(--text-muted)", cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center" }}>
-            <ArrowLeft size={16} />
-          </button>
-          <h2 style={{ fontSize: 16, fontWeight: 700, flex: 1 }}>Einstellungen</h2>
-          <button onClick={onClose} style={{ background: "none", border: "none", color: "var(--text-muted)", cursor: "pointer" }}>
-            <X size={18} />
-          </button>
-        </div>
+    <div style={{ position: "fixed", inset: 0, zIndex: 56, display: "flex", alignItems: "center", justifyContent: "center", background: "rgba(0,0,0,0.55)" }} onClick={e => { if (e.target === e.currentTarget) onClose(); }}>
+      <div style={{ background: "var(--bg-panel)", borderRadius: 16, width: 480, maxWidth: "94vw", maxHeight: "85vh", overflowY: "auto", border: "1px solid var(--border-strong)", boxShadow: "0 16px 48px rgba(0,0,0,0.5)", padding: 20 }}>
+        {header(page !== "main")}
 
-        {/* Search */}
-        <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 16 }}>
-          <Search size={14} style={{ color: "var(--text-muted)", flexShrink: 0 }} />
-          <input
-            type="text"
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            placeholder="Einstellungen durchsuchen…"
-            style={{
-              flex: 1, background: "var(--bg-input)", border: "1px solid var(--border-default)",
-              borderRadius: 8, padding: "8px 10px", fontSize: 13, color: "var(--text-primary)",
-              outline: "none", boxSizing: "border-box",
-            }}
-            autoFocus
-          />
-        </div>
+        {page === "main" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {categories.map(cat => (
+              <button key={cat.id} onClick={() => setPage(cat.id)}
+                style={{ display: "flex", alignItems: "center", gap: 14, width: "100%", padding: "14px 16px", borderRadius: 12, background: "rgba(255,255,255,0.02)", border: "1px solid rgba(255,255,255,0.05)", color: "var(--text-primary)", cursor: "pointer", textAlign: "left", transition: "all 0.15s" }}
+                onMouseEnter={e => { const el = e.currentTarget as HTMLElement; el.style.background = "rgba(255,255,255,0.05)"; el.style.borderColor = "rgba(255,255,255,0.1)"; }}
+                onMouseLeave={e => { const el = e.currentTarget as HTMLElement; el.style.background = "rgba(255,255,255,0.02)"; el.style.borderColor = "rgba(255,255,255,0.05)"; }}
+              >
+                <span style={{ opacity: 0.6 }}>{cat.icon}</span>
+                <div style={{ flex: 1 }}><div style={{ fontSize: 14, fontWeight: 600 }}>{cat.label}</div><div style={{ fontSize: 11, color: "var(--text-muted)", marginTop: 2 }}>{cat.desc}</div></div>
+                <ChevronRight size={16} style={{ opacity: 0.3 }}/>
+              </button>
+            ))}
+          </div>
+        )}
 
-        {/* ── Node Section (always visible when no search) ────────── */}
-        {(!searchQuery.trim() || "node".includes(searchQuery.toLowerCase())) && hasTauri && (
-          <div style={{ marginBottom: 16 }}>
-            <div style={{ fontSize: 10, fontWeight: 700, textTransform: "uppercase", color: "var(--text-muted)", marginBottom: 8, letterSpacing: "0.04em" }}>
-              System
-            </div>
-
-            {/* Node Status Card */}
-            <div style={{
-              background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.07)",
-              borderRadius: 12, padding: 14, display: "flex", alignItems: "center",
-              justifyContent: "space-between", gap: 12, marginBottom: 10,
-            }}>
-              <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
-                <span style={{ fontSize: 13, fontWeight: 600, color: "var(--text-primary)" }}>Lokale Node</span>
-                <NodeBadge status={status} />
-              </div>
-              <button onClick={toggleNode} disabled={loading || status?.status === "starting"}
-                style={{
-                  display: "flex", alignItems: "center", gap: 5,
-                  padding: "7px 14px", borderRadius: 8,
-                  background: isRunning ? "rgba(237,66,69,0.15)" : "rgba(59,165,92,0.15)",
-                  color: isRunning ? "var(--red)" : "var(--green)",
-                  border: `1px solid ${isRunning ? "rgba(237,66,69,0.3)" : "rgba(59,165,92,0.3)"}`,
-                  fontSize: 12, fontWeight: 600, cursor: loading ? "wait" : "pointer",
-                }}>
-                {loading ? <RefreshCw size={13} style={{ animation: "spin 0.7s linear infinite" }} /> :
-                 isRunning ? <Square size={13} /> : <Play size={13} />}
-                {isRunning ? "Stoppen" : "Starten"}
+        {page === "system" && (
+          <div>
+            <div style={{ ...card, display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+              <div style={{ display: "flex", flexDirection: "column", gap: 4 }}><span style={{ fontSize: 13, fontWeight: 600, color: "var(--text-primary)" }}>Lokale Node</span><NodeBadge status={status}/></div>
+              <button onClick={toggleNode} disabled={nl || status?.status === "starting"} style={{ display: "flex", alignItems: "center", gap: 5, padding: "7px 14px", borderRadius: 8, background: isRunning ? "rgba(237,66,69,0.15)" : "rgba(59,165,92,0.15)", color: isRunning ? "var(--red)" : "var(--green)", border: `1px solid ${isRunning ? "rgba(237,66,69,0.3)" : "rgba(59,165,92,0.3)"}`, fontSize: 12, fontWeight: 600, cursor: nl ? "wait" : "pointer" }}>
+                {nl ? <RefreshCw size={13} style={{ animation: "spin 0.7s linear infinite" }}/> : isRunning ? <Square size={13}/> : <Play size={13}/>}{isRunning ? "Stoppen" : "Starten"}
               </button>
             </div>
+            {ne && <div style={{ ...card, background: "rgba(237,66,69,0.08)", border: "1px solid rgba(237,66,69,0.15)", fontSize: 11, color: "var(--red)" }}>{ne}</div>}
 
-            {error && (
-              <div style={{ background: "rgba(237,66,69,0.08)", borderRadius: 8, padding: "8px 10px", fontSize: 11, color: "var(--red)", marginBottom: 10 }}>
-                {error}
-              </div>
-            )}
-
-            {/* CPU Slider */}
-            <div style={{ background: "rgba(255,255,255,0.02)", borderRadius: 10, padding: 12, border: "1px solid rgba(255,255,255,0.05)", marginBottom: 10 }}>
-              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
-                <span style={{ fontSize: 12, fontWeight: 500, color: "var(--text-secondary)" }}>CPU-Leistung</span>
-                <span style={{ fontSize: 12, fontWeight: 700, color: "var(--accent)", background: "var(--accent-bg)", borderRadius: 6, padding: "1px 8px" }}>{config.cpu_pct}%</span>
-              </div>
-              <input type="range" min={5} max={100} step={5} value={config.cpu_pct}
-                onChange={(e) => setConfig((c) => ({ ...c, cpu_pct: Number(e.target.value) }))}
-                style={{ width: "100%", accentColor: "var(--accent)", height: 4, cursor: "pointer" }} />
+            <div style={card}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}><span style={{ fontSize: 12, fontWeight: 500, color: "var(--text-secondary)" }}>CPU-Leistung</span><span style={{ fontSize: 12, fontWeight: 700, color: "var(--accent)", background: "var(--accent-bg)", borderRadius: 6, padding: "1px 8px" }}>{cfg.cpu_pct}%</span></div>
+              <input type="range" min={5} max={100} step={5} value={cfg.cpu_pct} onChange={e => setCfg(c => ({ ...c, cpu_pct: Number(e.target.value) }))} style={{ width: "100%", accentColor: "var(--accent)", height: 4, cursor: "pointer" }}/>
             </div>
 
-            {/* System Resources */}
-            {sysStats && (
-              <div style={{ background: "rgba(255,255,255,0.02)", borderRadius: 10, padding: 12, border: "1px solid rgba(255,255,255,0.05)", marginBottom: 10 }}>
-                <span style={{ fontSize: 12, fontWeight: 500, color: "var(--text-secondary)", display: "block", marginBottom: 10 }}>System-Auslastung</span>
-
-                {/* System CPU */}
-                <div style={{ marginBottom: 10 }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3 }}>
-                    <span style={{ fontSize: 11, color: "var(--text-muted)" }}>Gesamt CPU</span>
-                    <span style={{ fontSize: 11, fontWeight: 600, color: "var(--text-primary)", fontFamily: "monospace" }}>{sysStats.system_cpu_pct.toFixed(1)}%</span>
-                  </div>
-                  <div style={{ height: 5, borderRadius: 3, background: "rgba(255,255,255,0.06)", overflow: "hidden" }}>
-                    <div style={{ height: "100%", borderRadius: 3, background: sysStats.system_cpu_pct > 80 ? "var(--red)" : sysStats.system_cpu_pct > 50 ? "var(--accent)" : "var(--green)", width: `${Math.min(sysStats.system_cpu_pct, 100)}%`, transition: "width 0.5s" }} />
-                  </div>
-                </div>
-
-                {/* App CPU */}
-                <div style={{ marginBottom: 10 }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3 }}>
-                    <span style={{ fontSize: 11, color: "var(--text-muted)" }}>Stone App CPU</span>
-                    <span style={{ fontSize: 11, fontWeight: 600, color: "var(--accent)", fontFamily: "monospace" }}>{sysStats.app_cpu_pct.toFixed(1)}%</span>
-                  </div>
-                  <div style={{ height: 5, borderRadius: 3, background: "rgba(255,255,255,0.06)", overflow: "hidden" }}>
-                    <div style={{ height: "100%", borderRadius: 3, background: "var(--accent)", width: `${Math.min(sysStats.app_cpu_pct, 100)}%`, transition: "width 0.5s" }} />
-                  </div>
-                </div>
-
-                {/* Memory */}
-                <div>
-                  <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 3 }}>
-                    <span style={{ fontSize: 11, color: "var(--text-muted)" }}>RAM</span>
-                    <span style={{ fontSize: 11, fontWeight: 600, color: "var(--text-primary)", fontFamily: "monospace" }}>
-                      {sysStats.system_memory_used_mb} MB / {sysStats.system_memory_total_mb} MB
-                    </span>
-                  </div>
-                  <div style={{ height: 5, borderRadius: 3, background: "rgba(255,255,255,0.06)", overflow: "hidden" }}>
-                    <div style={{ height: "100%", borderRadius: 3, background: "var(--info)", width: `${Math.min((sysStats.system_memory_used_mb / sysStats.system_memory_total_mb) * 100, 100)}%`, transition: "width 0.5s" }} />
-                  </div>
-                  <div style={{ display: "flex", justifyContent: "space-between", marginTop: 4 }}>
-                    <span style={{ fontSize: 10, color: "var(--text-muted)" }}>App: {sysStats.app_memory_mb} MB</span>
-                    <span style={{ fontSize: 10, color: "var(--text-muted)" }}>{((sysStats.system_memory_used_mb / sysStats.system_memory_total_mb) * 100).toFixed(1)}%</span>
-                  </div>
-                </div>
+            {sys && (
+              <div style={card}>
+                <span style={secHdr}>System-Auslastung</span>
+                <StatBar label="Gesamt CPU" value={sys.system_cpu_pct} max={100}/>
+                <StatBar label="Stone App CPU" value={sys.app_cpu_pct} max={100} color="var(--accent)"/>
+                <StatBar label="RAM" value={sys.system_memory_used_mb} total={sys.system_memory_total_mb} max={sys.system_memory_total_mb} color="var(--info)"/>
+                <div style={{ display: "flex", justifyContent: "space-between", marginTop: 4 }}><span style={{ fontSize: 10, color: "var(--text-muted)" }}>App: {sys.app_memory_mb} MB</span><span style={{ fontSize: 10, color: "var(--text-muted)" }}>{((sys.system_memory_used_mb / sys.system_memory_total_mb) * 100).toFixed(1)}%</span></div>
               </div>
             )}
 
-            {/* Auto-Start Toggle */}
-            {hasTauri && (!searchQuery.trim() || "autostart auto start login system".includes(searchQuery.toLowerCase())) && (
-              <div style={{ background: "rgba(255,255,255,0.02)", borderRadius: 10, padding: 12, border: "1px solid rgba(255,255,255,0.05)", marginBottom: 10 }}>
-                <AutoStartToggle />
-              </div>
-            )}
+            <div style={card}><AutoStartToggle/></div>
 
-            {/* Update Panel */}
-            {hasTauri && (!searchQuery.trim() || "update version upgrade download".includes(searchQuery.toLowerCase())) && (
-              <div style={{ background: "rgba(255,255,255,0.02)", borderRadius: 10, padding: 12, border: "1px solid rgba(255,255,255,0.05)", marginBottom: 10 }}>
-                <UpdatePanel />
-              </div>
-            )}
-
-            {/* Notification Settings */}
-            {(!searchQuery.trim() || "benarichtigung notification".includes(searchQuery.toLowerCase())) && (
-              <div style={{ background: "rgba(255,255,255,0.02)", borderRadius: 10, padding: 12, border: "1px solid rgba(255,255,255,0.05)", marginBottom: 10 }}>
-                <span style={{ fontSize: 12, fontWeight: 500, color: "var(--text-secondary)", display: "block", marginBottom: 10 }}>Benachrichtigungen</span>
-                <NotificationToggles />
-              </div>
-            )}
-
-            {/* Network Info */}
-            <div style={{ background: "rgba(255,255,255,0.02)", borderRadius: 10, padding: 12, border: "1px solid rgba(255,255,255,0.05)" }}>
-              <span style={{ fontSize: 12, fontWeight: 500, color: "var(--text-secondary)", display: "block", marginBottom: 8 }}>Netzwerk</span>
+            <div style={card}>
+              <span style={secHdr}>Netzwerk</span>
               <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
-                <div style={{ display: "flex", justifyContent: "space-between" }}>
-                  <span style={{ fontSize: 11, color: "var(--text-muted)" }}>Status</span>
-                  <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
-                    {health.connected ? <Wifi size={11} style={{ color: "var(--green)" }} /> : <WifiOff size={11} style={{ color: "var(--text-muted)" }} />}
-                    <span style={{ fontSize: 11, fontWeight: 600, color: health.connected ? "var(--green)" : "var(--text-muted)" }}>
-                      {health.connected ? "Verbunden" : "Getrennt"}
-                    </span>
-                  </div>
-                </div>
-                {health.connected && (
-                  <div style={{ display: "flex", justifyContent: "space-between" }}>
-                    <span style={{ fontSize: 11, color: "var(--text-muted)" }}>Block-Höhe</span>
-                    <span style={{ fontSize: 11, fontFamily: "monospace", fontWeight: 600, color: "var(--text-primary)" }}>#{health.blockHeight.toLocaleString()}</span>
-                  </div>
-                )}
+                <div style={{ display: "flex", justifyContent: "space-between" }}><span style={{ fontSize: 11, color: "var(--text-muted)" }}>Status</span><div style={{ display: "flex", alignItems: "center", gap: 4 }}>{health.connected ? <Wifi size={11} style={{ color: "var(--green)" }}/> : <WifiOff size={11} style={{ color: "var(--text-muted)" }}/>}<span style={{ fontSize: 11, fontWeight: 600, color: health.connected ? "var(--green)" : "var(--text-muted)" }}>{health.connected ? "Verbunden" : "Getrennt"}</span></div></div>
+                {health.connected && <div style={{ display: "flex", justifyContent: "space-between" }}><span style={{ fontSize: 11, color: "var(--text-muted)" }}>Block-Höhe</span><span style={{ fontSize: 11, fontFamily: "monospace", fontWeight: 600, color: "var(--text-primary)" }}>#{health.blockHeight.toLocaleString()}</span></div>}
               </div>
             </div>
           </div>
         )}
 
-        {/* ── Settings List ────────────────────────────────────── */}
-        <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
-          {/* Group by category */}
-          {(["system", "personalization", "notifications", "privacy"] as SettingsCategory[]).map(cat => {
-            const catSections = filtered.filter(s => s.category === cat && s.id !== "node");
-            if (catSections.length === 0) return null;
-            return (
-              <div key={cat} style={{ marginBottom: 12 }}>
-                <div style={{ fontSize: 10, fontWeight: 700, textTransform: "uppercase", color: "var(--text-muted)", marginBottom: 6, letterSpacing: "0.04em" }}>
-                  {categoryLabels[cat]}
-                </div>
-                {catSections.map((section) => (
-                  <button key={section.id}
-                    style={{
-                      display: "flex", alignItems: "center", gap: 10,
-                      width: "100%", padding: "10px 12px", borderRadius: 10,
-                      background: "transparent", border: "1px solid transparent",
-                      color: "var(--text-secondary)", cursor: "pointer",
-                      fontSize: 13, textAlign: "left",
-                      transition: "all 0.12s",
-                      marginBottom: 2,
-                    }}
-                    onMouseEnter={(e) => {
-                      (e.currentTarget as HTMLElement).style.background = "rgba(255,255,255,0.04)";
-                      (e.currentTarget as HTMLElement).style.borderColor = "rgba(255,255,255,0.06)";
-                    }}
-                    onMouseLeave={(e) => {
-                      (e.currentTarget as HTMLElement).style.background = "transparent";
-                      (e.currentTarget as HTMLElement).style.borderColor = "transparent";
-                    }}
-                  >
-                    <span style={{ opacity: 0.6 }}>{section.icon}</span>
-                    <span style={{ flex: 1 }}>{section.label}</span>
-                    <span style={{ fontSize: 10, color: "var(--text-muted)", opacity: 0.4 }}>Coming soon</span>
-                    <ChevronRight size={13} style={{ opacity: 0.3 }} />
-                  </button>
-                ))}
-              </div>
-            );
-          })}
-        </div>
-
-        {searchQuery.trim() && filtered.length === 0 && (
-          <p style={{ fontSize: 12, color: "var(--text-muted)", textAlign: "center", padding: 24 }}>
-            Keine Einstellungen gefunden für "{searchQuery}"
-          </p>
+        {page === "personalization" && (
+          <div>
+            <div style={card}><div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}><div><span style={{ fontSize: 12, color: "var(--text-primary)" }}>Erscheinungsbild</span><p style={{ fontSize: 10, color: "var(--text-muted)", marginTop: 1 }}>Dark/Light Theme & Farbakzente</p></div><span style={{ fontSize: 10, color: "var(--text-muted)", opacity: 0.5 }}>Coming soon</span></div></div>
+            <div style={card}><div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}><div><span style={{ fontSize: 12, color: "var(--text-primary)" }}>Sprache</span><p style={{ fontSize: 10, color: "var(--text-muted)", marginTop: 1 }}>Deutsch, English, …</p></div><span style={{ fontSize: 10, color: "var(--text-muted)", opacity: 0.5 }}>Coming soon</span></div></div>
+            <div style={card}><span style={secHdr}>Benachrichtigungen</span><NotificationToggles/></div>
+          </div>
         )}
 
-        {/* Vorschläge */}
-        {!searchQuery.trim() && (
-          <div style={{
-            marginTop: 12, padding: 12, borderRadius: 10,
-            background: "rgba(212,168,83,0.05)", border: "1px solid rgba(212,168,83,0.12)",
-          }}>
-            <p style={{ fontSize: 10, fontWeight: 600, color: "var(--accent)", textTransform: "uppercase", letterSpacing: "0.04em", marginBottom: 6 }}>
-              💡 Geplante Einstellungen
-            </p>
-            <ul style={{ fontSize: 11, color: "var(--text-muted)", paddingLeft: 16, display: "flex", flexDirection: "column", gap: 3 }}>
-              <li>Dark/Light Theme & Farbakzente</li>
-              <li>Sprachauswahl (DE/EN/…)</li>
-              <li>Benachrichtigungen: Sound, Desktop-Push</li>
-              <li>Datenschutz: Telemetrie, Datenweitergabe</li>
-              <li>Auto-Start Node beim App-Start</li>
-              <li>Benachrichtigung bei neuen Freunden/Messages</li>
-            </ul>
+        {page === "privacy" && (
+          <div style={card}><span style={secHdr}>Datenschutz</span><p style={{ fontSize: 11, color: "var(--text-muted)", lineHeight: 1.5 }}>Einstellungen für Telemetrie, Diagnosedaten und Datenweitergabe folgen in einem kommenden Update.</p></div>
+        )}
+
+        {page === "updates" && (
+          <div>
+            <div style={card}><span style={secHdr}>App-Update</span><AppUpdatePanel/></div>
+            <div style={card}><span style={secHdr}>Node-Binaries</span><NodeBinaryPanel/></div>
           </div>
         )}
       </div>
