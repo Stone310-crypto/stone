@@ -81,17 +81,17 @@ function AppUpdatePanel() {
 
 // ── NodeBinaryPanel ─────────────────────────────────────────────
 function NodeBinaryPanel() {
-  const [tag, st] = useState<string|null>(null); const [chk, sc] = useState(false); const [dld, sd] = useState(false); const [err, se] = useState(""); const [done, sdone] = useState(false);
+  const [tag, st] = useState<string|null>(null); const [chk, sc] = useState(false); const [dld, sd] = useState(false); const [err, se] = useState(""); const [done, sdone] = useState(false); const [restarting, srestart] = useState(false);
   async function check() { sc(true); se(""); sdone(false); try { const {invoke}=await import("@tauri-apps/api/core"); st(await invoke<string|null>("node_binary_check_updates")); } catch(e:any){se(e?.message||String(e));} sc(false); }
-  async function download() { sd(true); se(""); try { const {invoke}=await import("@tauri-apps/api/core"); await invoke("node_binary_download_latest"); sdone(true); st(null); } catch(e:any){se(e?.message||String(e));} sd(false); }
+  async function download() { sd(true); se(""); srestart(false); try { const {invoke}=await import("@tauri-apps/api/core"); await invoke("node_binary_download_latest"); sdone(true); st(null); srestart(true); } catch(e:any){se(e?.message||String(e));} sd(false); }
   return (
     <div style={{display:"flex",flexDirection:"column",gap:8}}>
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
         <div><span style={{fontSize:12,color:"var(--text-primary)"}}>Node-Binaries</span><p style={{fontSize:10,color:"var(--text-muted)",marginTop:1}}>stone-app-node & stone-master</p></div>
         {!tag&&!done&&<button onClick={check} disabled={chk} style={btnSm}><RefreshCw size={12} style={chk?spin:undefined}/> {chk?"Prüfe…":"Prüfen"}</button>}
-        {done&&<span style={{fontSize:11,color:"#22c55e",fontWeight:600}}>✅ Aktuell</span>}
+        {done&&<span style={{fontSize:11,color:"#22c55e",fontWeight:600}}>✅ Aktuell{restarting?" – Node wurde neugestartet":""}</span>}
       </div>
-      {tag&&<div style={banner("59,130,246")}><div style={{fontWeight:600,fontSize:12,color:"#3b82f6",marginBottom:8}}>🆕 Neue Version: {tag}</div><button onClick={download} disabled={dld} style={{...btnSm,background:"#3b82f6",color:"#fff",border:"none"}}><Download size={12}/> {dld?"Download…":"Herunterladen"}</button></div>}
+      {tag&&<div style={banner("59,130,246")}><div style={{fontWeight:600,fontSize:12,color:"#3b82f6",marginBottom:8}}>🆕 Neue Version: {tag}</div><button onClick={download} disabled={dld} style={{...btnSm,background:"#3b82f6",color:"#fff",border:"none"}}><Download size={12}/> {dld?"Download & Neustart…":"Herunterladen & Node neustarten"}</button></div>}
       {err&&<div style={banner("239,68,68")}><div style={{fontSize:11,color:"#ef4444",display:"flex",alignItems:"center",gap:4,marginBottom:6}}><AlertTriangle size={12}/> {err}</div><button onClick={check} style={{...btnSm,border:"1px solid rgba(239,68,68,0.3)",background:"transparent",color:"#ef4444"}}>Wiederholen</button></div>}
     </div>
   );

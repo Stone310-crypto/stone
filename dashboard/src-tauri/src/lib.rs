@@ -8,7 +8,7 @@ mod gaming_proxy;
 mod miner_manager;
 use tauri::{AppHandle, Manager};
 use node_manager::{
-    SharedNodeState, NodeState,
+    SharedNodeState, NodeState, NodeStatus,
     get_local_ip,
     node_get_logs,
     node_get_status, node_get_config, node_set_config, node_start, node_stop,
@@ -210,25 +210,46 @@ pub fn run() {
             state.config = cfg;
             let shared: SharedNodeState = Arc::new(Mutex::new(state));
 
-            // Auto-download node binaries on first start (if missing)
+            // Auto-download node binaries on startup (always checks for updates).
+            // Node startet erst NACHDEM die Binaries bereit sind.
             let app_handle_dl = app.handle().clone();
+            let shared_clone = shared.clone();
+            let enabled_clone = enabled;
             tauri::async_runtime::spawn(async move {
-                // Wait for UI to render
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                if let Err(e) = node_binary_downloader::install_or_update_binaries(&app_handle_dl).await {
-                    eprintln!("[binary-dl] Initialer Download fehlgeschlagen (falls lokal vorhanden, wird trotzdem gestartet): {e}");
+                match node_binary_downloader::install_or_update_binaries(&app_handle_dl).await {
+                    Ok((_binaries, updated)) => {
+                        if updated {
+                            eprintln!("[binary-dl] Node-Binaries wurden aktualisiert.");
+                            // Wenn die Node läuft, neustarten
+                            let running = {
+                                let state = shared_clone.lock().unwrap_or_else(|e| e.into_inner());
+                                matches!(state.status, NodeStatus::Running { .. })
+                            };
+                            if running {
+                                eprintln!("[binary-dl] Node läuft – starte neu für Binary-Update…");
+                                let _ = node_manager::node_stop_internal(&shared_clone);
+                                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                                let _ = node_manager::node_start_internal(&app_handle_dl, &shared_clone);
+                                return;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("[binary-dl] Fehler beim Check: {e}");
+                    }
+                }
+                // Node starten falls enabled und noch nicht gestartet
+                if enabled_clone {
+                    let running = {
+                        let s = shared_clone.lock().unwrap_or_else(|e| e.into_inner());
+                        matches!(s.status, NodeStatus::Running { .. })
+                    };
+                    if !running {
+                        let _ = node_manager::node_start_internal(&app_handle_dl, &shared_clone);
+                    }
                 }
             });
-
-            // Auto-start node if config says so (delayed by 2s to let UI render)
-            if enabled {
-                let app_handle = app.handle().clone();
-                let shared_clone = shared.clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_secs(2));
-                    let _ = node_manager::node_start_internal(&app_handle, &shared_clone);
-                });
-            }
 
             app.manage(shared);
 
@@ -306,10 +327,29 @@ async fn node_binary_check_updates(app: AppHandle) -> Result<Option<String>, Str
 }
 
 #[tauri::command]
-async fn node_binary_download_latest(app: AppHandle) -> Result<Vec<(String, String)>, String> {
-    let results = node_binary_downloader::install_or_update_binaries(&app)
+async fn node_binary_download_latest(
+    app: AppHandle,
+    node_state: tauri::State<'_, SharedNodeState>,
+) -> Result<Vec<(String, String)>, String> {
+    let (results, updated) = node_binary_downloader::install_or_update_binaries(&app)
         .await
         .map_err(|e| e.to_string())?;
+
+    // Wenn Binaries aktualisiert wurden und Node läuft → neustarten
+    if updated {
+        let shared = node_state.inner().clone();
+        let running = {
+            let state = shared.lock().unwrap_or_else(|e| e.into_inner());
+            matches!(state.status, NodeStatus::Running { .. })
+        };
+        if running {
+            eprintln!("[binary-dl] Node läuft – starte neu für Binary-Update…");
+            let _ = node_manager::node_stop_internal(&shared);
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+            let _ = node_manager::node_start_internal(&app, &shared);
+        }
+    }
+
     Ok(results
         .into_iter()
         .map(|(name, path)| (name, path.to_string_lossy().to_string()))

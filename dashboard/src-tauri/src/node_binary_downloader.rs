@@ -282,8 +282,11 @@ async fn download_binary(
 }
 
 /// Installiert (oder aktualisiert) die Node-Binaries in den `binaries/`-Ordner.
-/// Wird beim ersten Start und bei manuellem Update aufgerufen.
-pub async fn install_or_update_binaries(app: &AppHandle) -> Result<Vec<(String, PathBuf)>> {
+/// Wird beim App-Start und bei manuellem Update aufgerufen.
+/// Überschreibt IMMER die Binaries, wenn eine neue Version verfügbar ist.
+/// Gibt (binaries, updated) zurück — `updated` ist true wenn tatsächlich neue
+/// Binaries heruntergeladen wurden.
+pub async fn install_or_update_binaries(app: &AppHandle) -> Result<(Vec<(String, PathBuf)>, bool)> {
     let data_dir = app
         .path()
         .app_data_dir()
@@ -291,36 +294,48 @@ pub async fn install_or_update_binaries(app: &AppHandle) -> Result<Vec<(String, 
     let dest_dir = data_dir.join("binaries");
     std::fs::create_dir_all(&dest_dir).context("binaries/ Ordner konnte nicht erstellt werden")?;
 
-    // Wenn bereits ein Binary existiert, NICHT überschreiben.
-    // (Erlaubt manuelles Deployment von Dev-Builds mit Fixes.)
-    #[cfg(target_os = "windows")]
-    let already_exists = dest_dir.join("stone-app-node.exe").exists()
-        || dest_dir.join("stone-master.exe").exists();
-    #[cfg(not(target_os = "windows"))]
-    let already_exists = dest_dir.join("stone-app-node").exists()
-        || dest_dir.join("stone-master").exists();
-
-    if already_exists {
-        println!("[binary-dl] Binary bereits vorhanden – überspringe Auto-Update");
-        let mut results = Vec::new();
-        for name in BINARY_NAMES {
-            #[cfg(target_os = "windows")]
-            let local = dest_dir.join(format!("{}.exe", name));
-            #[cfg(not(target_os = "windows"))]
-            let local = dest_dir.join(*name);
-            if local.exists() {
-                results.push((name.to_string(), local));
-            }
-        }
-        return Ok(results);
-    }
-
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(300))
         .build()
         .context("HTTP-Client-Fehler")?;
 
     let release = fetch_latest_release(&client).await?;
+
+    // Prüfe ob die lokale Version schon aktuell ist
+    let version_path = dest_dir.join("version.json");
+    let current_tag = if version_path.exists() {
+        std::fs::read_to_string(&version_path)
+            .ok()
+            .and_then(|d| serde_json::from_str::<BinaryVersion>(&d).ok())
+            .map(|v| v.tag)
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+
+    // Wenn Version aktuell UND beide Binaries existieren → nichts tun
+    if current_tag == release.tag_name && !current_tag.is_empty() {
+        let all_exist = BINARY_NAMES.iter().all(|name| {
+            #[cfg(target_os = "windows")]
+            let p = dest_dir.join(format!("{}.exe", name));
+            #[cfg(not(target_os = "windows"))]
+            let p = dest_dir.join(*name);
+            p.exists()
+        });
+        if all_exist {
+            println!("[binary-dl] Binaries aktuell ({}) – kein Update nötig", current_tag);
+            let binaries = BINARY_NAMES.iter().map(|name| {
+                #[cfg(target_os = "windows")]
+                let p = dest_dir.join(format!("{}.exe", name));
+                #[cfg(not(target_os = "windows"))]
+                let p = dest_dir.join(*name);
+                (name.to_string(), p)
+            }).collect();
+            return Ok((binaries, false));
+        }
+    }
+
+    println!("[binary-dl] Update: {} → {}", current_tag, release.tag_name);
 
     let mut results = Vec::new();
     for name in BINARY_NAMES {
@@ -364,7 +379,7 @@ pub async fn install_or_update_binaries(app: &AppHandle) -> Result<Vec<(String, 
     std::fs::write(dest_dir.join("version.json"), version_json)
         .context("Version-Datei konnte nicht geschrieben werden")?;
 
-    Ok(results)
+    Ok((results, true))
 }
 
 /// Prüft ob ein neueres Release verfügbar ist.

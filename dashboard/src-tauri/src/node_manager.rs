@@ -766,7 +766,7 @@ pub fn node_start_internal(
     Ok(format!("http://127.0.0.1:{}", port))
 }
 
-fn node_stop_internal(shared: &SharedNodeState) -> Result<(), String> {
+pub fn node_stop_internal(shared: &SharedNodeState) -> Result<(), String> {
     let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(mut child) = s.child.take() {
         child.kill().map_err(|e| format!("Konnte nicht stoppen: {e}"))?;
