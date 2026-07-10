@@ -205,10 +205,6 @@ jobs:
           TAG="${{ steps.tag.outputs.TAG }}"
           VERSION="${TAG#v}"
           BASE="https://github.com/Stone310-crypto/stone/releases/download/${TAG}"
-          MAC_AARCH64_SIG=""; MAC_X86_64_SIG=""; LINUX_SIG=""
-          [ -f "assets/Stone-Dashboard-aarch64-apple-darwin.app.tar.gz.sig" ] && MAC_AARCH64_SIG=$(cat "assets/Stone-Dashboard-aarch64-apple-darwin.app.tar.gz.sig")
-          [ -f "assets/Stone-Dashboard-x86_64-apple-darwin.app.tar.gz.sig" ] && MAC_X86_64_SIG=$(cat "assets/Stone-Dashboard-x86_64-apple-darwin.app.tar.gz.sig")
-          [ -f "assets/Stone-Dashboard-x86_64-unknown-linux-gnu.AppImage.tar.gz.sig" ] && LINUX_SIG=$(cat "assets/Stone-Dashboard-x86_64-unknown-linux-gnu.AppImage.tar.gz.sig")
           cat > assets/versions.json << JSONEOF
           {
             "version": "${VERSION}",
@@ -216,11 +212,11 @@ jobs:
             "pub_date": "$(date -u +"%Y-%m-%dT%H:%M:%SZ")",
             "platforms": {
               "darwin-aarch64": {
-                "signature": "${MAC_AARCH64_SIG}",
+                "signature": "",
                 "url": "${BASE}/Stone-Dashboard-aarch64-apple-darwin.app.tar.gz"
               },
               "darwin-x86_64": {
-                "signature": "${MAC_X86_64_SIG}",
+                "signature": "",
                 "url": "${BASE}/Stone-Dashboard-x86_64-apple-darwin.app.tar.gz"
               },
               "windows-x86_64": {
@@ -228,7 +224,7 @@ jobs:
                 "url": "${BASE}/Stone-Dashboard_${VERSION}_x64-setup.exe"
               },
               "linux-x86_64": {
-                "signature": "${LINUX_SIG}",
+                "signature": "",
                 "url": "${BASE}/Stone-Dashboard-x86_64-unknown-linux-gnu.AppImage.tar.gz"
               }
             }
