@@ -6,7 +6,8 @@ import { getNotifPrefs, saveNotifPrefs } from "../../hooks/useWebSocketEvents";
 import { nodeManager, type NodeConfig, type NodeStatus } from "../../api/node";
 import {
   ArrowLeft, X, Search, Play, Square, RefreshCw,
-  Wifi, WifiOff, Server, Palette, Globe, Shield, ChevronRight
+  Wifi, WifiOff, Server, Palette, Globe, Shield, ChevronRight,
+  Download, AlertTriangle,
 } from "lucide-react";
 
 interface SettingsOverlayProps {
@@ -109,6 +110,163 @@ function NotificationToggles() {
           }} />
         </button>
       </div>
+    </div>
+  );
+}
+
+function UpdatePanel() {
+  const [appVersion, setAppVersion] = useState("…");
+  const [updateState, setUpdateState] = useState<"idle" | "checking" | "available" | "downloading" | "ready" | "error">("idle");
+  const [updateInfo, setUpdateInfo] = useState<{ version: string; body: string } | null>(null);
+  const [updateError, setUpdateError] = useState("");
+  const [downloadProgress, setDownloadProgress] = useState(0);
+
+  useEffect(() => {
+    import("@tauri-apps/api/app").then(({ getVersion }) => {
+      getVersion().then(v => setAppVersion(v)).catch(() => setAppVersion("?"));
+    }).catch(() => setAppVersion("?"));
+  }, []);
+
+  async function checkForUpdate() {
+    setUpdateState("checking");
+    setUpdateError("");
+    try {
+      const { check } = await import("@tauri-apps/plugin-updater");
+      const update = await check({ timeout: 15000 });
+      if (update) {
+        setUpdateInfo({ version: update.version, body: update.body || "" });
+        setUpdateState("available");
+      } else {
+        setUpdateState("idle");
+      }
+    } catch (e: any) {
+      setUpdateError(e?.message || String(e));
+      setUpdateState("error");
+    }
+  }
+
+  async function downloadAndInstall() {
+    setUpdateState("downloading");
+    setUpdateError("");
+    setDownloadProgress(0);
+    try {
+      const { check } = await import("@tauri-apps/plugin-updater");
+      const update = await check({ timeout: 15000 });
+      if (!update) { setUpdateState("idle"); return; }
+      setUpdateInfo({ version: update.version, body: update.body || "" });
+
+      await update.downloadAndInstall((event) => {
+        if (event.event === "Progress") setDownloadProgress(p => Math.min(99, p + 5));
+        else if (event.event === "Finished") { setDownloadProgress(100); setUpdateState("ready"); }
+      }, { timeout: 120000 });
+
+      try {
+        const { relaunch } = await import("@tauri-apps/plugin-process");
+        await relaunch();
+      } catch {}
+    } catch (e: any) {
+      setUpdateError(e?.message || String(e));
+      setUpdateState("error");
+    }
+  }
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+      {/* Version info */}
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+        <div>
+          <span style={{ fontSize: 12, color: "var(--text-primary)" }}>Updates</span>
+          <p style={{ fontSize: 10, color: "var(--text-muted)", marginTop: 1 }}>
+            Installierte Version: v{appVersion}
+          </p>
+        </div>
+        {updateState === "idle" && (
+          <button onClick={checkForUpdate}
+            style={{
+              padding: "5px 10px", borderRadius: 6, border: "1px solid rgba(255,255,255,0.1)",
+              background: "rgba(255,255,255,0.04)", color: "var(--text-muted)",
+              fontSize: 11, cursor: "pointer", display: "flex", alignItems: "center", gap: 4,
+            }}>
+            <RefreshCw size={12} /> Prüfen
+          </button>
+        )}
+        {updateState === "checking" && (
+          <span style={{ fontSize: 11, color: "var(--text-muted)", display: "flex", alignItems: "center", gap: 4 }}>
+            <RefreshCw size={12} style={{ animation: "spin 1s linear infinite" }} /> Suche…
+          </span>
+        )}
+      </div>
+
+      {/* Available */}
+      {updateState === "available" && updateInfo && (
+        <div style={{
+          background: "rgba(59,130,246,0.08)", border: "1px solid rgba(59,130,246,0.2)",
+          borderRadius: 8, padding: "10px 12px",
+        }}>
+          <div style={{ fontWeight: 600, fontSize: 12, color: "#3b82f6", marginBottom: 4 }}>
+            🆕 Update v{updateInfo.version} verfügbar
+          </div>
+          {updateInfo.body && (
+            <div style={{ fontSize: 10, color: "var(--text-muted)", lineHeight: 1.4, maxHeight: 40, overflow: "hidden", marginBottom: 8 }}>
+              {updateInfo.body.slice(0, 250)}
+            </div>
+          )}
+          <button onClick={downloadAndInstall}
+            style={{
+              padding: "6px 12px", borderRadius: 6, border: "none",
+              background: "#3b82f6", color: "#fff", fontSize: 11, fontWeight: 600,
+              cursor: "pointer", display: "flex", alignItems: "center", gap: 4,
+            }}>
+            <Download size={12} /> Jetzt installieren
+          </button>
+        </div>
+      )}
+
+      {/* Downloading */}
+      {updateState === "downloading" && (
+        <div style={{
+          background: "rgba(59,130,246,0.06)", border: "1px solid rgba(59,130,246,0.15)",
+          borderRadius: 8, padding: "10px 12px",
+        }}>
+          <div style={{ fontSize: 12, color: "#3b82f6", display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
+            <RefreshCw size={12} style={{ animation: "spin 1s linear infinite" }} />
+            Download {downloadProgress}%
+          </div>
+          <div style={{ height: 4, borderRadius: 2, background: "rgba(59,130,246,0.15)", overflow: "hidden" }}>
+            <div style={{ height: "100%", width: `${downloadProgress}%`, background: "#3b82f6", borderRadius: 2, transition: "width 0.3s" }} />
+          </div>
+        </div>
+      )}
+
+      {/* Ready */}
+      {updateState === "ready" && (
+        <div style={{
+          background: "rgba(34,197,94,0.08)", border: "1px solid rgba(34,197,94,0.2)",
+          borderRadius: 8, padding: "10px 12px", fontSize: 12, color: "#22c55e",
+          display: "flex", alignItems: "center", gap: 6,
+        }}>
+          <Download size={12} /> Installiert – App startet neu…
+        </div>
+      )}
+
+      {/* Error */}
+      {updateState === "error" && (
+        <div style={{
+          background: "rgba(239,68,68,0.08)", border: "1px solid rgba(239,68,68,0.2)",
+          borderRadius: 8, padding: "10px 12px",
+        }}>
+          <div style={{ fontSize: 11, color: "#ef4444", display: "flex", alignItems: "center", gap: 4, marginBottom: 6 }}>
+            <AlertTriangle size={12} /> {updateError}
+          </div>
+          <button onClick={checkForUpdate}
+            style={{
+              padding: "4px 10px", borderRadius: 6, border: "1px solid rgba(239,68,68,0.3)",
+              background: "transparent", color: "#ef4444", fontSize: 10, cursor: "pointer",
+            }}>
+            Wiederholen
+          </button>
+        </div>
+      )}
     </div>
   );
 }
@@ -353,6 +511,13 @@ export default function SettingsOverlay({ onClose }: SettingsOverlayProps) {
             {hasTauri && (!searchQuery.trim() || "autostart auto start login system".includes(searchQuery.toLowerCase())) && (
               <div style={{ background: "rgba(255,255,255,0.02)", borderRadius: 10, padding: 12, border: "1px solid rgba(255,255,255,0.05)", marginBottom: 10 }}>
                 <AutoStartToggle />
+              </div>
+            )}
+
+            {/* Update Panel */}
+            {hasTauri && (!searchQuery.trim() || "update version upgrade download".includes(searchQuery.toLowerCase())) && (
+              <div style={{ background: "rgba(255,255,255,0.02)", borderRadius: 10, padding: 12, border: "1px solid rgba(255,255,255,0.05)", marginBottom: 10 }}>
+                <UpdatePanel />
               </div>
             )}
 
