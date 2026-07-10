@@ -20,6 +20,9 @@
     "updater:default",
     "updater:allow-check",
     "updater:allow-download",
-    "updater:allow-install"
+    "updater:allow-install",
+    "process:default",
+    "process:allow-restart",
+    "process:allow-exit"
   ]
 }

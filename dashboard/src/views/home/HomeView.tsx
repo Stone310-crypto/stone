@@ -1,6 +1,6 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { useAuth } from "../../auth/AuthContext";
-import { Hash, Download, RefreshCw, Info } from "lucide-react";
+import { Hash, Download, RefreshCw, Info, AlertTriangle } from "lucide-react";
 
 export default function HomeView() {
   const { session } = useAuth();
@@ -8,12 +8,19 @@ export default function HomeView() {
   const [updateState, setUpdateState] = useState<"idle" | "checking" | "available" | "downloading" | "ready" | "error">("idle");
   const [updateInfo, setUpdateInfo] = useState<{ version: string; body: string } | null>(null);
   const [updateError, setUpdateError] = useState("");
+  const [downloadProgress, setDownloadProgress] = useState(0);
+  const installTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     // App-Version aus dem Tauri-Package-Info lesen
     import("@tauri-apps/api/app").then(({ getVersion }) => {
       getVersion().then(v => setAppVersion(v)).catch(() => {});
     }).catch(() => {});
+    
+    // Cleanup timer on unmount
+    return () => {
+      if (installTimerRef.current) clearTimeout(installTimerRef.current);
+    };
   }, []);
 
   async function checkForUpdate() {
@@ -21,7 +28,7 @@ export default function HomeView() {
     setUpdateError("");
     try {
       const { check } = await import("@tauri-apps/plugin-updater");
-      const update = await check();
+      const update = await check({ timeout: 15000 });
       if (update) {
         setUpdateInfo({ version: update.version, body: update.body || "" });
         setUpdateState("available");
@@ -37,18 +44,39 @@ export default function HomeView() {
   async function downloadAndInstall() {
     setUpdateState("downloading");
     setUpdateError("");
+    setDownloadProgress(0);
     try {
       const { check } = await import("@tauri-apps/plugin-updater");
-      const update = await check();
+      const update = await check({ timeout: 15000 });
       if (!update) {
         setUpdateState("idle");
         return;
       }
-      await update.download();
-      setUpdateState("ready");
-      await update.install();
+      setUpdateInfo({ version: update.version, body: update.body || "" });
+
+      // downloadAndInstall handles both download + install + relaunch
+      await update.downloadAndInstall((event) => {
+        if (event.event === "Progress") {
+          setDownloadProgress(prev => Math.min(99, prev + 5));
+        } else if (event.event === "Finished") {
+          setDownloadProgress(100);
+          setUpdateState("ready");
+        }
+      }, { timeout: 120000 });
+
+      // On macOS, we may never reach here (process restarts).
+      // But if we do, something went wrong — try manual relaunch.
+      setUpdateError("Install abgeschlossen — starte neu...");
+      try {
+        const { relaunch } = await import("@tauri-apps/plugin-process");
+        await relaunch();
+      } catch {
+        // relaunch may fail if process plugin not available; that's OK
+      }
     } catch (e: any) {
-      setUpdateError(e?.message || String(e));
+      const msg = e?.message || String(e);
+      console.error("[updater] Fehler:", msg);
+      setUpdateError(msg);
       setUpdateState("error");
     }
   }
@@ -109,11 +137,23 @@ export default function HomeView() {
         {updateState === "downloading" && (
           <div style={{
             background: "rgba(59,130,246,0.06)", border: "1px solid rgba(59,130,246,0.15)",
-            borderRadius: 10, padding: "12px 16px", fontSize: 13, color: "#3b82f6",
-            display: "flex", alignItems: "center", gap: 8,
+            borderRadius: 10, padding: "12px 16px",
+            display: "flex", flexDirection: "column", gap: 8,
           }}>
-            <RefreshCw size={14} style={{ animation: "spin 1s linear infinite" }} />
-            Update wird heruntergeladen…
+            <div style={{ fontSize: 13, color: "#3b82f6", display: "flex", alignItems: "center", gap: 8 }}>
+              <RefreshCw size={14} style={{ animation: "spin 1s linear infinite" }} />
+              Update wird heruntergeladen… {downloadProgress}%
+            </div>
+            <div style={{
+              height: 4, borderRadius: 2, background: "rgba(59,130,246,0.15)",
+              overflow: "hidden",
+            }}>
+              <div style={{
+                height: "100%", width: `${downloadProgress}%`,
+                background: "#3b82f6", borderRadius: 2,
+                transition: "width 0.3s ease",
+              }} />
+            </div>
           </div>
         )}
 
@@ -121,10 +161,15 @@ export default function HomeView() {
         {updateState === "ready" && (
           <div style={{
             background: "rgba(34,197,94,0.08)", border: "1px solid rgba(34,197,94,0.2)",
-            borderRadius: 10, padding: "12px 16px", fontSize: 13, color: "#22c55e",
-            display: "flex", alignItems: "center", gap: 8,
+            borderRadius: 10, padding: "12px 16px",
+            display: "flex", flexDirection: "column", gap: 6,
           }}>
-            <Download size={14} /> App startet neu für Installation…
+            <div style={{ fontSize: 13, color: "#22c55e", display: "flex", alignItems: "center", gap: 8 }}>
+              <Download size={14} /> Update installiert ✅
+            </div>
+            <span style={{ fontSize: 11, color: "var(--text-muted)" }}>
+              Die App startet jetzt neu. Falls nichts passiert, starte sie bitte manuell.
+            </span>
           </div>
         )}
 
@@ -132,9 +177,20 @@ export default function HomeView() {
         {updateState === "error" && (
           <div style={{
             background: "rgba(239,68,68,0.08)", border: "1px solid rgba(239,68,68,0.2)",
-            borderRadius: 10, padding: "12px 16px", fontSize: 12, color: "#ef4444",
+            borderRadius: 10, padding: "12px 16px",
+            display: "flex", flexDirection: "column", gap: 8,
           }}>
-            Fehler: {updateError}
+            <div style={{ fontSize: 12, color: "#ef4444", display: "flex", alignItems: "center", gap: 6 }}>
+              <AlertTriangle size={14} /> Fehler: {updateError}
+            </div>
+            <button onClick={checkForUpdate}
+              style={{
+                padding: "6px 12px", borderRadius: 8, border: "1px solid rgba(239,68,68,0.3)",
+                background: "transparent", color: "#ef4444", fontSize: 12, cursor: "pointer",
+                alignSelf: "flex-start",
+              }}>
+              Erneut versuchen
+            </button>
           </div>
         )}
 
