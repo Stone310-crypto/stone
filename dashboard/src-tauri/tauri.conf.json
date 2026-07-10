@@ -37,7 +37,7 @@
       "endpoints": [
         "https://github.com/Stone310-crypto/stone/releases/latest/download/versions.json"
       ],
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEVGMTkxQzg5QzA5QUJFMzYKUldRMnZwckFpUndaNzlGYmZLMnM1aElTWVkvQWNSdlZzNHdqU3ZDNHNhZmNuTFpJWHhmUTF3d0sK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDJFNkM2MUQwQkM3QkMxNEEKUldSS3dYdTgwR0ZzTG0zTnFGS085a3pkcWdlNEY1QXhVSmZtbmdRWWpPaWVUa29DTEpaenZ6aGIK",
       "windows": {
         "installMode": "passive"
       }
