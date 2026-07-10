@@ -36,13 +36,17 @@
       "active": true,
       "endpoints": [
         "https://github.com/Stone310-crypto/stone/releases/latest/download/versions.json"
-      ]
+      ],
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDZENTA5MjNBNTMzNTQzMgpSV1F5VkRPbEl3blZCckpkZFZaVDFmNGlXYU40UmdxdjlEMHBKN2oyTEgwcVFhTXhvaStsU1phKwo=",
+      "windows": {
+        "installMode": "passive"
+      }
     }
   },
   "bundle": {
     "active": true,
     "targets": "all",
-    "createUpdaterArtifacts": false,
+    "createUpdaterArtifacts": true,
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
