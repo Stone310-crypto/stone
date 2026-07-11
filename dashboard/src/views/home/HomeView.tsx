@@ -46,6 +46,14 @@ export default function HomeView() {
     setUpdateError("");
     setDownloadProgress(0);
     try {
+      // ── Node sauber stoppen vor dem Update ─────────────────
+      try {
+        const { invoke } = await import("@tauri-apps/api/core");
+        await invoke("node_stop");
+        // Kurz warten, damit der Node-Prozess sauber beendet wird
+        await new Promise(r => setTimeout(r, 800));
+      } catch { /* Node läuft evtl. nicht – ignorieren */ }
+
       const { check } = await import("@tauri-apps/plugin-updater");
       const update = await check({ timeout: 15000 });
       if (!update) {
