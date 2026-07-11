@@ -138,6 +138,15 @@ jobs:
         with:
           projectPath: dashboard
           args: --target x86_64-pc-windows-msvc
+      - name: Rename Windows artifacts (remove spaces)
+        shell: bash
+        run: |
+          cd dashboard/src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis
+          for f in *.exe; do
+            newname=$(echo "$f" | sed 's/ /-/g')
+            if [ "$f" != "$newname" ]; then mv "$f" "$newname"; fi
+          done
+          ls -la
       - uses: actions/upload-artifact@v4
         with:
           name: dashboard-windows-x86_64
