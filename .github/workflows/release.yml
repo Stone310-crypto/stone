@@ -201,6 +201,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_UPDATER_PRIVATE_KEY }}
+      TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_UPDATER_KEY_PASSWORD }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
@@ -220,7 +223,6 @@ jobs:
           mkdir -p release
           find assets -type f | while read -r f; do
             base=$(basename "$f")
-            # Avoid overwriting different files with same basename
             if [ -f "release/$base" ]; then
               cp "$f" "release/$(echo "$f" | tr '/' '_')"
             else
@@ -229,19 +231,38 @@ jobs:
           done
           echo "=== Release files ==="
           find release -type f | sort
+      - name: Install minisign & sign Windows .exe
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+          echo "${TAURI_SIGNING_PRIVATE_KEY}" > /tmp/updater.key
+          WIN_EXE=$(find release -name "Stone-Dashboard_*_x64-setup.exe" -print -quit)
+          if [ -n "$WIN_EXE" ]; then
+            echo "Signing Windows installer: $WIN_EXE"
+            export MINISIGN_PASSWORD="${TAURI_SIGNING_PRIVATE_KEY_PASSWORD}"
+            minisign -S -s /tmp/updater.key -m "$WIN_EXE" -x "${WIN_EXE}.sig" -t "Stone Dashboard Windows"
+            echo "Signature:"
+            cat "${WIN_EXE}.sig"
+          else
+            echo "WARNING: No Windows .exe found to sign!"
+          fi
+          rm -f /tmp/updater.key
       - name: Generate versions.json
         run: |
           TAG="${{ steps.tag.outputs.TAG }}"
           VERSION="${TAG#v}"
           BASE="https://github.com/Stone310-crypto/stone/releases/download/${TAG}"
           # Read signatures from release/ dir (flattened)
-          MAC_ARM_SIG=""; MAC_X86_SIG=""; LINUX_SIG=""
+          MAC_ARM_SIG=""; MAC_X86_SIG=""; LINUX_SIG=""; WIN_SIG=""
           [ -f "release/Stone-Dashboard-aarch64-apple-darwin.app.tar.gz.sig" ] && MAC_ARM_SIG=$(cat "release/Stone-Dashboard-aarch64-apple-darwin.app.tar.gz.sig" | tr -d '\n\r')
           [ -f "release/Stone-Dashboard-x86_64-apple-darwin.app.tar.gz.sig" ] && MAC_X86_SIG=$(cat "release/Stone-Dashboard-x86_64-apple-darwin.app.tar.gz.sig" | tr -d '\n\r')
           [ -f "release/Stone-Dashboard-x86_64-unknown-linux-gnu.AppImage.tar.gz.sig" ] && LINUX_SIG=$(cat "release/Stone-Dashboard-x86_64-unknown-linux-gnu.AppImage.tar.gz.sig" | tr -d '\n\r')
+          # Windows signature — find the .sig we just generated
+          WIN_SIG_FILE=$(find release -name "Stone-Dashboard_*_x64-setup.exe.sig" -print -quit)
+          [ -n "$WIN_SIG_FILE" ] && WIN_SIG=$(cat "$WIN_SIG_FILE" | tr -d '\n\r')
           echo "MAC_ARM_SIG length: ${#MAC_ARM_SIG}"
           echo "MAC_X86_SIG length: ${#MAC_X86_SIG}"
           echo "LINUX_SIG length: ${#LINUX_SIG}"
+          echo "WIN_SIG length: ${#WIN_SIG}"
           cat > release/versions.json << JSONEOF
           {
             "version": "${VERSION}",
@@ -257,6 +278,7 @@ jobs:
                 "url": "${BASE}/Stone-Dashboard-x86_64-apple-darwin.app.tar.gz"
               },
               "windows-x86_64": {
+                "signature": "${WIN_SIG}",
                 "url": "${BASE}/Stone-Dashboard_${VERSION}_x64-setup.exe"
               },
               "linux-x86_64": {
