@@ -231,20 +231,27 @@ jobs:
           done
           echo "=== Release files ==="
           find release -type f | sort
-      - name: Install minisign & sign Windows .exe
+      - name: Setup Node for signing
+        run: cd dashboard && npm install
+      - name: Sign all updater artifacts (fallback if .sig missing)
         run: |
-          sudo apt-get update -qq && sudo apt-get install -y -qq minisign
+          cd dashboard
+          # Write private key to temp file
           echo "${TAURI_SIGNING_PRIVATE_KEY}" > /tmp/updater.key
-          WIN_EXE=$(find release -name "Stone-Dashboard_*_x64-setup.exe" -print -quit)
-          if [ -n "$WIN_EXE" ]; then
-            echo "Signing Windows installer: $WIN_EXE"
-            export MINISIGN_PASSWORD="${TAURI_SIGNING_PRIVATE_KEY_PASSWORD}"
-            minisign -S -s /tmp/updater.key -m "$WIN_EXE" -x "${WIN_EXE}.sig" -t "Stone Dashboard Windows"
-            echo "Signature:"
-            cat "${WIN_EXE}.sig"
-          else
-            echo "WARNING: No Windows .exe found to sign!"
-          fi
+          # Sign each updater artifact that lacks a .sig file
+          for f in ../release/Stone-Dashboard-*.app.tar.gz ../release/Stone-Dashboard-*.AppImage.tar.gz ../release/Stone-Dashboard_*_x64-setup.exe; do
+            [ -f "$f" ] || continue
+            SIG="${f}.sig"
+            if [ ! -f "$SIG" ]; then
+              echo "Generating signature for: $(basename $f)"
+              npx tauri signer sign --private-key /tmp/updater.key --password "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD}" "$f" || {
+                echo "WARNING: Failed to sign $f — trying without password"
+                npx tauri signer sign --private-key /tmp/updater.key "$f" || echo "ERROR: Signing failed for $f"
+              }
+            else
+              echo "Signature exists: $(basename $SIG)"
+            fi
+          done
           rm -f /tmp/updater.key
       - name: Generate versions.json
         run: |
