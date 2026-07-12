@@ -257,7 +257,6 @@ jobs:
                 "url": "${BASE}/Stone-Dashboard-x86_64-apple-darwin.app.tar.gz"
               },
               "windows-x86_64": {
-                "signature": "",
                 "url": "${BASE}/Stone-Dashboard_${VERSION}_x64-setup.exe"
               },
               "linux-x86_64": {

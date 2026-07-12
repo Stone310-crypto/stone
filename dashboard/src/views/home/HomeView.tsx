@@ -50,9 +50,11 @@ export default function HomeView() {
       try {
         const { invoke } = await import("@tauri-apps/api/core");
         await invoke("node_stop");
-        // Kurz warten, damit der Node-Prozess sauber beendet wird
         await new Promise(r => setTimeout(r, 800));
-      } catch { /* Node läuft evtl. nicht – ignorieren */ }
+        console.log("[updater] Node gestoppt vor Update.");
+      } catch (e) {
+        console.warn("[updater] Node-Stop fehlgeschlagen (ignoriert):", e);
+      }
 
       const { check } = await import("@tauri-apps/plugin-updater");
       const update = await check({ timeout: 15000 });
