@@ -42,6 +42,10 @@ path = "src/bin/app_node.rs"
 name = "stone-discover"
 path = "src/bin/stone_discover.rs"
 
+[[bin]]
+name = "chain-inspect"
+path = "src/bin/chain_inspect.rs"
+
 # ─── Abhängigkeiten ───────────────────────────────────────────────────────────
 [dependencies]
 # Serialisierung

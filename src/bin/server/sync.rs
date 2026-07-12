@@ -750,9 +750,93 @@ pub fn sync_chain_accounts_to_users(node: &Arc<MasterNodeState>, users: &Arc<Mut
 // ─── Bootstrap & Peer Health (benötigt von master_server.rs) ──────────────────
 
 fn resolve_self_url() -> Option<String> {
-    if let Ok(url) = std::env::var("STONE_PUBLIC_URL") { if !url.trim().is_empty() { return Some(url.trim().trim_end_matches('/').to_string()); } }
-    if let Ok(ip) = std::env::var("STONE_PUBLIC_IP") { if !ip.trim().is_empty() { let default_http = if stone::network::is_mainnet() { 3180 } else { 3080 }; let port = std::env::var("STONE_HTTP_PORT").or_else(|_| std::env::var("STONE_PORT")).ok().and_then(|v| v.parse::<u16>().ok()).unwrap_or(default_http); return Some(format!("http://{}:{}", ip.trim(), if port == 8080 { default_http } else { port })); } }
+    // 1. STONE_PUBLIC_URL hat höchste Priorität
+    if let Ok(url) = std::env::var("STONE_PUBLIC_URL") {
+        if !url.trim().is_empty() {
+            let url = url.trim().trim_end_matches('/').to_string();
+            if is_tailscale_or_cgnat_url(&url) {
+                eprintln!("[sync] ⚠️  STONE_PUBLIC_URL={url} ist eine Tailscale/CGNAT-Adresse!");
+                eprintln!("[sync]    Andere Nodes außerhalb deines Tailscale-Netzes können diese IP nicht erreichen.");
+                eprintln!("[sync]    Setze STONE_PUBLIC_URL auf deine echte öffentliche IP oder lass den public-ip-watchdog laufen.");
+                if let Some(real) = watchdog_public_ip() {
+                    eprintln!("[sync]    Verwende automatisch erkannte IP: {real}");
+                    return Some(build_self_url(&real));
+                }
+            }
+            return Some(url);
+        }
+    }
+
+    // 2. STONE_PUBLIC_IP
+    if let Ok(ip) = std::env::var("STONE_PUBLIC_IP") {
+        if !ip.trim().is_empty() {
+            let ip = ip.trim().to_string();
+            if is_tailscale_or_cgnat_ip(&ip) {
+                eprintln!("[sync] ⚠️  STONE_PUBLIC_IP={ip} ist eine Tailscale/CGNAT-Adresse (100.64-127.x)!");
+                eprintln!("[sync]    Andere Nodes außerhalb deines Tailscale-Netzes können diese IP nicht erreichen.");
+                eprintln!("[sync]    Versuche automatisch erkannte öffentliche IP (public-ip-watchdog)...");
+                if let Some(real) = watchdog_public_ip() {
+                    eprintln!("[sync]    ✅ Verwende echte öffentliche IP: {real}");
+                    return Some(build_self_url(&real));
+                }
+                eprintln!("[sync]    ⚠️  Keine watchdog-IP verfügbar. Setze STONE_PUBLIC_IP auf deine echte öffentliche IP.");
+                eprintln!("[sync]    Oder lösche STONE_PUBLIC_IP ganz — der watchdog erkennt sie automatisch.");
+            }
+            return Some(build_self_url(&ip));
+        }
+    }
+
+    // 3. Weder STONE_PUBLIC_URL noch STONE_PUBLIC_IP gesetzt:
+    //    Versuche watchdog (public_ip.txt). Das ist der Normalfall für die
+    //    meisten Deployments.
+    if let Some(ip) = watchdog_public_ip() {
+        return Some(build_self_url(&ip));
+    }
+
     None
+}
+
+/// Prüft ob eine IP im CGNAT/Tailscale-Bereich liegt (100.64.0.0/10).
+fn is_tailscale_or_cgnat_ip(ip: &str) -> bool {
+    if let Ok(addr) = ip.parse::<std::net::Ipv4Addr>() {
+        let o = addr.octets();
+        o[0] == 100 && (o[1] & 0xC0) == 64
+    } else {
+        false
+    }
+}
+
+/// Prüft ob eine URL auf eine CGNAT/Tailscale-IP zeigt.
+fn is_tailscale_or_cgnat_url(url: &str) -> bool {
+    let host = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))
+        .and_then(|s| s.split(':').next())
+        .unwrap_or("");
+    is_tailscale_or_cgnat_ip(host)
+}
+
+/// Baut die Self-URL aus einer IP (mit korrektem HTTP-Port).
+fn build_self_url(ip: &str) -> String {
+    let default_http = if stone::network::is_mainnet() { 3180 } else { 3080 };
+    let port = std::env::var("STONE_HTTP_PORT")
+        .or_else(|_| std::env::var("STONE_PORT"))
+        .ok()
+        .and_then(|v| v.parse::<u16>().ok())
+        .unwrap_or(default_http);
+    let effective_port = if port == 8080 { default_http } else { port };
+    format!("http://{}:{}", ip.trim(), effective_port)
+}
+
+/// Liest die vom public-ip-watchdog erkannte echte öffentliche IP.
+/// Gibt None zurück wenn keine bekannt oder die IP selbst CGNAT ist.
+fn watchdog_public_ip() -> Option<String> {
+    let path = format!("{}/public_ip.txt", stone::blockchain::data_dir());
+    let ip = std::fs::read_to_string(&path).ok()?.trim().to_string();
+    if ip.is_empty() || is_tailscale_or_cgnat_ip(&ip) {
+        return None;
+    }
+    Some(ip)
 }
 
 fn host_from_url(url: &str) -> Option<&str> { let s = url.split("://").nth(1).unwrap_or(url).split('/').next().unwrap_or("").split(':').next().unwrap_or("").trim(); if s.is_empty() { None } else { Some(s) } }
