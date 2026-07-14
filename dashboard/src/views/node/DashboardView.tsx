@@ -170,7 +170,6 @@ export default function DashboardView() {
           {vpnResult}
         </div>
       )}
-      </div>
 
       {/* System Stats */}
       <h2 style={{fontSize:14,fontWeight:600,marginBottom:8}}><Cpu size={14} style={{marginRight:6}}/>System</h2>
