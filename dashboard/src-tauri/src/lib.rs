@@ -16,7 +16,11 @@ use node_manager::{
     load_config,
     get_node_health,
     get_vpn_status,
+    start_vpn,
+    stop_vpn,
     install_vpn_service,
+    stop_vpn_service,
+    uninstall_vpn_service,
 };
 use miner_manager::{
     SharedMinerState, MinerState,
@@ -251,6 +255,20 @@ pub fn run() {
                         let _ = node_manager::node_start_internal(&app_handle_dl, &shared_clone);
                     }
                 }
+
+                // VPN auto-starten (wenn Binary vorhanden, nicht als Systemdienst installiert)
+                let app_handle_vpn = app_handle_dl.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(3));
+                    if !node_manager::is_vpn_running() && !node_manager::is_vpn_service_installed() {
+                        if node_manager::find_vpn_binary(&app_handle_vpn).is_some() {
+                            eprintln!("[app] VPN auto-start…");
+                            if let Err(e) = node_manager::start_vpn(app_handle_vpn.clone()) {
+                                eprintln!("[app] VPN auto-start: {e}");
+                            }
+                        }
+                    }
+                });
             });
 
             app.manage(shared);
@@ -273,7 +291,11 @@ pub fn run() {
             switch_node_network,
             get_node_health,
             get_vpn_status,
+            start_vpn,
+            stop_vpn,
             install_vpn_service,
+            stop_vpn_service,
+            uninstall_vpn_service,
             plugin_open_window,
             validate_upload_file,
             upload_file,
