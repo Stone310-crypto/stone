@@ -49,11 +49,11 @@ pub async fn run(socket: UdpSocket, mut registry: PeerRegistry, config: TunnelCo
     if !registry.is_relay() {
         // Client: Verbindung zu Relays aufbauen
         for relay_addr in registry.relay_addrs().to_vec() {
-            println!("🔗 Verbinde zu Relay: {relay_addr}");
+            eprintln!("🔗 Verbinde zu Relay: {relay_addr}");
             send_handshake(&socket, registry.keypair(), relay_addr).await?;
         }
         // Warte auf IP-Zuweisung via Handshake-Response
-        println!("⏳ Warte auf VPN-IP vom Relay...");
+        eprintln!("⏳ Warte auf VPN-IP vom Relay...");
     } else {
         // Relay: unsere eigene IP ist die erste im Pool
         our_vpn_ip = Some(Ipv4Addr::new(10, 1, 0, 1));
@@ -77,7 +77,7 @@ pub async fn run(socket: UdpSocket, mut registry: PeerRegistry, config: TunnelCo
     // Status-Ticker: zeigt alle 15s den aktuellen Zustand
     let mut status_timer = tokio::time::interval(Duration::from_secs(15));
 
-    println!("🟢 VPN-Tunnel aktiv ({} peers)", registry.count());
+    eprintln!("🟢 VPN-Tunnel aktiv ({} peers)", registry.count());
 
     // ── TUN read channel (lazy init) ──────────────────────────────────
     let (tun_tx, mut tun_rx) = mpsc::unbounded_channel::<Vec<u8>>();
@@ -159,7 +159,7 @@ pub async fn run(socket: UdpSocket, mut registry: PeerRegistry, config: TunnelCo
                     Some(ip) => format!("IP:{} P:{} {}", ip, registry.count(), if tun.is_some() { "TUN✓" } else { "TUN✗" }),
                     None => format!("P:{} ⏳", registry.count()),
                 };
-                println!("📊 [{}] {}", if registry.is_relay() { "RELAY" } else { "CLIENT" }, t);
+                eprintln!("📊 [{}] {}", if registry.is_relay() { "RELAY" } else { "CLIENT" }, t);
                 // Peer-Liste als JSON speichern (für Diagnose)
                 registry.write_peers_json();
                 if our_vpn_ip.is_none() && !registry.is_relay() {
@@ -222,7 +222,7 @@ async fn handle_packet(
         }
         TYPE_KEEPALIVE => {
             if let Some(peer) = registry.by_pubkey(&sender_pk).map(|p| p.clone()) {
-                println!("💓 Keepalive von {} (VPN {})", src, peer.vpn_ip);
+                eprintln!("💓 Keepalive von {} (VPN {})", src, peer.vpn_ip);
             }
             Ok(())
         }
@@ -238,7 +238,7 @@ async fn send_handshake(socket: &UdpSocket, keypair: &crate::crypto::Keypair, re
     let mut msg = vec![TYPE_HANDSHAKE];
     msg.extend_from_slice(&keypair.public_bytes());
     let sent = socket.send_to(&msg, relay).await?;
-    println!("👋 Handshake gesendet an {relay} ({sent} bytes)");
+    eprintln!("👋 Handshake gesendet an {relay} ({sent} bytes)");
     Ok(())
 }
 
@@ -256,9 +256,9 @@ async fn handle_handshake(
 ) -> Result<(), String> {
     if registry.is_relay() {
         // ── Relay: Client registrieren ──────────────────────────────
-        println!("📥 Handshake empfangen von {src} (pubkey: {}…)", &hex::encode(&sender_pk)[..16]);
+        eprintln!("📥 Handshake empfangen von {src} (pubkey: {}…)", &hex::encode(&sender_pk)[..16]);
         if let Some(vpn_ip) = registry.add_peer(sender_pk, src) {
-            println!("✅ Neuer Client: {} → VPN-IP {vpn_ip} ({}/254 vergeben)", src, registry.count());
+            eprintln!("✅ Neuer Client: {} → VPN-IP {vpn_ip} ({}/254 vergeben)", src, registry.count());
             let our_pk = registry.our_pubkey();
             let ip_octets = vpn_ip.octets();
             let mut response = vec![TYPE_HANDSHAKE];
@@ -272,7 +272,7 @@ async fn handle_handshake(
         // ── Client: Antwort vom Relay parsen ────────────────────────
         if payload.len() >= 4 {
             let vpn_ip = Ipv4Addr::new(payload[0], payload[1], payload[2], payload[3]);
-            println!("🎉 VPN-IP zugewiesen: {vpn_ip}");
+            eprintln!("🎉 VPN-IP zugewiesen: {vpn_ip}");
             registry.assign_self(vpn_ip);
             write_vpn_ip(&config.stone_data, vpn_ip);
             registry.add_peer(sender_pk, src);
@@ -449,7 +449,7 @@ fn handle_route_announce(
     let new_pk: [u8; 32] = payload[0..32].try_into().map_err(|_| "pk")?;
     let new_ip = std::net::Ipv4Addr::new(payload[32], payload[33], payload[34], payload[35]);
 
-    println!("📍 Route-Announce: {:?} = {new_ip}", &new_pk[..4]);
+    eprintln!("📍 Route-Announce: {:?} = {new_ip}", &new_pk[..4]);
     // Peer ist bereits registriert (via Relay), nur IP aktualisieren
     Ok(())
 }
@@ -461,7 +461,7 @@ pub fn write_vpn_ip(stone_data: &std::path::Path, ip: Ipv4Addr) {
     if let Err(e) = std::fs::write(&path, ip.to_string()) {
         eprintln!("⚠️ Konnte VPN-IP nicht speichern: {e}");
     } else {
-        println!("📝 VPN-IP gespeichert in {}", path.display());
+        eprintln!("📝 VPN-IP gespeichert in {}", path.display());
     }
 }
 

@@ -42,7 +42,7 @@ impl Keypair {
         let bytes = secret.to_bytes();
         std::fs::create_dir_all(stone_data).map_err(|e| format!("Mkdir: {e}"))?;
         std::fs::write(&path, bytes).map_err(|e| format!("Write: {e}"))?;
-        println!("🔑 Neues VPN-Keypair generiert: {}", path.display());
+        eprintln!("🔑 Neues VPN-Keypair generiert: {}", path.display());
         Ok(Keypair { secret, public })
     }
 

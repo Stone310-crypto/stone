@@ -65,13 +65,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
     let args = Args::parse();
 
-    println!("╔══════════════════════════════════════════╗");
-    println!("║   StoneVPN — Mesh Overlay Network       ║");
-    println!("╠══════════════════════════════════════════╣");
-    println!("║ IP-Pool: {: <30} ║", args.ip_pool);
-    println!("║ Port:    {: <30} ║", args.port);
-    println!("║ Modus:   {: <30} ║", if args.relay { "RELAY" } else { "CLIENT" });
-    println!("╚══════════════════════════════════════════╝");
+    eprintln!("╔══════════════════════════════════════════╗");
+    eprintln!("║   StoneVPN — Mesh Overlay Network       ║");
+    eprintln!("╠══════════════════════════════════════════╣");
+    eprintln!("║ IP-Pool: {: <30} ║", args.ip_pool);
+    eprintln!("║ Port:    {: <30} ║", args.port);
+    eprintln!("║ Modus:   {: <30} ║", if args.relay { "RELAY" } else { "CLIENT" });
+    eprintln!("╚══════════════════════════════════════════╝");
 
     // Relay: IP-Forwarding + NAT aktivieren
     if args.relay {
@@ -79,14 +79,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let pool = ip_pool::IpPool::new(&args.ip_pool)?;
-    println!("🌐 Pool: {}/24 ({} IPs)", pool.network(), pool.available());
+    eprintln!("🌐 Pool: {}/24 ({} IPs)", pool.network(), pool.available());
 
     let keypair = crypto::Keypair::load_or_create(&args.stone_data)
         .map_err(|e| format!("Keypair: {e}"))?;
-    println!("🔑 Pubkey: {}", hex::encode(keypair.public_bytes()));
+    eprintln!("🔑 Pubkey: {}", hex::encode(keypair.public_bytes()));
 
     let socket = tokio::net::UdpSocket::bind(format!("0.0.0.0:{}", args.port)).await?;
-    println!("📡 UDP: 0.0.0.0:{}", args.port);
+    eprintln!("📡 UDP: 0.0.0.0:{}", args.port);
 
     let relay_addrs: Vec<SocketAddr> = args.relays.split(',')
         .filter_map(|s| s.trim().parse().ok())

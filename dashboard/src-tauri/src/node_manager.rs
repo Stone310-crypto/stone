@@ -457,6 +457,106 @@ pub async fn get_vpn_status(
     }
 }
 
+/// Installiert stonevpn als Systemdienst (LaunchDaemon auf macOS, systemd auf Linux).
+/// Gibt den Pfad zum installierten Service zurück.
+#[tauri::command]
+pub fn install_vpn_service(app: AppHandle) -> Result<String, String> {
+    let vpn_binary = find_vpn_binary(&app)
+        .ok_or_else(|| "stonevpn-Binary nicht gefunden. Bitte warte auf das nächste GitHub-Release.".to_string())?;
+    prepare_binary(&vpn_binary)?;
+
+    let vpn_path = vpn_binary.to_string_lossy().to_string();
+    let vpn_port = "51821";
+    let vpn_relays = "212.227.54.241:51821";
+
+    #[cfg(target_os = "macos")]
+    {
+        let plist_path = "/Library/LaunchDaemons/com.stone.vpn.plist";
+        let plist_content = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.stone.vpn</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>{vpn_path}</string>
+        <string>--tun</string>
+        <string>--port</string>
+        <string>{vpn_port}</string>
+        <string>--relays</string>
+        <string>{vpn_relays}</string>
+        <string>--stone-data</string>
+        <string>/var/lib/stone/vpn</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/var/log/stonevpn.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/stonevpn.log</string>
+</dict>
+</plist>"#
+        );
+
+        // Write plist with admin privileges via osascript
+        let script = format!(
+            "do shell script \"mkdir -p /var/lib/stone/vpn /var/log && cat > '{plist_path}' << 'PLISTEOF'\n{plist_content}\nPLISTEOF\nlaunchctl unload '{plist_path}' 2>/dev/null; launchctl load '{plist_path}'\" with administrator privileges",
+            plist_path = plist_path,
+            plist_content = plist_content.replace('\\', "\\\\").replace('"', "\\\""),
+        );
+        std::process::Command::new("osascript")
+            .args(["-e", &script])
+            .status()
+            .map_err(|e| format!("osascript fehlgeschlagen: {e}"))?;
+
+        Ok(format!("LaunchDaemon installiert: {plist_path}"))
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let service_path = "/etc/systemd/system/stonevpn.service";
+        let service_content = format!(
+            r#"[Unit]
+Description=Stone VPN Client
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart={vpn_path} --tun --port {vpn_port} --relays {vpn_relays} --stone-data /var/lib/stone/vpn
+Restart=on-failure
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target"#
+        );
+
+        // Write via sudo
+        let script = format!(
+            "mkdir -p /var/lib/stone/vpn && cat > '{}' << 'EOF'\n{}\nEOF\nsystemctl daemon-reload && systemctl enable stonevpn && systemctl start stonevpn",
+            service_path, service_content
+        );
+        std::process::Command::new("sudo")
+            .args(["-n", "bash", "-c", &script])
+            .status()
+            .map_err(|_| "sudo fehlgeschlagen — bitte manuell mit root-Rechten installieren:\n  sudo bash scripts/new_node_setup.sh".to_string())?;
+
+        Ok(format!("Systemd-Service installiert: {service_path}"))
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // Windows: TODO — als Scheduled Task oder Windows Service registrieren
+        Err("Windows VPN-Service-Installation noch nicht implementiert.".to_string())
+    }
+}
+
 #[tauri::command]
 pub async fn get_node_health(
     state: tauri::State<'_, SharedNodeState>,
@@ -895,111 +995,16 @@ pub fn node_start_internal(
     s.status = NodeStatus::Running { port, pid };
     s.append_log(&format!("[app] Node läuft — PID={pid}, Port={port}"));
 
-    // ── VPN Auto-Start ──────────────────────────────────────────────────
-    let vpn_port = 51821;
-    let vpn_relays = "212.227.54.241:51821"; // TODO: aus Config lesen
-    let vpn_data_dir = data_dir.join("vpn");
-
-    if let Some(vpn_binary) = find_vpn_binary(app) {
-        let _ = prepare_binary(&vpn_binary);
-        let _ = std::fs::create_dir_all(&vpn_data_dir);
-
-        s.append_log("[vpn] Starte StoneVPN-Client…");
-
-        let vpn_bin_str = vpn_binary.to_string_lossy().to_string();
-        let vpn_data_str = vpn_data_dir.to_string_lossy().to_string();
-
-        // macOS: TUN benötigt root → via osascript mit Admin-Privilegien starten
-        // Linux: Bei root läuft es direkt, sonst sudo versuchen
-        // Windows: Admin-Rechte prüfen
-        let vpn_result = if cfg!(target_os = "macos") {
-            // macOS: osascript fragt nach Admin-Passwort (GUI-Dialog)
-            let script = format!(
-                "do shell script \"'{}' --tun --port {} --relays '{}' --stone-data '{}' > /dev/null 2>&1 &\" with administrator privileges",
-                vpn_bin_str.replace('\'', "'\\''"), vpn_port, vpn_relays, vpn_data_str.replace('\'', "'\\''")
-            );
-            s.append_log("[vpn] macOS: fordere Admin-Rechte an (TUN)…");
-            std::process::Command::new("osascript")
-                .args(["-e", &script])
-                .stdout(Stdio::null())
-                .stderr(Stdio::piped())
-                .spawn()
-                .map(|c| (c.id(), true)) // osascript managed den Prozess
-                .map_err(|e| format!("{e}"))
-        } else if cfg!(target_os = "linux") {
-            // Linux: Versuche mit sudo (TUN braucht root), fallback: direkt
-            let mut cmd = std::process::Command::new("sudo");
-            cmd.arg("-n")  // non-interactive (kein Passwort-Prompt)
-                .arg(&vpn_binary)
-                .arg("--tun")
-                .arg("--port").arg(vpn_port.to_string())
-                .arg("--relays").arg(vpn_relays)
-                .arg("--stone-data").arg(&vpn_data_str)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null());
-            
-            // Falls sudo -n fehlschlägt (kein passwortloser sudo), direkt probieren
-            match cmd.spawn() {
-                Ok(c) => Ok((c.id(), false)),
-                Err(_) => {
-                    s.append_log("[vpn] sudo fehlgeschlagen, versuche direkt…");
-                    std::process::Command::new(&vpn_binary)
-                        .arg("--tun")
-                        .arg("--port").arg(vpn_port.to_string())
-                        .arg("--relays").arg(vpn_relays)
-                        .arg("--stone-data").arg(&vpn_data_str)
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped())
-                        .spawn()
-                        .map(|c| (c.id(), false))
-                        .map_err(|e| format!("{e}"))
-                }
-            }
-        } else {
-            // Windows: direkt starten (Admin-Rechte schon im Installer)
-            std::process::Command::new(&vpn_binary)
-                .arg("--tun")
-                .arg("--port").arg(vpn_port.to_string())
-                .arg("--relays").arg(vpn_relays)
-                .arg("--stone-data").arg(&vpn_data_str)
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .map(|c| (c.id(), false))
-                .map_err(|e| format!("{e}"))
-        };
-
-        match vpn_result {
-            Ok((vpn_pid, _managed_by_osascript)) => {
-                s.append_log(&format!("[vpn] ✅ StoneVPN gestartet (PID={vpn_pid})"));
-                // VPN-IP-Datei pollen (30s Timeout)
-                let vpn_ip_path = vpn_data_dir.join("vpn_ip.txt");
-                let shared_poll = shared.clone();
-                std::thread::spawn(move || {
-                    let start = std::time::Instant::now();
-                    let timeout = std::time::Duration::from_secs(30);
-                    while start.elapsed() < timeout {
-                        if let Ok(ip) = std::fs::read_to_string(&vpn_ip_path) {
-                            let ip = ip.trim().to_string();
-                            if !ip.is_empty() {
-                                let mut s = shared_poll.lock().unwrap_or_else(|e| e.into_inner());
-                                s.append_log(&format!("[vpn] 🎉 VPN-IP zugewiesen: {ip}"));
-                                return;
-                            }
-                        }
-                        std::thread::sleep(std::time::Duration::from_millis(500));
-                    }
-                    let mut s = shared_poll.lock().unwrap_or_else(|e| e.into_inner());
-                    s.append_log("[vpn] ⚠️ Keine VPN-IP nach 30s — läuft der Relay?");
-                });
-            }
-            Err(e) => {
-                s.append_log(&format!("[vpn] ⚠️ Start fehlgeschlagen: {e}"));
-                s.append_log("[vpn] 💡 Tipp: Auf macOS muss der App einmalig Admin-Rechte erteilt werden.");
-            }
-        }
+    // ── VPN Hinweis ────────────────────────────────────────────────────
+    // Der VPN läuft als SYSTEM-DIENST (LaunchDaemon / systemd), nicht als
+    // Teil der App. Das vermeidet Permission-Probleme mit TUN-Devices.
+    // Über "VPN Service installieren" im Dashboard kann er eingerichtet werden.
+    if find_vpn_binary(app).is_some() {
+        s.append_log("[vpn] stonevpn-Binary gefunden.");
+        s.append_log("[vpn] 💡 VPN kann als Systemdienst installiert werden (Dashboard → Node → VPN Service).");
     } else {
-        s.append_log("[vpn] ⚠️ stonevpn-Binary nicht gefunden — VPN deaktiviert");
+        s.append_log("[vpn] ⚠️ stonevpn-Binary nicht gefunden.");
+        s.append_log("[vpn] 💡 Beim nächsten GitHub-Release wird stonevpn mit heruntergeladen.");
     }
 
     drop(s);
@@ -1013,15 +1018,7 @@ pub fn node_stop_internal(shared: &SharedNodeState) -> Result<(), String> {
         child.kill().map_err(|e| format!("Konnte nicht stoppen: {e}"))?;
         let _ = child.wait();
     }
-    // Kill VPN process too (find by name)
-    #[cfg(unix)]
-    {
-        let _ = Command::new("pkill").args(["-f", "stonevpn"]).status();
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let _ = Command::new("taskkill").args(["/F", "/IM", "stonevpn.exe"]).status();
-    }
+    // Note: VPN ist ein Systemdienst und wird hier NICHT beendet.
     s.status = NodeStatus::Stopped;
     Ok(())
 }

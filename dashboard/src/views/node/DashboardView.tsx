@@ -15,6 +15,8 @@ export default function DashboardView() {
 
   // ─── VPN Status ────────────────────────────────────────────────────
   const [vpnStatus, setVpnStatus] = useState<{active:boolean;vpn_ip:string|null;peer_count:number;peers:string[]}|null>(null);
+  const [vpnInstalling, setVpnInstalling] = useState(false);
+  const [vpnResult, setVpnResult] = useState<string|null>(null);
 
   useEffect(() => {
     const poll = async () => {
@@ -28,6 +30,20 @@ export default function DashboardView() {
     const id = setInterval(poll, 10000);
     return () => clearInterval(id);
   }, []);
+
+  async function installVpnService() {
+    setVpnInstalling(true);
+    setVpnResult(null);
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      const result: string = await invoke("install_vpn_service");
+      setVpnResult(result);
+    } catch(e: any) {
+      setVpnResult("❌ " + (e?.toString() ?? "Fehler"));
+    } finally {
+      setVpnInstalling(false);
+    }
+  }
 
   // ─── Updater ──────────────────────────────────────────────────────
   const [updateState, setUpdateState] = useState<"idle"|"checking"|"available"|"downloading"|"ready">("idle");
@@ -133,7 +149,27 @@ export default function DashboardView() {
         <StatCard icon={<Users size={16}/>} label="Peers" value={health?.peer_count??'—'} color="var(--green)"/>
         <StatCard icon={<Clock size={16}/>} label="Uptime" value={health?fmtUptime(health.uptime_secs):'—'} color="var(--blue)"/>
         <StatCard icon={<Database size={16}/>} label="Mempool" value={health?.mempool_size??'—'} color="var(--amber)"/>
-        <StatCard icon={<Shield size={16}/>} label="VPN" value={vpnStatus?.active ? (vpnStatus.vpn_ip ?? 'verbunden') : '—'} color={vpnStatus?.active ? 'var(--green)' : 'var(--text-muted)'} subtitle={vpnStatus?.active ? `${vpnStatus.peer_count} peers` : undefined}/>
+        <StatCard icon={<Shield size={16}/>} label="VPN" value={vpnStatus?.active ? (vpnStatus.vpn_ip ?? 'verbunden') : 'inaktiv'} color={vpnStatus?.active ? 'var(--green)' : 'var(--text-muted)'} subtitle={vpnStatus?.active ? `${vpnStatus.peer_count} peers` : undefined}/>
+      </div>
+
+      {/* VPN Service */}
+      {!vpnStatus?.active && (
+        <div style={{background:"rgba(99,102,241,0.06)",border:"1px solid rgba(99,102,241,0.15)",borderRadius:10,padding:"12px 16px",marginBottom:16,display:"flex",alignItems:"center",gap:12}}>
+          <div style={{flex:1}}>
+            <div style={{fontWeight:600,fontSize:13,color:"#6366f1"}}>🔒 VPN-Service nicht aktiv</div>
+            <div style={{fontSize:11,color:"var(--text-muted)",marginTop:2}}>Installiere den VPN als Systemdienst für automatischen Start bei Boot.</div>
+          </div>
+          <button onClick={installVpnService} disabled={vpnInstalling}
+            style={{padding:"8px 16px",borderRadius:8,background:"#6366f1",color:"#fff",border:"none",cursor:"pointer",fontSize:12,fontWeight:600,display:"flex",alignItems:"center",gap:6,whiteSpace:"nowrap",opacity:vpnInstalling?0.6:1}}>
+            <Shield size={14}/> {vpnInstalling ? "Installiere…" : "VPN installieren"}
+          </button>
+        </div>
+      )}
+      {vpnResult && (
+        <div style={{background: vpnResult.startsWith("❌") ? "rgba(239,68,68,0.06)" : "rgba(34,197,94,0.06)", border:"1px solid " + (vpnResult.startsWith("❌") ? "rgba(239,68,68,0.15)" : "rgba(34,197,94,0.15)"), borderRadius:10, padding:"10px 16px", marginBottom:16, fontSize:12, color: vpnResult.startsWith("❌") ? "#ef4444" : "#22c55e"}}>
+          {vpnResult}
+        </div>
+      )}
       </div>
 
       {/* System Stats */}

@@ -27,7 +27,7 @@ impl TunDevice {
 
         let network = Ipv4Addr::new(ip.octets()[0], ip.octets()[1], ip.octets()[2], 0);
         Self::add_route(network, ip)?;
-        println!("🌐 TUN: tun0 -> {ip}/24");
+        eprintln!("🌐 TUN: tun0 -> {ip}/24");
 
         // Firewall-Regel: Traffic auf tun0 erlauben
         Self::ensure_firewall_allows_tun();
@@ -53,7 +53,7 @@ impl TunDevice {
                         let _ = Command::new("ufw")
                             .args(["allow", "in", "on", "tun0"])
                             .output();
-                        println!("🛡️  ufw: allow in on tun0");
+                        eprintln!("🛡️  ufw: allow in on tun0");
                     }
                 }
             } else {
@@ -65,7 +65,7 @@ impl TunDevice {
                     let _ = Command::new("iptables")
                         .args(["-I", "INPUT", "-i", "tun0", "-j", "ACCEPT"])
                         .status();
-                    println!("🛡️  iptables: -I INPUT -i tun0 -j ACCEPT");
+                    eprintln!("🛡️  iptables: -I INPUT -i tun0 -j ACCEPT");
                 }
             }
         }
@@ -92,7 +92,7 @@ impl TunDevice {
                 let _ = Command::new("iptables")
                     .args(["-t", "nat", "-I", "POSTROUTING", "-s", "10.1.0.0/24", "-j", "MASQUERADE"])
                     .status();
-                println!("🛡️  NAT Masquerade für 10.1.0.0/24 aktiviert");
+                eprintln!("🛡️  NAT Masquerade für 10.1.0.0/24 aktiviert");
             }
         }
         #[cfg(target_os = "macos")]
@@ -209,7 +209,23 @@ impl TunDevice {
                 let _ = Command::new("route")
                     .args(["-n", "add", "-net", &net, "-interface", iface])
                     .output();
-                println!("🌐 Route: {net} -> {iface}");
+                eprintln!("🌐 Route: {net} -> {iface}");
+
+                // Verify route exists (macOS sometimes silently fails)
+                let check = Command::new("route")
+                    .args(["-n", "get", "10.1.0.1"])
+                    .output()
+                    .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+                    .unwrap_or_default();
+                if check.contains(iface.as_str()) {
+                    eprintln!("🌐 Route verified: 10.1.0.0/24 → {iface}");
+                } else {
+                    eprintln!("⚠️ Route verification failed, retrying…");
+                    // Retry once
+                    let _ = Command::new("route")
+                        .args(["-n", "add", "-net", &net, "-interface", iface])
+                        .output();
+                }
             } else {
                 // Fallback: route über .1 als Gateway
                 let gw = format!("{}.{}.{}.1", network.octets()[0], network.octets()[1], network.octets()[2]);
