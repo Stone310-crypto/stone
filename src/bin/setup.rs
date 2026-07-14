@@ -53,7 +53,7 @@ use server::{
         load_api_key, load_admin_key, load_peers_from_disk, load_trust_from_disk,
         AppState as NodeAppState, HEARTBEAT_INTERVAL,
     },
-    sync::{bootstrap_announce, fetch_missing_chunks, pull_from_peer, spawn_auto_sync_task, spawn_peer_health_task},
+    sync::{bootstrap_announce, fetch_missing_chunks, maybe_start_vpn, pull_from_peer, spawn_auto_sync_task, spawn_peer_health_task},
 };
 
 const CONFIG_FILE: &str = "node_config.json";
@@ -346,6 +346,9 @@ async fn start_full_node(state: SetupState) {
     println!("[node] Full-Node wird gestartet...");
 
     std::fs::create_dir_all(data_dir()).ok();
+
+    // VPN-Client starten falls STONE_VPN_ENABLED=1
+    maybe_start_vpn().await;
 
     // Post-Update Rollback prüfen (bei Crash-Loop → altes Binary wiederherstellen)
     if stone::updater::check_post_update_rollback(&data_dir()) {

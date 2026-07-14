@@ -1,0 +1,45 @@
+[package]
+name = "stonevpn"
+version = "0.1.0"
+edition = "2021"
+description = "StoneChain Mesh VPN — Overlay-Netzwerk für Stone Nodes"
+
+[[bin]]
+name = "stonevpn"
+path = "src/main.rs"
+
+[dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "2"
+
+# Cryptography (WireGuard-kompatibel: X25519 + ChaCha20Poly1305)
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+chacha20poly1305 = "0.10"
+rand = "0.8"
+
+# TUN device (virtual network interface)
+tun = "0.6"
+libc = "0.2"
+
+# Logging
+log = "0.4"
+env_logger = "0.11"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Networking
+socket2 = { version = "0.5", features = ["all"] }
+
+# Shared with stone (for key format compatibility)
+ed25519-dalek = "2"
+hex = "0.4"
+
+[profile.release]
+opt-level = 3
+lto = true

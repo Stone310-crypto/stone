@@ -32,7 +32,10 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 NODES_FILE="$PROJECT_DIR/nodes.toml"
 TARGET="x86_64-unknown-linux-gnu"
 BINARIES=("stone-setup" "stone-master")
+VPN_DIR="$PROJECT_DIR/stone_vpn"
+VPN_BIN="stonevpn"
 RELEASE_DIR="$PROJECT_DIR/target/$TARGET/release"
+VPN_RELEASE_DIR="$VPN_DIR/target/$TARGET/release"
 LOG_DIR=$(mktemp -d)
 
 # Farben
@@ -189,12 +192,19 @@ if [ "$BUILD" = true ]; then
             grep -E "Compiling stone |Finished|error" || true
     done
 
+    # stonevpn bauen
+    echo -e "${BLUE}[build]${NC}   Kompiliere ${YELLOW}$VPN_BIN${NC} ..."
+    (cd "$VPN_DIR" && cargo zigbuild --release --target "$TARGET" 2>&1) | \
+        grep -E "Compiling stonevpn|Finished|error" || true
+
     # Binary-Größen anzeigen
     echo ""
     for bin in "${BINARIES[@]}"; do
         SIZE=$(ls -lh "$RELEASE_DIR/$bin" | awk '{print $5}')
         echo -e "${GREEN}[build]${NC}   ✅ $bin: ${SIZE}"
     done
+    VPN_SIZE=$(ls -lh "$VPN_RELEASE_DIR/$VPN_BIN" | awk '{print $5}')
+    echo -e "${GREEN}[build]${NC}   ✅ $VPN_BIN: ${VPN_SIZE}"
     echo ""
 fi
 
@@ -453,6 +463,13 @@ validate_local_binaries() {
     if [ "$missing" -eq 1 ]; then
         echo -e "${RED}[error]${NC} Fehlende Binaries. Entweder bauen oder --skip-build entfernen."
         exit 1
+    fi
+    # stonevpn optional prüfen (Warnung falls nicht gebaut)
+    if [ ! -f "$VPN_RELEASE_DIR/$VPN_BIN" ]; then
+        echo -e "${YELLOW}[preflight]${NC} ⚠ stonevpn Binary nicht gefunden ($VPN_RELEASE_DIR/$VPN_BIN)"
+        echo -e "${YELLOW}[preflight]${NC}   VPN-Relay/Client wird nicht deployed. Falls benötigt: build_linux.sh ausführen."
+    else
+        echo -e "${GREEN}[preflight]${NC} ✅ stonevpn Binary gefunden ($(ls -lh "$VPN_RELEASE_DIR/$VPN_BIN" | awk '{print $5}'))"
     fi
 }
 
@@ -826,6 +843,14 @@ upload_to_node() {
             echo "[upload] ✅ $bin staged auf $name"
         done
 
+        # stonevpn deployen (wenn gebaut)
+        if [ -f "$VPN_RELEASE_DIR/$VPN_BIN" ]; then
+            echo "[upload] 📦 $VPN_BIN → $name ..."
+            scp -P "$port" -C -q "$VPN_RELEASE_DIR/$VPN_BIN" "$user@$host:$path/$VPN_BIN.staged"
+            ssh -p "$port" "$user@$host" "chmod +x $path/$VPN_BIN.staged"
+            echo "[upload] ✅ $VPN_BIN staged auf $name"
+        fi
+
         # Service-File vorbereiten (staged)
         local service_src="$PROJECT_DIR/configs/stone-node.service"
         if [ -n "$service" ] && [ -f "$service_src" ]; then
@@ -937,6 +962,14 @@ fi
 
 if [ -n "$CHAT_BATCH_MAX_WAIT_SECS" ]; then
     set_kv "STONE_CHAT_BATCH_MAX_WAIT_SECS" "$CHAT_BATCH_MAX_WAIT_SECS"
+fi
+
+# VPN-Konfiguration (standardmäßig enabled, falls nicht explizit deaktiviert)
+if ! grep -q '^STONE_VPN_ENABLED=' "$TMP_FILE"; then
+    set_kv "STONE_VPN_ENABLED" "1"
+fi
+if ! grep -q '^STONE_VPN_PORT=' "$TMP_FILE"; then
+    set_kv "STONE_VPN_PORT" "51821"
 fi
 
 mv "$TMP_FILE" "$ENV_FILE"
@@ -1094,14 +1127,15 @@ restart_node() {
         fi
 
         echo "[restart] 🔄 $name — systemctl restart $service ..."
-        ssh -p "$port" "$user@$host" bash -s -- "$service" "$path" "$network" "$MAINNET_P2P_PORT" "$bins" <<'RESTART_SCRIPT'
+        ssh -p "$port" "$user@$host" bash -s -- "$service" "$path" "$network" "$MAINNET_P2P_PORT" "$bins" "$VPN_BIN" <<'RESTART_SCRIPT'
             set -e
             SERVICE="$1"
             BIN_PATH="$2"
             NETWORK="$3"
             MAINNET_P2P_PORT="$4"
             shift 4
-            BINS="$*"
+            BINS="$1"
+            VPN_BIN="$2"
 
             # Ports je nach Netzwerk
             if [ "$NETWORK" = "mainnet" ]; then
@@ -1138,11 +1172,14 @@ restart_node() {
                 # diesen Node, nicht das andere Netz.
                 pkill -TERM -f "${BIN_PATH}/${proc}" 2>/dev/null || true
             done
+            # stonevpn ebenfalls stoppen
+            pkill -TERM -f "${BIN_PATH}/${VPN_BIN}" 2>/dev/null || true
             # Kurz warten und ggf. SIGKILL nachschieben, falls etwas hängt.
             sleep 2
             for proc in stone-setup stone-master; do
                 pkill -KILL -f "${BIN_PATH}/${proc}" 2>/dev/null || true
             done
+            pkill -KILL -f "${BIN_PATH}/${VPN_BIN}" 2>/dev/null || true
 
             # Binary-Swap NACH dem Stop: Prozess ist jetzt down → kein "Text file busy".
             cd "$BIN_PATH"
@@ -1153,6 +1190,12 @@ restart_node() {
                     sync
                 fi
             done
+            # stonevpn swap
+            if [ -f "${VPN_BIN}.staged" ]; then
+                [ -f "${VPN_BIN}" ] && cp "${VPN_BIN}" "${VPN_BIN}.bak"
+                mv "${VPN_BIN}.staged" "${VPN_BIN}"
+                sync
+            fi
 
             systemctl restart "$SERVICE"
             sleep 3
@@ -1220,6 +1263,136 @@ for i in $(seq 0 $((TOTAL - 1))); do
 done
 
 echo ""
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Phase 2c: VPN-Relay Auto-Start
+# ═════════════════════════════════════════════════════════════════════════════
+# Nodes with STONE_VPN_RELAYS configured act as VPN relays.
+# Nodes with STONE_VPN_ENABLED=1 start stonevpn as client via maybe_start_vpn().
+# Here we only start relays; clients are started by the Rust process itself.
+
+if [ "$ALL_OK" = true ]; then
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo -e "${CYAN}  Phase 2c: VPN-Relay Start${NC}"
+    echo -e "${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+    echo ""
+
+    # ── VPN Firewall Setup (auf allen Nodes) ─────────────────────────
+    setup_vpn_firewall() {
+        local idx="$1"
+        local name="${NODE_NAMES[$idx]}"
+        local host="${NODE_HOSTS[$idx]}"
+        local user="${NODE_USERS[$idx]}"
+        local port="${NODE_PORTS[$idx]}"
+        local log="$LOG_DIR/${name}_fw.log"
+
+        {
+            ssh -p "$port" "$user@$host" bash -s <<'FW_SETUP'
+set -e
+# UFW: Traffic auf tun0 erlauben (idempotent)
+if command -v ufw &>/dev/null && ufw status 2>/dev/null | grep -q "Status: active"; then
+    ufw allow in on tun0 2>/dev/null || true
+    echo "[fw] ufw: allow in on tun0 ✓"
+elif command -v iptables &>/dev/null; then
+    iptables -C INPUT -i tun0 -j ACCEPT 2>/dev/null || iptables -I INPUT -i tun0 -j ACCEPT
+    echo "[fw] iptables: tun0 ACCEPT ✓"
+fi
+# IP-Forwarding für Relay (schadet nicht auf Client)
+if [ -w /proc/sys/net/ipv4/ip_forward ]; then
+    echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
+fi
+FW_SETUP
+        } > "$log" 2>&1
+    }
+
+    echo -e "${BLUE}[vpn]${NC} Firewall-Check auf allen Nodes..."
+    for i in $(seq 0 $((TOTAL - 1))); do
+        setup_vpn_firewall "$i" &
+    done
+    wait
+    for i in $(seq 0 $((TOTAL - 1))); do
+        if [ -f "$LOG_DIR/${NODE_NAMES[$i]}_fw.log" ]; then
+            sed 's/^/    /' "$LOG_DIR/${NODE_NAMES[$i]}_fw.log"
+        fi
+    done
+    echo ""
+
+    start_vpn_relay() {
+        local idx="$1"
+        local name="${NODE_NAMES[$idx]}"
+        local host="${NODE_HOSTS[$idx]}"
+        local user="${NODE_USERS[$idx]}"
+        local port="${NODE_PORTS[$idx]}"
+        local path="${NODE_PATHS[$idx]}"
+        local root="${NODE_ROOTS[$idx]}"
+        local network="${NODE_NETWORKS[$idx]}"
+        local log="$LOG_DIR/${name}_vpn.log"
+
+        {
+            # Prüfe ob der Node Relays in seiner .env konfiguriert hat
+            local vpn_relays
+            vpn_relays=$(ssh -p "$port" "$user@$host" \
+                "grep '^STONE_VPN_RELAYS=' $root/.env 2>/dev/null | cut -d'=' -f2- || true")
+            local vpn_enabled=$(ssh -p "$port" "$user@$host" \
+                "grep '^STONE_VPN_ENABLED=' $root/.env 2>/dev/null | cut -d'=' -f2- || true")
+
+            if [ -z "$vpn_relays" ] && [ "$vpn_enabled" != "1" ]; then
+                echo "[vpn] $name — keine VPN-Konfiguration, überspringe"
+                return 0
+            fi
+
+            local data_dir="stone_data"
+            [ "$network" = "mainnet" ] && data_dir="stone_data_mainnet"
+
+            # Falls STONE_VPN_RELAYS gesetzt ist, starte als Relay (nur VPS)
+            if [ -n "$vpn_relays" ]; then
+                local vpn_port="${STONE_VPN_PORT:-51821}"
+                echo "[vpn] $name — starte VPN-Relay auf Port $vpn_port ..."
+                ssh -p "$port" "$user@$host" bash -s -- "$path" "$VPN_BIN" "$root" "$data_dir" "$vpn_port" <<'VPN_RELAY'
+set -e
+BIN_PATH="$1"
+VPN_BIN="$2"
+ROOT="$3"
+DATA_DIR="$4"
+PORT="$5"
+
+# Kill vorherigen stonevpn-Prozess
+pkill -TERM -f "${BIN_PATH}/${VPN_BIN}" 2>/dev/null || true
+sleep 1
+pkill -KILL -f "${BIN_PATH}/${VPN_BIN}" 2>/dev/null || true
+
+nohup "${BIN_PATH}/${VPN_BIN}" --relay --tun --port "$PORT" --stone-data "${ROOT}/${DATA_DIR}" \
+    > "${ROOT}/stonevpn_relay.log" 2>&1 &
+echo "[vpn] Relay gestartet (PID $!)"
+sleep 2
+if pgrep -f "${BIN_PATH}/${VPN_BIN}" >/dev/null 2>&1; then
+    echo "[vpn] ✅ Relay läuft auf Port $PORT (data: ${ROOT}/${DATA_DIR})"
+else
+    echo "[vpn] ❌ Relay nicht gestartet"
+    cat "${ROOT}/stonevpn_relay.log" 2>/dev/null || true
+fi
+VPN_RELAY
+                echo "[vpn] ✅ $name — VPN-Relay deployed"
+            elif [ "$vpn_enabled" = "1" ]; then
+                echo "[vpn] $name — VPN-Client (wird von stone-master gestartet via maybe_start_vpn mit --tun)"
+            fi
+        } > "$log" 2>&1
+    }
+
+    VPN_PIDS=()
+    for i in $(seq 0 $((TOTAL - 1))); do
+        start_vpn_relay "$i" &
+        VPN_PIDS+=($!)
+    done
+
+    for i in $(seq 0 $((TOTAL - 1))); do
+        wait "${VPN_PIDS[$i]}" || true
+        if [ -f "$LOG_DIR/${NODE_NAMES[$i]}_vpn.log" ]; then
+            sed 's/^/    /' "$LOG_DIR/${NODE_NAMES[$i]}_vpn.log"
+        fi
+    done
+    echo ""
+fi
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Phase 3: Post-Deploy-Konvergenzcheck

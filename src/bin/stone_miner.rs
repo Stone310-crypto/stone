@@ -880,19 +880,30 @@ async fn handle_p2p_event(
                                 );
                                 continue;
                             }
-                            // SECURITY: Prüfe ob der Signer im ValidatorSet bekannt ist
+                            // SECURITY: Auto-Discover validators from received blocks
+                            // (same behavior as app_node.rs and master_server.rs).
+                            // New validators are added to the set, allowing the chain
+                            // to grow organically without pre-registration.
                             let vs = node.validator_set.read().unwrap_or_else(|e| e.into_inner());
                             let is_known_validator = vs.validators.iter().any(|v| {
                                 v.public_key_hex == block.validator_pub_key
                             });
                             drop(vs);
                             if !is_known_validator {
-                                eprintln!(
-                                    "[sync] ⚠ Block #{} Signer PubKey {}… nicht im ValidatorSet – übersprungen",
-                                    block.index,
-                                    &block.validator_pub_key[..16.min(block.validator_pub_key.len())],
-                                );
-                                continue;
+                                // Auto-discover: add to validator set
+                                let mut vs = node.validator_set.write().unwrap_or_else(|e| e.into_inner());
+                                if !vs.validators.iter().any(|v| v.public_key_hex == block.validator_pub_key) {
+                                    let info = stone::consensus::ValidatorInfo::new(
+                                        &block.signer,
+                                        &block.validator_pub_key,
+                                    );
+                                    vs.add(info);
+                                    println!(
+                                        "[sync] 🔍 Neuer Validator auto-entdeckt: {}… (aus Block #{})",
+                                        &block.validator_pub_key[..12.min(block.validator_pub_key.len())],
+                                        block.index,
+                                    );
+                                }
                             }
                         }
 

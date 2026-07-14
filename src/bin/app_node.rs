@@ -38,7 +38,7 @@ use server::{
         load_api_key, load_admin_key, load_peers_from_disk, load_trust_from_disk,
         AppState, HEARTBEAT_INTERVAL,
     },
-    sync::{bootstrap_announce, pull_from_peer, spawn_auto_sync_task, spawn_peer_health_task},
+    sync::{bootstrap_announce, maybe_start_vpn, pull_from_peer, spawn_auto_sync_task, spawn_peer_health_task},
 };
 
 use stone::network::NetworkEvent;
@@ -57,6 +57,9 @@ async fn main() {
     if let Err(e) = std::fs::create_dir_all(&ddir) {
         eprintln!("[app-node] Warnung: Data-Dir konnte nicht erstellt werden: {e}");
     }
+
+    // ── VPN Auto-Start (StoneVPN Mesh Overlay) ──────────────────────────
+    maybe_start_vpn().await;
 
     // ── ChunkStore (ignoriert Fehler – app-node braucht keinen Storage) ──
     if let Err(e) = ChunkStore::new() {

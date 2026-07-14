@@ -50,7 +50,7 @@ use server::{
     sync_router::build_sync_router,
     rate_limiter::RateLimits,
     state::{load_api_key, load_admin_key, load_peers_from_disk, load_trust_from_disk, save_peers, AppState, HEARTBEAT_INTERVAL},
-    sync::{bootstrap_announce, fetch_missing_chunks, pull_from_peer, spawn_auto_sync_task, spawn_peer_health_task},
+    sync::{bootstrap_announce, fetch_missing_chunks, maybe_start_vpn, pull_from_peer, spawn_auto_sync_task, spawn_peer_health_task},
 };
 
 static STAGE4_RECOVERY_RUNNING: AtomicBool = AtomicBool::new(false);
@@ -113,6 +113,7 @@ async fn maybe_run_stage4_snapshot_recovery(
     }
 }
 
+
 #[tokio::main]
 async fn main() {
     // ── .env laden (nur aus CWD, nicht aus Parent-Verzeichnissen) ─────────────
@@ -123,6 +124,12 @@ async fn main() {
     }
 
     std::fs::create_dir_all(data_dir()).expect("DATA_DIR anlegen");
+
+    // ── VPN Auto-Start (StoneVPN Mesh Overlay) ──────────────────────────
+    // Wenn STONE_VPN_ENABLED=1, startet der Master-Node automatisch
+    // den stonevpn-Client. Die zugewiesene VPN-IP wird via
+    // stone_data/vpn_ip.txt ausgetauscht und als STONE_PUBLIC_IP gesetzt.
+    maybe_start_vpn().await;
 
     // Post-Update Rollback prüfen
     if stone::updater::check_post_update_rollback(&data_dir()) {

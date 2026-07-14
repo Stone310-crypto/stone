@@ -248,7 +248,7 @@ def main():
             print(f"      TXs:        {txs}")
             print(f"      ChatBatches: {chat}")
             print(f"      Timestamp:  {ts}")
-            print(f"  {key}: {get_node_status(...)}")
+            print(f"      Status:     {get_node_status(ns['host'], ns.get('user', 'root'), ns.get('port', '22'), api_port)}")
 
         # Zeige die Gruppen
         groups = defaultdict(list)

@@ -41,13 +41,17 @@ fn save_public_ip(ip: &str) {
     let _ = std::fs::write(public_ip_file(), ip);
 }
 
-/// Fragt die öffentliche IPv4-Adresse über mehrere externe Dienste ab.
+/// Fragt die öffentliche IP-Adresse über mehrere externe Dienste ab.
+/// Bevorzugt IPv4 (api4.ipify.org), akzeptiert aber auch IPv6 als Fallback.
 /// Gibt `None` zurück wenn alle Dienste fehlschlagen.
 pub async fn fetch_public_ip() -> Option<String> {
+    // IPv4-only Endpoints ZUERST (dual-stack Hosts liefern sonst IPv6)
     let services = [
-        "https://api.ipify.org",
-        "https://ifconfig.me/ip",
-        "https://icanhazip.com",
+        "https://api4.ipify.org",       // IPv4-only
+        "https://ipv4.icanhazip.com",   // IPv4-only
+        "https://api.ipify.org",        // any (Fallback)
+        "https://ifconfig.me/ip",       // any (Fallback)
+        "https://icanhazip.com",        // any (Fallback)
     ];
 
     let client = match reqwest::Client::builder()
@@ -63,13 +67,7 @@ pub async fn fetch_public_ip() -> Option<String> {
             Ok(resp) => {
                 if let Ok(ip) = resp.text().await {
                     let ip = ip.trim().to_string();
-                    // Einfache IPv4-Validierung: 7-15 Zeichen, Punkte, Ziffern
-                    if !ip.is_empty()
-                        && ip.len() >= 7
-                        && ip.len() <= 15
-                        && ip.chars().all(|c| c.is_ascii_digit() || c == '.')
-                        && ip.split('.').count() == 4
-                    {
+                    if is_valid_public_ip(&ip) {
                         return Some(ip);
                     }
                 }
@@ -78,6 +76,33 @@ pub async fn fetch_public_ip() -> Option<String> {
         }
     }
     None
+}
+
+/// Prüft ob eine IP als öffentliche Adresse gültig ist (IPv4 oder IPv6).
+fn is_valid_public_ip(ip: &str) -> bool {
+    if ip.is_empty() {
+        return false;
+    }
+    // IPv4: 7-15 Zeichen, Punkte + Ziffern
+    if ip.len() >= 7 && ip.len() <= 15
+        && ip.chars().all(|c| c.is_ascii_digit() || c == '.')
+        && ip.split('.').count() == 4
+    {
+        // Keine privaten/Loopback-Adressen
+        if let Ok(addr) = ip.parse::<std::net::Ipv4Addr>() {
+            return !addr.is_loopback()
+                && !addr.is_private()
+                && !addr.is_link_local()
+                && !addr.is_unspecified();
+        }
+    }
+    // IPv6: Doppelpunkte + Hex (keine Link-Local oder Loopback)
+    if ip.contains(':') {
+        if let Ok(addr) = ip.parse::<std::net::Ipv6Addr>() {
+            return !addr.is_loopback() && !addr.is_unspecified();
+        }
+    }
+    false
 }
 
 /// Startet den Public-IP-Watchdog als Hintergrund-Task.

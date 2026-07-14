@@ -438,6 +438,12 @@ pub fn spawn_auto_sync_task(
             if chain_sync_counter % 4 == 0 {
                 sync_chain_accounts_to_users(&node, &users);
             }
+            // Periodisch bei Bootstrap-Nodes neu registrieren (alle 6 Minuten).
+            // Stellt sicher dass andere Nodes immer unsere aktuelle URL kennen,
+            // auch wenn sich die IP (z.B. nach Tailscale→Public-IP-Fix) geändert hat.
+            if chain_sync_counter % 12 == 0 {
+                bootstrap_announce(&node).await;
+            }
         }
     });
 }
@@ -844,6 +850,79 @@ fn same_host_url(a: &str, b: &str) -> bool { match (host_from_url(a), host_from_
 fn endpoint_from_url(url: &str) -> Option<(String, u16)> { let s = url.split("://").nth(1).unwrap_or(url).split('/').next().unwrap_or(""); let mut parts = s.split(':'); let host = parts.next().unwrap_or("").to_ascii_lowercase(); if host.is_empty() { return None; } let port = parts.next().and_then(|v| v.parse::<u16>().ok()).unwrap_or(80); Some((host, port)) }
 fn same_endpoint_url(a: &str, b: &str) -> bool { match (endpoint_from_url(a), endpoint_from_url(b)) { (Some(ea), Some(eb)) => ea == eb, _ => false } }
 fn is_bootstrap_url(url: &str) -> bool { let configured = if let Ok(raw) = std::env::var("STONE_BOOTSTRAP_HTTP_URLS") { raw.split(',').map(str::trim).filter(|s| !s.is_empty()).map(|s| s.trim_end_matches('/').to_string()).collect::<Vec<_>>() } else { stone::network::default_bootstrap_http_urls() }; configured.iter().any(|b| same_endpoint_url(url, b)) }
+
+/// Startet den StoneVPN-Client als Subprozess, falls STONE_VPN_ENABLED=1.
+/// Wartet auf die Zuweisung einer VPN-IP und setzt STONE_PUBLIC_IP.
+/// Wird von master_server und app_node beim Start aufgerufen.
+pub async fn maybe_start_vpn() {
+    let enabled = std::env::var("STONE_VPN_ENABLED")
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    if !enabled { return; }
+
+    let data_dir = stone::blockchain::data_dir();
+    let vpn_ip_path = format!("{data_dir}/vpn_ip.txt");
+
+    let vpn_bin = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("stonevpn")))
+        .unwrap_or_else(|| std::path::PathBuf::from("./stonevpn"));
+
+    let port = std::env::var("STONE_VPN_PORT").ok().and_then(|v| v.parse::<u16>().ok()).unwrap_or(51821);
+    let relays = std::env::var("STONE_VPN_RELAYS").unwrap_or_default();
+
+    println!("[vpn] 🚀 Starte StoneVPN-Client...");
+    println!("[vpn]    Binary: {}", vpn_bin.display());
+    println!("[vpn]    Port:   {port}");
+    println!("[vpn]    Relays: {}", if relays.is_empty() { "(keine)" } else { &relays });
+    println!("[vpn]    Data:   {data_dir}");
+
+    let mut cmd = std::process::Command::new(&vpn_bin);
+    cmd.arg("--port").arg(port.to_string());
+    cmd.arg("--stone-data").arg(&data_dir);
+    cmd.arg("--tun");   // TUN device für IP-Layer über VPN
+    if !relays.is_empty() { cmd.arg("--relays").arg(&relays); }
+
+    // Log in stone_data ablegen, nicht in stdout/stderr (die würden verloren gehen)
+    let vpn_log = format!("{data_dir}/stonevpn.log");
+    let log_file = match std::fs::File::create(&vpn_log) {
+        Ok(f) => f,
+        Err(_) => {
+            eprintln!("[vpn] ⚠️ Konnte Log-Datei nicht erstellen: {vpn_log}");
+            return;
+        }
+    };
+    cmd.stdout(log_file.try_clone().unwrap());
+    cmd.stderr(log_file);
+
+    match cmd.spawn() {
+        Ok(mut child) => {
+            println!("[vpn] ✅ StoneVPN gestartet (PID {})", child.id());
+            let start = std::time::Instant::now();
+            let timeout = std::time::Duration::from_secs(30);
+            while start.elapsed() < timeout {
+                if let Ok(ip) = std::fs::read_to_string(&vpn_ip_path) {
+                    let ip = ip.trim().to_string();
+                    if !ip.is_empty() {
+                        println!("[vpn] 🎉 VPN-IP zugewiesen: {ip}");
+                        std::env::set_var("STONE_PUBLIC_IP", &ip);
+                        println!("[vpn]    STONE_PUBLIC_IP={ip} (für Sync/Announce)");
+                        tokio::spawn(async move { let _ = child.wait(); });
+                        return;
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                match child.try_wait() {
+                    Ok(Some(s)) => { eprintln!("[vpn] ❌ StoneVPN beendet: {s}"); return; }
+                    _ => {}
+                }
+            }
+            eprintln!("[vpn] ⚠️  Keine VPN-IP nach 30s — läuft ein Relay?");
+            let _ = child.kill();
+        }
+        Err(e) => eprintln!("[vpn] ❌ StoneVPN nicht gestartet: {e} — Binary vorhanden? cargo build --release --bin stonevpn"),
+    }
+}
 
 pub async fn bootstrap_announce(node: &Arc<MasterNodeState>) {
     let self_url = match resolve_self_url() { Some(url) => url, None => return };

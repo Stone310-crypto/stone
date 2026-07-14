@@ -218,12 +218,52 @@ def main() -> int:
     # Timestamp in .env speichern
     set_env_value(env_path, "STONE_BOOTSTRAP_AT", datetime.utcnow().isoformat() + "Z")
 
+    # ── VPN-Konfiguration ──────────────────────────────────────────────────
+    print(f"\n{BOLD}  VPN-Konfiguration{RESET}")
+    print(f"  {'─'*40}")
+
+    vpn_enabled = env.get("STONE_VPN_ENABLED", "1")
+    try:
+        answer = input(f"  VPN aktivieren? (Y/n, default=Y): ").strip().lower()
+        if answer == "n":
+            vpn_enabled = "0"
+        else:
+            vpn_enabled = "1"
+    except (EOFError, KeyboardInterrupt):
+        pass
+
+    set_env_value(env_path, "STONE_VPN_ENABLED", vpn_enabled)
+
+    if vpn_enabled == "1":
+        vpn_relays = env.get("STONE_VPN_RELAYS", "")
+        if not vpn_relays:
+            print(f"\n  {YELLOW}VPN-Relays angeben (kommagetrennt):{RESET}")
+            print(f"  Beispiel: 212.227.54.241:51821,69.48.200.255:51821")
+            try:
+                vpn_relays = input(f"  Relays: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                vpn_relays = ""
+        else:
+            info(f"Bereits konfigurierte Relays: {vpn_relays}")
+
+        if vpn_relays:
+            set_env_value(env_path, "STONE_VPN_RELAYS", vpn_relays)
+            ok(f"VPN-Relays gespeichert: {vpn_relays}")
+
+        vpn_port = env.get("STONE_VPN_PORT", "51821")
+        set_env_value(env_path, "STONE_VPN_PORT", vpn_port)
+        ok(f"VPN-Port: {vpn_port}")
+
     print(f"\n{GREEN}{BOLD}{'═'*55}{RESET}")
     print(f"{GREEN}{BOLD}  ✅ Bootstrap erfolgreich!{RESET}")
     print(f"{GREEN}{BOLD}{'═'*55}{RESET}")
     print(f"\n  Jetzt Node starten:")
     print(f"  {CYAN}cargo run --bin stone-master{RESET}")
-    print(f"  oder: {CYAN}./target/debug/stone-master{RESET}\n")
+    print(f"  oder: {CYAN}./target/release/stone-setup{RESET}")
+    if vpn_enabled == "1" and vpn_relays:
+        print(f"\n  VPN-IP nach Start: {CYAN}cat stone_data/vpn_ip.txt{RESET}")
+    print(f"\n  Oder mit dem Auto-Setup-Script:")
+    print(f"  {CYAN}sudo bash scripts/new_node_setup.sh --testnet --name \"{node_id}\"{RESET}\n")
     return 0
 
 
