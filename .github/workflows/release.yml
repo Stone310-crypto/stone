@@ -227,6 +227,9 @@ jobs:
           - os: macos-latest
             target: x86_64-apple-darwin
             suffix: macos-x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            suffix: windows-x86_64
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4

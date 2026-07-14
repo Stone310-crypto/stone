@@ -134,6 +134,27 @@ pub fn ensure_binaries_available(app: &AppHandle) -> Result<(), String> {
             )
         })?;
 
+        // Für stonevpn: zusätzlich als generischen Namen speichern,
+        // damit find_vpn_binary() die Binary ohne Plattform-Suffix findet.
+        if *name == "stonevpn" {
+            #[cfg(target_os = "windows")]
+            let generic_name = "stonevpn.exe";
+            #[cfg(not(target_os = "windows"))]
+            let generic_name = "stonevpn";
+            let generic_path = binaries_dir.join(generic_name);
+            let _ = std::fs::copy(&dest_path, &generic_path);
+            // Ausführbar machen
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Ok(meta) = std::fs::metadata(&generic_path) {
+                    let mut perms = meta.permissions();
+                    perms.set_mode(0o755);
+                    let _ = std::fs::set_permissions(&generic_path, perms);
+                }
+            }
+        }
+
         // Ausführbar machen (Unix)
         #[cfg(unix)]
         {
