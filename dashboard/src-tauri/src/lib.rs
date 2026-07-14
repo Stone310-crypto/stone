@@ -15,6 +15,7 @@ use node_manager::{
     switch_node_network,
     load_config,
     get_node_health,
+    get_vpn_status,
 };
 use miner_manager::{
     SharedMinerState, MinerState,
@@ -270,6 +271,7 @@ pub fn run() {
             node_stop,
             switch_node_network,
             get_node_health,
+            get_vpn_status,
             plugin_open_window,
             validate_upload_file,
             upload_file,

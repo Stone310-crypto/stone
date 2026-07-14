@@ -87,7 +87,7 @@ function NodeBinaryPanel() {
   return (
     <div style={{display:"flex",flexDirection:"column",gap:8}}>
       <div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
-        <div><span style={{fontSize:12,color:"var(--text-primary)"}}>Node-Binaries</span><p style={{fontSize:10,color:"var(--text-muted)",marginTop:1}}>stone-app-node & stone-master</p></div>
+        <div><span style={{fontSize:12,color:"var(--text-primary)"}}>Node-Binaries</span><p style={{fontSize:10,color:"var(--text-muted)",marginTop:1}}>stone-app-node, stone-master, stonevpn</p></div>
         {!tag&&!done&&<button onClick={check} disabled={chk} style={btnSm}><RefreshCw size={12} style={chk?spin:undefined}/> {chk?"Prüfe…":"Prüfen"}</button>}
         {done&&<span style={{fontSize:11,color:"#22c55e",fontWeight:600}}>✅ Aktuell{restarting?" – Node wurde neugestartet":""}</span>}
       </div>

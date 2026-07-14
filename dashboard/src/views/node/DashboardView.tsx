@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
 import { useSystemStats } from "../../hooks/useSystemStats";
-import { Cpu, Database, Clock, Users, Server, Terminal, Save, RefreshCw, Download } from "lucide-react";
+import { Cpu, Database, Clock, Users, Server, Terminal, Save, RefreshCw, Download, Shield } from "lucide-react";
 
 export default function DashboardView() {
   const stats = useSystemStats(3000);
@@ -12,6 +12,22 @@ export default function DashboardView() {
   const logRef = useRef<HTMLDivElement>(null);
   const pausedRef = useRef(false);
   useEffect(()=>{pausedRef.current=logPaused},[logPaused]);
+
+  // ─── VPN Status ────────────────────────────────────────────────────
+  const [vpnStatus, setVpnStatus] = useState<{active:boolean;vpn_ip:string|null;peer_count:number;peers:string[]}|null>(null);
+
+  useEffect(() => {
+    const poll = async () => {
+      try {
+        const { invoke } = await import("@tauri-apps/api/core");
+        const vs: any = await invoke("get_vpn_status");
+        setVpnStatus(vs);
+      } catch(e) {}
+    };
+    poll();
+    const id = setInterval(poll, 10000);
+    return () => clearInterval(id);
+  }, []);
 
   // ─── Updater ──────────────────────────────────────────────────────
   const [updateState, setUpdateState] = useState<"idle"|"checking"|"available"|"downloading"|"ready">("idle");
@@ -117,6 +133,7 @@ export default function DashboardView() {
         <StatCard icon={<Users size={16}/>} label="Peers" value={health?.peer_count??'—'} color="var(--green)"/>
         <StatCard icon={<Clock size={16}/>} label="Uptime" value={health?fmtUptime(health.uptime_secs):'—'} color="var(--blue)"/>
         <StatCard icon={<Database size={16}/>} label="Mempool" value={health?.mempool_size??'—'} color="var(--amber)"/>
+        <StatCard icon={<Shield size={16}/>} label="VPN" value={vpnStatus?.active ? (vpnStatus.vpn_ip ?? 'verbunden') : '—'} color={vpnStatus?.active ? 'var(--green)' : 'var(--text-muted)'} subtitle={vpnStatus?.active ? `${vpnStatus.peer_count} peers` : undefined}/>
       </div>
 
       {/* System Stats */}
@@ -160,17 +177,18 @@ export default function DashboardView() {
       </div>
       <div ref={logRef} style={{background:"#0a0b0f",border:"1px solid var(--border)",borderRadius:10,padding:12,fontFamily:"'SF Mono',Menlo,monospace",fontSize:11,color:"#a0a0a0",height:200,overflowY:"auto",whiteSpace:"pre-wrap",lineHeight:1.5}}>
         {logs.length===0&&<span style={{opacity:0.5}}>Warte auf Node-Logs…</span>}
-        {logs.map((l,i)=><div key={i} style={{color:l.startsWith('[err]')?'#ef4444':l.startsWith('[out]')?'var(--text-dim)':'var(--text-muted)'}}>{l}</div>)}
+        {logs.map((l,i)=><div key={i} style={{color:l.startsWith('[err]')?'#ef4444':l.startsWith('[vpn]')?'#22c55e':l.startsWith('[out]')?'var(--text-dim)':'var(--text-muted)'}}>{l}</div>)}
       </div>
     </div>
   );
 }
 
-function StatCard({icon,label,value,color,bar,barColor}:{icon?:any;label:string;value:string|number;color:string;bar?:number;barColor?:string}){
+function StatCard({icon,label,value,color,bar,barColor,subtitle}:{icon?:any;label:string;value:string|number;color:string;bar?:number;barColor?:string;subtitle?:string}){
   return(
     <div style={{background:"var(--bg-panel)",border:"1px solid var(--border)",borderRadius:10,padding:14}}>
       <div style={{display:"flex",alignItems:"center",gap:6,marginBottom:4,color:"var(--text-muted)"}}>{icon}<span style={{fontSize:12,fontWeight:600}}>{label}</span></div>
       <div style={{fontSize:22,fontWeight:700,fontFamily:"monospace",color}}>{value}</div>
+      {subtitle && <div style={{fontSize:10,color:"var(--text-muted)",marginTop:2}}>{subtitle}</div>}
       {bar!==undefined&&<div style={{height:6,background:"rgba(255,255,255,0.06)",borderRadius:3,overflow:"hidden",marginTop:8}}><div style={{height:"100%",borderRadius:3,background:barColor||color,width:Math.min(100,bar)+"%",transition:"width .3s"}}/></div>}
     </div>
   );

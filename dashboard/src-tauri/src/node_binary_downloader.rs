@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Manager};
 
 const GITHUB_API: &str = "https://api.github.com/repos/Stone310-crypto/stone/releases/latest";
-const BINARY_NAMES: &[&str] = &["stone-app-node", "stone-master"];
+const BINARY_NAMES: &[&str] = &["stone-app-node", "stone-master", "stonevpn"];
 
 #[derive(Debug, Deserialize)]
 struct GitHubAsset {
