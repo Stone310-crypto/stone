@@ -1,9 +1,13 @@
-use std::io::{Read, Write};
-use std::net::Ipv4Addr;
-use std::os::unix::io::AsRawFd;
-use std::process::Command;
+// ── Unix implementation ──────────────────────────────────────────
 
-pub struct TunDevice {
+#[cfg(unix)]
+mod unix_impl {
+    use std::io::{Read, Write};
+    use std::net::Ipv4Addr;
+    use std::os::unix::io::AsRawFd;
+    use std::process::Command;
+
+    pub struct TunDevice {
     dev: Box<dyn ReadWrite>,
     ip: Ipv4Addr,
 }
@@ -241,3 +245,28 @@ impl TunDevice {
         Ok(())
     }
 }
+} // close unix_impl
+
+#[cfg(unix)]
+pub use unix_impl::TunDevice;
+
+// ── Windows stub ──────────────────────────────────────────────────
+
+#[cfg(not(unix))]
+mod windows_stub {
+    use std::net::Ipv4Addr;
+
+    pub struct TunDevice;
+    impl TunDevice {
+        pub fn create(_ip: Ipv4Addr) -> Result<Self, String> {
+            Err("TUN device not supported on Windows".into())
+        }
+        pub fn ip(&self) -> Ipv4Addr { Ipv4Addr::new(10, 1, 0, 1) }
+        pub fn read_packet(&mut self) -> Result<Vec<u8>, String> { Ok(vec![]) }
+        pub fn write_packet(&mut self, _data: &[u8]) -> Result<(), String> { Ok(()) }
+        pub fn enable_ip_forwarding() {}
+    }
+}
+
+#[cfg(not(unix))]
+pub use windows_stub::TunDevice;

@@ -29,6 +29,7 @@ mod ip_pool;
 mod crypto;
 mod peer;
 mod tunnel;
+#[cfg(unix)]
 mod tun_device;
 
 use clap::Parser;
@@ -73,9 +74,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("║ Modus:   {: <30} ║", if args.relay { "RELAY" } else { "CLIENT" });
     eprintln!("╚══════════════════════════════════════════╝");
 
-    // Relay: IP-Forwarding + NAT aktivieren
+    // Relay: IP-Forwarding + NAT aktivieren (nur Unix)
+    #[cfg(unix)]
     if args.relay {
         tun_device::TunDevice::enable_ip_forwarding();
+    }
+    #[cfg(not(unix))]
+    if args.relay {
+        eprintln!("⚠️  Relay-Modus ist nur auf Linux/macOS verfügbar");
     }
 
     let pool = ip_pool::IpPool::new(&args.ip_pool)?;
