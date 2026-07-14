@@ -440,8 +440,8 @@ pub async fn get_vpn_status(
         }
         _ => {
             // Fallback: lade direkt aus dem Datenverzeichnis
-            let data_dir_name = if cfg.network == "mainnet" { "node_data_mainnet" } else { "node_data_testnet" };
-            if let Ok(dir) = std::env::current_exe().and_then(|_| {
+            let _data_dir_name = if cfg.network == "mainnet" { "node_data_mainnet" } else { "node_data_testnet" };
+            if let Ok(_dir) = std::env::current_exe().and_then(|_| {
                 Ok(std::env::var("STONE_DATA_DIR").unwrap_or_default())
             }) {
                 // ignore
@@ -587,7 +587,7 @@ WantedBy=multi-user.target"#
         let log_file = std::fs::File::create(&log_path)
             .map_err(|e| format!("Log-Datei: {e}"))?;
 
-        let child = std::process::Command::new(&vpn_path)
+        let mut child = std::process::Command::new(&vpn_path)
             .arg("--tun")
             .arg("--port").arg(vpn_port)
             .arg("--relays").arg(vpn_relays)
