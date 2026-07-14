@@ -72,10 +72,10 @@ jobs:
           if [ -f stone-setup.exe ]; then cp stone-setup.exe "$SETUP"; else cp stone-setup "$SETUP"; fi
           # stonevpn from stone_vpn subdir
           V="stonevpn-${{ matrix.suffix }}"
-          if [ -f ../../stone_vpn/target/${{ matrix.target }}/release/stonevpn.exe ]; then
-            cp ../../stone_vpn/target/${{ matrix.target }}/release/stonevpn.exe "$V"
-          elif [ -f ../../stone_vpn/target/${{ matrix.target }}/release/stonevpn ]; then
-            cp ../../stone_vpn/target/${{ matrix.target }}/release/stonevpn "$V"
+          if [ -f ../../../stone_vpn/target/${{ matrix.target }}/release/stonevpn.exe ]; then
+            cp ../../../stone_vpn/target/${{ matrix.target }}/release/stonevpn.exe "$V"
+          elif [ -f ../../../stone_vpn/target/${{ matrix.target }}/release/stonevpn ]; then
+            cp ../../../stone_vpn/target/${{ matrix.target }}/release/stonevpn "$V"
           fi
           if [ "$(uname)" = "Darwin" ]; then
             shasum -a 256 "$NODE" | awk '{print $1}' > "$NODE.sha256"
