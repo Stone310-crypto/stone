@@ -22,11 +22,6 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 chacha20poly1305 = "0.10"
 rand = "0.8"
 
-# TUN device (virtual network interface) — Unix only
-[target.'cfg(unix)'.dependencies]
-tun = "0.6"
-libc = "0.2"
-
 # Logging
 log = "0.4"
 env_logger = "0.11"
@@ -34,10 +29,18 @@ env_logger = "0.11"
 # CLI
 clap = { version = "4", features = ["derive"] }
 
+# Encoding
+hex = "0.4"
+
 # Networking
 socket2 = { version = "0.5", features = ["all"] }
 
 # Shared with stone (for key format compatibility)
+
+# TUN device (virtual network interface) — Unix only
+[target.'cfg(unix)'.dependencies]
+tun = "0.6"
+libc = "0.2"
 ed25519-dalek = "2"
 hex = "0.4"
 

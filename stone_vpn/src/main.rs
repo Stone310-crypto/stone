@@ -29,7 +29,6 @@ mod ip_pool;
 mod crypto;
 mod peer;
 mod tunnel;
-#[cfg(unix)]
 mod tun_device;
 
 use clap::Parser;
