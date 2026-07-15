@@ -62,22 +62,39 @@ pub fn save_users(users: &[User]) {
     }
 }
 
+/// Normalisiert eine BIP39-Phrase für konsistentes Hashing:
+/// lowercase, whitespace kollabieren, trim.
+fn normalize_phrase(phrase: &str) -> Option<String> {
+    let collapsed = phrase.split_whitespace().collect::<Vec<_>>().join(" ");
+    if collapsed.is_empty() { return None; }
+    Some(collapsed.to_lowercase())
+}
+
 pub fn create_user_with_phrase(name: &str) -> (User, String) {
     let mnemonic = Mnemonic::generate_in(Language::English, 12).unwrap();
-    let phrase = mnemonic.to_string();
-    let mut h = Sha256::new();
-    h.update(phrase.as_bytes());
-    let hash = hex::encode(h.finalize());
+    let phrase = mnemonic.to_string(); // bereits lowercase + single-space (BIP39-Standard)
+    // Normalisiere konsistent mit resolve_phrase:
+    let normalized = normalize_phrase(&phrase).unwrap_or_else(|| phrase.clone());
+    let hash = hex::encode(Sha256::digest(normalized.as_bytes()));
     let api_key = format!("sk_{}", hex::encode(&rand::random::<[u8;16]>()));
     let wallet = wallet_address_from_phrase(&phrase);
     let user = User { id: String::new(), name: name.into(), bio: String::new(), api_key, phrase_hash: hash, quota_bytes: default_quota_bytes(), wallet_address: wallet, account_type: default_account_type(), org_id: String::new(), org_role: String::new(), discord_id: String::new(), discord_username: String::new(), updated_at: chrono::Utc::now().timestamp() };
     (user, phrase)
 }
 
+/// Normalisiert die Phrase und gibt den SHA256-Hash zurück.
 pub fn resolve_phrase(phrase: &str) -> Option<String> {
+    let normalized = normalize_phrase(phrase)?;
+    let mut h = Sha256::new();
+    h.update(normalized.as_bytes());
+    Some(hex::encode(h.finalize()))
+}
+
+/// Legacy-Hash ohne Normalisierung (für Abwärtskompatibilität mit alten Accounts).
+pub fn resolve_phrase_legacy(phrase: &str) -> String {
     let mut h = Sha256::new();
     h.update(phrase.as_bytes());
-    Some(hex::encode(h.finalize()))
+    hex::encode(h.finalize())
 }
 
 pub fn wallet_address_from_phrase(phrase: &str) -> String {

@@ -402,33 +402,75 @@ pub struct VpnStatus {
     pub active: bool,
     pub installed: bool,
     pub vpn_ip: Option<String>,
+    pub vpn_id: Option<String>,
     pub peer_count: u32,
     pub peers: Vec<String>,
     pub mode: String, // "managed" | "service" | "none"
 }
 
+/// Eigene VPN-ID Info (aus vpn_id_state.json).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MyVpnIdInfo {
+    pub current_id: String,
+    pub rotation_count: u32,
+    pub previous_ids: Vec<String>,
+    pub last_rotation: u64,
+}
+
+/// Liest die VPN-ID State Datei aus dem VPN-Datenverzeichnis.
+fn read_my_vpn_id(app: &AppHandle) -> Option<MyVpnIdInfo> {
+    let path = vpn_data_dir(app).join("vpn_id_state.json");
+    let json = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&json).ok()
+}
+
 /// Prüft ob der stonevpn-Prozess aktuell läuft.
+/// Verwendet mehrere Methoden für Zuverlässigkeit.
 pub fn is_vpn_running() -> bool {
+    // Methode 1: pgrep (Unix) / tasklist (Windows)
     #[cfg(unix)]
     {
-        std::process::Command::new("pgrep")
+        let pgrep_ok = std::process::Command::new("pgrep")
+            .args(["-x", "stonevpn"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if pgrep_ok { return true; }
+        
+        // Fallback: pgrep -f (matcht auch Pfade)
+        let pgrep_f = std::process::Command::new("pgrep")
             .args(["-f", "stonevpn"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
             .map(|s| s.success())
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if pgrep_f { return true; }
+        
+        // Fallback 2: Prüfe ob Port 51821 in Benutzung ist
+        let port_check = std::process::Command::new("lsof")
+            .args(["-i", ":51821", "-s", "UDP:LISTEN"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .map(|o| !o.stdout.is_empty())
+            .unwrap_or(false);
+        if port_check { return true; }
     }
     #[cfg(target_os = "windows")]
     {
-        std::process::Command::new("tasklist")
+        let tasklist_ok = std::process::Command::new("tasklist")
             .args(["/FI", "IMAGENAME eq stonevpn.exe"])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).contains("stonevpn.exe"))
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if tasklist_ok { return true; }
     }
+    false
 }
 
 /// Prüft ob der VPN-Systemdienst installiert ist.
@@ -488,13 +530,114 @@ pub fn get_vpn_status(app: AppHandle) -> VpnStatus {
         else if running { "managed" }
         else { "none" };
 
+    let vpn_id = read_my_vpn_id(&app).map(|i| i.current_id);
+
     VpnStatus {
         active: running,
         installed,
         vpn_ip,
+        vpn_id,
         peer_count: peers.len() as u32,
         peers,
         mode: mode.to_string(),
+    }
+}
+
+/// Gibt die eigene VPN-ID und Rotations-Info zurück.
+#[tauri::command]
+pub fn get_my_vpn_id(app: AppHandle) -> Result<MyVpnIdInfo, String> {
+    read_my_vpn_id(&app)
+        .ok_or_else(|| "Keine VPN-ID gefunden. Starte den VPN zuerst, damit eine ID generiert wird.".to_string())
+}
+
+/// Generiert eine neue VPN-ID (Rotation).
+/// Die alte ID bleibt 24h gültig.
+#[tauri::command]
+pub fn rotate_my_vpn_id(app: AppHandle) -> Result<String, String> {
+    let data_dir = vpn_data_dir(&app);
+    let path = data_dir.join("vpn_id_state.json");
+
+    // Lade aktuellen State oder erstelle neuen
+    let mut state: serde_json::Value = if path.exists() {
+        let json = std::fs::read_to_string(&path)
+            .map_err(|e| format!("Lesen fehlgeschlagen: {e}"))?;
+        serde_json::from_str(&json)
+            .map_err(|e| format!("Parse: {e}"))?
+    } else {
+        // Neuen State anlegen
+        serde_json::json!({
+            "current_id": "00000000",
+            "rotation_count": 0,
+            "previous_ids": [],
+            "last_rotation": 0
+        })
+    };
+
+    let old_id = state["current_id"].as_str().unwrap_or("00000000").to_string();
+
+    // Neue zufällige ID generieren
+    let new_id: String = {
+        use rand::Rng;
+        let mut rng = rand::thread_rng();
+        let bytes: [u8; 4] = rng.gen();
+        hex::encode(bytes)
+    };
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    // Alte ID in previous_ids verschieben (max 5)
+    let mut previous: Vec<String> = state["previous_ids"]
+        .as_array()
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        .unwrap_or_default();
+    previous.push(old_id.clone());
+    if previous.len() > 5 { previous.remove(0); }
+
+    let count = state["rotation_count"].as_u64().unwrap_or(0) as u32 + 1;
+
+    state["current_id"] = serde_json::json!(new_id);
+    state["rotation_count"] = serde_json::json!(count);
+    state["previous_ids"] = serde_json::json!(previous);
+    state["last_rotation"] = serde_json::json!(now);
+
+    // Zurückschreiben
+    std::fs::create_dir_all(&data_dir).ok();
+    let json = serde_json::to_string_pretty(&state)
+        .map_err(|e| format!("Serialize: {e}"))?;
+    std::fs::write(&path, json)
+        .map_err(|e| format!("Schreiben: {e}"))?;
+
+    Ok(new_id)
+}
+
+/// Stellt sicher, dass eine VPN-ID existiert (generiert Erst-ID).
+fn ensure_vpn_id_exists(app: &AppHandle) {
+    let data_dir = vpn_data_dir(app);
+    let path = data_dir.join("vpn_id_state.json");
+    if !path.exists() {
+        let _ = std::fs::create_dir_all(&data_dir);
+        let new_id: String = {
+            use rand::Rng;
+            let bytes: [u8; 4] = rand::thread_rng().gen();
+            hex::encode(bytes)
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let state = serde_json::json!({
+            "current_id": new_id,
+            "rotation_count": 0,
+            "previous_ids": [],
+            "last_rotation": now
+        });
+        if let Ok(json) = serde_json::to_string_pretty(&state) {
+            let _ = std::fs::write(&path, json);
+            eprintln!("[vpn] 🆔 Erste VPN-ID generiert: {new_id}");
+        }
     }
 }
 
@@ -502,6 +645,9 @@ pub fn get_vpn_status(app: AppHandle) -> VpnStatus {
 /// Der VPN läuft solange, bis die App ihn stoppt oder beendet wird.
 #[tauri::command]
 pub fn start_vpn(app: AppHandle) -> Result<String, String> {
+    // Stelle sicher, dass eine VPN-ID existiert (generiere Erst-ID falls nötig)
+    ensure_vpn_id_exists(&app);
+
     // Prüfe ob bereits ein VPN läuft
     if is_vpn_running() {
         // Bereits aktiv — IP auslesen

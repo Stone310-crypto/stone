@@ -5,7 +5,7 @@ import { useQueryClient } from "@tanstack/react-query";
 import Avatar from "../../components/ui/Avatar";
 import { nodeManager, type NodeConfig, type NodeStatus } from "../../api/node";
 import { useNodeHealth } from "../../hooks/useNodeHealth";
-import { LogOut, Settings, Copy, Check, User, Server, Play, Square, RefreshCw, Wifi, WifiOff } from "lucide-react";
+import { LogOut, Settings, Copy, Check, User, Server, Play, Square, RefreshCw, Wifi, WifiOff, Shield, RotateCw } from "lucide-react";
 
 type Panel = "profile" | "settings" | "node";
 
@@ -483,6 +483,42 @@ export default function ProfileView() {
   const [nodeUrl, setNodeUrl] = useState(settings.nodeUrl);
   const [saved, setSaved] = useState(false);
 
+  // ─── VPN-ID Info ──────────────────────────────────────────────────────
+  const [vpnId, setVpnId] = useState<string | null>(null);
+  const [vpnIdRotating, setVpnIdRotating] = useState(false);
+  const [vpnIdResult, setVpnIdResult] = useState<string | null>(null);
+
+  useEffect(() => {
+    const poll = async () => {
+      try {
+        const { invoke } = await import("@tauri-apps/api/core");
+        const info: any = await invoke("get_my_vpn_id");
+        if (info?.current_id && info.current_id !== "00000000") {
+          setVpnId(info.current_id);
+        }
+      } catch(e) {}
+    };
+    poll();
+    const id = setInterval(poll, 10000);
+    return () => clearInterval(id);
+  }, []);
+
+  async function rotateVpnId() {
+    setVpnIdRotating(true);
+    setVpnIdResult(null);
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      const newId: string = await invoke("rotate_my_vpn_id");
+      setVpnId(newId);
+      setVpnIdResult(`Neue ID: ${newId}`);
+      setTimeout(() => setVpnIdResult(null), 5000);
+    } catch(e: any) {
+      setVpnIdResult("❌ " + (e?.toString() ?? "Fehler"));
+    } finally {
+      setVpnIdRotating(false);
+    }
+  }
+
   function copyWallet() {
     if (!session) return;
     navigator.clipboard.writeText(session.walletAddress);
@@ -628,6 +664,29 @@ export default function ProfileView() {
                       {copied ? <Check size={12} /> : <Copy size={12} />}
                     </button>
                   </div>
+                </div>
+
+                {/* Nutzer-ID */}
+                <div style={{ marginTop: 10, background: "rgba(99,102,241,0.06)", border: "1px solid rgba(99,102,241,0.15)", borderRadius: 10, padding: "10px 12px" }}>
+                  <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: vpnId ? 5 : 0 }}>
+                    <p style={{ fontSize: 11, fontWeight: 500, color: "var(--text-muted)", display: "flex", alignItems: "center", gap: 4 }}>
+                      <Shield size={11} /> Nutzer-ID
+                    </p>
+                    {vpnId && (
+                      <button onClick={rotateVpnId} disabled={vpnIdRotating}
+                        style={{ padding: "3px 8px", borderRadius: 5, background: "rgba(99,102,241,0.15)", color: "#818cf8", border: "1px solid rgba(99,102,241,0.25)", cursor: "pointer", fontSize: 9, fontWeight: 600, display: "flex", alignItems: "center", gap: 3, opacity: vpnIdRotating ? 0.5 : 1 }}>
+                        <RotateCw size={9} style={{ animation: vpnIdRotating ? "spin 1s linear infinite" : "none" }} /> Neue ID
+                      </button>
+                    )}
+                  </div>
+                  {vpnId ? (
+                    <p style={{ fontFamily: "monospace", fontSize: 13, fontWeight: 600, color: "#818cf8" }}>{vpnId}</p>
+                  ) : (
+                    <p style={{ fontSize: 11, color: "var(--text-muted)" }}>Nutzer-ID wird generiert, sobald der VPN startet.</p>
+                  )}
+                  {vpnIdResult && (
+                    <p style={{ fontSize: 10, color: vpnIdResult.startsWith("❌") ? "var(--red)" : "#818cf8", marginTop: 3 }}>{vpnIdResult}</p>
+                  )}
                 </div>
               </div>
             </div>

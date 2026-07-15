@@ -1,7 +1,7 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useAuth } from "../../auth/AuthContext";
 import Avatar from "../../components/ui/Avatar";
-import { ArrowLeft, X, Camera, Loader2 } from "lucide-react";
+import { ArrowLeft, X, Camera, Loader2, RotateCw, Copy, Check } from "lucide-react";
 
 interface ProfileEditOverlayProps {
   onClose: () => void;
@@ -15,6 +15,41 @@ export default function ProfileEditOverlay({ onClose }: ProfileEditOverlayProps)
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
   const [saved, setSaved] = useState(false);
+
+  // ─── VPN-ID ──────────────────────────────────────────────────────────
+  const [vpnId, setVpnId] = useState<string | null>(null);
+  const [vpnIdChanging, setVpnIdChanging] = useState(false);
+  const [vpnIdCopied, setVpnIdCopied] = useState(false);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const { invoke } = await import("@tauri-apps/api/core");
+        const info: any = await invoke("get_my_vpn_id");
+        if (info?.current_id && info.current_id !== "00000000") setVpnId(info.current_id);
+      } catch {}
+    })();
+  }, []);
+
+  async function rotateVpnId() {
+    setVpnIdChanging(true);
+    try {
+      const { invoke } = await import("@tauri-apps/api/core");
+      const newId: string = await invoke("rotate_my_vpn_id");
+      setVpnId(newId);
+    } catch(e: any) {
+      setError(e?.toString() ?? "Fehler beim ID-Wechsel");
+    } finally {
+      setVpnIdChanging(false);
+    }
+  }
+
+  function copyVpnId() {
+    if (!vpnId) return;
+    navigator.clipboard.writeText(vpnId);
+    setVpnIdCopied(true);
+    setTimeout(() => setVpnIdCopied(false), 2000);
+  }
 
   const handleSave = async () => {
     if (!username.trim()) return;
@@ -175,6 +210,37 @@ export default function ProfileEditOverlay({ onClose }: ProfileEditOverlayProps)
               />
               <p style={{ fontSize: 10, color: "var(--text-muted)", marginTop: 4 }}>
                 Server-Tags werden in zukünftigen Updates verfügbar sein.
+              </p>
+            </div>
+
+            {/* Nutzer-ID */}
+            <div>
+              <label style={{ display: "block", fontSize: 11, fontWeight: 600, color: "var(--text-muted)", marginBottom: 6, textTransform: "uppercase", letterSpacing: "0.04em" }}>
+                🛡 Nutzer-ID
+              </label>
+              {vpnId ? (
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <div style={{ flex: 1, padding: "10px 12px", borderRadius: 10, background: "rgba(99,102,241,0.08)", border: "1px solid rgba(99,102,241,0.2)", fontFamily: "monospace", fontSize: 14, fontWeight: 600, color: "#818cf8" }}>
+                    {vpnId}
+                  </div>
+                  <button onClick={copyVpnId} title="ID kopieren"
+                    style={{ padding: 8, borderRadius: 8, background: "var(--bg-input)", border: "1px solid var(--border-default)", color: vpnIdCopied ? "var(--green)" : "var(--text-muted)", cursor: "pointer", flexShrink: 0 }}>
+                    {vpnIdCopied ? <Check size={14} /> : <Copy size={14} />}
+                  </button>
+                  <button onClick={rotateVpnId} disabled={vpnIdChanging}
+                    title="Neue zufällige ID generieren"
+                    style={{ padding: "8px 14px", borderRadius: 8, background: "rgba(99,102,241,0.15)", border: "1px solid rgba(99,102,241,0.3)", color: "#818cf8", cursor: "pointer", fontSize: 12, fontWeight: 600, display: "flex", alignItems: "center", gap: 6, whiteSpace: "nowrap", opacity: vpnIdChanging ? 0.5 : 1 }}>
+                    <RotateCw size={12} style={{ animation: vpnIdChanging ? "spin 1s linear infinite" : "none" }} />
+                    {vpnIdChanging ? "…" : "Neue ID"}
+                  </button>
+                </div>
+              ) : (
+                <div style={{ padding: "10px 12px", borderRadius: 10, background: "var(--bg-surface)", border: "1px solid var(--border-default)", fontSize: 12, color: "var(--text-muted)" }}>
+                  Starte den VPN, um eine Nutzer-ID zu generieren.
+                </div>
+              )}
+              <p style={{ fontSize: 10, color: "var(--text-muted)", marginTop: 4 }}>
+                Deine Nutzer-ID wird zum Finden von Freunden verwendet. Du kannst sie jederzeit ändern.
               </p>
             </div>
 

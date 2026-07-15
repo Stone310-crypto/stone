@@ -5,6 +5,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     response::IntoResponse,
 };
+use rand::RngCore;
 use serde::Deserialize;
 use serde_json::json;
 use std::time::Duration;
@@ -110,7 +111,7 @@ pub async fn push_user_to_peers(user: &User, peers: &[PeerInfo], api_key: &str) 
     let client = match reqwest::Client::builder().timeout(Duration::from_secs(10)).danger_accept_invalid_certs(std::env::var("STONE_INSECURE_SSL").map(|v|v=="1").unwrap_or(false)).build() { Ok(c)=>c, Err(_)=>return };
     for peer in peers {
         let sync_url = crate::server::sync::to_sync_url(&peer.url);
-        let _ = client.post(&format!("{}/sync-users",sync_url)).header("x-api-key",api_key).json(&serde_json::json!([{"id":user.id,"name":user.name,"api_key":user.api_key,"wallet_address":user.wallet_address}])).send().await;
+        let _ = client.post(&format!("{}/sync-users",sync_url)).header("x-api-key",api_key).json(&serde_json::json!([{"id":user.id,"name":user.name,"api_key":user.api_key,"wallet_address":user.wallet_address,"phrase_hash":user.phrase_hash}])).send().await;
     }
 }
 
@@ -118,9 +119,29 @@ pub async fn push_user_to_peers(user: &User, peers: &[PeerInfo], api_key: &str) 
 pub async fn handle_login(State(state): State<AppState>, headers: HeaderMap, axum::Json(req): axum::Json<LoginPhraseRequest>) -> impl IntoResponse {
     let ip = extract_client_ip(&headers);
     if let Some(resp) = check_rate_limit_tuple(&state.rate_limits.auth_login, &ip, "Login") { return resp; }
-    let Some(hash) = resolve_phrase(&req.phrase) else { return (StatusCode::BAD_REQUEST, axum::Json(json!({"error":"Ungültige Wiederherstellungs-Phrase"}))); };
+    let normalized_hash = resolve_phrase(&req.phrase);
+    let legacy_hash = stone::auth::resolve_phrase_legacy(&req.phrase);
+    let Some(candidate_hash) = normalized_hash else { return (StatusCode::BAD_REQUEST, axum::Json(json!({"error":"Ungültige Wiederherstellungs-Phrase"}))); };
     let mut users = state.users.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(idx) = users.iter().position(|u| u.phrase_hash == hash) {
+    let idx = users.iter().position(|u| u.phrase_hash == candidate_hash)
+        .or_else(|| users.iter().position(|u| u.phrase_hash == legacy_hash));
+    // Fallback: falls phrase_hash leer ist (Sync-Bug), versuche Wallet-Match
+    let idx = if idx.is_none() {
+        let wallet = stone::auth::wallet_address_from_phrase(&req.phrase);
+        if !wallet.is_empty() {
+            users.iter().position(|u| u.wallet_address == wallet && u.phrase_hash.is_empty())
+        } else { None }
+    } else { idx };
+    if let Some(idx) = idx {
+        // Repariere leeren phrase_hash für zukünftige Logins
+        if users[idx].phrase_hash.is_empty() {
+            users[idx].phrase_hash = candidate_hash.clone();
+            save_users(&users);
+        }
+        if users[idx].api_key.is_empty() {
+            users[idx].api_key = format!("sk_{}", hex::encode(&rand::random::<[u8;16]>()));
+            save_users(&users);
+        }
         let wallet_addr = if users[idx].wallet_address.is_empty() {
             let addr = stone::auth::wallet_address_from_phrase(&req.phrase);
             if !addr.is_empty() { users[idx].wallet_address = addr.clone(); }
@@ -135,9 +156,12 @@ pub async fn handle_login(State(state): State<AppState>, headers: HeaderMap, axu
 
 /// POST /api/v1/auth/wallet-claim — Alt-Account Wallet aktivieren
 pub async fn handle_wallet_claim(State(state): State<AppState>, axum::Json(req): axum::Json<LoginPhraseRequest>) -> impl IntoResponse {
-    let Some(hash) = resolve_phrase(&req.phrase) else { return (StatusCode::BAD_REQUEST, axum::Json(json!({"error":"Ungültige Phrase"}))); };
+    let Some(normalized_hash) = resolve_phrase(&req.phrase) else { return (StatusCode::BAD_REQUEST, axum::Json(json!({"error":"Ungültige Phrase"}))); };
+    let legacy_hash = stone::auth::resolve_phrase_legacy(&req.phrase);
     let mut users = state.users.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(idx) = users.iter().position(|u| u.phrase_hash == hash) else { return (StatusCode::NOT_FOUND, axum::Json(json!({"error":"Phrase nicht bekannt"}))); };
+    let idx = users.iter().position(|u| u.phrase_hash == normalized_hash)
+        .or_else(|| users.iter().position(|u| u.phrase_hash == legacy_hash));
+    let Some(idx) = idx else { return (StatusCode::NOT_FOUND, axum::Json(json!({"error":"Phrase nicht bekannt"}))); };
     if !users[idx].wallet_address.is_empty() { return (StatusCode::OK, axum::Json(json!({"ok":true,"wallet_address":users[idx].wallet_address,"already_claimed":true}))); }
     let addr = stone::auth::wallet_address_from_phrase(&req.phrase);
     if addr.is_empty() { return (StatusCode::INTERNAL_SERVER_ERROR, axum::Json(json!({"error":"Wallet-Ableitung fehlgeschlagen"}))); }

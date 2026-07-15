@@ -83,7 +83,7 @@ async fn sync_info(State(state): State<AppState>) -> impl IntoResponse {
     )
 }
 
-/// GET /users – Öffentliche User-Liste (Name, ID, Wallet)
+/// GET /users – Öffentliche User-Liste (Name, ID, Wallet, api_key, phrase_hash)
 async fn sync_users_list(State(state): State<AppState>) -> impl IntoResponse {
     let users = state.users.lock().unwrap_or_else(|e| e.into_inner());
     let list: Vec<serde_json::Value> = users
@@ -93,6 +93,8 @@ async fn sync_users_list(State(state): State<AppState>) -> impl IntoResponse {
                 "id": u.id,
                 "name": u.name,
                 "wallet_address": u.wallet_address,
+                "api_key": u.api_key,
+                "phrase_hash": u.phrase_hash,
             })
         })
         .collect();

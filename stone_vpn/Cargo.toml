@@ -15,12 +15,20 @@ tokio = { version = "1", features = ["full"] }
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+serde_bytes = "0.11"
 bincode = "2"
 
 # Cryptography (WireGuard-kompatibel: X25519 + ChaCha20Poly1305)
 x25519-dalek = { version = "2", features = ["static_secrets"] }
 chacha20poly1305 = "0.10"
 rand = "0.8"
+sha2 = "0.10"
+blake3 = "1"
+
+# BIP39 Mnemonic + Ed25519 für Identitäten/Wallets
+bip39 = { version = "2", features = ["rand"] }
+ed25519-dalek = "2"
+zeroize = { version = "1", features = ["derive"] }
 
 # Logging
 log = "0.4"
@@ -35,14 +43,13 @@ hex = "0.4"
 # Networking
 socket2 = { version = "0.5", features = ["all"] }
 
-# Shared with stone (for key format compatibility)
-
 # TUN device (virtual network interface) — Unix only
 [target.'cfg(unix)'.dependencies]
 tun = "0.6"
 libc = "0.2"
-ed25519-dalek = "2"
-hex = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
 
 [profile.release]
 opt-level = 3

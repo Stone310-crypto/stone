@@ -26,6 +26,10 @@ const TYPE_HANDSHAKE: u8 = 0x01;
 const TYPE_DATA: u8 = 0x02;
 const TYPE_KEEPALIVE: u8 = 0x03;
 const TYPE_ROUTE_ANNOUNCE: u8 = 0x04;
+const TYPE_CHAT: u8 = 0x06;
+const TYPE_FRIEND_REQUEST: u8 = 0x0A;
+const TYPE_FRIEND_RESPONSE: u8 = 0x0B;
+const TYPE_ID_CHANGE_NOTIFY: u8 = 0x0C;
 
 /// Maximale Paketgröße
 const MAX_PACKET: usize = 1500;
@@ -228,6 +232,18 @@ async fn handle_packet(
         }
         TYPE_ROUTE_ANNOUNCE => {
             handle_route_announce(registry, sender_pk, payload)
+        }
+        TYPE_CHAT => {
+            handle_chat(registry, sender_pk, payload, src).await
+        }
+        TYPE_FRIEND_REQUEST => {
+            handle_friend_request(registry, sender_pk, payload, src).await
+        }
+        TYPE_FRIEND_RESPONSE => {
+            handle_friend_response(registry, sender_pk, payload).await
+        }
+        TYPE_ID_CHANGE_NOTIFY => {
+            handle_id_change_notify(registry, sender_pk, payload).await
         }
         _ => Err(format!("Unbekannter Paket-Typ: {pkt_type}")),
     }
@@ -451,6 +467,85 @@ fn handle_route_announce(
 
     eprintln!("📍 Route-Announce: {:?} = {new_ip}", &new_pk[..4]);
     // Peer ist bereits registriert (via Relay), nur IP aktualisieren
+    Ok(())
+}
+
+// ── Messenger-Handler (NEU) ───────────────────────────────────────────────
+
+/// Verarbeitet eine eingehende Chat-Nachricht (TYPE_CHAT).
+async fn handle_chat(
+    registry: &mut PeerRegistry,
+    _sender_pk: [u8; 32],
+    payload: &[u8],
+    _src: SocketAddr,
+) -> Result<(), String> {
+    // Payload enthält die E2EE-verschlüsselte ChatMessage.
+    // Entschlüsselung erfolgt in der GUI/App, nicht hier im Tunnel.
+    if payload.len() < 32 {
+        return Err("Chat-Paket zu kurz".into());
+    }
+    // Message-ID sind die ersten 32 Bytes
+    let msg_id_hex = hex::encode(&payload[0..8.min(payload.len())]);
+    eprintln!("💬 Chat-Nachricht empfangen (msg={msg_id_hex}…, len={})", payload.len());
+    Ok(())
+}
+
+/// Verarbeitet eine Freundschaftsanfrage (TYPE_FRIEND_REQUEST).
+async fn handle_friend_request(
+    _registry: &mut PeerRegistry,
+    _sender_pk: [u8; 32],
+    payload: &[u8],
+    _src: SocketAddr,
+) -> Result<(), String> {
+    match serde_json::from_slice::<crate::friends::FriendRequest>(payload) {
+        Ok(req) => {
+            eprintln!("👥 Freundschaftsanfrage: {} → {} (Name: {})",
+                &req.from_id[..8.min(req.from_id.len())],
+                &req.to_id[..8.min(req.to_id.len())],
+                req.display_name,
+            );
+        }
+        Err(_) => { /* Nicht als JSON parsebar, ignorieren */ }
+    }
+    Ok(())
+}
+
+/// Verarbeitet eine Antwort auf eine Freundschaftsanfrage (TYPE_FRIEND_RESPONSE).
+async fn handle_friend_response(
+    _registry: &mut PeerRegistry,
+    _sender_pk: [u8; 32],
+    payload: &[u8],
+) -> Result<(), String> {
+    match serde_json::from_slice::<crate::friends::FriendResponse>(payload) {
+        Ok(resp) => {
+            let status = if resp.accepted { "✅ akzeptiert" } else { "❌ abgelehnt" };
+            eprintln!("👥 Freundschaftsanfrage {}: {} ← {}",
+                status,
+                &resp.from_id[..8.min(resp.from_id.len())],
+                &resp.to_id[..8.min(resp.to_id.len())],
+            );
+        }
+        Err(_) => {}
+    }
+    Ok(())
+}
+
+/// Verarbeitet eine ID-Wechsel-Benachrichtigung (TYPE_ID_CHANGE_NOTIFY).
+async fn handle_id_change_notify(
+    _registry: &mut PeerRegistry,
+    _sender_pk: [u8; 32],
+    payload: &[u8],
+) -> Result<(), String> {
+    match serde_json::from_slice::<crate::friends::IdChangeNotify>(payload) {
+        Ok(notify) => {
+            eprintln!("🔄 ID-Wechsel: {} → {} (Wallet: {}…)",
+                &notify.old_id[..8.min(notify.old_id.len())],
+                &notify.new_id[..8.min(notify.new_id.len())],
+                &hex::encode(&notify.wallet_hash)[..8],
+            );
+        }
+        Err(_) => {}
+    }
     Ok(())
 }
 
