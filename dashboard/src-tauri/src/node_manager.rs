@@ -425,52 +425,27 @@ fn read_my_vpn_id(app: &AppHandle) -> Option<MyVpnIdInfo> {
 }
 
 /// Prüft ob der stonevpn-Prozess aktuell läuft.
-/// Verwendet mehrere Methoden für Zuverlässigkeit.
 pub fn is_vpn_running() -> bool {
-    // Methode 1: pgrep (Unix) / tasklist (Windows)
     #[cfg(unix)]
     {
-        let pgrep_ok = std::process::Command::new("pgrep")
-            .args(["-x", "stonevpn"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false);
-        if pgrep_ok { return true; }
-        
-        // Fallback: pgrep -f (matcht auch Pfade)
-        let pgrep_f = std::process::Command::new("pgrep")
+        std::process::Command::new("pgrep")
             .args(["-f", "stonevpn"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
             .map(|s| s.success())
-            .unwrap_or(false);
-        if pgrep_f { return true; }
-        
-        // Fallback 2: Prüfe ob Port 51821 in Benutzung ist
-        let port_check = std::process::Command::new("lsof")
-            .args(["-i", ":51821", "-s", "UDP:LISTEN"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output()
-            .map(|o| !o.stdout.is_empty())
-            .unwrap_or(false);
-        if port_check { return true; }
+            .unwrap_or(false)
     }
     #[cfg(target_os = "windows")]
     {
-        let tasklist_ok = std::process::Command::new("tasklist")
+        std::process::Command::new("tasklist")
             .args(["/FI", "IMAGENAME eq stonevpn.exe"])
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .output()
             .map(|o| String::from_utf8_lossy(&o.stdout).contains("stonevpn.exe"))
-            .unwrap_or(false);
-        if tasklist_ok { return true; }
+            .unwrap_or(false)
     }
-    false
 }
 
 /// Prüft ob der VPN-Systemdienst installiert ist.
@@ -530,124 +505,63 @@ pub fn get_vpn_status(app: AppHandle) -> VpnStatus {
         else if running { "managed" }
         else { "none" };
 
-    let vpn_id = read_my_vpn_id(&app).map(|i| i.current_id);
-
     VpnStatus {
         active: running,
         installed,
         vpn_ip,
-        vpn_id,
+        vpn_id: read_my_vpn_id(&app).map(|i| i.current_id),
         peer_count: peers.len() as u32,
         peers,
         mode: mode.to_string(),
     }
 }
 
-/// Gibt die eigene VPN-ID und Rotations-Info zurück.
+/// Liest die eigene VPN-ID aus der State-Datei.
 #[tauri::command]
 pub fn get_my_vpn_id(app: AppHandle) -> Result<MyVpnIdInfo, String> {
-    read_my_vpn_id(&app)
-        .ok_or_else(|| "Keine VPN-ID gefunden. Starte den VPN zuerst, damit eine ID generiert wird.".to_string())
+    read_my_vpn_id(&app).ok_or_else(|| "Keine VPN-ID gefunden — stonevpn läuft evtl. nicht.".into())
 }
 
-/// Generiert eine neue VPN-ID (Rotation).
-/// Die alte ID bleibt 24h gültig.
+/// Rotiert die VPN-ID (generiert neue Identität).
 #[tauri::command]
 pub fn rotate_my_vpn_id(app: AppHandle) -> Result<String, String> {
+    // Zufällige ID generieren
+    use rand::Rng;
+    let new_id: String = rand::thread_rng()
+        .sample_iter(&rand::distributions::Alphanumeric)
+        .take(32)
+        .map(char::from)
+        .collect();
     let data_dir = vpn_data_dir(&app);
-    let path = data_dir.join("vpn_id_state.json");
+    let _ = std::fs::create_dir_all(&data_dir);
+    let state_path = data_dir.join("vpn_id_state.json");
 
-    // Lade aktuellen State oder erstelle neuen
-    let mut state: serde_json::Value = if path.exists() {
-        let json = std::fs::read_to_string(&path)
-            .map_err(|e| format!("Lesen fehlgeschlagen: {e}"))?;
-        serde_json::from_str(&json)
-            .map_err(|e| format!("Parse: {e}"))?
-    } else {
-        // Neuen State anlegen
-        serde_json::json!({
-            "current_id": "00000000",
-            "rotation_count": 0,
-            "previous_ids": [],
-            "last_rotation": 0
-        })
-    };
+    let mut info = read_my_vpn_id(&app).unwrap_or(MyVpnIdInfo {
+        current_id: String::new(),
+        rotation_count: 0,
+        previous_ids: vec![],
+        last_rotation: 0,
+    });
 
-    let old_id = state["current_id"].as_str().unwrap_or("00000000").to_string();
-
-    // Neue zufällige ID generieren
-    let new_id: String = {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
-        let bytes: [u8; 4] = rng.gen();
-        hex::encode(bytes)
-    };
-
-    let now = std::time::SystemTime::now()
+    info.previous_ids.push(info.current_id.clone());
+    info.current_id = new_id.clone();
+    info.rotation_count += 1;
+    info.last_rotation = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
 
-    // Alte ID in previous_ids verschieben (max 5)
-    let mut previous: Vec<String> = state["previous_ids"]
-        .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-        .unwrap_or_default();
-    previous.push(old_id.clone());
-    if previous.len() > 5 { previous.remove(0); }
+    std::fs::write(&state_path, serde_json::to_string_pretty(&info).map_err(|e| e.to_string())?)
+        .map_err(|e| format!("VPN-ID State konnte nicht geschrieben werden: {e}"))?;
 
-    let count = state["rotation_count"].as_u64().unwrap_or(0) as u32 + 1;
-
-    state["current_id"] = serde_json::json!(new_id);
-    state["rotation_count"] = serde_json::json!(count);
-    state["previous_ids"] = serde_json::json!(previous);
-    state["last_rotation"] = serde_json::json!(now);
-
-    // Zurückschreiben
-    std::fs::create_dir_all(&data_dir).ok();
-    let json = serde_json::to_string_pretty(&state)
-        .map_err(|e| format!("Serialize: {e}"))?;
-    std::fs::write(&path, json)
-        .map_err(|e| format!("Schreiben: {e}"))?;
-
-    Ok(new_id)
-}
-
-/// Stellt sicher, dass eine VPN-ID existiert (generiert Erst-ID).
-fn ensure_vpn_id_exists(app: &AppHandle) {
-    let data_dir = vpn_data_dir(app);
-    let path = data_dir.join("vpn_id_state.json");
-    if !path.exists() {
-        let _ = std::fs::create_dir_all(&data_dir);
-        let new_id: String = {
-            use rand::Rng;
-            let bytes: [u8; 4] = rand::thread_rng().gen();
-            hex::encode(bytes)
-        };
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let state = serde_json::json!({
-            "current_id": new_id,
-            "rotation_count": 0,
-            "previous_ids": [],
-            "last_rotation": now
-        });
-        if let Ok(json) = serde_json::to_string_pretty(&state) {
-            let _ = std::fs::write(&path, json);
-            eprintln!("[vpn] 🆔 Erste VPN-ID generiert: {new_id}");
-        }
-    }
+    Ok(format!("VPN-ID rotiert → {}", &new_id[..8]))
 }
 
 /// Startet stonevpn direkt (nicht als Systemdienst).
 /// Der VPN läuft solange, bis die App ihn stoppt oder beendet wird.
 #[tauri::command]
+#[allow(unused_variables)]
 pub fn start_vpn(app: AppHandle) -> Result<String, String> {
-    // Stelle sicher, dass eine VPN-ID existiert (generiere Erst-ID falls nötig)
-    ensure_vpn_id_exists(&app);
-
     // Prüfe ob bereits ein VPN läuft
     if is_vpn_running() {
         // Bereits aktiv — IP auslesen
@@ -710,7 +624,7 @@ pub fn start_vpn(app: AppHandle) -> Result<String, String> {
             .stdout(log_file.try_clone().map_err(|e| format!("{e}"))?)
             .stderr(log_file);
 
-        let child = cmd.spawn()
+        let mut child = cmd.spawn()
             .map_err(|e| format!("Start fehlgeschlagen: {e}\n\n💡 Tipp: Starte die App als Administrator, damit TUN-Devices erstellt werden können."))?;
 
         let pid = child.id();
@@ -764,6 +678,7 @@ pub fn stop_vpn() -> Result<String, String> {
 
 /// Installiert stonevpn als Systemdienst (LaunchDaemon / systemd).
 #[tauri::command]
+#[allow(unused_variables)]
 pub fn install_vpn_service(app: AppHandle) -> Result<String, String> {
     let vpn_binary = find_vpn_binary(&app)
         .ok_or_else(|| "stonevpn-Binary nicht gefunden.".to_string())?;
