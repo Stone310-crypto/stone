@@ -303,20 +303,19 @@ jobs:
       - name: Sign all updater artifacts (fallback if .sig missing)
         run: |
           cd dashboard
-          # Write private key to temp file
           echo "${TAURI_SIGNING_PRIVATE_KEY}" > /tmp/updater.key
-          # Sign each updater artifact that lacks a .sig file
+          shopt -s nullglob
           for f in ../release/Stone-Dashboard-*.app.tar.gz ../release/Stone-Dashboard-*.AppImage.tar.gz ../release/Stone-Dashboard_*_x64-setup.exe; do
             [ -f "$f" ] || continue
             SIG="${f}.sig"
             if [ ! -f "$SIG" ]; then
               echo "Generating signature for: $(basename $f)"
               npx tauri signer sign --private-key /tmp/updater.key --password "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD}" "$f" || {
-                echo "WARNING: Failed to sign $f — trying without password"
-                npx tauri signer sign --private-key /tmp/updater.key "$f" || echo "ERROR: Signing failed for $f"
+                echo "WARNING: Failed with password — trying without"
+                npx tauri signer sign --private-key /tmp/updater.key "$f" || echo "ERROR: Signing totally failed for $f"
               }
             else
-              echo "Signature exists: $(basename $SIG)"
+              echo "Signature exists: $(basename $SIG) ($(wc -c < "$SIG") bytes)"
             fi
           done
           rm -f /tmp/updater.key
