@@ -243,7 +243,75 @@ pub fn find_binary(app: &AppHandle, override_path: &str) -> Option<PathBuf> {
     candidates.into_iter().find(|p| p.exists())
 }
 
-// ── VPN (jetzt im libp2p-Swarm integriert, kein separater Prozess) ──────────
+// ── node_config.db writer ─────────────────────────────────────────────────────
+
+/// Write config to node_config.db (and node_config.json for backward compat).
+fn write_node_config(data_dir: &PathBuf, cfg: &NodeConfig) -> Result<(), String> {
+    // Primär: SQLite-DB
+    if let Ok(db) = crate::node_config_db::NodeConfigDB::open(data_dir) {
+        let _ = db.set("setup_complete", "true");
+        let _ = db.set("node_name", "StoneDesktopNode");
+        let _ = db.set("wallet_address", "");
+        let _ = db.set_u16("http_port", cfg.port);
+        let _ = db.set_u16("p2p_port", 5003);
+        let _ = db.set("data_dir", &data_dir.to_string_lossy());
+        let _ = db.set("auto_mining_enabled", "true");
+        let _ = db.set("auto_mining_timeout_secs", "120");
+        let _ = db.set("miner_heartbeat_timeout_secs", "30");
+        let _ = db.set("api_key", &cfg.api_key);
+        let _ = db.set("network", &cfg.network);
+
+        // seed_peers als JSON-Array
+        let seed_peers_json: Vec<String> = cfg
+            .seed_peers
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        let json = serde_json::to_string(&seed_peers_json).map_err(|e| format!("serialize: {e}"))?;
+        let _ = db.set("seed_peers", &json);
+
+        // Bootstrap-Nodes
+        let net = if cfg.network == "mainnet" { "mainnet" } else { "testnet" };
+        let _ = db.replace_bootstrap_nodes(&seed_peers_json, net);
+    }
+
+    // Sekundär: JSON (Abwärtskompatibilität)
+    let seed_peers_json: Vec<serde_json::Value> = cfg
+        .seed_peers
+        .split(',')
+        .map(|s| serde_json::Value::String(s.trim().to_string()))
+        .filter(|v| !v.as_str().unwrap_or("").is_empty())
+        .collect();
+
+    let node_cfg = serde_json::json!({
+        "setup_complete": true,
+        "node_name": "StoneDesktopNode",
+        "wallet_address": "",
+        "seed_peers": seed_peers_json,
+        "http_port": cfg.port,
+        "p2p_port": 5003,
+        "data_dir": data_dir.to_string_lossy(),
+        "auto_mining_enabled": true,
+        "auto_mining_timeout_secs": 120,
+        "miner_heartbeat_timeout_secs": 30
+    });
+
+    let json = serde_json::to_string_pretty(&node_cfg)
+        .map_err(|e| format!("Config-Serialisierung: {e}"))?;
+    std::fs::write(data_dir.join("node_config.json"), json)
+        .map_err(|e| format!("Config schreiben: {e}"))?;
+
+    Ok(())
+}
+
+// ── Tauri commands ────────────────────────────────────────────────────────────
+
+#[tauri::command]
+pub fn node_get_logs(state: tauri::State<'_, SharedNodeState>) -> Vec<String> {
+    let s = state.lock().unwrap_or_else(|e| e.into_inner());
+    s.peek_logs(200)
+}
 //
 // Die alten VPN-Funktionen existieren nur noch als Stubs für
 // Abwärtskompatibilität. Der VPN läuft jetzt direkt im P2P-Swarm
@@ -252,14 +320,35 @@ pub fn find_binary(app: &AppHandle, override_path: &str) -> Option<PathBuf> {
 //   POST /api/v1/vpn/rotate
 //   POST /api/v1/users/me/vpn-id
 
+/// VPN-Status für das Dashboard (Stub — wird via Node-HTTP-API abgefragt).
+#[derive(Debug, Clone, Serialize)]
+pub struct VpnStatus {
+    pub active: bool,
+    pub installed: bool,
+    pub vpn_ip: Option<String>,
+    pub vpn_id: Option<String>,
+    pub peer_count: u32,
+    pub peers: Vec<String>,
+    pub mode: String,
+}
+
+/// Eigene VPN-ID Info (Stub — wird via Node-HTTP-API abgefragt).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MyVpnIdInfo {
+    pub current_id: String,
+    pub rotation_count: u32,
+    pub previous_ids: Vec<String>,
+    pub last_rotation: u64,
+}
+
 /// Veraltet: Der VPN ist jetzt im libp2p-Swarm integriert.
 pub fn find_vpn_binary(_app: &AppHandle) -> Option<PathBuf> {
-    None // Keine separate Binary mehr nötig
+    None
 }
 
 /// Veraltet: Der VPN läuft jetzt im Node-Prozess.
 pub fn is_vpn_running() -> bool {
-    false // Wird jetzt über die Node-HTTP-API abgefragt
+    false
 }
 
 /// Veraltet: Kein separater Systemdienst mehr nötig.
@@ -271,13 +360,8 @@ pub fn is_vpn_service_installed() -> bool {
 #[tauri::command]
 pub fn get_vpn_status(_app: AppHandle) -> VpnStatus {
     VpnStatus {
-        active: false,
-        installed: false,
-        vpn_ip: None,
-        vpn_id: None,
-        peer_count: 0,
-        peers: vec![],
-        mode: "integrated".into(),
+        active: false, installed: false, vpn_ip: None, vpn_id: None,
+        peer_count: 0, peers: vec![], mode: "integrated".into(),
     }
 }
 
@@ -293,22 +377,22 @@ pub fn rotate_my_vpn_id(_app: AppHandle) -> Result<String, String> {
     Err("VPN-ID-Rotation jetzt via Node-HTTP-API: POST /api/v1/vpn/rotate".into())
 }
 
-/// Veraltet: Der VPN startet automatisch mit dem Node (kein manueller Start nötig).
+/// Veraltet: Der VPN startet automatisch mit dem Node.
 #[tauri::command]
 pub fn start_vpn(_app: AppHandle) -> Result<String, String> {
-    Ok("ℹ️ Der VPN ist jetzt im Stone-Node integriert und läuft automatisch, sobald P2P aktiv ist.".into())
+    Ok("ℹ️ Der VPN ist jetzt im Stone-Node integriert und läuft automatisch.".into())
 }
 
 /// Veraltet: Der VPN stoppt automatisch mit dem Node.
 #[tauri::command]
 pub fn stop_vpn() -> Result<String, String> {
-    Ok("ℹ️ Der VPN ist jetzt im Stone-Node integriert und stoppt automatisch mit dem Node.".into())
+    Ok("ℹ️ Der VPN ist jetzt im Stone-Node integriert und stoppt automatisch.".into())
 }
 
 /// Veraltet: Kein separater Systemdienst mehr nötig.
 #[tauri::command]
 pub fn install_vpn_service(_app: AppHandle) -> Result<String, String> {
-    Ok("ℹ️ Der VPN läuft jetzt direkt im Node-Prozess — kein separater Dienst nötig.".into())
+    Ok("ℹ️ Der VPN läuft jetzt direkt im Node-Prozess.".into())
 }
 
 /// Veraltet.
@@ -321,6 +405,19 @@ pub fn stop_vpn_service() -> Result<String, String> {
 #[tauri::command]
 pub fn uninstall_vpn_service() -> Result<String, String> {
     Ok("ℹ️ Kein separater VPN-Dienst vorhanden.".into())
+}
+
+// ── Health ────────────────────────────────────────────────────────────────────
+
+/// Ruft Blockchain-Netzwerkdaten von der lokalen Node ab.
+#[derive(Debug, Clone, Serialize)]
+pub struct NodeHealthResponse {
+    pub block_height: u64,
+    pub peer_count: u64,
+    pub uptime_secs: u64,
+    pub mempool_size: u64,
+    pub network: String,
+    pub node_id: String,
 }
 
 #[tauri::command]
