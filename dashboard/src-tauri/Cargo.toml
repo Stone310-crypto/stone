@@ -52,4 +52,6 @@ chrono = "0.4"
 rusqlite = { version = "0.31", features = ["bundled-sqlcipher-vendored-openssl", "serde_json"] }
 hostname = "0.4"
 futures = { version = "0.3", features = ["async-await"] }
+# Integrierter VPN (keine externe Binary mehr nötig)
+stonevpn = { path = "../../stone_vpn", default-features = false }
 

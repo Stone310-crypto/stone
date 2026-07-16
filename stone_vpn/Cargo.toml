@@ -4,9 +4,18 @@ version = "0.1.0"
 edition = "2021"
 description = "StoneChain Mesh VPN — Overlay-Netzwerk für Stone Nodes"
 
+[lib]
+name = "stonevpn"
+path = "src/lib.rs"
+
 [[bin]]
 name = "stonevpn"
 path = "src/main.rs"
+required-features = ["cli"]
+
+[features]
+default = ["cli"]
+cli = ["clap", "env_logger"]
 
 [dependencies]
 # Async runtime
@@ -32,16 +41,18 @@ zeroize = { version = "1", features = ["derive"] }
 
 # Logging
 log = "0.4"
-env_logger = "0.11"
+env_logger = { version = "0.11", optional = true }
 
 # CLI
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive"], optional = true }
 
 # Encoding
 hex = "0.4"
 
 # Networking
 socket2 = { version = "0.5", features = ["all"] }
+
+# Shared with stone (for key format compatibility)
 
 # TUN device (virtual network interface) — Unix only
 [target.'cfg(unix)'.dependencies]

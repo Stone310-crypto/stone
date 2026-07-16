@@ -11,6 +11,7 @@
 //!   - Sendet Keepalives (alle 25s) um NAT-Mapping offen zu halten
 //!   - Empfängt Daten vom Relay (von anderen Clients)
 
+use crate::types::VpnStatusUpdate;
 use crate::peer::PeerRegistry;
 use crate::tun_device::TunDevice;
 use tokio::net::UdpSocket;
@@ -26,7 +27,9 @@ const TYPE_HANDSHAKE: u8 = 0x01;
 const TYPE_DATA: u8 = 0x02;
 const TYPE_KEEPALIVE: u8 = 0x03;
 const TYPE_ROUTE_ANNOUNCE: u8 = 0x04;
+const TYPE_NAT_PROBE: u8 = 0x05;       // Client→Relay: "Bin ich erreichbar?"
 const TYPE_CHAT: u8 = 0x06;
+const TYPE_NAT_PROBE_ACK: u8 = 0x09;   // Relay→Client: "Ja, ich habe dich erreicht"
 const TYPE_FRIEND_REQUEST: u8 = 0x0A;
 const TYPE_FRIEND_RESPONSE: u8 = 0x0B;
 const TYPE_ID_CHANGE_NOTIFY: u8 = 0x0C;
@@ -46,6 +49,29 @@ pub struct TunnelConfig {
 }
 
 pub async fn run(socket: UdpSocket, mut registry: PeerRegistry, config: TunnelConfig) -> Result<(), Box<dyn std::error::Error>> {
+    run_inner(socket, registry, config, None, None, "unknown".into()).await
+}
+
+/// Wie `run`, aber mit Channel-basierten Status-Updates für die Dashboard-Integration.
+pub async fn run_with_status(
+    socket: UdpSocket,
+    registry: PeerRegistry,
+    config: TunnelConfig,
+    status_tx: mpsc::UnboundedSender<VpnStatusUpdate>,
+    status_arc: Arc<tokio::sync::RwLock<VpnStatusUpdate>>,
+    mode_str: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    run_inner(socket, registry, config, Some(status_tx), Some(status_arc), mode_str).await
+}
+
+async fn run_inner(
+    socket: UdpSocket,
+    mut registry: PeerRegistry,
+    config: TunnelConfig,
+    status_tx: Option<mpsc::UnboundedSender<VpnStatusUpdate>>,
+    status_arc: Option<Arc<tokio::sync::RwLock<VpnStatusUpdate>>>,
+    mode_str: String,
+) -> Result<(), Box<dyn std::error::Error>> {
     let mut buf = [0u8; MAX_PACKET];
     let mut our_vpn_ip: Option<Ipv4Addr> = None;
     let mut tun: Option<Arc<Mutex<TunDevice>>> = None;
@@ -166,6 +192,25 @@ pub async fn run(socket: UdpSocket, mut registry: PeerRegistry, config: TunnelCo
                 eprintln!("📊 [{}] {}", if registry.is_relay() { "RELAY" } else { "CLIENT" }, t);
                 // Peer-Liste als JSON speichern (für Diagnose)
                 registry.write_peers_json();
+                // Channel-basiertes Status-Update (für Dashboard-Integration)
+                if let Some(ref tx) = status_tx {
+                    let update = VpnStatusUpdate {
+                        vpn_ip: our_vpn_ip.map(|ip| ip.to_string()),
+                        peer_count: registry.count(),
+                        tun_active: tun.is_some(),
+                        mode: mode_str.clone(),
+                        updated_at: std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                    };
+                    if let Some(ref arc) = status_arc {
+                        if let Ok(mut w) = arc.try_write() {
+                            *w = update.clone();
+                        }
+                    }
+                    let _ = tx.send(update);
+                }
                 if our_vpn_ip.is_none() && !registry.is_relay() {
                     for ra in registry.relay_addrs().to_vec() {
                         let _ = send_handshake(&socket, registry.keypair(), ra).await;
@@ -228,6 +273,23 @@ async fn handle_packet(
             if let Some(peer) = registry.by_pubkey(&sender_pk).map(|p| p.clone()) {
                 eprintln!("💓 Keepalive von {} (VPN {})", src, peer.vpn_ip);
             }
+            Ok(())
+        }
+        TYPE_NAT_PROBE => {
+            // Relay: Client fragt ob sein Port erreichbar ist → ACK zurück
+            eprintln!("🔍 NAT-Probe von {src}");
+            let our_pk = registry.our_pubkey();
+            let mut ack = vec![TYPE_NAT_PROBE_ACK];
+            ack.extend_from_slice(&our_pk);
+            ack.extend_from_slice(&src.port().to_be_bytes());
+            socket.send_to(&ack, src).await.map_err(|e| e.to_string())?;
+            eprintln!("✅ NAT-Probe-ACK gesendet an {src}");
+            Ok(())
+        }
+        TYPE_NAT_PROBE_ACK => {
+            // Client: Relay hat unseren Port erreicht → Port ist offen!
+            eprintln!("🟢 NAT-Probe-ACK von {src} — Port ist offen (Relay-fähig)!");
+            registry.set_nat_open(true);
             Ok(())
         }
         TYPE_ROUTE_ANNOUNCE => {
@@ -299,6 +361,12 @@ async fn handle_handshake(
                     Err(e) => eprintln!("⚠️ TUN: {e}"),
                 }
             }
+            // NAT-Probe: Relay fragen ob unser Port erreichbar ist
+            let our_pk = registry.our_pubkey();
+            let mut probe = vec![TYPE_NAT_PROBE];
+            probe.extend_from_slice(&our_pk);
+            let _ = socket.send_to(&probe, src).await;
+            eprintln!("🔍 NAT-Probe gesendet an Relay {src}");
         }
     }
     Ok(())

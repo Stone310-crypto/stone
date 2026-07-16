@@ -37,6 +37,8 @@ pub struct PeerRegistry {
     our_vpn_ip: Option<Ipv4Addr>,
     /// Pfad zum stone_data Verzeichnis
     stone_data: PathBuf,
+    /// NAT-Probe: true wenn Port von außen erreichbar (→ relay-fähig)
+    nat_open: bool,
 }
 
 impl PeerRegistry {
@@ -56,6 +58,7 @@ impl PeerRegistry {
             is_relay,
             our_vpn_ip: None,
             stone_data,
+            nat_open: false,
         }
     }
 
@@ -113,6 +116,20 @@ impl PeerRegistry {
 
     pub fn is_relay(&self) -> bool {
         self.is_relay
+    }
+
+    /// Markiert den Port als von außen erreichbar (nach NAT-Probe).
+    pub fn set_nat_open(&mut self, open: bool) {
+        self.nat_open = open;
+        if open && !self.is_relay {
+            eprintln!("🟢 NAT-Probe erfolgreich — Port ist offen, Relay-Modus aktiviert");
+            self.is_relay = true;
+        }
+    }
+
+    /// true wenn NAT-Probe erfolgreich war (Port offen).
+    pub fn is_nat_open(&self) -> bool {
+        self.nat_open
     }
 
     pub fn relay_addrs(&self) -> &[SocketAddr] {

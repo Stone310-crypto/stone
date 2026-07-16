@@ -6,6 +6,7 @@ mod modules;
 mod extensions;
 mod gaming_proxy;
 mod miner_manager;
+mod vpn_manager;
 use tauri::{AppHandle, Manager};
 use node_manager::{
     SharedNodeState, NodeState, NodeStatus,
@@ -16,14 +17,13 @@ use node_manager::{
     load_config,
     get_node_health,
     get_vpn_status,
-    get_my_vpn_id,
-    rotate_my_vpn_id,
     start_vpn,
     stop_vpn,
     install_vpn_service,
     stop_vpn_service,
     uninstall_vpn_service,
 };
+use vpn_manager::IntegratedVpn;
 use miner_manager::{
     SharedMinerState, MinerState,
     miner_start, miner_stop, miner_status, miner_set_autostart,
@@ -183,6 +183,38 @@ fn detect_file_type_cmd(path: String) -> Result<Option<file_upload::MagicByteInf
     Ok(file_upload::detect_file_type(&buf))
 }
 
+// ─── Integrierter VPN (stonevpn Library, keine externe Binary) ─────────────
+
+/// Status des integrierten VPN abrufen.
+#[tauri::command]
+async fn vpn_status(state: tauri::State<'_, IntegratedVpn>) -> Result<stonevpn::VpnStatusUpdate, String> {
+    Ok(state.status().await)
+}
+
+/// Integrierten VPN starten.
+#[tauri::command]
+async fn vpn_start(state: tauri::State<'_, IntegratedVpn>, app: AppHandle) -> Result<stonevpn::VpnStatusUpdate, String> {
+    if state.is_running().await {
+        return Ok(state.status().await);
+    }
+    let data_dir = app.path().app_data_dir()
+        .unwrap_or_else(|_| std::path::PathBuf::from("."))
+        .join("vpn_data");
+    let _ = std::fs::create_dir_all(&data_dir);
+    let config = stonevpn::VpnConfig {
+        stone_data: data_dir,
+        ..Default::default()
+    };
+    state.start(config).await
+}
+
+/// Integrierten VPN stoppen.
+#[tauri::command]
+async fn vpn_stop(state: tauri::State<'_, IntegratedVpn>) -> Result<bool, String> {
+    state.stop().await;
+    Ok(true)
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -258,22 +290,36 @@ pub fn run() {
                     }
                 }
 
-                // VPN auto-starten (wenn Binary vorhanden, nicht als Systemdienst installiert)
+                // Integrierter VPN auto-starten (keine externe Binary mehr nötig)
                 let app_handle_vpn = app_handle_dl.clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_secs(3));
-                    if !node_manager::is_vpn_running() && !node_manager::is_vpn_service_installed() {
-                        if node_manager::find_vpn_binary(&app_handle_vpn).is_some() {
-                            eprintln!("[app] VPN auto-start…");
-                            if let Err(e) = node_manager::start_vpn(app_handle_vpn.clone()) {
-                                eprintln!("[app] VPN auto-start: {e}");
-                            }
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                    let vpn_state = app_handle_vpn.state::<IntegratedVpn>();
+                    if !vpn_state.is_running().await {
+                        let data_dir = app_handle_vpn.path().app_data_dir()
+                            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+                            .join("vpn_data");
+                        let _ = std::fs::create_dir_all(&data_dir);
+                        let config = stonevpn::VpnConfig {
+                            ip_pool: "10.1.0.0/24".into(),
+                            port: 51821,
+                            relays: "212.227.54.241:51821".into(),
+                            stone_data: data_dir,
+                            enable_tun: true,
+                            relay: false,
+                        };
+                        eprintln!("[app] Integrierter VPN auto-start…");
+                        if let Err(e) = vpn_state.start(config).await {
+                            eprintln!("[app] VPN auto-start: {e}");
                         }
                     }
                 });
             });
 
             app.manage(shared);
+
+            // Integrierter VPN-State
+            app.manage(IntegratedVpn::new());
 
             // Miner state
             let miner_state = MinerState::new();
@@ -293,10 +339,11 @@ pub fn run() {
             switch_node_network,
             get_node_health,
             get_vpn_status,
-            get_my_vpn_id,
-            rotate_my_vpn_id,
             start_vpn,
             stop_vpn,
+            vpn_status,
+            vpn_start,
+            vpn_stop,
             install_vpn_service,
             stop_vpn_service,
             uninstall_vpn_service,

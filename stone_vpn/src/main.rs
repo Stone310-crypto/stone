@@ -30,11 +30,12 @@ mod crypto;
 mod peer;
 mod tunnel;
 mod tun_device;
-mod identity;
-mod vpn_id;
-mod storage;
+mod types;
 mod friends;
 mod chat;
+mod storage;
+mod vpn_id;
+mod identity;
 
 use clap::Parser;
 use std::net::SocketAddr;
