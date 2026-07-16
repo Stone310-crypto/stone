@@ -123,18 +123,45 @@ pub async fn handle_login(State(state): State<AppState>, headers: HeaderMap, axu
     let legacy_hash = stone::auth::resolve_phrase_legacy(&req.phrase);
     let Some(candidate_hash) = normalized_hash else { return (StatusCode::BAD_REQUEST, axum::Json(json!({"error":"Ungültige Wiederherstellungs-Phrase"}))); };
     let mut users = state.users.lock().unwrap_or_else(|e| e.into_inner());
+
+    // Debug: zeige Hash-Info
+    let wallet_derived = stone::auth::wallet_address_from_phrase(&req.phrase);
+    let user_count = users.len();
+    let users_with_hash = users.iter().filter(|u| !u.phrase_hash.is_empty()).count();
+    eprintln!("[login] ip={ip} hash={}… legacy={}… wallet={}… users={} with_hash={}",
+        &candidate_hash[..16], &legacy_hash[..16], &wallet_derived[..16], user_count, users_with_hash);
+
     let idx = users.iter().position(|u| u.phrase_hash == candidate_hash)
         .or_else(|| users.iter().position(|u| u.phrase_hash == legacy_hash));
     // Fallback: falls phrase_hash leer ist (Sync-Bug), versuche Wallet-Match
-    let idx = if idx.is_none() {
-        let wallet = stone::auth::wallet_address_from_phrase(&req.phrase);
-        if !wallet.is_empty() {
-            users.iter().position(|u| u.wallet_address == wallet && u.phrase_hash.is_empty())
+    let mut idx = if idx.is_none() {
+        if !wallet_derived.is_empty() {
+            let wallet_idx = users.iter().position(|u| u.wallet_address == wallet_derived && u.phrase_hash.is_empty());
+            if wallet_idx.is_some() {
+                eprintln!("[login] 🔧 Wallet-Fallback (leerer hash) für wallet={}…", &wallet_derived[..16]);
+            }
+            wallet_idx
         } else { None }
     } else { idx };
+
+    // Zweiter Fallback: Wallet-Match auch wenn phrase_hash existiert aber nicht matched
+    // (z.B. nach Algorithmus-Änderung zwischen Versionen)
+    if idx.is_none() && !wallet_derived.is_empty() {
+        idx = users.iter().position(|u| u.wallet_address == wallet_derived);
+        if idx.is_some() {
+            eprintln!("[login] 🔧 Wallet-Fallback (hash-Mismatch) für wallet={}…", &wallet_derived[..16]);
+        }
+    }
     if let Some(idx) = idx {
         // Repariere leeren phrase_hash für zukünftige Logins
         if users[idx].phrase_hash.is_empty() {
+            users[idx].phrase_hash = candidate_hash.clone();
+            save_users(&users);
+            eprintln!("[login] 🔧 phrase_hash repariert für user={}", users[idx].id);
+        }
+        // Aktualisiere phrase_hash falls er nicht mit candidate_hash übereinstimmt (Algorithmus-Change)
+        if !users[idx].phrase_hash.is_empty() && users[idx].phrase_hash != candidate_hash && users[idx].phrase_hash != legacy_hash {
+            eprintln!("[login] 🔧 phrase_hash aktualisiert (alt={}… neu={}…)", &users[idx].phrase_hash[..16], &candidate_hash[..16]);
             users[idx].phrase_hash = candidate_hash.clone();
             save_users(&users);
         }
