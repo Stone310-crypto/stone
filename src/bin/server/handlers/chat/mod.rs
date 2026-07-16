@@ -293,7 +293,7 @@ fn reconcile_stale_pending_entries(
     healed
 }
 
-/// Lokale Suche: state.users + on-chain account_names.
+/// Lokale Suche: state.users + on-chain account_names + VPN-ID.
 pub(super) fn resolve_local(identifier: &str, state: &AppState) -> Vec<serde_json::Value> {
     let users = state.users.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -309,7 +309,18 @@ pub(super) fn resolve_local(identifier: &str, state: &AppState) -> Vec<serde_jso
         }
     }
 
-    // 2) Wallet-Adresse direkt
+    // 2) VPN Nutzer-ID (exakt)
+    if let Some(u) = users.iter().find(|u| u.vpn_id.as_deref() == Some(identifier)) {
+        return vec![json!({
+            "user_id": u.id,
+            "name": u.name,
+            "bio": u.bio,
+            "wallet": u.wallet_address,
+            "vpn_id": u.vpn_id,
+        })];
+    }
+
+    // 3) Wallet-Adresse direkt
     if identifier.len() == 64 && identifier.chars().all(|c| c.is_ascii_hexdigit()) {
         if let Some(u) = users.iter().find(|u| u.wallet_address == identifier) {
             return vec![json!({
@@ -330,7 +341,7 @@ pub(super) fn resolve_local(identifier: &str, state: &AppState) -> Vec<serde_jso
         }
     }
 
-    // 3) Name-Suche (case-insensitive, substring) — lokale Users
+    // 4) Name-Suche (case-insensitive, substring) — lokale Users
     let lower = identifier.to_lowercase();
     let mut matches: Vec<serde_json::Value> = users
         .iter()
@@ -345,7 +356,7 @@ pub(super) fn resolve_local(identifier: &str, state: &AppState) -> Vec<serde_jso
         })
         .collect();
 
-    // 4) On-Chain Account-Registry (andere Nodes)
+    // 5) On-Chain Account-Registry (andere Nodes)
     {
         let known_wallets: std::collections::HashSet<String> = matches
             .iter()

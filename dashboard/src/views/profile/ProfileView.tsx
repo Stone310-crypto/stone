@@ -511,6 +511,13 @@ export default function ProfileView() {
       const newId: string = await invoke("rotate_my_vpn_id");
       setVpnId(newId);
       setVpnIdResult(`Neue ID: ${newId}`);
+      // Beim Server registrieren, damit Freunde die ID finden können
+      try {
+        const { auth } = await import("../../api/stone");
+        await auth.registerVpnId(newId);
+      } catch {
+        // Server-Registrierung optional — ID funktioniert auch lokal
+      }
       setTimeout(() => setVpnIdResult(null), 5000);
     } catch(e: any) {
       setVpnIdResult("❌ " + (e?.toString() ?? "Fehler"));

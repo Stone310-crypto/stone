@@ -37,6 +37,11 @@ export default function ProfileEditOverlay({ onClose }: ProfileEditOverlayProps)
       const { invoke } = await import("@tauri-apps/api/core");
       const newId: string = await invoke("rotate_my_vpn_id");
       setVpnId(newId);
+      // Beim Server registrieren
+      try {
+        const { auth } = await import("../../api/stone");
+        await auth.registerVpnId(newId);
+      } catch { /* optional */ }
     } catch(e: any) {
       setError(e?.toString() ?? "Fehler beim ID-Wechsel");
     } finally {

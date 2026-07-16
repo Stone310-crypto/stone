@@ -485,6 +485,7 @@ pub async fn pull_users_from_peer(peer_url: &str, _api_key: &str, users: &Arc<Mu
         let wallet = ru["wallet_address"].as_str().unwrap_or_default().to_string();
         let api_key = ru["api_key"].as_str().unwrap_or_default().to_string();
         let phrase_hash = ru["phrase_hash"].as_str().unwrap_or_default().to_string();
+        let vpn_id = ru["vpn_id"].as_str().unwrap_or_default().to_string();
         if name.is_empty() { continue; }
         let existing = local.iter_mut().find(|u| {
             (!u.wallet_address.is_empty() && !wallet.is_empty() && u.wallet_address == wallet) || (!id.is_empty() && u.id == id)
@@ -494,6 +495,7 @@ pub async fn pull_users_from_peer(peer_url: &str, _api_key: &str, users: &Arc<Mu
             if ex.wallet_address.is_empty() && !wallet.is_empty() { ex.wallet_address = wallet; updated += 1; }
             if ex.api_key.is_empty() && !api_key.is_empty() { ex.api_key = api_key; updated += 1; }
             if ex.phrase_hash.is_empty() && !phrase_hash.is_empty() { ex.phrase_hash = phrase_hash; updated += 1; }
+            if ex.vpn_id.is_none() && !vpn_id.is_empty() { ex.vpn_id = Some(vpn_id); updated += 1; }
             continue;
         }
         local.push(User {
@@ -502,7 +504,7 @@ pub async fn pull_users_from_peer(peer_url: &str, _api_key: &str, users: &Arc<Mu
             quota_bytes: stone::auth::default_quota_bytes(),
             wallet_address: wallet, account_type: stone::auth::default_account_type(),
             org_id: String::new(), org_role: String::new(),
-            discord_id: String::new(), discord_username: String::new(), bio: String::new(), updated_at: 0,
+            discord_id: String::new(), discord_username: String::new(), bio: String::new(), vpn_id: None, updated_at: 0,
         });
         added += 1;
     }
@@ -626,7 +628,7 @@ async fn sync_users_from_peer(node: &Arc<MasterNodeState>, peer_url: &str) {
             quota_bytes: stone::auth::default_quota_bytes(),
             wallet_address: wallet, account_type: stone::auth::default_account_type(),
             org_id: String::new(), org_role: String::new(),
-            discord_id: String::new(), discord_username: String::new(), bio: String::new(), updated_at: 0,
+            discord_id: String::new(), discord_username: String::new(), bio: String::new(), vpn_id: None, updated_at: 0,
         });
     }
 
@@ -747,7 +749,7 @@ pub fn sync_chain_accounts_to_users(node: &Arc<MasterNodeState>, users: &Arc<Mut
         if exists { continue; }
         let api_key_hash = ledger.account_api_key_hash(wallet).unwrap_or_default().to_string();
         let id = format!("u-{}", uuid::Uuid::new_v4().to_string().split('-').next().unwrap_or("0000"));
-        local.push(User { id, name: name.clone(), bio: String::new(), api_key: api_key_hash.clone(), phrase_hash: api_key_hash, quota_bytes: stone::auth::default_quota_bytes(), wallet_address: wallet.clone(), account_type: stone::auth::default_account_type(), org_id: String::new(), org_role: String::new(), discord_id: String::new(), discord_username: String::new(), updated_at: chrono::Utc::now().timestamp() });
+        local.push(User { id, name: name.clone(), bio: String::new(), api_key: api_key_hash.clone(), phrase_hash: api_key_hash, quota_bytes: stone::auth::default_quota_bytes(), wallet_address: wallet.clone(), account_type: stone::auth::default_account_type(), org_id: String::new(), org_role: String::new(), discord_id: String::new(), discord_username: String::new(), vpn_id: None, updated_at: chrono::Utc::now().timestamp() });
         added += 1;
     }
     if added > 0 { save_users(&local); println!("[sync] 📋 {added} Chain-Accounts in lokale User-Liste synchronisiert"); }

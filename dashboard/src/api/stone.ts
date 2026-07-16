@@ -59,6 +59,11 @@ export const auth = {
   qrStatus: (token: string) =>
     apiFetch<{ status: string; session_token?: string; api_key?: string; phrase?: string; user?: any }>(
       `/api/v1/auth/qr/status/${token}`, { skipAuth: true }),
+  /// Registriert die VPN Nutzer-ID beim Server (für Freundesuche via /chat/resolve)
+  registerVpnId: (vpnId: string) =>
+    apiFetch<{ ok: boolean; vpn_id: string }>("/api/v1/users/me/vpn-id", {
+      method: "POST", body: JSON.stringify({ vpn_id: vpnId }),
+    }),
 };
 
 // ── Node ──────────────────────────────────────────────────────────────────────

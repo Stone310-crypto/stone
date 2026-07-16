@@ -650,3 +650,47 @@ pub async fn handle_list_bug_reports(
         })),
     ))
 }
+
+// ─── VPN Nutzer-ID ──────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct UpdateVpnIdRequest {
+    pub vpn_id: String,
+}
+
+/// POST /api/v1/users/me/vpn-id — Registriert die VPN Nutzer-ID beim Server,
+/// damit sie über /api/v1/chat/resolve/ gefunden werden kann.
+pub async fn handle_update_vpn_id(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    axum::Json(req): axum::Json<UpdateVpnIdRequest>,
+) -> impl IntoResponse {
+    let user = match require_user(&headers, &state) {
+        Ok(u) => u,
+        Err(e) => return e.into_response(),
+    };
+
+    let vpn_id = req.vpn_id.trim().to_string();
+    if vpn_id.is_empty() || vpn_id.len() < 4 || vpn_id.len() > 64 {
+        return (StatusCode::BAD_REQUEST, axum::Json(json!({"error": "Ungültige VPN-ID"}))).into_response();
+    }
+
+    {
+        let mut users = state.users.lock().unwrap_or_else(|e| e.into_inner());
+        // Entferne diese VPN-ID von anderen Usern (falls ID recycled wurde)
+        for u in users.iter_mut() {
+            if u.vpn_id.as_deref() == Some(&vpn_id) && u.id != user.id {
+                u.vpn_id = None;
+            }
+        }
+        // Setze die neue VPN-ID
+        if let Some(u) = users.iter_mut().find(|u| u.id == user.id) {
+            u.vpn_id = Some(vpn_id.clone());
+            save_users(&users);
+        } else {
+            return (StatusCode::NOT_FOUND, axum::Json(json!({"error": "User nicht gefunden"}))).into_response();
+        }
+    }
+
+    (StatusCode::OK, axum::Json(json!({"ok": true, "vpn_id": vpn_id}))).into_response()
+}

@@ -328,7 +328,7 @@ async fn sync_receive_users(
                 org_id: String::new(),
                 org_role: String::new(),
                 discord_id: String::new(),
-                discord_username: String::new(), bio: String::new(), updated_at: 0,
+                discord_username: String::new(), bio: String::new(), vpn_id: None, updated_at: 0,
             });
             added += 1;
         }
@@ -654,7 +654,7 @@ async fn sync_qr_approve(
         org_id: String::new(),
         org_role: String::new(),
         discord_id: String::new(),
-        discord_username: String::new(), bio: String::new(), updated_at: 0,
+        discord_username: String::new(), bio: String::new(), vpn_id: None, updated_at: 0,
     });
 
     let session_token = stone::auth::generate_session_token(

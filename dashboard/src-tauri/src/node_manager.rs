@@ -577,23 +577,38 @@ pub fn start_vpn(app: AppHandle) -> Result<String, String> {
     let vpn_port = "51821";
     let vpn_relays = "212.227.54.241:51821";
     let data_dir = vpn_data_dir(&app);
-    let _ = std::fs::create_dir_all(&data_dir);
+    // Datenverzeichnis erstellen — Fehler nicht ignorieren!
+    std::fs::create_dir_all(&data_dir)
+        .map_err(|e| format!("VPN-Datenverzeichnis konnte nicht erstellt werden: {e}"))?;
     let data_str = data_dir.to_string_lossy().to_string();
     let log_path = data_dir.join("stonevpn.log");
 
-    let log_file = std::fs::File::create(&log_path)
-        .map_err(|e| format!("Log-Datei: {e}"))?;
+    // Alte Log-Datei löschen (vermeidet Permission-Denied wenn Admin-owned)
+    let _ = std::fs::remove_file(&log_path);
+
+    // Log-Datei öffnen; falls nicht möglich → ohne Log fortfahren (stderr/stdio verwerfen)
+    let use_log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&log_path)
+        .is_ok();
 
     #[cfg(target_os = "macos")]
     {
-        // macOS: TUN via osascript mit Admin-Rechten, stderr in Log-Datei
+        // macOS: TUN via osascript mit Admin-Rechten
+        let log_redirect = if use_log_file {
+            format!(" >> '{}' 2>&1", log_path.to_string_lossy().replace('\'', "'\\''"))
+        } else {
+            String::from(" > /dev/null 2>&1")
+        };
         let script = format!(
-            "do shell script \"'{}' --tun --port {} --relays '{}' --stone-data '{}' >> '{}' 2>&1 &\" with administrator privileges",
+            "do shell script \"'{}' --tun --port {} --relays '{}' --stone-data '{}'{} &\" with administrator privileges",
             vpn_path.replace('\'', "'\\''"),
             vpn_port,
             vpn_relays,
             data_str.replace('\'', "'\\''"),
-            log_path.to_string_lossy().replace('\'', "'\\''"),
+            log_redirect,
         );
         let mut child = std::process::Command::new("osascript")
             .args(["-e", &script])
@@ -615,24 +630,63 @@ pub fn start_vpn(app: AppHandle) -> Result<String, String> {
 
     #[cfg(not(target_os = "macos"))]
     {
-        // Linux/Windows: Starte direkt (TUN braucht root, fallback: ohne --tun)
+        // Linux/Windows: Starte direkt (TUN braucht root/admin, fallback: ohne --tun)
         let mut cmd = std::process::Command::new(&vpn_path);
         #[cfg(target_os = "windows")]
         {
             use std::os::windows::process::CommandExt;
-            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+            // CREATE_NO_WINDOW + DETACHED_PROCESS: verhindert Konsolenfenster
+            cmd.creation_flags(0x08000008);
         }
         cmd.arg("--tun")
             .arg("--port").arg(vpn_port)
             .arg("--relays").arg(vpn_relays)
-            .arg("--stone-data").arg(&data_str)
-            .stdout(log_file.try_clone().map_err(|e| format!("{e}"))?)
-            .stderr(log_file);
+            .arg("--stone-data").arg(&data_str);
+
+        // Log-Datei nur umleiten wenn sie geöffnet werden konnte
+        if use_log_file {
+            let log_file = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&log_path)
+                .map_err(|e| format!("Log-Datei: {e}"))?;
+            cmd.stdout(log_file.try_clone().map_err(|e| format!("{e}"))?)
+                .stderr(log_file);
+        } else {
+            cmd.stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null());
+        }
 
         let mut child = cmd.spawn()
             .map_err(|e| format!("Start fehlgeschlagen: {e}\n\n💡 Tipp: Starte die App als Administrator, damit TUN-Devices erstellt werden können."))?;
 
         let pid = child.id();
+
+        // Prüfe nach 1s ob der Prozess noch läuft (detektiert sofortige Crashes)
+        std::thread::sleep(std::time::Duration::from_millis(1000));
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let log_tail = if use_log_file {
+                    std::fs::read_to_string(&log_path)
+                        .unwrap_or_default()
+                        .lines()
+                        .rev()
+                        .take(5)
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                } else {
+                    String::from("(kein Log verfügbar)")
+                };
+                return Err(format!(
+                    "VPN-Prozess sofort beendet (Exit: {}).\nLetzte Log-Zeilen:\n{}",
+                    status, log_tail
+                ));
+            }
+            Ok(None) => {} // Läuft noch — ok
+            Err(e) => {}   // Prozess-Status nicht lesbar — weitermachen
+        }
+
         std::thread::spawn(move || { let _ = child.wait(); });
 
         // Warte auf VPN-IP
@@ -1184,7 +1238,7 @@ pub fn node_start_internal(
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
-        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        cmd.creation_flags(0x08000008); // CREATE_NO_WINDOW | DETACHED_PROCESS
     }
     cmd.env("STONE_PORT", port.to_string())
         .env("STONE_DATA_DIR", data_dir.to_string_lossy().as_ref())

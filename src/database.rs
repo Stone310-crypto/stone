@@ -457,6 +457,7 @@ impl Database {
                 quota_bytes: row.get::<_, i64>(5).unwrap_or(0) as u64,
                 account_type: row.get(6)?, org_id: row.get(7)?, org_role: row.get(8)?,
                 discord_id: row.get(9)?, discord_username: String::new(),
+                vpn_id: None,
                 bio: bio_val,
                 updated_at: ts_val,
             })

@@ -35,6 +35,9 @@ pub struct User {
     pub discord_id: String,
     #[serde(default)]
     pub discord_username: String,
+    /// Aktuelle VPN Nutzer-ID (für Freundesuche, 8-32 Zeichen)
+    #[serde(default)]
+    pub vpn_id: Option<String>,
     /// Letztes Profil-Update (Unix-Timestamp) — für Sync-Priorisierung
     #[serde(default)]
     pub updated_at: i64,
@@ -78,7 +81,7 @@ pub fn create_user_with_phrase(name: &str) -> (User, String) {
     let hash = hex::encode(Sha256::digest(normalized.as_bytes()));
     let api_key = format!("sk_{}", hex::encode(&rand::random::<[u8;16]>()));
     let wallet = wallet_address_from_phrase(&phrase);
-    let user = User { id: String::new(), name: name.into(), bio: String::new(), api_key, phrase_hash: hash, quota_bytes: default_quota_bytes(), wallet_address: wallet, account_type: default_account_type(), org_id: String::new(), org_role: String::new(), discord_id: String::new(), discord_username: String::new(), updated_at: chrono::Utc::now().timestamp() };
+    let user = User { id: String::new(), name: name.into(), bio: String::new(), api_key, phrase_hash: hash, quota_bytes: default_quota_bytes(), wallet_address: wallet, account_type: default_account_type(), org_id: String::new(), org_role: String::new(), discord_id: String::new(), discord_username: String::new(), vpn_id: None, updated_at: chrono::Utc::now().timestamp() };
     (user, phrase)
 }
 
@@ -271,7 +274,7 @@ pub fn rebuild_users_from_ledger(ledger: &crate::token::TokenLedger, local: &[Us
                 org_id: String::new(),
                 org_role: String::new(),
                 discord_id: String::new(),
-                discord_username: String::new(), bio: String::new(), updated_at: 0,
+                discord_username: String::new(), bio: String::new(), vpn_id: None, updated_at: 0,
             });
         }
     }
