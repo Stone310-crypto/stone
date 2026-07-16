@@ -617,6 +617,11 @@ pub fn start_vpn(app: AppHandle) -> Result<String, String> {
     {
         // Linux/Windows: Starte direkt (TUN braucht root, fallback: ohne --tun)
         let mut cmd = std::process::Command::new(&vpn_path);
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+        }
         cmd.arg("--tun")
             .arg("--port").arg(vpn_port)
             .arg("--relays").arg(vpn_relays)
@@ -1175,6 +1180,12 @@ pub fn node_start_internal(
         .join(",");
 
     let mut cmd = Command::new(&binary);
+    // Windows: Keine Konsole öffnen, Node im Hintergrund starten
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x08000000); // CREATE_NO_WINDOW
+    }
     cmd.env("STONE_PORT", port.to_string())
         .env("STONE_DATA_DIR", data_dir.to_string_lossy().as_ref())
         .env("STONE_NETWORK", cfg.network.as_str())
