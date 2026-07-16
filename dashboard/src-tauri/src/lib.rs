@@ -16,14 +16,7 @@ use node_manager::{
     switch_node_network,
     load_config,
     get_node_health,
-    get_vpn_status,
-    start_vpn,
-    stop_vpn,
-    install_vpn_service,
-    stop_vpn_service,
-    uninstall_vpn_service,
 };
-use vpn_manager::IntegratedVpn;
 use miner_manager::{
     SharedMinerState, MinerState,
     miner_start, miner_stop, miner_status, miner_set_autostart,
@@ -183,36 +176,30 @@ fn detect_file_type_cmd(path: String) -> Result<Option<file_upload::MagicByteInf
     Ok(file_upload::detect_file_type(&buf))
 }
 
-// ─── Integrierter VPN (stonevpn Library, keine externe Binary) ─────────────
+// ─── VPN-Status (via Node HTTP API, kein separater Prozess) ─────────────
 
-/// Status des integrierten VPN abrufen.
+/// VPN-Status vom lokalen Node abrufen (GET /api/v1/vpn/status).
 #[tauri::command]
-async fn vpn_status(state: tauri::State<'_, IntegratedVpn>) -> Result<stonevpn::VpnStatusUpdate, String> {
-    Ok(state.status().await)
-}
-
-/// Integrierten VPN starten.
-#[tauri::command]
-async fn vpn_start(state: tauri::State<'_, IntegratedVpn>, app: AppHandle) -> Result<stonevpn::VpnStatusUpdate, String> {
-    if state.is_running().await {
-        return Ok(state.status().await);
-    }
-    let data_dir = app.path().app_data_dir()
-        .unwrap_or_else(|_| std::path::PathBuf::from("."))
-        .join("vpn_data");
-    let _ = std::fs::create_dir_all(&data_dir);
-    let config = stonevpn::VpnConfig {
-        stone_data: data_dir,
-        ..Default::default()
+async fn dashboard_vpn_status(node_state: tauri::State<'_, SharedNodeState>) -> Result<vpn_manager::VpnStatusResponse, String> {
+    let port = {
+        let s = node_state.lock().unwrap_or_else(|e| e.into_inner());
+        s.config.port
     };
-    state.start(config).await
+    vpn_manager::fetch_vpn_status(port).await
 }
 
-/// Integrierten VPN stoppen.
+/// VPN-ID rotieren (POST /api/v1/vpn/rotate).
 #[tauri::command]
-async fn vpn_stop(state: tauri::State<'_, IntegratedVpn>) -> Result<bool, String> {
-    state.stop().await;
-    Ok(true)
+async fn dashboard_vpn_rotate(
+    node_state: tauri::State<'_, SharedNodeState>,
+) -> Result<String, String> {
+    let port = {
+        let s = node_state.lock().unwrap_or_else(|e| e.into_inner());
+        s.config.port
+    };
+    // Session-Token aus dem Session-Store (falls verfügbar)
+    let token = std::env::var("STONE_SESSION_TOKEN").unwrap_or_default();
+    vpn_manager::rotate_vpn_id(port, &token).await
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -289,34 +276,9 @@ pub fn run() {
                         let _ = node_manager::node_start_internal(&app_handle_dl, &shared_clone);
                     }
                 }
-
-                // Integrierter VPN auto-starten (keine externe Binary mehr nötig)
-                let app_handle_vpn = app_handle_dl.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                    let vpn_state = app_handle_vpn.state::<IntegratedVpn>();
-                    if !vpn_state.is_running().await {
-                        let data_dir = app_handle_vpn.path().app_data_dir()
-                            .unwrap_or_else(|_| std::path::PathBuf::from("."))
-                            .join("vpn_data");
-                        let _ = std::fs::create_dir_all(&data_dir);
-                        let config = stonevpn::VpnConfig {
-                            stone_data: data_dir,
-                            ..Default::default()
-                        };
-                        eprintln!("[app] Integrierter VPN auto-start (port={}, tun={})…", config.port, config.enable_tun);
-                        match vpn_state.start(config).await {
-                            Err(e) => eprintln!("[app] VPN auto-start fehlgeschlagen: {e}"),
-                            Ok(_) => eprintln!("[app] VPN läuft"),
-                        }
-                    }
-                });
             });
 
             app.manage(shared);
-
-            // Integrierter VPN-State
-            app.manage(IntegratedVpn::new());
 
             // Miner state
             let miner_state = MinerState::new();
@@ -335,15 +297,8 @@ pub fn run() {
             node_stop,
             switch_node_network,
             get_node_health,
-            get_vpn_status,
-            start_vpn,
-            stop_vpn,
-            vpn_status,
-            vpn_start,
-            vpn_stop,
-            install_vpn_service,
-            stop_vpn_service,
-            uninstall_vpn_service,
+            dashboard_vpn_status,
+            dashboard_vpn_rotate,
             plugin_open_window,
             validate_upload_file,
             upload_file,

@@ -125,10 +125,7 @@ async fn main() {
 
     std::fs::create_dir_all(data_dir()).expect("DATA_DIR anlegen");
 
-    // ── VPN Auto-Start (StoneVPN Mesh Overlay) ──────────────────────────
-    // Wenn STONE_VPN_ENABLED=1, startet der Master-Node automatisch
-    // den stonevpn-Client. Die zugewiesene VPN-IP wird via
-    // stone_data/vpn_ip.txt ausgetauscht und als STONE_PUBLIC_IP gesetzt.
+    // ── VPN (jetzt im libp2p-Swarm integriert, kein separater Prozess) ──
     maybe_start_vpn().await;
 
     // Post-Update Rollback prüfen

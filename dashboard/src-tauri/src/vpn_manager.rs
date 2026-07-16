@@ -1,56 +1,80 @@
-//! Integrierter VPN-Manager — ersetzt die externe stonevpn Binary.
+//! VPN-Manager — Fragt den VPN-Status vom lokalen Stone-Node ab.
+//!
+//! Der VPN läuft jetzt direkt im libp2p-Swarm des Nodes (kein separater
+//! Prozess, keine separate Binary). Das Dashboard fragt nur noch den
+//! Status via HTTP API ab und delegiert VPN-ID-Rotation an den Node.
 
-use std::sync::{Arc, RwLock};
-use tokio::sync::Mutex;
-use stonevpn::{VpnConfig, VpnService, VpnStatusUpdate};
+use serde::{Deserialize, Serialize};
 
-pub struct IntegratedVpn {
-    service: Mutex<VpnService>,
-    cached_status: Arc<RwLock<VpnStatusUpdate>>,
-    config: RwLock<VpnConfig>,
+/// VPN-Status vom Node (HTTP API Response).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VpnStatusResponse {
+    pub active: bool,
+    pub vpn_id: Option<String>,
+    pub display_name: String,
+    pub peer_count: usize,
+    pub peers: Vec<VpnPeerInfo>,
+    pub mode: String,
 }
 
-impl IntegratedVpn {
-    pub fn new() -> Self {
-        IntegratedVpn {
-            service: Mutex::new(VpnService::new()),
-            cached_status: Arc::new(RwLock::new(VpnStatusUpdate {
-                vpn_ip: None, peer_count: 0, tun_active: false,
-                mode: "stopped".into(), updated_at: 0,
-            })),
-            config: RwLock::new(VpnConfig::default()),
-        }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VpnPeerInfo {
+    pub vpn_id: String,
+    pub peer_id: String,
+    pub display_name: String,
+    pub wallet_hash: Option<String>,
+    pub last_seen: u64,
+}
+
+/// Ruft den VPN-Status vom lokalen Node ab (HTTP GET /api/v1/vpn/status).
+pub async fn fetch_vpn_status(node_port: u16) -> Result<VpnStatusResponse, String> {
+    let url = format!("http://127.0.0.1:{}/api/v1/vpn/status", node_port);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|e| format!("HTTP-Client: {e}"))?;
+    let resp = client.get(&url).send().await.map_err(|e| format!("VPN-Status nicht erreichbar: {e}"))?;
+    let body: VpnStatusResponse = resp.json().await.map_err(|e| format!("VPN-Status Parse-Fehler: {e}"))?;
+    Ok(body)
+}
+
+/// Rotiert die VPN-ID (POST /api/v1/vpn/rotate).
+pub async fn rotate_vpn_id(node_port: u16, session_token: &str) -> Result<String, String> {
+    let url = format!("http://127.0.0.1:{}/api/v1/vpn/rotate", node_port);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("HTTP-Client: {e}"))?;
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", session_token))
+        .send()
+        .await
+        .map_err(|e| format!("VPN-Rotation fehlgeschlagen: {e}"))?;
+    let body: serde_json::Value = resp.json().await.map_err(|e| format!("Parse-Fehler: {e}"))?;
+    body["vpn_id"]
+        .as_str()
+        .map(|s| s.to_string())
+        .ok_or_else(|| body["error"].as_str().unwrap_or("Unbekannter Fehler").to_string())
+}
+
+/// Registriert die VPN-ID beim Server (POST /api/v1/users/me/vpn-id).
+pub async fn register_vpn_id(node_port: u16, session_token: &str, vpn_id: &str) -> Result<(), String> {
+    let url = format!("http://127.0.0.1:{}/api/v1/users/me/vpn-id", node_port);
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("HTTP-Client: {e}"))?;
+    let resp = client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", session_token))
+        .json(&serde_json::json!({"vpn_id": vpn_id}))
+        .send()
+        .await
+        .map_err(|e| format!("VPN-ID-Registrierung fehlgeschlagen: {e}"))?;
+    if !resp.status().is_success() {
+        let body: serde_json::Value = resp.json().await.unwrap_or_default();
+        return Err(body["error"].as_str().unwrap_or("Unbekannter Fehler").to_string());
     }
-
-    pub async fn start(&self, config: VpnConfig) -> Result<VpnStatusUpdate, String> {
-        *self.config.write().unwrap() = config.clone();
-        let mut service = self.service.lock().await;
-        let mut status_rx = service.start(config).await?;
-
-        let cached = self.cached_status.clone();
-        tokio::spawn(async move {
-            while let Some(update) = status_rx.recv().await {
-                *cached.write().unwrap() = update;
-            }
-        });
-
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-        Ok(self.cached_status.read().unwrap().clone())
-    }
-
-    pub async fn stop(&self) {
-        self.service.lock().await.stop().await;
-        *self.cached_status.write().unwrap() = VpnStatusUpdate {
-            mode: "stopped".into(), vpn_ip: None,
-            tun_active: false, peer_count: 0, updated_at: 0,
-        };
-    }
-
-    pub async fn status(&self) -> VpnStatusUpdate {
-        self.cached_status.read().unwrap().clone()
-    }
-
-    pub async fn is_running(&self) -> bool {
-        self.service.lock().await.is_running().await
-    }
+    Ok(())
 }

@@ -58,6 +58,7 @@ use crate::blockchain::Block;
 
 pub mod swarm_task;
 pub mod handle;
+pub mod vpn_protocol;
 
 pub use handle::NetworkHandle;
 pub use handle::start_network;
@@ -141,6 +142,9 @@ pub static TOPIC_CHAT_CONTENT: LazyLock<String> =
 /// Miner-Identity & Heartbeats (Auto-Block-Timer Cluster-Awareness)
 pub static TOPIC_MINERS: LazyLock<String> =
     LazyLock::new(|| format!("stone/{}/miners/v1", net_tag()));
+/// VPN-ID Announcements (Mesh-VPN Peer Discovery)
+pub static TOPIC_VPN_ID: LazyLock<String> =
+    LazyLock::new(|| format!("stone/{}/vpn-id/v1", net_tag()));
 
 /// Protokoll-Version für den Sync-Handshake.
 /// Peers mit einer anderen Major-Version werden abgelehnt.
@@ -687,6 +691,30 @@ pub enum NetworkEvent {
         payload: Vec<u8>,
         from_peer: String,
     },
+
+    // ── VPN Events ───────────────────────────────────────────────────────
+    /// Ein VPN-Peer hat sich via Gossipsub angekündigt.
+    VpnPeerAnnounced {
+        vpn_id: String,
+        peer_id: String,
+        display_name: String,
+        wallet_hash: Option<String>,
+    },
+    /// Eine direkte VPN-Chat-Nachricht wurde empfangen.
+    VpnChatReceived {
+        message: vpn_protocol::VpnChatMessage,
+        from_peer: String,
+    },
+    /// Eine Freundschaftsanfrage wurde empfangen.
+    VpnFriendRequestReceived {
+        request: vpn_protocol::VpnFriendRequest,
+        from_peer: String,
+    },
+    /// Eine Antwort auf eine Freundschaftsanfrage wurde empfangen.
+    VpnFriendResponseReceived {
+        response: vpn_protocol::VpnFriendResponse,
+        from_peer: String,
+    },
 }
 
 /// Befehle die von außen an den Swarm-Task gesendet werden.
@@ -755,6 +783,38 @@ pub enum NetworkCommand {
     /// Eigenen Stake-Level setzen (wird von MasterNode periodisch aufgerufen).
     /// Beeinflusst Relay-Priorität: höherer Stake = Peers bevorzugen uns als Sync-Quelle.
     SetStakeLevel(u64),
+
+    // ── VPN Befehle ──────────────────────────────────────────────────────
+    /// Unsere VPN-ID setzen (vom Server/Account zugewiesen).
+    SetVpnId {
+        vpn_id: String,
+        display_name: String,
+        wallet_hash: Option<String>,
+    },
+    /// VPN-ID rotieren (neue ID generieren).
+    RotateVpnId,
+    /// Unsere aktuelle VPN-ID abfragen.
+    GetVpnId(tokio::sync::oneshot::Sender<Option<vpn_protocol::VpnIdState>>),
+    /// VPN-Peer-Liste abfragen.
+    GetVpnPeers(tokio::sync::oneshot::Sender<Vec<vpn_protocol::VpnPeer>>),
+    /// Eine VPN-Chat-Nachricht an einen Peer senden.
+    SendVpnChat {
+        target_peer_id: PeerId,
+        message: vpn_protocol::VpnChatMessage,
+        reply: tokio::sync::oneshot::Sender<Result<vpn_protocol::VpnChatResponse, String>>,
+    },
+    /// Eine Freundschaftsanfrage an einen Peer senden.
+    SendVpnFriendRequest {
+        target_peer_id: PeerId,
+        request: vpn_protocol::VpnFriendRequest,
+        reply: tokio::sync::oneshot::Sender<Result<vpn_protocol::VpnFriendResponse, String>>,
+    },
+    /// Auf eine Freundschaftsanfrage antworten.
+    SendVpnFriendResponse {
+        target_peer_id: PeerId,
+        response: vpn_protocol::VpnFriendResponse,
+        reply: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
 }
 
 impl std::fmt::Debug for NetworkCommand {
@@ -776,6 +836,13 @@ impl std::fmt::Debug for NetworkCommand {
             Self::SetChainRef(_) => write!(f, "SetChainRef(..)"),
             Self::ReportPenalty { peer_id_str, points, .. } => write!(f, "ReportPenalty({peer_id_str}, {points})"),
             Self::SetStakeLevel(level) => write!(f, "SetStakeLevel({level})"),
+            Self::SetVpnId { vpn_id, .. } => write!(f, "SetVpnId({vpn_id})"),
+            Self::RotateVpnId => write!(f, "RotateVpnId"),
+            Self::GetVpnId(_) => write!(f, "GetVpnId(..)"),
+            Self::GetVpnPeers(_) => write!(f, "GetVpnPeers(..)"),
+            Self::SendVpnChat { target_peer_id, .. } => write!(f, "SendVpnChat({target_peer_id})"),
+            Self::SendVpnFriendRequest { target_peer_id, .. } => write!(f, "SendVpnFriendRequest({target_peer_id})"),
+            Self::SendVpnFriendResponse { target_peer_id, .. } => write!(f, "SendVpnFriendResponse({target_peer_id})"),
         }
     }
 }
@@ -1148,6 +1215,8 @@ pub struct StoneBehaviour {
     pub gossipsub: gossipsub::Behaviour,
     pub block_exchange: request_response::cbor::Behaviour<BlockRequest, BlockResponse>,
     pub shard_exchange: request_response::cbor::Behaviour<ShardRequest, ShardResponse>,
+    pub vpn_chat: request_response::cbor::Behaviour<vpn_protocol::VpnChatRequest, vpn_protocol::VpnChatResponse>,
+    pub vpn_friend: request_response::cbor::Behaviour<vpn_protocol::VpnFriendRequest, vpn_protocol::VpnFriendResponse>,
     pub relay_client: relay::client::Behaviour,
     pub relay_server: relay::Behaviour,
     pub dcutr: dcutr::Behaviour,
@@ -1262,6 +1331,30 @@ pub fn build_swarm(
         request_response::Config::default(),
     );
 
+    // ── Request/Response (VPN Chat) ──────────────────────────────────────────
+    let vpn_chat_proto: &'static str = Box::leak(
+        format!("/stone/{}/vpn-chat/1.0.0", net_tag()).into_boxed_str(),
+    );
+    let vpn_chat = request_response::cbor::Behaviour::new(
+        [(
+            libp2p::StreamProtocol::new(vpn_chat_proto),
+            ProtocolSupport::Full,
+        )],
+        request_response::Config::default(),
+    );
+
+    // ── Request/Response (VPN Friend) ────────────────────────────────────────
+    let vpn_friend_proto: &'static str = Box::leak(
+        format!("/stone/{}/vpn-friend/1.0.0", net_tag()).into_boxed_str(),
+    );
+    let vpn_friend = request_response::cbor::Behaviour::new(
+        [(
+            libp2p::StreamProtocol::new(vpn_friend_proto),
+            ProtocolSupport::Full,
+        )],
+        request_response::Config::default(),
+    );
+
     // ── AutoNAT – erkennt ob wir hinter NAT sind ─────────────────────────────
     let autonat = autonat::Behaviour::new(peer_id, autonat::Config {
         boot_delay: Duration::from_secs(10),
@@ -1325,6 +1418,8 @@ pub fn build_swarm(
                 gossipsub: gossipsub,
                 block_exchange: block_exchange,
                 shard_exchange: shard_exchange,
+                vpn_chat: vpn_chat,
+                vpn_friend: vpn_friend,
                 relay_client,
                 relay_server,
                 dcutr,

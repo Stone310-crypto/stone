@@ -694,3 +694,80 @@ pub async fn handle_update_vpn_id(
 
     (StatusCode::OK, axum::Json(json!({"ok": true, "vpn_id": vpn_id}))).into_response()
 }
+
+// ─── VPN Status (via libp2p VPN Protocol) ────────────────────────────────────
+
+/// GET /api/v1/vpn/status — Gibt den aktuellen VPN-Status zurück.
+/// Der VPN läuft jetzt direkt im libp2p-Swarm (kein separater Prozess mehr).
+pub async fn handle_vpn_status(
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let (vpn_id, display_name, vpn_mode, peer_count, peers) = if let Some(ref net) = state.network {
+        let id_state = net.get_vpn_id().await;
+        let vpn_id = id_state.as_ref().map(|s| s.current_id.clone());
+        let display_name = id_state.as_ref().map(|s| s.display_name.clone()).unwrap_or_default();
+        let vpn_mode = id_state.as_ref().map(|s| s.mode.clone()).unwrap_or_else(|| "unknown".into());
+        let vpn_peers = net.get_vpn_peers().await;
+        let peer_count = vpn_peers.len();
+        let peers: Vec<serde_json::Value> = vpn_peers.iter().map(|p| {
+            json!({
+                "vpn_id": p.vpn_id,
+                "peer_id": p.peer_id.to_string(),
+                "display_name": p.display_name,
+                "wallet_hash": p.wallet_hash,
+                "last_seen": p.last_seen,
+            })
+        }).collect();
+        (vpn_id, display_name, vpn_mode, peer_count, peers)
+    } else {
+        (None, String::new(), "unknown".into(), 0, vec![])
+    };
+
+    let active = vpn_id.is_some();
+    let is_relay = vpn_mode == "relay";
+
+    (StatusCode::OK, axum::Json(json!({
+        "active": active,
+        "vpn_id": vpn_id,
+        "display_name": display_name,
+        "mode": vpn_mode,
+        "is_relay": is_relay,
+        "peer_count": peer_count,
+        "peers": peers,
+    }))).into_response()
+}
+
+/// POST /api/v1/vpn/rotate — Rotiert die VPN-ID und gibt die neue zurück.
+pub async fn handle_vpn_rotate(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let user = match require_user(&headers, &state) {
+        Ok(u) => u,
+        Err(e) => return e.into_response(),
+    };
+
+    let new_vpn_id = if let Some(ref net) = state.network {
+        net.rotate_vpn_id().await;
+        net.get_vpn_id().await.map(|s| s.current_id)
+    } else {
+        None
+    };
+
+    let new_id = match new_vpn_id {
+        Some(id) => id,
+        None => return (StatusCode::SERVICE_UNAVAILABLE,
+            axum::Json(json!({"error": "VPN nicht verfügbar (P2P deaktiviert?)"}))).into_response(),
+    };
+
+    // Update user's vpn_id in the user store
+    {
+        let mut users = state.users.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(u) = users.iter_mut().find(|u| u.id == user.id) {
+            u.vpn_id = Some(new_id.clone());
+            save_users(&users);
+        }
+    }
+
+    (StatusCode::OK, axum::Json(json!({"ok": true, "vpn_id": new_id}))).into_response()
+}

@@ -651,12 +651,17 @@ impl SwarmTask {
             self.pending_chain_info.retain(|_, peer_id| connected_ids.contains(peer_id));
         }
 
-        // Verbundene Peers nach Stake-Level sortieren (höchster Stake zuerst).
-        let mut connected: Vec<(PeerId, u64)> = self.peers.iter()
+        // Verbundene Peers nach Stake-Level sortieren (höchster Stake zuerst),
+        // dann VPN-Peers bevorzugen (VPN-primary sync).
+        let mut connected: Vec<(PeerId, u64, bool)> = self.peers.iter()
             .filter(|(_, info)| info.connected)
-            .map(|(pid, info)| (*pid, info.stake_level))
+            .map(|(pid, info)| {
+                let has_vpn = self.vpn_peers.by_peer_id(pid).is_some();
+                (*pid, info.stake_level, has_vpn)
+            })
             .collect();
-        connected.sort_by(|a, b| b.1.cmp(&a.1));
+        // Sort: 1. Stake (desc), 2. VPN-Peer bevorzugt
+        connected.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)));
 
         if connected.is_empty() {
             return;
@@ -671,7 +676,7 @@ impl SwarmTask {
         // Auch GossipSub-Handshake senden für Peers die hinter UNS sind
         self.send_sync_handshake();
 
-        for (peer_id, _stake) in connected {
+        for (peer_id, _stake, _has_vpn) in connected {
             if self.is_protocol_mismatch_quarantined(&peer_id) {
                 continue;
             }

@@ -58,7 +58,7 @@ async fn main() {
         eprintln!("[app-node] Warnung: Data-Dir konnte nicht erstellt werden: {e}");
     }
 
-    // ── VPN Auto-Start (StoneVPN Mesh Overlay) ──────────────────────────
+    // ── VPN (jetzt im libp2p-Swarm integriert) ──────────────────────────
     maybe_start_vpn().await;
 
     // ── ChunkStore (ignoriert Fehler – app-node braucht keinen Storage) ──

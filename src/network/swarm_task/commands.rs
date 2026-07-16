@@ -325,6 +325,98 @@ impl SwarmTask {
                 self.local_stake_level = level;
                 false
             }
+
+            // ── VPN Befehle ──────────────────────────────────────────────────
+
+            NetworkCommand::SetVpnId { vpn_id, display_name, wallet_hash } => {
+                let mut state = self.vpn_id_state.clone().unwrap_or_else(|| {
+                    crate::network::vpn_protocol::VpnIdState::new()
+                });
+                state.current_id = vpn_id;
+                state.display_name = display_name;
+                state.linked_wallet_hash = wallet_hash;
+                self.vpn_id_state = Some(state);
+
+                // Sofort via Gossipsub ankündigen
+                self.last_vpn_announce = None;
+                self.announce_vpn_id();
+
+                // VPN-ID Topic subscriben (falls noch nicht geschehen)
+                let topic = crate::network::vpn_protocol::vpn_id_topic();
+                if let Err(e) = self.swarm.behaviour_mut().gossipsub.subscribe(&topic) {
+                    eprintln!("[vpn] Konnte VPN-ID-Topic nicht subscriben: {e}");
+                }
+
+                println!("[vpn] 🆔 VPN-ID gesetzt: {} (name={})",
+                    self.vpn_id_state.as_ref().map(|s| &s.current_id[..]).unwrap_or("?"),
+                    self.vpn_id_state.as_ref().map(|s| &s.display_name[..]).unwrap_or("?"));
+                false
+            }
+
+            NetworkCommand::RotateVpnId => {
+                if let Some(ref mut state) = self.vpn_id_state {
+                    let new_id = state.rotate();
+                    println!("[vpn] 🔄 VPN-ID rotiert → {}", &new_id[..8]);
+                    // Neu ankündigen
+                    self.last_vpn_announce = None;
+                    self.announce_vpn_id();
+                }
+                false
+            }
+
+            NetworkCommand::GetVpnId(reply) => {
+                let _ = reply.send(self.vpn_id_state.clone());
+                false
+            }
+
+            NetworkCommand::GetVpnPeers(reply) => {
+                let peers: Vec<_> = self.vpn_peers.all().into_iter().cloned().collect();
+                let _ = reply.send(peers);
+                false
+            }
+
+            NetworkCommand::SendVpnChat { target_peer_id, message, reply } => {
+                if self.is_protocol_mismatch_quarantined(&target_peer_id) {
+                    let _ = reply.send(Err("Peer ist inkompatibel (Protokoll-Mismatch-Cooldown)".into()));
+                    return false;
+                }
+                let request = crate::network::vpn_protocol::VpnChatRequest { message };
+                let req_id = self.swarm.behaviour_mut().vpn_chat
+                    .send_request(&target_peer_id, request);
+                self.pending_vpn_chat.insert(req_id, reply);
+                false
+            }
+
+            NetworkCommand::SendVpnFriendRequest { target_peer_id, request, reply } => {
+                if self.is_protocol_mismatch_quarantined(&target_peer_id) {
+                    let _ = reply.send(Err("Peer ist inkompatibel (Protokoll-Mismatch-Cooldown)".into()));
+                    return false;
+                }
+                let req_id = self.swarm.behaviour_mut().vpn_friend
+                    .send_request(&target_peer_id, request);
+                self.pending_vpn_friend_req.insert(req_id, reply);
+                false
+            }
+
+            NetworkCommand::SendVpnFriendResponse { target_peer_id, response, reply } => {
+                if self.is_protocol_mismatch_quarantined(&target_peer_id) {
+                    let _ = reply.send(Err("Peer ist inkompatibel (Protokoll-Mismatch-Cooldown)".into()));
+                    return false;
+                }
+                // Konvertiere FriendResponse in einen FriendRequest (als Antwort-Transport)
+                let request = crate::network::vpn_protocol::VpnFriendRequest {
+                    request_id: response.request_id,
+                    from_id: response.from_id,
+                    to_id: String::new(), // wird vom Empfänger ignoriert
+                    display_name: response.display_name,
+                    wallet_hash: response.wallet_hash,
+                    timestamp: response.timestamp,
+                };
+                let req_id = self.swarm.behaviour_mut().vpn_friend
+                    .send_request(&target_peer_id, request);
+                self.pending_vpn_friend_resp.insert(req_id, reply);
+                false
+            }
         }
     }
 }

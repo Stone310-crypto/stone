@@ -57,9 +57,6 @@ jobs:
       - name: Build stone-setup
         run: cargo build --release --bin stone-setup --target ${{ matrix.target }}
 
-      - name: Build stonevpn
-        run: cargo build --release --bin stonevpn --manifest-path stone_vpn/Cargo.toml --target ${{ matrix.target }}
-
       - name: Prepare and rename binaries
         shell: bash
         run: |
@@ -70,23 +67,14 @@ jobs:
           if [ -f stone-app-node.exe ]; then cp stone-app-node.exe "$NODE"; else cp stone-app-node "$NODE"; fi
           if [ -f stone-master.exe ]; then cp stone-master.exe "$MASTER"; else cp stone-master "$MASTER"; fi
           if [ -f stone-setup.exe ]; then cp stone-setup.exe "$SETUP"; else cp stone-setup "$SETUP"; fi
-          # stonevpn from stone_vpn subdir
-          V="stonevpn-${{ matrix.suffix }}"
-          if [ -f ../../../stone_vpn/target/${{ matrix.target }}/release/stonevpn.exe ]; then
-            cp ../../../stone_vpn/target/${{ matrix.target }}/release/stonevpn.exe "$V"
-          elif [ -f ../../../stone_vpn/target/${{ matrix.target }}/release/stonevpn ]; then
-            cp ../../../stone_vpn/target/${{ matrix.target }}/release/stonevpn "$V"
-          fi
           if [ "$(uname)" = "Darwin" ]; then
             shasum -a 256 "$NODE" | awk '{print $1}' > "$NODE.sha256"
             shasum -a 256 "$MASTER" | awk '{print $1}' > "$MASTER.sha256"
             shasum -a 256 "$SETUP" | awk '{print $1}' > "$SETUP.sha256"
-            [ -f "$V" ] && shasum -a 256 "$V" | awk '{print $1}' > "$V.sha256"
           else
             sha256sum "$NODE" | awk '{print $1}' > "$NODE.sha256"
             sha256sum "$MASTER" | awk '{print $1}' > "$MASTER.sha256"
             sha256sum "$SETUP" | awk '{print $1}' > "$SETUP.sha256"
-            [ -f "$V" ] && sha256sum "$V" | awk '{print $1}' > "$V.sha256"
           fi
 
       - name: Upload node binaries
@@ -100,8 +88,6 @@ jobs:
             target/${{ matrix.target }}/release/stone-master-${{ matrix.suffix }}.sha256
             target/${{ matrix.target }}/release/stone-setup-${{ matrix.suffix }}
             target/${{ matrix.target }}/release/stone-setup-${{ matrix.suffix }}.sha256
-            target/${{ matrix.target }}/release/stonevpn-${{ matrix.suffix }}
-            target/${{ matrix.target }}/release/stonevpn-${{ matrix.suffix }}.sha256
 
   # ── Dashboard macOS ──────────────────────────────────────────────────
   build-dashboard-macos:

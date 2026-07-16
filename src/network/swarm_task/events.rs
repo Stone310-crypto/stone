@@ -306,6 +306,9 @@ impl SwarmTask {
                         });
                         gossipsub::MessageAcceptance::Accept
                     }
+                } else if topic == *crate::network::TOPIC_VPN_ID {
+                    // VPN-ID Announcements
+                    self.handle_vpn_id_gossip(&message.data, propagation_source)
                 } else {
                     // Unbekanntes Topic – nicht weiterleiten, kein Penalty
                     gossipsub::MessageAcceptance::Ignore
@@ -704,6 +707,10 @@ impl SwarmTask {
                     autonat::NatStatus::Public(_addr) => {
                         self.nat_status = NatStatus::Public;
                         println!("[p2p] ✅ NAT-Status: Öffentlich erreichbar");
+                        // VPN-Modus aktualisieren
+                        if let Some(ref mut state) = self.vpn_id_state {
+                            state.mode = "relay".into();
+                        }
                     }
                     autonat::NatStatus::Private => {
                         self.nat_status = NatStatus::Private;
@@ -712,6 +719,10 @@ impl SwarmTask {
                         self.establish_relay_reservations();
                         // Zusätzlich: Alle bereits verbundenen Peers als potentielle Relays nutzen
                         self.auto_discover_relays();
+                        // VPN-Modus aktualisieren
+                        if let Some(ref mut state) = self.vpn_id_state {
+                            state.mode = "client".into();
+                        }
                     }
                     autonat::NatStatus::Unknown => {
                         self.nat_status = NatStatus::Unknown;
@@ -909,6 +920,51 @@ impl SwarmTask {
             }
 
             StoneBehaviourEvent::ShardExchange(_) => {}
+
+            // ── VPN Chat ──────────────────────────────────────────────────────
+            StoneBehaviourEvent::VpnChat(
+                request_response::Event::Message { peer, message, .. }
+            ) => match message {
+                request_response::Message::Request { request, channel, .. } => {
+                    let response = self.handle_vpn_chat_request(request, peer);
+                    let _ = self.swarm.behaviour_mut().vpn_chat
+                        .send_response(channel, response);
+                }
+                request_response::Message::Response { response, request_id, .. } => {
+                    self.handle_vpn_chat_response(response, request_id);
+                }
+            },
+            StoneBehaviourEvent::VpnChat(
+                request_response::Event::OutboundFailure { request_id, error, .. }
+            ) => {
+                if let Some(reply) = self.pending_vpn_chat.remove(&request_id) {
+                    let _ = reply.send(Err(format!("VPN-Chat fehlgeschlagen: {error}")));
+                }
+            },
+
+            // ── VPN Friend ────────────────────────────────────────────────────
+            StoneBehaviourEvent::VpnFriend(
+                request_response::Event::Message { peer, message, .. }
+            ) => match message {
+                request_response::Message::Request { request, channel, .. } => {
+                    let response = self.handle_vpn_friend_request(request, peer);
+                    let _ = self.swarm.behaviour_mut().vpn_friend
+                        .send_response(channel, response);
+                }
+                request_response::Message::Response { response, request_id, .. } => {
+                    self.handle_vpn_friend_response(response, request_id);
+                }
+            },
+            StoneBehaviourEvent::VpnFriend(
+                request_response::Event::OutboundFailure { request_id, error, .. }
+            ) => {
+                if let Some(reply) = self.pending_vpn_friend_req.remove(&request_id) {
+                    let _ = reply.send(Err(format!("Freundschaftsanfrage fehlgeschlagen: {error}")));
+                }
+                if let Some(reply) = self.pending_vpn_friend_resp.remove(&request_id) {
+                    let _ = reply.send(Err(format!("Freundschaftsantwort fehlgeschlagen: {error}")));
+                }
+            },
 
             _ => {}
         }

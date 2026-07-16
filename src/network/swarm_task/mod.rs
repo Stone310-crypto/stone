@@ -16,6 +16,7 @@ mod maintenance;
 mod relay;
 mod scoring;
 mod sync;
+mod vpn;
 
 use crate::blockchain::Block;
 use futures_util::StreamExt;
@@ -228,6 +229,30 @@ pub(crate) struct SwarmTask {
     pub(crate) health_last_reason: String,
     /// Cooldown bis zur nächsten orchestrierten Health-Aktion.
     pub(crate) health_cooldown_until: Option<Instant>,
+
+    // ─── VPN State ───────────────────────────────────────────────────────
+
+    /// Unsere VPN-ID (von Server/Account zugewiesen)
+    pub(crate) vpn_id_state: Option<crate::network::vpn_protocol::VpnIdState>,
+    /// Bekannte VPN-Peers (via Gossipsub Discovery)
+    pub(crate) vpn_peers: crate::network::vpn_protocol::VpnPeerRegistry,
+    /// Wann unsere VPN-ID zuletzt via Gossipsub angekündigt wurde
+    pub(crate) last_vpn_announce: Option<Instant>,
+    /// Ausstehende VPN-Chat-Antworten: request_id → reply
+    pub(crate) pending_vpn_chat: HashMap<
+        request_response::OutboundRequestId,
+        tokio::sync::oneshot::Sender<Result<crate::network::vpn_protocol::VpnChatResponse, String>>,
+    >,
+    /// Ausstehende VPN-Friend-Requests: request_id → reply
+    pub(crate) pending_vpn_friend_req: HashMap<
+        request_response::OutboundRequestId,
+        tokio::sync::oneshot::Sender<Result<crate::network::vpn_protocol::VpnFriendResponse, String>>,
+    >,
+    /// Ausstehende VPN-Friend-Responses: request_id → reply
+    pub(crate) pending_vpn_friend_resp: HashMap<
+        request_response::OutboundRequestId,
+        tokio::sync::oneshot::Sender<Result<(), String>>,
+    >,
 }
 
 /// Tracking für Fehlverhalten eines Peers
@@ -789,6 +814,7 @@ impl SwarmTask {
                 }
                 _ = cleanup_ticker.tick() => {
                     self.periodic_cleanup();
+                    self.announce_vpn_id();
                 }
                 _ = keepalive_ticker.tick() => {
                     self.keepalive_ping_peers();

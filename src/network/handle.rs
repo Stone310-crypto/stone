@@ -184,6 +184,89 @@ impl NetworkHandle {
     pub async fn set_stake_level(&self, level: u64) {
         let _ = self.cmd_tx.send(NetworkCommand::SetStakeLevel(level)).await;
     }
+
+    // ── VPN API ──────────────────────────────────────────────────────────────
+
+    /// Setzt die VPN-ID dieses Nodes (vom Server/Account zugewiesen).
+    pub async fn set_vpn_id(&self, vpn_id: &str, display_name: &str, wallet_hash: Option<&str>) {
+        let _ = self.cmd_tx.send(NetworkCommand::SetVpnId {
+            vpn_id: vpn_id.to_string(),
+            display_name: display_name.to_string(),
+            wallet_hash: wallet_hash.map(|s| s.to_string()),
+        }).await;
+    }
+
+    /// Rotiert die VPN-ID (generiert eine neue).
+    pub async fn rotate_vpn_id(&self) {
+        let _ = self.cmd_tx.send(NetworkCommand::RotateVpnId).await;
+    }
+
+    /// Fragt die aktuelle VPN-ID ab.
+    pub async fn get_vpn_id(&self) -> Option<crate::network::vpn_protocol::VpnIdState> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx.send(NetworkCommand::GetVpnId(tx)).await.ok()?;
+        rx.await.ok()?
+    }
+
+    /// Gibt die Liste bekannter VPN-Peers zurück.
+    pub async fn get_vpn_peers(&self) -> Vec<crate::network::vpn_protocol::VpnPeer> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        if self.cmd_tx.send(NetworkCommand::GetVpnPeers(tx)).await.is_err() {
+            return vec![];
+        }
+        rx.await.unwrap_or_default()
+    }
+
+    /// Sendet eine VPN-Chat-Nachricht an einen Peer.
+    pub async fn send_vpn_chat(
+        &self,
+        target_peer_id: PeerId,
+        message: crate::network::vpn_protocol::VpnChatMessage,
+    ) -> Result<crate::network::vpn_protocol::VpnChatResponse, String> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx.send(NetworkCommand::SendVpnChat {
+            target_peer_id,
+            message,
+            reply: tx,
+        }).await.map_err(|_| "P2P-Task nicht erreichbar".to_string())?;
+        tokio::time::timeout(std::time::Duration::from_secs(10), rx)
+            .await.map_err(|_| "Timeout".to_string())?
+            .unwrap_or(Err("Interner Fehler".to_string()))
+    }
+
+    /// Sendet eine Freundschaftsanfrage an einen Peer.
+    pub async fn send_vpn_friend_request(
+        &self,
+        target_peer_id: PeerId,
+        request: crate::network::vpn_protocol::VpnFriendRequest,
+    ) -> Result<crate::network::vpn_protocol::VpnFriendResponse, String> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx.send(NetworkCommand::SendVpnFriendRequest {
+            target_peer_id,
+            request,
+            reply: tx,
+        }).await.map_err(|_| "P2P-Task nicht erreichbar".to_string())?;
+        tokio::time::timeout(std::time::Duration::from_secs(10), rx)
+            .await.map_err(|_| "Timeout".to_string())?
+            .unwrap_or(Err("Interner Fehler".to_string()))
+    }
+
+    /// Sendet eine Antwort auf eine Freundschaftsanfrage.
+    pub async fn send_vpn_friend_response(
+        &self,
+        target_peer_id: PeerId,
+        response: crate::network::vpn_protocol::VpnFriendResponse,
+    ) -> Result<(), String> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.cmd_tx.send(NetworkCommand::SendVpnFriendResponse {
+            target_peer_id,
+            response,
+            reply: tx,
+        }).await.map_err(|_| "P2P-Task nicht erreichbar".to_string())?;
+        tokio::time::timeout(std::time::Duration::from_secs(10), rx)
+            .await.map_err(|_| "Timeout".to_string())?
+            .unwrap_or(Err("Interner Fehler".to_string()))
+    }
 }
 
 // ─── start_network ────────────────────────────────────────────────────────────
@@ -384,6 +467,13 @@ pub async fn start_network(
         health_last_transition: Instant::now(),
         health_last_reason: String::new(),
         health_cooldown_until: None,
+        // VPN State
+        vpn_id_state: None,
+        vpn_peers: crate::network::vpn_protocol::VpnPeerRegistry::new(),
+        last_vpn_announce: None,
+        pending_vpn_chat: HashMap::new(),
+        pending_vpn_friend_req: HashMap::new(),
+        pending_vpn_friend_resp: HashMap::new(),
     };
 
     tokio::spawn(task.run());

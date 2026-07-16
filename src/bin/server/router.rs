@@ -184,7 +184,8 @@ use super::handlers::{
     spv::{handle_spv_headers, handle_spv_tip, handle_spv_tx_proof, handle_spv_doc_proof, handle_spv_item_proof, handle_spv_item_history},
     users::{handle_delete_user, handle_delete_own_account, handle_list_users, handle_list_users_public,
            handle_testnet_users, handle_submit_bug_report, handle_list_bug_reports,
-           handle_my_bug_reports, handle_update_bug_report, handle_update_vpn_id},
+           handle_my_bug_reports, handle_update_bug_report, handle_update_vpn_id,
+           handle_vpn_status, handle_vpn_rotate},
     testnet_hub::{
         handle_hub_register, handle_hub_report, handle_hub_users, handle_hub_bug_reports,
         handle_hub_bulk_sync, handle_hub_send_message, handle_hub_send_coins,
@@ -308,6 +309,9 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/account", delete(handle_delete_own_account))
         // VPN Nutzer-ID registrieren (für Freundesuche via /chat/resolve)
         .route("/api/v1/users/me/vpn-id", post(handle_update_vpn_id))
+        // VPN Status (libp2p-integriert, kein separater Prozess)
+        .route("/api/v1/vpn/status", get(handle_vpn_status))
+        .route("/api/v1/vpn/rotate", post(handle_vpn_rotate))
         // Alias: Frontend ruft /api/v1/users/{id}/documents statt /api/v1/documents/user/{id}
         .route("/api/v1/users/{user_id}/documents", get(handle_list_user_documents))
         // Auth

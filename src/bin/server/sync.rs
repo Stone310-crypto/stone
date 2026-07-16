@@ -853,77 +853,20 @@ fn endpoint_from_url(url: &str) -> Option<(String, u16)> { let s = url.split(":/
 fn same_endpoint_url(a: &str, b: &str) -> bool { match (endpoint_from_url(a), endpoint_from_url(b)) { (Some(ea), Some(eb)) => ea == eb, _ => false } }
 fn is_bootstrap_url(url: &str) -> bool { let configured = if let Ok(raw) = std::env::var("STONE_BOOTSTRAP_HTTP_URLS") { raw.split(',').map(str::trim).filter(|s| !s.is_empty()).map(|s| s.trim_end_matches('/').to_string()).collect::<Vec<_>>() } else { stone::network::default_bootstrap_http_urls() }; configured.iter().any(|b| same_endpoint_url(url, b)) }
 
-/// Startet den StoneVPN-Client als Subprozess, falls STONE_VPN_ENABLED=1.
-/// Wartet auf die Zuweisung einer VPN-IP und setzt STONE_PUBLIC_IP.
-/// Wird von master_server und app_node beim Start aufgerufen.
+/// VPN ist jetzt direkt in den libp2p-Swarm integriert (kein separater Prozess).
+/// Die VPN-ID wird vom Server/Account zugewiesen und über Gossipsub angekündigt.
+/// Diese Funktion existiert nur noch für Abwärtskompatibilität.
+/// Der VPN läuft automatisch, sobald P2P aktiv ist.
 pub async fn maybe_start_vpn() {
     let enabled = std::env::var("STONE_VPN_ENABLED")
         .map(|v| v == "1")
         .unwrap_or(false);
     if !enabled { return; }
 
-    let data_dir = stone::blockchain::data_dir();
-    let vpn_ip_path = format!("{data_dir}/vpn_ip.txt");
-
-    let vpn_bin = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("stonevpn")))
-        .unwrap_or_else(|| std::path::PathBuf::from("./stonevpn"));
-
-    let port = std::env::var("STONE_VPN_PORT").ok().and_then(|v| v.parse::<u16>().ok()).unwrap_or(51821);
-    let relays = std::env::var("STONE_VPN_RELAYS").unwrap_or_default();
-
-    println!("[vpn] 🚀 Starte StoneVPN-Client...");
-    println!("[vpn]    Binary: {}", vpn_bin.display());
-    println!("[vpn]    Port:   {port}");
-    println!("[vpn]    Relays: {}", if relays.is_empty() { "(keine)" } else { &relays });
-    println!("[vpn]    Data:   {data_dir}");
-
-    let mut cmd = std::process::Command::new(&vpn_bin);
-    cmd.arg("--port").arg(port.to_string());
-    cmd.arg("--stone-data").arg(&data_dir);
-    cmd.arg("--tun");   // TUN device für IP-Layer über VPN
-    if !relays.is_empty() { cmd.arg("--relays").arg(&relays); }
-
-    // Log in stone_data ablegen, nicht in stdout/stderr (die würden verloren gehen)
-    let vpn_log = format!("{data_dir}/stonevpn.log");
-    let log_file = match std::fs::File::create(&vpn_log) {
-        Ok(f) => f,
-        Err(_) => {
-            eprintln!("[vpn] ⚠️ Konnte Log-Datei nicht erstellen: {vpn_log}");
-            return;
-        }
-    };
-    cmd.stdout(log_file.try_clone().unwrap());
-    cmd.stderr(log_file);
-
-    match cmd.spawn() {
-        Ok(mut child) => {
-            println!("[vpn] ✅ StoneVPN gestartet (PID {})", child.id());
-            let start = std::time::Instant::now();
-            let timeout = std::time::Duration::from_secs(30);
-            while start.elapsed() < timeout {
-                if let Ok(ip) = std::fs::read_to_string(&vpn_ip_path) {
-                    let ip = ip.trim().to_string();
-                    if !ip.is_empty() {
-                        println!("[vpn] 🎉 VPN-IP zugewiesen: {ip}");
-                        std::env::set_var("STONE_PUBLIC_IP", &ip);
-                        println!("[vpn]    STONE_PUBLIC_IP={ip} (für Sync/Announce)");
-                        tokio::spawn(async move { let _ = child.wait(); });
-                        return;
-                    }
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                match child.try_wait() {
-                    Ok(Some(s)) => { eprintln!("[vpn] ❌ StoneVPN beendet: {s}"); return; }
-                    _ => {}
-                }
-            }
-            eprintln!("[vpn] ⚠️  Keine VPN-IP nach 30s — läuft ein Relay?");
-            let _ = child.kill();
-        }
-        Err(e) => eprintln!("[vpn] ❌ StoneVPN nicht gestartet: {e} — Binary vorhanden? cargo build --release --bin stonevpn"),
-    }
+    println!("[vpn] ℹ️  VPN ist jetzt im libp2p-Swarm integriert (kein separater Prozess).");
+    println!("[vpn]    Die VPN-ID wird vom Account-Server zugewiesen.");
+    println!("[vpn]    Nutze POST /api/v1/users/me/vpn-id zum Registrieren.");
+    println!("[vpn]    Status: GET /api/v1/vpn/status");
 }
 
 pub async fn bootstrap_announce(node: &Arc<MasterNodeState>) {
