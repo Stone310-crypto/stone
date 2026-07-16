@@ -7,6 +7,7 @@ mod extensions;
 mod gaming_proxy;
 mod miner_manager;
 mod vpn_manager;
+mod app_logger;
 use tauri::{AppHandle, Manager};
 use node_manager::{
     SharedNodeState, NodeState, NodeStatus,
@@ -204,6 +205,16 @@ async fn dashboard_vpn_rotate(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // ── Logger initialisieren (SO FRÜH WIE MÖGLICH) ──────────────────────
+    app_logger::install_panic_hook();
+    // App-Datenverzeichnis so früh wie möglich ermitteln
+    let log_dir = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    app_logger::init(&log_dir);
+    app_logger::step("App-Start: Logger initialisiert");
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_shell::init())
@@ -214,8 +225,11 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
+            app_logger::step("Setup: Tauri-Plugins geladen, starte Initialisierung...");
+
             // Modules-Verzeichnis erstellen (für optionale Module)
             let _ = std::fs::create_dir_all(&modules::dirs_next());
+            app_logger::done("Verzeichnisse: modules");
             let mods_dir = std::env::current_exe()
                 .ok()
                 .and_then(|p| p.parent().map(|p| p.join("modules")))
@@ -224,14 +238,25 @@ pub fn run() {
 
             // Extensions-Verzeichnis erstellen
             let _ = std::fs::create_dir_all(&extensions::extensions_dir());
+            app_logger::done("Verzeichnisse: extensions");
+
+            // Logger auf das richtige App-Datenverzeichnis umleiten
+            if let Ok(data_dir) = app.path().app_data_dir() {
+                app_logger::init(&data_dir);
+                app_logger::info(&format!("App-Datenverzeichnis: {}", data_dir.display()));
+            }
 
             // Bundled Extensions aus den App-Ressourcen extrahieren (Production-Build)
+            app_logger::step("Extrahiere Bundled Extensions...");
             extract_bundled_extensions(app.handle());
+            app_logger::done("Bundled Extensions extrahiert");
 
+            app_logger::step("Lade Node-Konfiguration...");
             let mut cfg = load_config(app.handle());
             // Immer Mainnet/3180 als Standard – kein automatischer Testnet-Start
             cfg.network = "mainnet".to_string();
             cfg.port = 3180;
+            app_logger::done(&format!("Node-Konfiguration geladen (Port={}, Netzwerk={})", cfg.port, cfg.network));
             let enabled = cfg.enabled;
             let mut state = NodeState::new();
             state.config = cfg;
@@ -243,18 +268,20 @@ pub fn run() {
             let shared_clone = shared.clone();
             let enabled_clone = enabled;
             tauri::async_runtime::spawn(async move {
+                app_logger::step("Background: Warte 1s, dann Node-Binary-Check...");
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                app_logger::step("Background: Prüfe/Installiere Node-Binaries...");
                 match node_binary_downloader::install_or_update_binaries(&app_handle_dl).await {
                     Ok((_binaries, updated)) => {
+                        app_logger::done(&format!("Node-Binaries bereit (updated={})", updated));
                         if updated {
-                            eprintln!("[binary-dl] Node-Binaries wurden aktualisiert.");
-                            // Wenn die Node läuft, neustarten
+                            app_logger::info("Node-Binaries wurden aktualisiert.");
                             let running = {
                                 let state = shared_clone.lock().unwrap_or_else(|e| e.into_inner());
                                 matches!(state.status, NodeStatus::Running { .. })
                             };
                             if running {
-                                eprintln!("[binary-dl] Node läuft – starte neu für Binary-Update…");
+                                app_logger::info("Node läuft – starte neu für Binary-Update…");
                                 let _ = node_manager::node_stop_internal(&shared_clone);
                                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                                 let _ = node_manager::node_start_internal(&app_handle_dl, &shared_clone);
@@ -263,7 +290,7 @@ pub fn run() {
                         }
                     }
                     Err(e) => {
-                        eprintln!("[binary-dl] Fehler beim Check: {e}");
+                        app_logger::error(&format!("Node-Binary-Check fehlgeschlagen: {e}"));
                     }
                 }
                 // Node starten falls enabled und noch nicht gestartet
@@ -273,18 +300,22 @@ pub fn run() {
                         matches!(s.status, NodeStatus::Running { .. })
                     };
                     if !running {
+                        app_logger::step("Background: Starte Node...");
                         let _ = node_manager::node_start_internal(&app_handle_dl, &shared_clone);
                     }
                 }
             });
 
             app.manage(shared);
+            app_logger::done("SharedNodeState registriert");
 
             // Miner state
             let miner_state = MinerState::new();
             let shared_miner: SharedMinerState = Arc::new(Mutex::new(miner_state));
             app.manage(shared_miner);
+            app_logger::done("MinerState registriert");
 
+            app_logger::step("Setup abgeschlossen — App bereit");
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![

@@ -691,40 +691,46 @@ pub fn node_start_internal(
     app: &AppHandle,
     shared: &SharedNodeState,
 ) -> Result<String, String> {
+    crate::app_logger::step(&format!("node_start_internal: begin"));
     let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
 
     if matches!(s.status, NodeStatus::Running { .. }) {
+        crate::app_logger::info("Node läuft bereits, überspringe Start.");
         return Ok(format!("http://127.0.0.1:{}", s.config.port));
     }
 
     // Kill alle Prozesse die noch auf dem Port lauschen (vom vorherigen Run)
     let port = s.config.port;
     if kill_process_on_port(port) {
-        eprintln!("[node] Port {} freigeräumt (alter Prozess gekillt)", port);
-        // Kurz warten damit der Port frei wird
+        crate::app_logger::info(&format!("Port {} freigeräumt (alter Prozess gekillt)", port));
         std::thread::sleep(std::time::Duration::from_millis(500));
     }
 
     // Auto-download node binaries from GitHub if missing locally (first run)
     s.status = NodeStatus::Starting;
     s.append_log("[app] Prüfe Node-Binaries…");
+    crate::app_logger::step("Prüfe/Download Node-Binaries...");
     if let Err(e) = crate::node_binary_downloader::ensure_binaries_available(app) {
-        s.status = NodeStatus::Error {
-            message: format!("Binary-Download fehlgeschlagen: {e}"),
-        };
-        return Err(format!(
-            "Node-Binaries nicht verfügbar und Download fehlgeschlagen: {e}"
-        ));
+        let msg = format!("Binary-Download fehlgeschlagen: {e}");
+        crate::app_logger::error(&msg);
+        s.status = NodeStatus::Error { message: msg.clone() };
+        return Err(msg);
     }
+    crate::app_logger::done("Node-Binaries verfügbar");
 
     // Find binary (prefers stone-app-node, falls back to stone-master)
+    crate::app_logger::step("Suche Node-Binary...");
     let binary = find_binary(app, &s.config.binary_path).ok_or_else(|| {
+        let msg = "Node-Binary nicht gefunden.".to_string();
+        crate::app_logger::error(&msg);
         s.status = NodeStatus::BinaryNotFound;
-        "Node-Binary nicht gefunden. Kein GitHub-Release vorhanden? Erstelle einen Release mit den Binaries.".to_string()
+        msg
     })?;
+    crate::app_logger::done(&format!("Binary gefunden: {}", binary.display()));
 
     // Automatically fix permissions and remove quarantine — the main fix
     prepare_binary(&binary).map_err(|e| {
+        crate::app_logger::error(&format!("Binary-Vorbereitung fehlgeschlagen: {e}"));
         s.status = NodeStatus::Error { message: e.clone() };
         e
     })?;
@@ -811,6 +817,7 @@ pub fn node_start_internal(
     if let Ok(nu) = std::env::var("NOMAD_URL") {
         cmd.env("NOMAD_URL", &nu);
     }
+    crate::app_logger::step(&format!("Starte Node-Prozess: {} (Port={})", binary.display(), port));
     let mut child = cmd
         .current_dir(&data_dir)
         .stdout(Stdio::piped())
@@ -818,12 +825,14 @@ pub fn node_start_internal(
         .spawn()
         .map_err(|e| {
             let msg = format!("Start fehlgeschlagen: {e}");
+            crate::app_logger::error(&msg);
             let mut s = shared.lock().unwrap_or_else(|e2| e2.into_inner());
             s.status = NodeStatus::Error { message: msg.clone() };
             msg
         })?;
 
     let pid = child.id();
+    crate::app_logger::done(&format!("Node-Prozess gestartet (PID={})", pid));
 
     // Spawn log reader threads for stdout/stderr
     {
@@ -863,6 +872,7 @@ pub fn node_start_internal(
     s.child = Some(child);
     s.status = NodeStatus::Running { port, pid };
     s.append_log(&format!("[app] Node läuft — PID={pid}, Port={port}"));
+    crate::app_logger::done(&format!("Node läuft: PID={pid}, Port={port}, URL=http://127.0.0.1:{port}"));
 
     // ── VPN Hinweis ────────────────────────────────────────────────────
     // Der VPN ist jetzt direkt im libp2p-Swarm des Nodes integriert.
@@ -923,35 +933,46 @@ fn persist_config(app: &AppHandle, config: &NodeConfig) {
 // ── Load persisted config on startup ─────────────────────────────────────────
 
 pub fn load_config(app: &AppHandle) -> NodeConfig {
+    crate::app_logger::step("load_config: Lade Node-Konfiguration...");
     let default = NodeConfig::default();
     if let Ok(data_dir) = app.path().app_data_dir() {
+        crate::app_logger::info(&format!("load_config: data_dir={}", data_dir.display()));
         let _ = std::fs::create_dir_all(&data_dir);
 
         // Versuche SQLite-DB (node_config.db)
-        if let Ok(db) = crate::node_config_db::NodeConfigDB::open(&data_dir) {
-            // Migration von JSON → DB (einmalig)
-            db.migrate_json_if_needed(&data_dir);
+        match crate::node_config_db::NodeConfigDB::open(&data_dir) {
+            Ok(db) => {
+                crate::app_logger::done("load_config: SQLite-DB geöffnet");
+                // Migration von JSON → DB (einmalig)
+                db.migrate_json_if_needed(&data_dir);
 
-            let mut cfg = default.clone();
-            if let Some(v) = db.get("enabled") { cfg.enabled = v == "true"; }
-            if let Some(v) = db.get("http_port") { if let Ok(p) = v.parse() { cfg.port = p; } }
-            if let Some(v) = db.get("cpu_pct") { if let Ok(p) = v.parse() { cfg.cpu_pct = p; } }
-            if let Some(v) = db.get("binary_path") { cfg.binary_path = v; }
-            if let Some(v) = db.get("seed_peers") { cfg.seed_peers = v; }
-            if let Some(v) = db.get("api_key") { cfg.api_key = v; }
-            if let Some(v) = db.get("network") { cfg.network = v; }
-            return cfg;
+                let mut cfg = default.clone();
+                if let Some(v) = db.get("enabled") { cfg.enabled = v == "true"; }
+                if let Some(v) = db.get("http_port") { if let Ok(p) = v.parse() { cfg.port = p; } }
+                if let Some(v) = db.get("cpu_pct") { if let Ok(p) = v.parse() { cfg.cpu_pct = p; } }
+                if let Some(v) = db.get("binary_path") { cfg.binary_path = v; }
+                if let Some(v) = db.get("seed_peers") { cfg.seed_peers = v; }
+                if let Some(v) = db.get("api_key") { cfg.api_key = v; }
+                if let Some(v) = db.get("network") { cfg.network = v; }
+                crate::app_logger::done(&format!("load_config: Konfiguration geladen (network={}, port={})", cfg.network, cfg.port));
+                return cfg;
+            }
+            Err(e) => {
+                crate::app_logger::warn(&format!("load_config: SQLite-DB Fehler: {e}, versuche JSON-Fallback"));
+            }
         }
 
         // Fallback: node_config.json
         let cfg_path = data_dir.join("node_config.json");
         if let Ok(data) = std::fs::read_to_string(&cfg_path) {
+            crate::app_logger::done("load_config: node_config.json geladen");
             if let Ok(cfg) = serde_json::from_str::<NodeConfig>(&data) {
                 return cfg;
             }
         }
     }
     // First launch — persist default config
+    crate::app_logger::info("load_config: Erster Start — schreibe Default-Konfiguration");
     if let Ok(data_dir) = app.path().app_data_dir() {
         let _ = std::fs::create_dir_all(&data_dir);
         if let Ok(db) = crate::node_config_db::NodeConfigDB::open(&data_dir) {
