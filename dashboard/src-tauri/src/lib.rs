@@ -207,11 +207,9 @@ async fn dashboard_vpn_rotate(
 pub fn run() {
     // ── Logger initialisieren (SO FRÜH WIE MÖGLICH) ──────────────────────
     app_logger::install_panic_hook();
-    // App-Datenverzeichnis so früh wie möglich ermitteln
-    let log_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
-        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    // Temp-Verzeichnis als Fallback (App-Datenverzeichnis ist noch nicht verfügbar)
+    let log_dir = std::env::temp_dir().join("stone-dashboard");
+    let _ = std::fs::create_dir_all(&log_dir);
     app_logger::init(&log_dir);
     app_logger::step("App-Start: Logger initialisiert");
 
@@ -301,7 +299,24 @@ pub fn run() {
                     };
                     if !running {
                         app_logger::step("Background: Starte Node...");
-                        let _ = node_manager::node_start_internal(&app_handle_dl, &shared_clone);
+                        // catch_unwind um Panic zu loggen statt lautlos zu crashen
+                        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            node_manager::node_start_internal(&app_handle_dl, &shared_clone)
+                        }));
+                        match result {
+                            Ok(Ok(url)) => app_logger::done(&format!("Node gestartet: {url}")),
+                            Ok(Err(e)) => app_logger::error(&format!("Node-Start fehlgeschlagen: {e}")),
+                            Err(panic_info) => {
+                                let msg = if let Some(s) = panic_info.downcast_ref::<String>() {
+                                    s.clone()
+                                } else if let Some(s) = panic_info.downcast_ref::<&str>() {
+                                    s.to_string()
+                                } else {
+                                    "Unbekannte Panic".to_string()
+                                };
+                                app_logger::error(&format!("PANIC beim Node-Start: {msg}"));
+                            }
+                        }
                     }
                 }
             });

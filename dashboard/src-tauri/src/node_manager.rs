@@ -692,7 +692,9 @@ pub fn node_start_internal(
     shared: &SharedNodeState,
 ) -> Result<String, String> {
     crate::app_logger::step(&format!("node_start_internal: begin"));
+    crate::app_logger::info("node_start_internal: locking shared state...");
     let mut s = shared.lock().unwrap_or_else(|e| e.into_inner());
+    crate::app_logger::info(&format!("node_start_internal: locked, current_status={:?}", s.status));
 
     if matches!(s.status, NodeStatus::Running { .. }) {
         crate::app_logger::info("Node läuft bereits, überspringe Start.");
@@ -701,6 +703,7 @@ pub fn node_start_internal(
 
     // Kill alle Prozesse die noch auf dem Port lauschen (vom vorherigen Run)
     let port = s.config.port;
+    crate::app_logger::info(&format!("node_start_internal: port={}, checke auf alte Prozesse...", port));
     if kill_process_on_port(port) {
         crate::app_logger::info(&format!("Port {} freigeräumt (alter Prozess gekillt)", port));
         std::thread::sleep(std::time::Duration::from_millis(500));

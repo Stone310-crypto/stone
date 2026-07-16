@@ -60,7 +60,8 @@ fn log_raw(msg: &str) {
             let _ = logger.file.flush();
         }
     }
-    // Auch auf stderr ausgeben (für Development)
+    // stderr nur im Debug-Modus (Windows hat keine Konsole im Release)
+    #[cfg(debug_assertions)]
     eprintln!("{msg}");
 }
 
