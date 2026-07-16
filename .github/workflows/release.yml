@@ -303,22 +303,18 @@ jobs:
       - name: Sign all updater artifacts (fallback if .sig missing)
         run: |
           cd dashboard
-          echo "${TAURI_SIGNING_PRIVATE_KEY}" > /tmp/updater.key
           shopt -s nullglob
           for f in ../release/Stone-Dashboard-*.app.tar.gz ../release/Stone-Dashboard-*.AppImage.tar.gz ../release/Stone-Dashboard_*_x64-setup.exe; do
             [ -f "$f" ] || continue
             SIG="${f}.sig"
-            if [ ! -f "$SIG" ]; then
+            if [ ! -f "$SIG" ] || [ $(wc -c < "$SIG" 2>/dev/null || echo 0) -lt 10 ]; then
               echo "Generating signature for: $(basename $f)"
-              npx tauri signer sign --private-key /tmp/updater.key --password "${TAURI_SIGNING_PRIVATE_KEY_PASSWORD}" "$f" || {
-                echo "WARNING: Failed with password — trying without"
-                npx tauri signer sign --private-key /tmp/updater.key "$f" || echo "ERROR: Signing totally failed for $f"
-              }
+              npx tauri signer sign "$f" 2>&1 || echo "WARNING: Signing failed for $(basename $f)"
+              echo "Signature size: $(wc -c < "$SIG" 2>/dev/null || echo 0) bytes"
             else
-              echo "Signature exists: $(basename $SIG) ($(wc -c < "$SIG") bytes)"
+              echo "Signature OK: $(basename $SIG) ($(wc -c < "$SIG") bytes)"
             fi
           done
-          rm -f /tmp/updater.key
       - name: Generate versions.json
         run: |
           TAG="${{ steps.tag.outputs.TAG }}"
