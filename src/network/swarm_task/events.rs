@@ -706,15 +706,17 @@ impl SwarmTask {
                 match new {
                     autonat::NatStatus::Public(_addr) => {
                         self.nat_status = NatStatus::Public;
-                        println!("[p2p] ✅ NAT-Status: Öffentlich erreichbar");
+                        println!("[p2p] ✅ NAT-Status: Öffentlich erreichbar → VPN-Modus: RELAY");
                         // VPN-Modus aktualisieren
                         if let Some(ref mut state) = self.vpn_id_state {
                             state.mode = "relay".into();
+                            println!("[vpn] 🟢 VPN-Modus auf 'relay' gesetzt (ID={})",
+                                &state.current_id[..8.min(state.current_id.len())]);
                         }
                     }
                     autonat::NatStatus::Private => {
                         self.nat_status = NatStatus::Private;
-                        println!("[p2p] 🔒 NAT-Status: Privat – nutze Relay für Erreichbarkeit");
+                        println!("[p2p] 🔒 NAT-Status: Privat → VPN-Modus: CLIENT (hinter NAT)");
                         // Bei privatem NAT automatisch Relay-Reservierungen herstellen
                         self.establish_relay_reservations();
                         // Zusätzlich: Alle bereits verbundenen Peers als potentielle Relays nutzen
@@ -722,10 +724,13 @@ impl SwarmTask {
                         // VPN-Modus aktualisieren
                         if let Some(ref mut state) = self.vpn_id_state {
                             state.mode = "client".into();
+                            println!("[vpn] 🟡 VPN-Modus auf 'client' gesetzt (ID={})",
+                                &state.current_id[..8.min(state.current_id.len())]);
                         }
                     }
                     autonat::NatStatus::Unknown => {
                         self.nat_status = NatStatus::Unknown;
+                        println!("[vpn] ⚪ VPN-Modus: unknown (NAT-Status noch nicht ermittelt)");
                     }
                 }
             }

@@ -304,7 +304,30 @@ pub fn run() {
                             node_manager::node_start_internal(&app_handle_dl, &shared_clone)
                         }));
                         match result {
-                            Ok(Ok(url)) => app_logger::done(&format!("Node gestartet: {url}")),
+                            Ok(Ok(url)) => {
+                                app_logger::done(&format!("Node gestartet: {url}"));
+                                // Periodische VPN-Status-Checks (alle 30s)
+                                let port = {
+                                    let s = shared_clone.lock().unwrap_or_else(|e| e.into_inner());
+                                    s.config.port
+                                };
+                                app_logger::info(&format!("Starte periodische VPN-Status-Checks (Port={})...", port));
+                                tokio::spawn(async move {
+                                    loop {
+                                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                                        match vpn_manager::fetch_vpn_status(port).await {
+                                            Ok(status) => {
+                                                if !status.active {
+                                                    app_logger::warn("vpn: NICHT AKTIV — keine VPN-ID gesetzt? Nutze POST /api/v1/users/me/vpn-id");
+                                                }
+                                            }
+                                            Err(e) => {
+                                                app_logger::warn(&format!("vpn: Status-Check fehlgeschlagen: {e}"));
+                                            }
+                                        }
+                                    }
+                                });
+                            }
                             Ok(Err(e)) => app_logger::error(&format!("Node-Start fehlgeschlagen: {e}")),
                             Err(panic_info) => {
                                 let msg = if let Some(s) = panic_info.downcast_ref::<String>() {

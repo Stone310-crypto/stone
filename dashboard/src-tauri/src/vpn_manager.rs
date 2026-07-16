@@ -28,18 +28,36 @@ pub struct VpnPeerInfo {
 
 /// Ruft den VPN-Status vom lokalen Node ab (HTTP GET /api/v1/vpn/status).
 pub async fn fetch_vpn_status(node_port: u16) -> Result<VpnStatusResponse, String> {
+    crate::app_logger::info(&format!("vpn: Frage Status ab (Port={})...", node_port));
     let url = format!("http://127.0.0.1:{}/api/v1/vpn/status", node_port);
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
-        .map_err(|e| format!("HTTP-Client: {e}"))?;
-    let resp = client.get(&url).send().await.map_err(|e| format!("VPN-Status nicht erreichbar: {e}"))?;
-    let body: VpnStatusResponse = resp.json().await.map_err(|e| format!("VPN-Status Parse-Fehler: {e}"))?;
+        .map_err(|e| {
+            crate::app_logger::error(&format!("vpn: HTTP-Client-Fehler: {e}"));
+            format!("HTTP-Client: {e}")
+        })?;
+    let resp = client.get(&url).send().await.map_err(|e| {
+        crate::app_logger::error(&format!("vpn: Node nicht erreichbar (Port={}): {e}", node_port));
+        format!("VPN-Status nicht erreichbar: {e}")
+    })?;
+    let body: VpnStatusResponse = resp.json().await.map_err(|e| {
+        crate::app_logger::error(&format!("vpn: Parse-Fehler: {e}"));
+        format!("VPN-Status Parse-Fehler: {e}")
+    })?;
+    crate::app_logger::done(&format!(
+        "vpn: Status OK — active={}, mode={}, vpn_id={}, peers={}",
+        body.active,
+        body.mode,
+        body.vpn_id.as_deref().unwrap_or("(keine)"),
+        body.peer_count
+    ));
     Ok(body)
 }
 
 /// Rotiert die VPN-ID (POST /api/v1/vpn/rotate).
 pub async fn rotate_vpn_id(node_port: u16, session_token: &str) -> Result<String, String> {
+    crate::app_logger::step("vpn: Rotiere VPN-ID...");
     let url = format!("http://127.0.0.1:{}/api/v1/vpn/rotate", node_port);
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -50,16 +68,22 @@ pub async fn rotate_vpn_id(node_port: u16, session_token: &str) -> Result<String
         .header("Authorization", format!("Bearer {}", session_token))
         .send()
         .await
-        .map_err(|e| format!("VPN-Rotation fehlgeschlagen: {e}"))?;
+        .map_err(|e| {
+            crate::app_logger::error(&format!("vpn: Rotation fehlgeschlagen: {e}"));
+            format!("VPN-Rotation fehlgeschlagen: {e}")
+        })?;
     let body: serde_json::Value = resp.json().await.map_err(|e| format!("Parse-Fehler: {e}"))?;
-    body["vpn_id"]
+    let new_id = body["vpn_id"]
         .as_str()
         .map(|s| s.to_string())
-        .ok_or_else(|| body["error"].as_str().unwrap_or("Unbekannter Fehler").to_string())
+        .ok_or_else(|| body["error"].as_str().unwrap_or("Unbekannter Fehler").to_string())?;
+    crate::app_logger::done(&format!("vpn: Neue VPN-ID: {}", &new_id[..8.min(new_id.len())]));
+    Ok(new_id)
 }
 
 /// Registriert die VPN-ID beim Server (POST /api/v1/users/me/vpn-id).
 pub async fn register_vpn_id(node_port: u16, session_token: &str, vpn_id: &str) -> Result<(), String> {
+    crate::app_logger::step(&format!("vpn: Registriere VPN-ID '{}' beim Server...", &vpn_id[..8.min(vpn_id.len())]));
     let url = format!("http://127.0.0.1:{}/api/v1/users/me/vpn-id", node_port);
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(10))
@@ -71,10 +95,16 @@ pub async fn register_vpn_id(node_port: u16, session_token: &str, vpn_id: &str) 
         .json(&serde_json::json!({"vpn_id": vpn_id}))
         .send()
         .await
-        .map_err(|e| format!("VPN-ID-Registrierung fehlgeschlagen: {e}"))?;
+        .map_err(|e| {
+            crate::app_logger::error(&format!("vpn: ID-Registrierung fehlgeschlagen: {e}"));
+            format!("VPN-ID-Registrierung fehlgeschlagen: {e}")
+        })?;
     if !resp.status().is_success() {
         let body: serde_json::Value = resp.json().await.unwrap_or_default();
-        return Err(body["error"].as_str().unwrap_or("Unbekannter Fehler").to_string());
+        let err = body["error"].as_str().unwrap_or("Unbekannter Fehler").to_string();
+        crate::app_logger::error(&format!("vpn: ID-Registrierung abgelehnt: {err}"));
+        return Err(err);
     }
+    crate::app_logger::done("vpn: VPN-ID erfolgreich beim Server registriert");
     Ok(())
 }

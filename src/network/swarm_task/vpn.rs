@@ -47,8 +47,18 @@ impl SwarmTask {
                     }
                 }
 
+                let is_new = self.vpn_peers.by_vpn_id(&announce.vpn_id).is_none();
                 // Aktualisiere VPN-Peer-Registry
                 self.vpn_peers.upsert(&announce, source);
+
+                if is_new {
+                    println!("[vpn] 🆕 Neuer VPN-Peer: id={} name='{}' mode={} relay={} (via {source})",
+                        &announce.vpn_id[..8.min(announce.vpn_id.len())],
+                        announce.display_name,
+                        announce.mode,
+                        announce.relay_available,
+                    );
+                }
 
                 // Event an die Anwendung senden
                 let _ = self.event_tx.send(NetworkEvent::VpnPeerAnnounced {
@@ -61,7 +71,7 @@ impl SwarmTask {
                 gossipsub::MessageAcceptance::Accept
             }
             Err(e) => {
-                eprintln!("[vpn] Ungültige VPN-ID-Ankündigung von {source}: {e}");
+                eprintln!("[vpn] ❌ Ungültige VPN-ID-Ankündigung von {source}: {e}");
                 gossipsub::MessageAcceptance::Reject
             }
         }
@@ -200,16 +210,27 @@ impl SwarmTask {
         let data = match serde_json::to_vec(&announce) {
             Ok(d) => d,
             Err(e) => {
-                eprintln!("[vpn] Fehler beim Serialisieren der VPN-ID-Ankündigung: {e}");
+                eprintln!("[vpn] ❌ Fehler beim Serialisieren der VPN-ID-Ankündigung: {e}");
                 return;
             }
         };
 
         let topic = vpn_id_topic();
-        if let Err(e) = self.swarm.behaviour_mut().gossipsub.publish(topic, data) {
-            eprintln!("[vpn] Fehler beim Senden der VPN-ID-Ankündigung: {e}");
-            return;
-        }
+        match self.swarm.behaviour_mut().gossipsub.publish(topic.clone(), data) {
+            Ok(_) => {
+                println!("[vpn] 📡 VPN-ID angekündigt: id={} mode={} peers={} relay={}",
+                    &state.current_id[..8.min(state.current_id.len())],
+                    mode.as_str(),
+                    self.vpn_peers.count(),
+                    mode == VpnMode::Relay,
+                );
+            }
+            Err(e) => {
+                if !e.to_string().contains("InsufficientPeers") {
+                    eprintln!("[vpn] ❌ Fehler beim Senden der VPN-ID-Ankündigung: {e}");
+                }
+            }
+        };
 
         self.last_vpn_announce = Some(Instant::now());
 
