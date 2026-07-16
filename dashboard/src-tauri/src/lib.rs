@@ -301,16 +301,13 @@ pub fn run() {
                             .join("vpn_data");
                         let _ = std::fs::create_dir_all(&data_dir);
                         let config = stonevpn::VpnConfig {
-                            ip_pool: "10.1.0.0/24".into(),
-                            port: 51821,
-                            relays: "212.227.54.241:51821".into(),
                             stone_data: data_dir,
-                            enable_tun: true,
-                            relay: false,
+                            ..Default::default()
                         };
-                        eprintln!("[app] Integrierter VPN auto-start…");
-                        if let Err(e) = vpn_state.start(config).await {
-                            eprintln!("[app] VPN auto-start: {e}");
+                        eprintln!("[app] Integrierter VPN auto-start (port={}, tun={})…", config.port, config.enable_tun);
+                        match vpn_state.start(config).await {
+                            Err(e) => eprintln!("[app] VPN auto-start fehlgeschlagen: {e}"),
+                            Ok(_) => eprintln!("[app] VPN läuft"),
                         }
                     }
                 });

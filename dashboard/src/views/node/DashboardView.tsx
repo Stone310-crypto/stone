@@ -13,8 +13,8 @@ export default function DashboardView() {
   const pausedRef = useRef(false);
   useEffect(()=>{pausedRef.current=logPaused},[logPaused]);
 
-  // ─── VPN Status ────────────────────────────────────────────────────
-  const [vpnStatus, setVpnStatus] = useState<{active:boolean;installed:boolean;vpn_ip:string|null;peer_count:number;peers:string[];mode:string}|null>(null);
+  // ─── VPN Status (integrierter VPN) ───────────────────────────────
+  const [vpnStatus, setVpnStatus] = useState<{active:boolean;installed:boolean;vpn_id?:string;vpn_ip:string|null;peer_count:number;peers:string[];mode:string;tun_active?:boolean}|null>(null);
   const [vpnAction, setVpnAction] = useState<string|null>(null);
   const [vpnResult, setVpnResult] = useState<string|null>(null);
 
@@ -22,9 +22,28 @@ export default function DashboardView() {
     const poll = async () => {
       try {
         const { invoke } = await import("@tauri-apps/api/core");
-        const vs: any = await invoke("get_vpn_status");
-        setVpnStatus(vs);
-      } catch(e) {}
+        // Integrierten VPN-Status abrufen
+        const vs: any = await invoke("vpn_status");
+        if (vs) {
+          setVpnStatus({
+            active: vs.mode !== "stopped" && vs.mode !== "error",
+            installed: false,
+            vpn_ip: vs.vpn_ip,
+            vpn_id: vs.vpn_ip, // Nutzer-ID = VPN-IP für Anzeige
+            peer_count: vs.peer_count ?? 0,
+            peers: [],
+            mode: vs.mode === "relay" ? "Relay" : vs.mode === "client" ? "Client" : vs.mode,
+            tun_active: vs.tun_active,
+          });
+        }
+      } catch(e) {
+        // Fallback: alten Befehl probieren
+        try {
+          const { invoke } = await import("@tauri-apps/api/core");
+          const vs: any = await invoke("get_vpn_status");
+          if (vs) setVpnStatus(vs);
+        } catch {}
+      }
     };
     poll();
     const id = setInterval(poll, 5000);
@@ -36,8 +55,18 @@ export default function DashboardView() {
     setVpnResult(null);
     try {
       const { invoke } = await import("@tauri-apps/api/core");
-      const result: string = await invoke(action);
-      setVpnResult(result);
+      // Neue integrierte VPN-Commands bevorzugen
+      if (action === "start_vpn") {
+        const result: any = await invoke("vpn_start");
+        setVpnResult(`VPN gestartet — IP: ${result?.vpn_ip ?? 'warte…'}`);
+      } else if (action === "stop_vpn") {
+        await invoke("vpn_stop");
+        setVpnResult("VPN gestoppt");
+      } else {
+        // Alle anderen Actions (install/uninstall service) via altem Befehl
+        const result: string = await invoke(action);
+        setVpnResult(result);
+      }
     } catch(e: any) {
       setVpnResult("❌ " + (e?.toString() ?? "Fehler"));
     } finally {
@@ -159,12 +188,12 @@ export default function DashboardView() {
           <div style={{flex:1}}>
             <div style={{fontWeight:600,fontSize:13}}>
               VPN {vpnStatus?.active ? `🟢 ${vpnStatus.vpn_ip ?? 'verbunden'}` : '⚫ inaktiv'}
-              {vpnStatus?.installed && <span style={{fontSize:10,color:"var(--text-muted)",marginLeft:8}}>(Systemdienst)</span>}
+              {vpnStatus?.tun_active && <span style={{fontSize:10,color:"var(--green)",marginLeft:6}}>TUN</span>}
             </div>
             <div style={{fontSize:11,color:"var(--text-muted)"}}>
               {vpnStatus?.active
-                ? `${vpnStatus.peer_count} Peers · ${vpnStatus.mode === 'service' ? 'Systemdienst' : 'App-gesteuert'}`
-                : vpnStatus?.installed ? 'Dienst installiert, läuft nicht' : 'Nicht installiert'}
+                ? `${vpnStatus.peer_count} Peers · ${vpnStatus.mode || 'aktiv'}`
+                : 'Nicht gestartet'}
             </div>
           </div>
           <div style={{display:"flex",gap:6}}>

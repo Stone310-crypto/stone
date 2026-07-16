@@ -21,7 +21,10 @@ impl Default for VpnConfig {
             port: 51821,
             relays: "212.227.54.241:51821".into(),
             stone_data: PathBuf::from("./stone_data"),
+            #[cfg(unix)]
             enable_tun: true,
+            #[cfg(not(unix))]
+            enable_tun: false, // Windows: kein TUN-Support
             relay: false,
         }
     }
