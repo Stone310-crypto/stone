@@ -247,4 +247,68 @@ impl SwarmTask {
             NatStatus::Unknown => VpnMode::Unknown,
         }
     }
+
+    /// Stellt sicher dass VPN aktiviert ist (Safety-Net).
+    ///
+    /// Wird vom AutoNAT-Event-Handler aufgerufen, wenn der NAT-Status
+    /// erkannt wurde (Public/Private). Falls `maybe_start_vpn` noch nicht
+    /// gelaufen ist oder fehlgeschlagen ist, wird hier eine VPN-ID
+    /// generiert und der VPN automatisch aktiviert.
+    pub(super) fn ensure_vpn_activated(&mut self, detected_mode: &str) {
+        // Bereits aktiviert → nichts zu tun
+        if self.vpn_id_state.is_some() {
+            return;
+        }
+
+        println!("[vpn] ⚡ Auto-Aktivierung: NAT-Status={} → initialisiere VPN...", detected_mode);
+
+        // Versuche VPN-ID aus Datei zu laden (stone_data/vpn_id.txt)
+        let vpn_id = Self::try_load_vpn_id_from_disk()
+            .unwrap_or_else(|| {
+                let id = crate::network::vpn_protocol::generate_vpn_id();
+                println!("[vpn] 🆕 Neue VPN-ID generiert: {}", &id[..8.min(id.len())]);
+                id
+            });
+
+        let node_name = std::env::var("STONE_NODE_NAME")
+            .unwrap_or_else(|_| hostname::get()
+                .map(|h| h.to_string_lossy().to_string())
+                .unwrap_or_else(|_| "stone-node".into()));
+
+        let mut state = crate::network::vpn_protocol::VpnIdState::new();
+        state.current_id = vpn_id;
+        state.display_name = node_name;
+        state.mode = detected_mode.to_string();
+
+        // VPN-ID Topic subscriben
+        let topic = crate::network::vpn_protocol::vpn_id_topic();
+        if let Err(e) = self.swarm.behaviour_mut().gossipsub.subscribe(&topic) {
+            eprintln!("[vpn] ⚠ Konnte VPN-ID-Topic nicht subscriben: {e}");
+        }
+
+        self.vpn_id_state = Some(state);
+        self.last_vpn_announce = None;
+        self.announce_vpn_id();
+
+        let id = self.vpn_id_state.as_ref().map(|s| &s.current_id[..]).unwrap_or("?");
+        println!("[vpn] ✅ VPN auto-aktiviert: id={} mode={}", &id[..8.min(id.len())], detected_mode);
+    }
+
+    /// Versucht die VPN-ID aus stone_data/vpn_id.txt zu laden.
+    fn try_load_vpn_id_from_disk() -> Option<String> {
+        let data_dir = crate::blockchain::data_dir();
+        let path = format!("{data_dir}/vpn_id.txt");
+        match std::fs::read_to_string(&path) {
+            Ok(content) => {
+                let id = content.trim().to_string();
+                if id.len() >= 4 {
+                    println!("[vpn] 📂 VPN-ID aus Datei geladen: {}", &id[..8.min(id.len())]);
+                    Some(id)
+                } else {
+                    None
+                }
+            }
+            Err(_) => None,
+        }
+    }
 }

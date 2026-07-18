@@ -854,19 +854,75 @@ fn same_endpoint_url(a: &str, b: &str) -> bool { match (endpoint_from_url(a), en
 fn is_bootstrap_url(url: &str) -> bool { let configured = if let Ok(raw) = std::env::var("STONE_BOOTSTRAP_HTTP_URLS") { raw.split(',').map(str::trim).filter(|s| !s.is_empty()).map(|s| s.trim_end_matches('/').to_string()).collect::<Vec<_>>() } else { stone::network::default_bootstrap_http_urls() }; configured.iter().any(|b| same_endpoint_url(url, b)) }
 
 /// VPN ist jetzt direkt in den libp2p-Swarm integriert (kein separater Prozess).
-/// Die VPN-ID wird vom Server/Account zugewiesen und über Gossipsub angekündigt.
-/// Diese Funktion existiert nur noch für Abwärtskompatibilität.
-/// Der VPN läuft automatisch, sobald P2P aktiv ist.
-pub async fn maybe_start_vpn() {
+/// Auto-aktiviert den VPN mit einer gespeicherten oder neu generierten VPN-ID.
+/// Wird in einem eigenen tokio::spawn aufgerufen — darf den Node nicht crashen.
+pub async fn maybe_start_vpn(network: &Option<stone::network::NetworkHandle>) {
+    // Jeder Fehler wird geloggt, NIEMALS panicked
+    if let Err(e) = try_start_vpn(network).await {
+        eprintln!("[vpn] ❌ VPN-Aktivierung fehlgeschlagen: {e}");
+    }
+}
+
+async fn try_start_vpn(network: &Option<stone::network::NetworkHandle>) -> Result<(), String> {
+    println!("[vpn] ███████████████████████████████████████");
+    println!("[vpn] █ try_start_vpn AUFGERUFEN (v0.6.18) █");
+    println!("[vpn] ███████████████████████████████████████");
     let enabled = std::env::var("STONE_VPN_ENABLED")
         .map(|v| v == "1")
-        .unwrap_or(false);
-    if !enabled { return; }
+        .unwrap_or(true);
+    if !enabled {
+        println!("[vpn] ℹ️  VPN deaktiviert (STONE_VPN_ENABLED=0)");
+        return Ok(());
+    }
 
-    println!("[vpn] ℹ️  VPN ist jetzt im libp2p-Swarm integriert (kein separater Prozess).");
-    println!("[vpn]    Die VPN-ID wird vom Account-Server zugewiesen.");
-    println!("[vpn]    Nutze POST /api/v1/users/me/vpn-id zum Registrieren.");
+    let handle = network.as_ref()
+        .ok_or_else(|| "P2P nicht aktiv".to_string())?;
+
+    // Prüfe ob bereits eine VPN-ID gesetzt ist
+    if let Some(state) = handle.get_vpn_id().await {
+        if !state.current_id.is_empty() {
+            println!("[vpn] ✅ VPN bereits aktiv: id={} mode={}",
+                &state.current_id[..8.min(state.current_id.len())], state.mode);
+            return Ok(());
+        }
+    }
+
+    // VPN-ID aus Datei laden oder neu generieren
+    let vpn_id = load_or_generate_vpn_id()?;
+
+    let node_name = std::env::var("STONE_NODE_NAME")
+        .unwrap_or_else(|_| hostname::get()
+            .map(|h| h.to_string_lossy().to_string())
+            .unwrap_or_else(|_| "stone-node".into()));
+
+    println!("[vpn] 🆔 Setze VPN-ID: {} (node={})", &vpn_id[..8.min(vpn_id.len())], node_name);
+    handle.set_vpn_id(&vpn_id, &node_name, None).await;
+
+    println!("[vpn] ✅ VPN aktiviert — ID wird per Gossipsub angekündigt.");
     println!("[vpn]    Status: GET /api/v1/vpn/status");
+    Ok(())
+}
+
+/// Lädt die VPN-ID aus stone_data/vpn_id.txt oder generiert eine neue.
+pub fn load_or_generate_vpn_id() -> Result<String, String> {
+    let data_dir = stone::blockchain::data_dir();
+    let vpn_id_path = format!("{data_dir}/vpn_id.txt");
+
+    // Versuche aus Datei zu laden
+    if let Ok(id) = std::fs::read_to_string(&vpn_id_path) {
+        let id = id.trim().to_string();
+        if id.len() >= 4 {
+            return Ok(id);
+        }
+    }
+
+    // Neue ID generieren
+    let id = stone::network::vpn_protocol::generate_vpn_id();
+    std::fs::create_dir_all(&data_dir)
+        .map_err(|e| format!("Verzeichnis erstellen: {e}"))?;
+    std::fs::write(&vpn_id_path, &id)
+        .map_err(|e| format!("VPN-ID speichern: {e}"))?;
+    Ok(id)
 }
 
 pub async fn bootstrap_announce(node: &Arc<MasterNodeState>) {

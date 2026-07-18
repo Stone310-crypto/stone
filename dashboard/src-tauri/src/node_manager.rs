@@ -176,25 +176,8 @@ pub fn find_binary(app: &AppHandle, override_path: &str) -> Option<PathBuf> {
             v.push(PathBuf::from(override_path));
         }
 
-        // 1. Dedicated binaries folder — highest default priority
-        if let Ok(data_dir) = app.path().app_data_dir() {
-            let bin_dir = data_dir.join("binaries");
-            v.push(bin_dir.join(exe_name("stone-app-node")));
-            v.push(bin_dir.join(exe_name("stone-master")));
-            // Also check legacy location (root of app data dir)
-            v.push(data_dir.join(exe_name("stone-app-node")));
-            v.push(data_dir.join(exe_name("stone-master")));
-        }
-
-        // 2. Next to our own executable
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
-                v.push(dir.join(exe_name("stone-app-node")));
-                v.push(dir.join(exe_name("stone-master")));
-            }
-        }
-
-        // 3. Project build output (developer shortcut)
+        // 1. Project build output (developer shortcut) — HÖCHSTE Priorität
+        //    Damit der lokal gebaute Binary immer Vorrang vor GitHub-Downloads hat.
         #[cfg(unix)]
         if let Some(home) = std::env::var_os("HOME") {
             let home = PathBuf::from(home);
@@ -206,6 +189,24 @@ pub fn find_binary(app: &AppHandle, override_path: &str) -> Option<PathBuf> {
             let profile = PathBuf::from(userprofile);
             v.push(profile.join("stone/target/release/stone-app-node.exe"));
             v.push(profile.join("stone/target/release/stone-master.exe"));
+        }
+
+        // 2. Dedicated binaries folder (GitHub-Downloads)
+        if let Ok(data_dir) = app.path().app_data_dir() {
+            let bin_dir = data_dir.join("binaries");
+            v.push(bin_dir.join(exe_name("stone-app-node")));
+            v.push(bin_dir.join(exe_name("stone-master")));
+            // Also check legacy location (root of app data dir)
+            v.push(data_dir.join(exe_name("stone-app-node")));
+            v.push(data_dir.join(exe_name("stone-master")));
+        }
+
+        // 3. Next to our own executable (bundled)
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                v.push(dir.join(exe_name("stone-app-node")));
+                v.push(dir.join(exe_name("stone-master")));
+            }
         }
 
         // 4. PATH lookup

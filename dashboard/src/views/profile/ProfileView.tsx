@@ -492,9 +492,9 @@ export default function ProfileView() {
     const poll = async () => {
       try {
         const { invoke } = await import("@tauri-apps/api/core");
-        const info: any = await invoke("get_my_vpn_id");
-        if (info?.current_id && info.current_id !== "00000000") {
-          setVpnId(info.current_id);
+        const vs: any = await invoke("dashboard_vpn_status");
+        if (vs?.active && vs.vpn_id) {
+          setVpnId(vs.vpn_id);
         }
       } catch(e) {}
     };
@@ -508,7 +508,7 @@ export default function ProfileView() {
     setVpnIdResult(null);
     try {
       const { invoke } = await import("@tauri-apps/api/core");
-      const newId: string = await invoke("rotate_my_vpn_id");
+      const newId: string = await invoke("dashboard_vpn_rotate");
       setVpnId(newId);
       setVpnIdResult(`Neue ID: ${newId}`);
       // Beim Server registrieren, damit Freunde die ID finden können

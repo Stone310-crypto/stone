@@ -25,8 +25,8 @@ export default function ProfileEditOverlay({ onClose }: ProfileEditOverlayProps)
     (async () => {
       try {
         const { invoke } = await import("@tauri-apps/api/core");
-        const info: any = await invoke("get_my_vpn_id");
-        if (info?.current_id && info.current_id !== "00000000") setVpnId(info.current_id);
+        const vs: any = await invoke("dashboard_vpn_status");
+        if (vs?.active && vs.vpn_id) setVpnId(vs.vpn_id);
       } catch {}
     })();
   }, []);
@@ -35,7 +35,7 @@ export default function ProfileEditOverlay({ onClose }: ProfileEditOverlayProps)
     setVpnIdChanging(true);
     try {
       const { invoke } = await import("@tauri-apps/api/core");
-      const newId: string = await invoke("rotate_my_vpn_id");
+      const newId: string = await invoke("dashboard_vpn_rotate");
       setVpnId(newId);
       // Beim Server registrieren
       try {

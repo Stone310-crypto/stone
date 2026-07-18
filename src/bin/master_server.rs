@@ -125,8 +125,7 @@ async fn main() {
 
     std::fs::create_dir_all(data_dir()).expect("DATA_DIR anlegen");
 
-    // ── VPN (jetzt im libp2p-Swarm integriert, kein separater Prozess) ──
-    maybe_start_vpn().await;
+    // ── VPN (jetzt im libp2p-Swarm integriert, wird nach P2P-Start aktiviert) ──
 
     // Post-Update Rollback prüfen
     if stone::updater::check_post_update_rollback(&data_dir()) {
@@ -605,6 +604,16 @@ async fn main() {
                         };
                         handle.set_stake_level(level).await;
                     }
+
+                    // VPN aktivieren (integriert im libp2p-Swarm)
+                    // Mit Timeout awaiten, dann HTTP-Server starten
+                    println!("[vpn] 🚀 Starte VPN-Aktivierung...");
+                    let vpn_handle = handle.clone();
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        maybe_start_vpn(&Some(vpn_handle)),
+                    ).await;
+                    println!("[vpn] 🏁 VPN-Aktivierung abgeschlossen.");
 
                     // Periodisch Stake-Level aktualisieren (alle 5 Min)
                     {

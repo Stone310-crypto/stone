@@ -707,6 +707,8 @@ impl SwarmTask {
                     autonat::NatStatus::Public(_addr) => {
                         self.nat_status = NatStatus::Public;
                         println!("[p2p] ✅ NAT-Status: Öffentlich erreichbar → VPN-Modus: RELAY");
+                        // ── VPN automatisch aktivieren falls noch nicht geschehen ──
+                        self.ensure_vpn_activated("relay");
                         // VPN-Modus aktualisieren
                         if let Some(ref mut state) = self.vpn_id_state {
                             state.mode = "relay".into();
@@ -717,6 +719,8 @@ impl SwarmTask {
                     autonat::NatStatus::Private => {
                         self.nat_status = NatStatus::Private;
                         println!("[p2p] 🔒 NAT-Status: Privat → VPN-Modus: CLIENT (hinter NAT)");
+                        // ── VPN automatisch aktivieren falls noch nicht geschehen ──
+                        self.ensure_vpn_activated("client");
                         // Bei privatem NAT automatisch Relay-Reservierungen herstellen
                         self.establish_relay_reservations();
                         // Zusätzlich: Alle bereits verbundenen Peers als potentielle Relays nutzen

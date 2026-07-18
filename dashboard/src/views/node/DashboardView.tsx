@@ -13,8 +13,8 @@ export default function DashboardView() {
   const pausedRef = useRef(false);
   useEffect(()=>{pausedRef.current=logPaused},[logPaused]);
 
-  // ─── VPN Status (integrierter VPN) ───────────────────────────────
-  const [vpnStatus, setVpnStatus] = useState<{active:boolean;installed:boolean;vpn_id?:string;vpn_ip:string|null;peer_count:number;peers:string[];mode:string;tun_active?:boolean}|null>(null);
+  // ─── VPN Status (immer aktiv — im libp2p-Swarm integriert) ─────
+  const [vpnStatus, setVpnStatus] = useState<{vpn_id?:string;peer_count:number;peers:string[];mode:string}|null>(null);
   const [vpnAction, setVpnAction] = useState<string|null>(null);
   const [vpnResult, setVpnResult] = useState<string|null>(null);
 
@@ -22,27 +22,18 @@ export default function DashboardView() {
     const poll = async () => {
       try {
         const { invoke } = await import("@tauri-apps/api/core");
-        // Integrierten VPN-Status abrufen
-        const vs: any = await invoke("vpn_status");
+        // VPN-Status vom integrierten libp2p-VPN (HTTP /api/v1/vpn/status)
+        const vs: any = await invoke("dashboard_vpn_status");
         if (vs) {
           setVpnStatus({
-            active: vs.mode !== "stopped" && vs.mode !== "error",
-            installed: false,
-            vpn_ip: vs.vpn_ip,
-            vpn_id: vs.vpn_ip, // Nutzer-ID = VPN-IP für Anzeige
+            vpn_id: vs.vpn_id ?? undefined,
             peer_count: vs.peer_count ?? 0,
-            peers: [],
-            mode: vs.mode === "relay" ? "Relay" : vs.mode === "client" ? "Client" : vs.mode,
-            tun_active: vs.tun_active,
+            peers: (vs.peers || []).map((p: any) => p.display_name || p.vpn_id || p.peer_id),
+            mode: vs.mode || "auto",
           });
         }
       } catch(e) {
-        // Fallback: alten Befehl probieren
-        try {
-          const { invoke } = await import("@tauri-apps/api/core");
-          const vs: any = await invoke("get_vpn_status");
-          if (vs) setVpnStatus(vs);
-        } catch {}
+        // Node noch nicht gestartet — null lassen (UI zeigt Ladezustand)
       }
     };
     poll();
@@ -55,17 +46,17 @@ export default function DashboardView() {
     setVpnResult(null);
     try {
       const { invoke } = await import("@tauri-apps/api/core");
-      // Neue integrierte VPN-Commands bevorzugen
       if (action === "start_vpn") {
-        const result: any = await invoke("vpn_start");
-        setVpnResult(`VPN gestartet — IP: ${result?.vpn_ip ?? 'warte…'}`);
+        // VPN startet automatisch mit dem Node — kein separater Start nötig
+        setVpnResult("✅ VPN ist bereits im Node integriert und aktiv.");
       } else if (action === "stop_vpn") {
-        await invoke("vpn_stop");
-        setVpnResult("VPN gestoppt");
+        // VPN stoppen nicht separat möglich (Teil des libp2p-Swarms)
+        setVpnResult("ℹ️ VPN kann nicht separat gestoppt werden (Teil des P2P-Netzwerks).");
+      } else if (action === "rotate_vpn") {
+        const newId: string = await invoke("dashboard_vpn_rotate");
+        setVpnResult("✅ Neue VPN-ID: " + (newId?.substring(0, 8) ?? "???"));
       } else {
-        // Alle anderen Actions (install/uninstall service) via altem Befehl
-        const result: string = await invoke(action);
-        setVpnResult(result);
+        setVpnResult("ℹ️ Aktion '" + action + "' nicht verfügbar (VPN ist jetzt im Node integriert).");
       }
     } catch(e: any) {
       setVpnResult("❌ " + (e?.toString() ?? "Fehler"));
@@ -178,59 +169,33 @@ export default function DashboardView() {
         <StatCard icon={<Users size={16}/>} label="Peers" value={health?.peer_count??'—'} color="var(--green)"/>
         <StatCard icon={<Clock size={16}/>} label="Uptime" value={health?fmtUptime(health.uptime_secs):'—'} color="var(--blue)"/>
         <StatCard icon={<Database size={16}/>} label="Mempool" value={health?.mempool_size??'—'} color="var(--amber)"/>
-        <StatCard icon={<Shield size={16}/>} label="VPN" value={vpnStatus?.active ? (vpnStatus.vpn_ip ?? 'verbunden') : 'inaktiv'} color={vpnStatus?.active ? 'var(--green)' : 'var(--text-muted)'} subtitle={vpnStatus?.active ? `${vpnStatus.peer_count} peers` : undefined}/>
+        <StatCard icon={<Shield size={16}/>} label="VPN" value={vpnStatus?.vpn_id ? vpnStatus.vpn_id.substring(0,8)+'…' : 'verbunden'} color="var(--green)" subtitle={vpnStatus ? `${vpnStatus.peer_count} peers · ${vpnStatus.mode}` : 'via P2P-Swarm'}/>
       </div>
 
-      {/* VPN Status & Controls */}
+      {/* VPN — Standard-Verbindung (immer aktiv im libp2p-Swarm) */}
       <div style={{background:"var(--bg-panel)",border:"1px solid var(--border)",borderRadius:10,padding:"12px 16px",marginBottom:16}}>
         <div style={{display:"flex",alignItems:"center",gap:12}}>
-          <Shield size={18} style={{color: vpnStatus?.active ? "var(--green)" : "var(--text-muted)"}}/>
+          <Shield size={18} style={{color:"var(--green)"}}/>
           <div style={{flex:1}}>
             <div style={{fontWeight:600,fontSize:13}}>
-              VPN {vpnStatus?.active ? `🟢 ${vpnStatus.vpn_ip ?? 'verbunden'}` : '⚫ inaktiv'}
-              {vpnStatus?.tun_active && <span style={{fontSize:10,color:"var(--green)",marginLeft:6}}>TUN</span>}
+              🟢 VPN Standard-Verbindung
+              {vpnStatus?.vpn_id && <span style={{fontSize:10,color:"var(--text-muted)",marginLeft:6,fontFamily:"monospace"}}>{vpnStatus.vpn_id}</span>}
             </div>
             <div style={{fontSize:11,color:"var(--text-muted)"}}>
-              {vpnStatus?.active
-                ? `${vpnStatus.peer_count} Peers · ${vpnStatus.mode || 'aktiv'}`
-                : 'Nicht gestartet'}
+              {vpnStatus
+                ? `${vpnStatus.peer_count} Peers · Mode: ${vpnStatus.mode}`
+                : 'VPN ist immer aktiv — Teil des P2P-Swarms'}
             </div>
           </div>
           <div style={{display:"flex",gap:6}}>
-            {!vpnStatus?.active && (
-              <button onClick={() => vpnActionHandler("start_vpn")} disabled={vpnAction !== null}
-                style={{padding:"5px 12px",borderRadius:6,background:"var(--green)",color:"#fff",border:"none",cursor:"pointer",fontSize:11,fontWeight:600,whiteSpace:"nowrap",opacity:vpnAction?0.6:1}}>
-                ▶ Start
-              </button>
-            )}
-            {vpnStatus?.active && (
-              <button onClick={() => vpnActionHandler("stop_vpn")} disabled={vpnAction !== null}
-                style={{padding:"5px 12px",borderRadius:6,background:"var(--amber)",color:"#000",border:"none",cursor:"pointer",fontSize:11,fontWeight:600,whiteSpace:"nowrap",opacity:vpnAction?0.6:1}}>
-                ⏹ Stop
-              </button>
-            )}
-            {!vpnStatus?.installed && (
-              <button onClick={() => vpnActionHandler("install_vpn_service")} disabled={vpnAction !== null}
-                style={{padding:"5px 12px",borderRadius:6,background:"var(--accent)",color:"#fff",border:"none",cursor:"pointer",fontSize:11,fontWeight:600,whiteSpace:"nowrap",opacity:vpnAction?0.6:1}}>
-                🔧 Installieren
-              </button>
-            )}
-            {vpnStatus?.installed && (
-              <>
-                <button onClick={() => vpnActionHandler("stop_vpn_service")} disabled={vpnAction !== null}
-                  style={{padding:"5px 12px",borderRadius:6,background:"var(--border)",color:"var(--text)",border:"none",cursor:"pointer",fontSize:10,whiteSpace:"nowrap",opacity:vpnAction?0.6:1}}>
-                  ⏸ Dienst Stop
-                </button>
-                <button onClick={() => vpnActionHandler("uninstall_vpn_service")} disabled={vpnAction !== null}
-                  style={{padding:"5px 12px",borderRadius:6,background:"rgba(239,68,68,0.1)",color:"#ef4444",border:"1px solid rgba(239,68,68,0.2)",cursor:"pointer",fontSize:10,whiteSpace:"nowrap",opacity:vpnAction?0.6:1}}>
-                  🗑 Deinstallieren
-                </button>
-              </>
-            )}
+            <button onClick={() => vpnActionHandler("rotate_vpn")} disabled={vpnAction !== null}
+              style={{padding:"5px 12px",borderRadius:6,background:"var(--accent)",color:"#fff",border:"none",cursor:"pointer",fontSize:11,fontWeight:600,whiteSpace:"nowrap",opacity:vpnAction?0.6:1}}>
+              🔄 Neue ID
+            </button>
           </div>
         </div>
         {vpnAction && (
-          <div style={{fontSize:11,color:"var(--text-muted)",marginTop:6}}>⏳ {vpnAction === "start_vpn" ? "Starte VPN…" : vpnAction === "stop_vpn" ? "Stoppe…" : vpnAction === "install_vpn_service" ? "Installiere…" : vpnAction === "uninstall_vpn_service" ? "Deinstalliere…" : "Bitte warten…"}</div>
+          <div style={{fontSize:11,color:"var(--text-muted)",marginTop:6}}>⏳ {vpnAction === "rotate_vpn" ? "Generiere neue VPN-ID…" : "Bitte warten…"}</div>
         )}
         {vpnResult && (
           <div style={{marginTop:6,fontSize:11,color: vpnResult.startsWith("❌") ? "#ef4444" : "var(--green)",whiteSpace:"pre-wrap"}}>{vpnResult}</div>

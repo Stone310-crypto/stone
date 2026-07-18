@@ -699,12 +699,36 @@ pub async fn handle_update_vpn_id(
 
 /// GET /api/v1/vpn/status — Gibt den aktuellen VPN-Status zurück.
 /// Der VPN läuft jetzt direkt im libp2p-Swarm (kein separater Prozess mehr).
+/// Falls P2P aktiv ist aber noch keine VPN-ID gesetzt wurde, wird sie hier
+/// automatisch nachgeholt (Lazy-Activation als Safety-Net).
 pub async fn handle_vpn_status(
     State(state): State<AppState>,
 ) -> impl IntoResponse {
     let (vpn_id, display_name, vpn_mode, peer_count, peers) = if let Some(ref net) = state.network {
         let id_state = net.get_vpn_id().await;
-        let vpn_id = id_state.as_ref().map(|s| s.current_id.clone());
+        let mut vpn_id = id_state.as_ref().and_then(|s| if s.current_id.is_empty() { None } else { Some(s.current_id.clone()) });
+        
+        // ── Lazy-Activation: Falls P2P läuft aber keine VPN-ID gesetzt ist,
+        //     VPN jetzt automatisch aktivieren (Safety-Net für fehlgeschlagenes maybe_start_vpn) ──
+        if vpn_id.is_none() {
+            println!("[vpn] ⚠️ handle_vpn_status: Keine VPN-ID gesetzt obwohl P2P läuft → aktiviere jetzt...");
+            // Kein maybe_start_vpn import — direkt die ID generieren und setzen
+            let new_id = crate::server::sync::load_or_generate_vpn_id()
+                .unwrap_or_else(|e| {
+                    eprintln!("[vpn] ❌ Lazy-Activation fehlgeschlagen: {e}");
+                    "00000000".to_string()
+                });
+            if new_id != "00000000" {
+                let node_name = std::env::var("STONE_NODE_NAME")
+                    .unwrap_or_else(|_| hostname::get()
+                        .map(|h| h.to_string_lossy().to_string())
+                        .unwrap_or_else(|_| "stone-node".into()));
+                println!("[vpn] 🆔 Lazy-Activation: Setze VPN-ID {} (node={})", &new_id[..8.min(new_id.len())], node_name);
+                net.set_vpn_id(&new_id, &node_name, None).await;
+                vpn_id = Some(new_id);
+            }
+        }
+        
         let display_name = id_state.as_ref().map(|s| s.display_name.clone()).unwrap_or_default();
         let vpn_mode = id_state.as_ref().map(|s| s.mode.clone()).unwrap_or_else(|| "unknown".into());
         let vpn_peers = net.get_vpn_peers().await;

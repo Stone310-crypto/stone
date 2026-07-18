@@ -347,8 +347,8 @@ async fn start_full_node(state: SetupState) {
 
     std::fs::create_dir_all(data_dir()).ok();
 
-    // VPN-Client starten falls STONE_VPN_ENABLED=1
-    maybe_start_vpn().await;
+    // VPN wird später von stone-master aktiviert (nach P2P-Start).
+    // setup hat kein P2P, daher kein VPN-Aufruf hier.
 
     // Post-Update Rollback prüfen (bei Crash-Loop → altes Binary wiederherstellen)
     if stone::updater::check_post_update_rollback(&data_dir()) {
@@ -602,6 +602,14 @@ async fn start_full_node(state: SetupState) {
                 }
                 // Network-Handle speichern
                 *state.network.write().await = Some(handle.clone());
+
+                // ── VPN aktivieren (integriert im libp2p-Swarm) ──────────
+                {
+                    let vpn_handle = handle.clone();
+                    tokio::spawn(async move {
+                        maybe_start_vpn(&Some(vpn_handle)).await;
+                    });
+                }
 
                 // ── Mining → Gossip Bridge: geminete Blöcke broadcasten ──
                 {

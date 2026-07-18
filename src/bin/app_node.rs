@@ -58,8 +58,7 @@ async fn main() {
         eprintln!("[app-node] Warnung: Data-Dir konnte nicht erstellt werden: {e}");
     }
 
-    // ── VPN (jetzt im libp2p-Swarm integriert) ──────────────────────────
-    maybe_start_vpn().await;
+    // ── VPN (jetzt im libp2p-Swarm integriert, wird nach P2P-Start aktiviert) ──
 
     // ── ChunkStore (ignoriert Fehler – app-node braucht keinen Storage) ──
     if let Err(e) = ChunkStore::new() {
@@ -211,6 +210,14 @@ async fn main() {
                         handle.set_chain_count(count).await;
                     }
                     handle.set_chain_ref(node.chain.clone()).await;
+
+                    // VPN aktivieren (integriert im libp2p-Swarm)
+                    // Mit Timeout awaiten damit der HTTP-Server erst startet wenn VPN ready ist
+                    let vpn_handle = handle.clone();
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        maybe_start_vpn(&Some(vpn_handle)),
+                    ).await;
 
                     // P2P Event-Loop ──────────────────────────────────────
                     {
