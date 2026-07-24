@@ -578,6 +578,7 @@ impl SwarmTask {
 
                             // Range-Requests für fehlende Blöcke
                             let mut idx = sync_from;
+                            let mut ranges = 0u64;
                             while idx < remote_height {
                                 let end = (idx + MAX_BLOCKS_PER_RANGE - 1).min(remote_height - 1);
                                 let _ = self.swarm.behaviour_mut().block_exchange.send_request(
@@ -585,7 +586,12 @@ impl SwarmTask {
                                     BlockRequest { block_index: idx, block_index_end: Some(end) },
                                 );
                                 idx = end + 1;
+                                ranges += 1;
                             }
+                            println!(
+                                "[p2p] 🔄 Sync von {peer}: {ranges} Range-Requests für Blöcke #{sync_from}..=#{} abgesetzt",
+                                remote_height - 1,
+                            );
                         }
                         if remote_height <= actual_local {
                             self.sync_target_peer = None;

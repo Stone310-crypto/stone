@@ -620,12 +620,17 @@ impl SwarmTask {
             if let Some(last) = self.sync_buffer_last_insert {
                 if last.elapsed() > Duration::from_secs(30) {
                     let remaining = self.sync_buffer.len();
-                    eprintln!("[p2p] ⚠ Sync-Buffer Timeout: {remaining} Blöcke verwaist (nächster erwartet: #{}, erster im Buffer: #{})" ,
+                    eprintln!("[p2p] ⚠ Sync-Buffer Timeout: {remaining} Blöcke verwaist (nächster erwartet: #{}, erster im Buffer: #{}) – starte Re-Sync" ,
                         self.sync_expected_next,
                         self.sync_buffer.keys().next().unwrap_or(&0),
                     );
                     self.sync_buffer.clear();
                     self.sync_buffer_last_insert = None;
+                    // Re-Sync aktiv anstoßen: eigenen Handshake senden, damit
+                    // vorausliegende Peers ihre Höhe melden und der Range-Sync
+                    // die Lücke erneut schließt (statt bis zum nächsten
+                    // 30s-Tick untätig zu warten).
+                    self.send_sync_handshake();
                 }
             }
         } else {
@@ -797,6 +802,7 @@ impl SwarmTask {
 
             // Fehlende Blöcke per Range-Requests abrufen
             let mut idx = sync_from;
+            let mut ranges = 0u64;
             while idx < msg.block_count {
                 let end = (idx + MAX_BLOCKS_PER_RANGE - 1).min(msg.block_count - 1);
                 let _ = self.swarm.behaviour_mut().block_exchange.send_request(
@@ -804,7 +810,12 @@ impl SwarmTask {
                     BlockRequest { block_index: idx, block_index_end: Some(end) },
                 );
                 idx = end + 1;
+                ranges += 1;
             }
+            println!(
+                "[p2p] 🔄 Sync von {source}: hole Blöcke #{sync_from}..=#{} in {ranges} Range-Requests",
+                msg.block_count - 1,
+            );
         } else if msg.block_count < actual_local {
             // Wir haben mehr Blöcke → eigenen Handshake senden damit der Peer synct
             self.send_sync_handshake();

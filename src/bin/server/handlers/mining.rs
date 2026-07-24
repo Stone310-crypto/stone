@@ -864,9 +864,28 @@ pub async fn handle_mining_submit(
             // Block via P2P-Gossipsub broadcasten
             {
                 let tx = state.node.block_broadcast_tx.lock().unwrap_or_else(|e| e.into_inner());
-                if let Some(ref sender) = *tx {
-                    let _ = sender.send(block.clone());
+                match tx.as_ref() {
+                    Some(sender) => {
+                        if sender.send(block.clone()).is_err() {
+                            eprintln!(
+                                "[mining] ⚠ Block #{}: Broadcast-Kanal geschlossen – Block wird NICHT propagiert!",
+                                block.index,
+                            );
+                        }
+                    }
+                    None => {
+                        eprintln!(
+                            "[mining] ⚠ Block #{} committed, aber KEIN Broadcast-Kanal verdrahtet (block_broadcast_tx=None) – Block wird NICHT ins Netz propagiert!",
+                            block.index,
+                        );
+                    }
                 }
+            }
+
+            // Chain-Höhe dem Swarm melden, damit ChainInfo/Sync-Handshake die
+            // aktuelle Höhe liefern (Peers erkennen so, dass wir voraus sind).
+            if let Some(net) = state.network.as_ref() {
+                net.set_chain_count(block.index + 1).await;
             }
 
             (

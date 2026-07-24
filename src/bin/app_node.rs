@@ -219,6 +219,21 @@ async fn main() {
                         maybe_start_vpn(&Some(vpn_handle)),
                     ).await;
 
+                    // ── Mining → Gossip Bridge: geminete Blöcke broadcasten ──
+                    // Ohne diese Brücke werden lokal geminete Blöcke (Mining-Submit,
+                    // Auto-Mining) zwar committed, aber NIE ins Netz propagiert.
+                    {
+                        let (broadcast_tx, mut broadcast_rx) =
+                            tokio::sync::mpsc::unbounded_channel::<stone::blockchain::Block>();
+                        *node.block_broadcast_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(broadcast_tx);
+                        let net_bc = handle.clone();
+                        tokio::spawn(async move {
+                            while let Some(block) = broadcast_rx.recv().await {
+                                net_bc.broadcast_block(block).await;
+                            }
+                        });
+                    }
+
                     // P2P Event-Loop ──────────────────────────────────────
                     {
                         let mut event_rx = handle.subscribe();
@@ -295,14 +310,90 @@ async fn main() {
                                             }
                                             Err(ref e) if e.starts_with("Stale:") || e.contains("Duplikat") => {}
                                             Err(ref e) if e.starts_with("Gap:") || e.contains("previous_hash") => {
-                                                eprintln!("[p2p] Block #{idx} Gap — erwarte Nachfolge-Blöcke");
-                                                // Don't trigger HTTP resync — wait for the missing blocks
-                                                // to arrive via P2P. The auto-sync task will handle gaps
-                                                // every 30s.
+                                                eprintln!("[p2p] Block #{idx} nicht anschlussfähig ({e}) — fehlende Blöcke kommen via ChainInfo-/Range-Sync");
                                             }
                                             Err(e) => {
                                                 eprintln!("[p2p] Block #{idx} abgelehnt: {e}");
                                             }
+                                        }
+                                    }
+
+                                    // ── Range-Sync Batch (mehrere Blöcke auf einmal) ──
+                                    NetworkEvent::RangeSyncReceived { mut blocks, from_peer } => {
+                                        blocks.sort_by_key(|b| b.index);
+                                        blocks.dedup_by_key(|b| b.index);
+                                        let peer_short = &from_peer[..12.min(from_peer.len())];
+                                        println!("[p2p] ← {} Blöcke via Range-Sync von {peer_short} [{}-{}]",
+                                            blocks.len(),
+                                            blocks.first().map(|b| b.index).unwrap_or(0),
+                                            blocks.last().map(|b| b.index).unwrap_or(0),
+                                        );
+
+                                        let mut added = 0u64;
+                                        for block in blocks {
+                                            let idx = block.index;
+                                            let block_txs: Vec<_> = block.transactions.clone();
+                                            let chat_batches: Vec<_> = block.chat_batches.clone();
+
+                                            let chain_result: Result<u64, String> = {
+                                                let mut chain = node_bg.chain.lock().unwrap_or_else(|e| e.into_inner());
+                                                if !block.validator_pub_key.is_empty() {
+                                                    let mut vs = node_bg.validator_set.write().unwrap_or_else(|e| e.into_inner());
+                                                    if !vs.validators.iter().any(|v| v.public_key_hex == block.validator_pub_key) {
+                                                        let info = stone::consensus::ValidatorInfo::new(
+                                                            &block.signer, &block.validator_pub_key,
+                                                        );
+                                                        vs.add(info);
+                                                    }
+                                                }
+                                                match chain.accept_peer_block(block.clone(), Some(true), None) {
+                                                    Ok(_) => {
+                                                        if !block_txs.is_empty() {
+                                                            let mut ledger = node_bg.token_ledger.write().unwrap_or_else(|e| e.into_inner());
+                                                            ledger.replay_mode = true;
+                                                            let _ = ledger.apply_block_txs(&block_txs, idx);
+                                                            ledger.replay_mode = false;
+                                                            let _ = ledger.persist();
+                                                        }
+                                                        stone::master::MasterNodeState::process_htlc_txs(&node_bg, &block_txs, idx);
+                                                        for batch in &chat_batches {
+                                                            if !batch.messages.is_empty() {
+                                                                node_bg.message_pool.store_batch_record(
+                                                                    &batch.merkle_root, &batch.messages, idx,
+                                                                );
+                                                                let msg_ids: Vec<String> = batch.messages.iter().map(|m| m.msg_id.clone()).collect();
+                                                                node_bg.message_pool.mark_confirmed(&msg_ids, idx);
+                                                            }
+                                                        }
+                                                        {
+                                                            let mut chat_idx = chat_idx_bg.lock().unwrap_or_else(|e| e.into_inner());
+                                                            chat_idx.index_new_blocks(&[&block], Some(&node_bg.message_pool));
+                                                            stone::chat::save_chat_index(&chat_idx);
+                                                        }
+                                                        if let Ok(mut t) = node_bg.block_timer.lock() {
+                                                            t.reset();
+                                                        }
+                                                        added += 1;
+                                                        Ok(chain.blocks.len() as u64)
+                                                    }
+                                                    Err(e) => Err(e),
+                                                }
+                                            };
+                                            match chain_result {
+                                                Ok(count) => {
+                                                    handle_bg.set_chain_count(count).await;
+                                                }
+                                                Err(ref e) if e.starts_with("Stale:") || e.contains("Duplikat") => {}
+                                                Err(ref e) if e.starts_with("Gap:") || e.contains("previous_hash") => {
+                                                    eprintln!("[p2p] Range-Sync Block #{idx} nicht anschlussfähig ({e}) — warte auf Lückenfüllung");
+                                                }
+                                                Err(e) => {
+                                                    eprintln!("[p2p] Range-Sync Block #{idx} abgelehnt: {e}");
+                                                }
+                                            }
+                                        }
+                                        if added > 0 {
+                                            println!("[p2p] ✅ Range-Sync: {added} Blöcke von {peer_short} hinzugefügt");
                                         }
                                     }
 

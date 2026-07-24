@@ -1705,8 +1705,21 @@ impl MasterNodeState {
                         // Broadcast + reset
                         {
                             let tx = state.block_broadcast_tx.lock().unwrap_or_else(|e| e.into_inner());
-                            if let Some(ref sender) = *tx {
-                                let _ = sender.send(block.clone());
+                            match tx.as_ref() {
+                                Some(sender) => {
+                                    if sender.send(block.clone()).is_err() {
+                                        eprintln!(
+                                            "[auto-mining] ⚠ Block #{}: Broadcast-Kanal geschlossen – Block wird NICHT propagiert!",
+                                            block.index,
+                                        );
+                                    }
+                                }
+                                None => {
+                                    eprintln!(
+                                        "[auto-mining] ⚠ Block #{} committed, aber KEIN Broadcast-Kanal verdrahtet (block_broadcast_tx=None) – Block wird NICHT ins Netz propagiert!",
+                                        block.index,
+                                    );
+                                }
                             }
                         }
                         if let Ok(mut t) = state.block_timer.lock() {

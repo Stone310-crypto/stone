@@ -40,8 +40,17 @@ impl SwarmTask {
                                 }
                             }
                             Err(gossipsub::PublishError::InsufficientPeers) => {
-                                // Kein Peer verbunden – kein Fehler, nur Info
-                                println!("[p2p] Block #{} – keine Peers verbunden, Broadcast übersprungen", block.index);
+                                // Kein Mesh-Peer – Block geht nur über Pull-Sync raus.
+                                // Peer-/Mesh-Zahlen mitloggen, damit Sync-Probleme
+                                // (z.B. isolierter Node) nachvollziehbar bleiben.
+                                let connected = self.swarm.connected_peers().count();
+                                let mesh = self.swarm.behaviour().gossipsub
+                                    .mesh_peers(&gossipsub::TopicHash::from_raw(TOPIC_BLOCKS.as_str()))
+                                    .count();
+                                println!(
+                                    "[p2p] ⚠ Block #{} – kein Mesh für Broadcast (connected={connected}, mesh={mesh}) – Verbreitung nur via Pull-Sync",
+                                    block.index,
+                                );
                             }
                             Err(e) => eprintln!("[p2p] Broadcast-Fehler: {e}"),
                         }

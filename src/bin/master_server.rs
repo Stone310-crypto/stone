@@ -615,6 +615,21 @@ async fn main() {
                     ).await;
                     println!("[vpn] 🏁 VPN-Aktivierung abgeschlossen.");
 
+                    // ── Mining → Gossip Bridge: geminete Blöcke broadcasten ──
+                    // Ohne diese Brücke werden lokal geminete Blöcke (Mining-Submit,
+                    // Auto-Mining) zwar committed, aber NIE ins Netz propagiert.
+                    {
+                        let (broadcast_tx, mut broadcast_rx) =
+                            tokio::sync::mpsc::unbounded_channel::<stone::blockchain::Block>();
+                        *node.block_broadcast_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(broadcast_tx);
+                        let net_bc = handle.clone();
+                        tokio::spawn(async move {
+                            while let Some(block) = broadcast_rx.recv().await {
+                                net_bc.broadcast_block(block).await;
+                            }
+                        });
+                    }
+
                     // Periodisch Stake-Level aktualisieren (alle 5 Min)
                     {
                         let node_sl = node.clone();

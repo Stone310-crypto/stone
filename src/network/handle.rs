@@ -24,12 +24,18 @@ pub struct NetworkHandle {
 impl NetworkHandle {
     /// Broadcastet einen Block per Gossipsub an alle Peers.
     pub async fn broadcast_block(&self, block: Block) {
-        let _ = self.cmd_tx.send(NetworkCommand::BroadcastBlock(Box::new(block))).await;
+        let idx = block.index;
+        if let Err(e) = self.cmd_tx.send(NetworkCommand::BroadcastBlock(Box::new(block))).await {
+            eprintln!("[p2p] ⚠ Block #{idx}: Broadcast-Befehl erreichte den Swarm-Task nicht: {e}");
+        }
     }
 
     /// Broadcastet eine Token-TX per Gossipsub an alle Peers.
     pub async fn broadcast_tx(&self, tx: crate::token::TokenTx) {
-        let _ = self.cmd_tx.send(NetworkCommand::BroadcastTx(Box::new(tx))).await;
+        let tx_id = tx.tx_id.clone();
+        if let Err(e) = self.cmd_tx.send(NetworkCommand::BroadcastTx(Box::new(tx))).await {
+            eprintln!("[p2p] ⚠ TX {tx_id}: Broadcast-Befehl erreichte den Swarm-Task nicht: {e}");
+        }
     }
 
     /// Publiziert eine generische Nachricht auf einem Gossipsub-Topic.

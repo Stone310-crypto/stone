@@ -61,3 +61,4 @@ stonechain-9439b-firebase-adminsdk-fbsvc-dd131971a5.json
 *.sh
 deploy.sh
 start.sh
+AGENTS.md
