@@ -668,6 +668,40 @@ impl SwarmTask {
         // Sort: 1. Stake (desc), 2. VPN-Peer bevorzugt
         connected.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)));
 
+        // ── VPN-Peers auto-dialen (auch nicht-verbundene) ─────────────────
+        // Gehe alle bekannten VPN-Peers durch und versuche sie zu dialen
+        // falls sie noch nicht connected sind. So werden VPN-Peers als
+        // Sync-Quellen erschlossen auch wenn der Gossipsub-Mesh leer ist.
+        {
+            let local_pid = *self.swarm.local_peer_id();
+            let vpn_peer_ids: Vec<PeerId> = self.vpn_peers.all().iter()
+                .map(|vp| vp.peer_id)
+                .filter(|pid| *pid != local_pid)
+                .collect();
+            for vpn_pid in &vpn_peer_ids {
+                let is_connected = self.peers.get(vpn_pid).map(|p| p.connected).unwrap_or(false);
+                if !is_connected && !self.is_peer_banned(vpn_pid) {
+                    // Versuche über bekannte Adressen zu dialen
+                    if let Some(info) = self.peers.get(vpn_pid) {
+                        for addr_str in &info.addresses {
+                            if let Ok(addr) = addr_str.parse::<libp2p::Multiaddr>() {
+                                if let Err(e) = self.swarm.dial(addr) {
+                                    // Erwarteter Fehler bei Relay-Clients: nicht loggen
+                                    if !e.to_string().contains("No addresses") {
+                                        eprintln!("[vpn] ⚠ Auto-Dial {vpn_pid}: {e}");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Falls keine Adressen bekannt, Kademlia-Bootstrap anstoßen
+                    if self.peers.get(vpn_pid).is_none() {
+                        let _ = self.swarm.behaviour_mut().kad.bootstrap();
+                    }
+                }
+            }
+        }
+
         if connected.is_empty() {
             return;
         }

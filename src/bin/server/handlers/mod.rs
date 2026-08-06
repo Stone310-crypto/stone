@@ -29,6 +29,7 @@ pub mod token;
 pub mod trust;
 pub mod updates;
 pub mod users;
+pub mod vpn_services;
 pub mod watchdog;
 pub mod pop_mining;
 pub mod ws;

@@ -9,6 +9,10 @@ User=root
 WorkingDirectory=__STONE_ROOT__
 EnvironmentFile=-__STONE_ROOT__/.env
 Environment=STONE_NETWORK=__STONE_NETWORK__
+# VPN-Tunnel: Standardmäßig aktiv, Port 51822 (testnet) / 51823 (mainnet)
+# Zum Deaktivieren: STONE_VPN_ENABLED=0
+# Environment=STONE_VPN_SERVER_PORT=51822
+# Environment=STONE_VPN_PSK=...
 ExecStart=__STONE_PATH__/stone-setup
 Restart=on-failure
 RestartSec=5

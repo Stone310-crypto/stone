@@ -42,10 +42,12 @@ use stone::{
     blockchain::{data_dir, NodeRole},
     master::MasterNodeState,
     network::{start_network, NetworkHandle},
+    network::vpn_tunnel::{VpnTunnel, VpnTunnelHandle, TunnelConfig},
     storage::ChunkStore,
 };
 
 use server::{
+    handlers::vpn_services::VpnServiceRegistry,
     router::build_router,
     sync_router::build_sync_router,
     rate_limiter::RateLimits,
@@ -54,6 +56,79 @@ use server::{
 };
 
 static STAGE4_RECOVERY_RUNNING: AtomicBool = AtomicBool::new(false);
+
+// ─── VPN-Tunnel Startup ─────────────────────────────────────────────────────
+
+/// Startet den VPN-Tunnel. Standardmäßig aktiv (STONE_VPN_ENABLED=0 zum Deaktivieren).
+/// Läuft im Server-Modus auf Port 51822 (STONE_VPN_SERVER_PORT zum Ändern).
+/// Gibt None zurück wenn deaktiviert oder Start fehlschlägt.
+async fn start_vpn_tunnel_if_enabled() -> Option<VpnTunnelHandle> {
+    let enabled = std::env::var("STONE_VPN_ENABLED")
+        .map(|v| v != "0")  // Alles außer "0" = enabled
+        .unwrap_or(true);   // Default: enabled
+
+    if !enabled {
+        eprintln!("[vpn-tunnel] ℹ️  VPN deaktiviert (STONE_VPN_ENABLED=0)");
+        return None;
+    }
+
+    let server_port: u16 = std::env::var("STONE_VPN_SERVER_PORT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(51822);  // Default: Server-Modus auf Port 51822
+
+    let server_addr = std::env::var("STONE_VPN_SERVER_ADDR")
+        .ok()
+        .and_then(|v| v.parse::<std::net::SocketAddr>().ok());
+
+    let psk = std::env::var("STONE_VPN_PSK")
+        .unwrap_or_else(|_| {
+            if server_port > 0 {
+                // Auto-generiere PSK für Server
+                let pk = hex::encode(&rand::random::<[u8; 32]>());
+                eprintln!("[vpn-tunnel] ⚠ Kein STONE_VPN_PSK gesetzt! Auto-generiert: {pk}");
+                pk
+            } else {
+                String::new()
+            }
+        });
+
+    let client_id = std::env::var("STONE_VPN_CLIENT_ID")
+        .ok()
+        .or_else(|| {
+            // Versuche VPN-ID aus Datei zu laden
+            let path = format!("{}/vpn_id.txt", data_dir());
+            std::fs::read_to_string(&path).ok().map(|s| s.trim().to_string())
+        });
+
+    let subnet_prefix: u8 = std::env::var("STONE_VPN_SUBNET_PREFIX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(24);
+
+    let config = TunnelConfig {
+        stone_data: std::path::PathBuf::from(data_dir()),
+        server_port,
+        server_addr,
+        psk,
+        client_id,
+        subnet_prefix,
+    };
+
+    let mode = if server_port > 0 { "Server" } else { "Client" };
+    eprintln!("[vpn-tunnel] 🚀 Starte VPN-Tunnel im {mode}-Modus...");
+
+    match VpnTunnel::new(config).start().await {
+        Ok(handle) => {
+            eprintln!("[vpn-tunnel] ✅ VPN-Tunnel gestartet ({mode})");
+            Some(handle)
+        }
+        Err(e) => {
+            eprintln!("[vpn-tunnel] ❌ VPN-Tunnel Start fehlgeschlagen: {e}");
+            None
+        }
+    }
+}
 
 async fn maybe_run_stage4_snapshot_recovery(
     node: &Arc<MasterNodeState>,
@@ -468,7 +543,17 @@ async fn main() {
     // Hintergrund-Tasks starten
     // master_server ist ein reiner Full-Node (Sync, API, Validierung, Storage).
     MasterNodeState::start_heartbeat(node.clone(), HEARTBEAT_INTERVAL);
-    spawn_auto_sync_task(node.clone(), api_key.clone(), users.clone(), orgs.clone(), chat_index_arc.clone());
+
+    // ── VPN-Tunnel starten (falls aktiviert) ───────────────────────────────
+    let vpn_tunnel_handle = start_vpn_tunnel_if_enabled().await;
+    spawn_auto_sync_task(
+        node.clone(),
+        api_key.clone(),
+        users.clone(),
+        orgs.clone(),
+        chat_index_arc.clone(),
+        vpn_tunnel_handle.clone(),
+    );
 
     // Public-IP Watchdog: erkennt Änderungen der öffentlichen IPv4 (stündlich)
     stone::public_ip_watchdog::spawn_ip_watchdog(node.clone());
@@ -614,21 +699,6 @@ async fn main() {
                         maybe_start_vpn(&Some(vpn_handle)),
                     ).await;
                     println!("[vpn] 🏁 VPN-Aktivierung abgeschlossen.");
-
-                    // ── Mining → Gossip Bridge: geminete Blöcke broadcasten ──
-                    // Ohne diese Brücke werden lokal geminete Blöcke (Mining-Submit,
-                    // Auto-Mining) zwar committed, aber NIE ins Netz propagiert.
-                    {
-                        let (broadcast_tx, mut broadcast_rx) =
-                            tokio::sync::mpsc::unbounded_channel::<stone::blockchain::Block>();
-                        *node.block_broadcast_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(broadcast_tx);
-                        let net_bc = handle.clone();
-                        tokio::spawn(async move {
-                            while let Some(block) = broadcast_rx.recv().await {
-                                net_bc.broadcast_block(block).await;
-                            }
-                        });
-                    }
 
                     // Periodisch Stake-Level aktualisieren (alle 5 Min)
                     {
@@ -954,7 +1024,7 @@ async fn main() {
                                                 let node_r = node_bg.clone();
                                                 let key_r = api_key_bg.clone();
                                                 tokio::spawn(async move {
-                                                    pull_from_peer(&node_r, &url, &key_r).await;
+                                                    pull_from_peer(&node_r, &url, &key_r, None).await;
                                                 });
                                             } else {
                                                 eprintln!("[sync] ⚠ Keine URL für Peer {from} – versuche alle bekannten Peers");
@@ -963,7 +1033,7 @@ async fn main() {
                                                 tokio::spawn(async move {
                                                     let peers = node_r.get_peers();
                                                     for p in peers.iter().filter(|p| p.is_healthy()) {
-                                                        pull_from_peer(&node_r, &p.url, &key_r).await;
+                                                        pull_from_peer(&node_r, &p.url, &key_r, None).await;
                                                     }
                                                 });
                                             }
@@ -1612,6 +1682,7 @@ async fn main() {
         api_key: api_key.clone(),
         admin_key,
         network: network_handle,
+        vpn_tunnel: vpn_tunnel_handle,
         rate_limits,
         updater: updater.clone(),
         orgs: Arc::new(std::sync::Mutex::new(stone::organization::load_orgs())),
@@ -1631,6 +1702,7 @@ async fn main() {
         play_drops: server::state::PlayDropTracker::new(server::state::PlayDropConfig::from_env()),
         watchdog: stone::watchdog::WatchdogState::new(),
         pop_mining: pop_mining_shared,
+        vpn_services: VpnServiceRegistry::new(),
     };
 
     let router = build_router(state.clone());

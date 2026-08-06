@@ -53,6 +53,7 @@ services:
       - "8080:8080"
       - "4001:4001"      # P2P TCP (Testnet)
       - "4001:4001/udp"  # P2P QUIC (Testnet)
+      - "51822:51822/udp"  # VPN (Testnet)
     environment:
       STONE_NETWORK: "testnet"
       STONE_NODE_NAME: "stone-testnet"
@@ -60,6 +61,8 @@ services:
       STONE_STORAGE_GB: "50"
       STONE_HTTP_PORT: "8080"
       STONE_P2P_PORT: "4001"
+      STONE_VPN_SERVER_PORT: "51822"
+      STONE_VPN_PSK: "${STONE_VPN_PSK:-}"
       STONE_SEED_PEERS: "/ip4/212.227.54.241/tcp/4001/p2p/12D3KooWNz9GTNsFks567mHaQLKR4Ai6MCiw5WUDWAgvny1ow4tJ,/ip4/212.227.54.241/udp/4001/quic-v1/p2p/12D3KooWNz9GTNsFks567mHaQLKR4Ai6MCiw5WUDWAgvny1ow4tJ"
       NOMAD_URL: "https://chain.unrooted.dev"
       NODE_SECRET: "${NODE_SECRET:-}"
@@ -82,6 +85,7 @@ services:
       - "8180:8180"
       - "5001:5001"      # P2P TCP (Mainnet)
       - "5001:5001/udp"  # P2P QUIC (Mainnet)
+      - "51823:51823/udp"  # VPN (Mainnet, anderer Port als Testnet)
     environment:
       STONE_NETWORK: "mainnet"
       STONE_NODE_NAME: "stone-mainnet"
@@ -89,6 +93,8 @@ services:
       STONE_STORAGE_GB: "50"
       STONE_HTTP_PORT: "8180"
       STONE_P2P_PORT: "5001"
+      STONE_VPN_SERVER_PORT: "51823"
+      STONE_VPN_PSK: "${STONE_VPN_PSK_MAINNET:-}"
       STONE_SEED_PEERS: "/ip4/212.227.54.241/tcp/5001/p2p/12D3KooWNz9GTNsFks567mHaQLKR4Ai6MCiw5WUDWAgvny1ow4tJ,/ip4/212.227.54.241/udp/5001/quic-v1/p2p/12D3KooWNz9GTNsFks567mHaQLKR4Ai6MCiw5WUDWAgvny1ow4tJ"
       NOMAD_URL: "https://chain.unrooted.dev"
       NODE_SECRET: "${NODE_SECRET:-}"

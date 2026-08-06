@@ -14,9 +14,11 @@ use stone::{
     push::{PushTokenStore, FcmClient},
 };
 use super::handlers::audio_relay::AudioRooms;
+use super::handlers::vpn_services::VpnServiceRegistry;
 use stone::{
     master::{MasterNodeState, PeerInfo, TrustEntry, TrustVote},
     network::NetworkHandle,
+    network::vpn_tunnel::VpnTunnelHandle,
     organization::Organization,
     pop_mining::PopMiningState,
     storage::{ChunkStore, StoneStore},
@@ -46,6 +48,8 @@ pub struct AppState {
     pub admin_key: Arc<String>,
     /// P2P-Netzwerk-Handle (None = P2P deaktiviert)
     pub network: Option<NetworkHandle>,
+    /// VPN-Tunnel-Handle (None = VPN deaktiviert)
+    pub vpn_tunnel: Option<VpnTunnelHandle>,
     /// Rate Limiter für verschiedene Endpoints
     pub rate_limits: Arc<RateLimits>,
     /// OTA Update Manager
@@ -84,6 +88,8 @@ pub struct AppState {
     pub watchdog: WatchdogState,
     /// Proof-of-Play Mining (VRF-basiertes Gameplay-Mining)
     pub pop_mining: PopMiningState,
+    /// VPN-Service-Registry (für Stone-VPN Dashboard)
+    pub vpn_services: VpnServiceRegistry,
 }
 
 // ─── Mobile Action Store ─────────────────────────────────────────────────────

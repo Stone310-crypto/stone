@@ -59,6 +59,7 @@ use crate::blockchain::Block;
 pub mod swarm_task;
 pub mod handle;
 pub mod vpn_protocol;
+pub mod vpn_tunnel;
 
 pub use handle::NetworkHandle;
 pub use handle::start_network;

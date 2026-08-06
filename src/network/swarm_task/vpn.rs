@@ -58,6 +58,33 @@ impl SwarmTask {
                         announce.mode,
                         announce.relay_available,
                     );
+
+                    // ── Auto-Dial für Sync: Neuen VPN-Peer direkt anwählen ──
+                    // Falls der Peer noch nicht verbunden ist, dialen wir ihn
+                    // damit er als Sync-Quelle verfügbar wird.
+                    let is_connected = self.swarm.is_connected(&source);
+                    if !is_connected {
+                        // PeerId aus dem Announce parsen und dialen
+                        if let Ok(pid) = announce.peer_id.parse::<PeerId>() {
+                            if pid != *self.swarm.local_peer_id() {
+                                println!("[vpn] 🔗 Auto-Dial VPN-Peer für Sync: {pid}");
+                                // Dial via Kademlia-Adressen oder direkt
+                                if let Some(addrs) = self.peers.get(&pid).map(|p| p.addresses.clone()) {
+                                    for addr_str in &addrs {
+                                        if let Ok(addr) = addr_str.parse::<libp2p::Multiaddr>() {
+                                            if let Err(e) = self.swarm.dial(addr) {
+                                                eprintln!("[vpn] ⚠ Dial {pid} fehlgeschlagen: {e}");
+                                            }
+                                        }
+                                    }
+                                }
+                                // Wenn keine Adressen bekannt, Kademlia bootstrap versuchen
+                                if self.peers.get(&pid).is_none() {
+                                    let _ = self.swarm.behaviour_mut().kad.bootstrap();
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // Event an die Anwendung senden

@@ -12,6 +12,7 @@ use stone::{
     database::DbMetadata,
     master::{MasterNodeState, NodeEvent, PeerStatus, PeerInfo, TrustEntry, TrustVote},
     message_pool::PooledMessage,
+    network::vpn_tunnel::VpnTunnelHandle,
     organization::{load_orgs, save_orgs, Organization},
     storage::ChunkStore,
 };
@@ -36,7 +37,12 @@ pub fn to_sync_url(peer_url: &str) -> String {
     format!("{}:{}", base, sync_port)
 }
 
-pub async fn pull_from_peer(node: &Arc<MasterNodeState>, peer_url: &str, api_key: &str) {
+pub async fn pull_from_peer(
+    node: &Arc<MasterNodeState>,
+    peer_url: &str,
+    api_key: &str,
+    vpn_tunnel: Option<&VpnTunnelHandle>,
+) {
     let client = match reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .danger_accept_invalid_certs(
@@ -70,9 +76,40 @@ pub async fn pull_from_peer(node: &Arc<MasterNodeState>, peer_url: &str, api_key
             }
         }
         _ => {
-            node.set_peer_status(peer_url, PeerStatus::Unreachable);
-            node.metrics.sync_failure.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return;
+            // ── VPN-Fallback: Health-Check per VPN-Proxy ─────────────────
+            if let Some(vpn) = vpn_tunnel {
+                if let Ok(result) = vpn.http_get(&health_url).await {
+                    if result.status == 200 {
+                        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&result.body) {
+                            let h = val.get("block_height").and_then(|v| v.as_u64()).unwrap_or(0);
+                            if h > 0 {
+                                eprintln!("[sync] 🔒 VPN-Fallback: {peer_url} Health OK via VPN (height={h})");
+                                h
+                            } else {
+                                node.set_peer_status(peer_url, PeerStatus::Unreachable);
+                                node.metrics.sync_failure.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                return;
+                            }
+                        } else {
+                            node.set_peer_status(peer_url, PeerStatus::Unreachable);
+                            node.metrics.sync_failure.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            return;
+                        }
+                    } else {
+                        node.set_peer_status(peer_url, PeerStatus::Unreachable);
+                        node.metrics.sync_failure.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        return;
+                    }
+                } else {
+                    node.set_peer_status(peer_url, PeerStatus::Unreachable);
+                    node.metrics.sync_failure.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                }
+            } else {
+                node.set_peer_status(peer_url, PeerStatus::Unreachable);
+                node.metrics.sync_failure.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                return;
+            }
         }
     };
 
@@ -131,7 +168,50 @@ pub async fn pull_from_peer(node: &Arc<MasterNodeState>, peer_url: &str, api_key
         let blocks_url = format!("{}/api/v1/blocks?per_page={}&page={}&detail=true", peer_url.trim_end_matches('/'), per_page, page);
         let resp = match client.get(&blocks_url).header("x-api-key", api_key).header("x-node-request", "internal").send().await {
             Ok(r) => r,
-            Err(e) => { eprintln!("[sync] {peer_url} blocks request (page {page}): {e}"); node.set_peer_status(peer_url, PeerStatus::Unreachable); node.metrics.sync_failure.fetch_add(1, std::sync::atomic::Ordering::Relaxed); return; }
+            Err(e) => {
+                // ── VPN-Fallback für Block-Request ─────────────────────
+                if let Some(vpn) = vpn_tunnel {
+                    let vpn_url = format!("{}/api/v1/blocks?per_page={}&page={}&detail=true", peer_url.trim_end_matches('/'), per_page, page);
+                    match vpn.http_get(&vpn_url).await {
+                        Ok(result) if result.status == 200 => {
+                            eprintln!("[sync] 🔒 VPN-Fallback: Blocks page {page} via VPN");
+                            match serde_json::from_slice::<serde_json::Value>(&result.body) {
+                                Ok(val) => {
+                                    let page_blocks: Vec<stone::blockchain::Block> = match val.get("blocks").and_then(|b| serde_json::from_value(b.clone()).ok()) {
+                                        Some(b) => b,
+                                        None => break 'page_loop,
+                                    };
+                                    if page_blocks.is_empty() { break 'page_loop; }
+                                    let has_needed = page_blocks.iter().any(|b| b.index >= local_height);
+                                    all_blocks.extend(page_blocks);
+                                    if has_needed {
+                                        all_blocks.sort_by_key(|b| b.index);
+                                        let min_idx = all_blocks.first().map(|b| b.index).unwrap_or(0);
+                                        if min_idx <= local_height { break 'page_loop; }
+                                    }
+                                    continue 'page_loop;
+                                }
+                                Err(parse_err) => {
+                                    eprintln!("[sync] {peer_url} VPN parse error (page {page}): {parse_err}");
+                                    node.metrics.sync_failure.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    return;
+                                }
+                            }
+                        }
+                        _ => {
+                            eprintln!("[sync] {peer_url} blocks request (page {page}): {e} (VPN-Fallback ebenfalls fehlgeschlagen)");
+                            node.set_peer_status(peer_url, PeerStatus::Unreachable);
+                            node.metrics.sync_failure.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            return;
+                        }
+                    }
+                } else {
+                    eprintln!("[sync] {peer_url} blocks request (page {page}): {e}");
+                    node.set_peer_status(peer_url, PeerStatus::Unreachable);
+                    node.metrics.sync_failure.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                }
+            }
         };
         let val: serde_json::Value = match resp.json().await { Ok(v) => v, Err(e) => { eprintln!("[sync] {peer_url} parse error (page {page}): {e}"); node.metrics.sync_failure.fetch_add(1, std::sync::atomic::Ordering::Relaxed); return; } };
         let page_blocks: Vec<stone::blockchain::Block> = match val.get("blocks").and_then(|b| serde_json::from_value(b.clone()).ok()) { Some(b) => b, None => break };
@@ -400,6 +480,7 @@ pub fn spawn_auto_sync_task(
     users: Arc<Mutex<Vec<User>>>,
     orgs: Arc<Mutex<Vec<Organization>>>,
     chat_idx: Arc<std::sync::Mutex<ChatIndex>>,
+    vpn_tunnel: Option<VpnTunnelHandle>,
 ) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(AUTO_SYNC_INTERVAL);
@@ -412,7 +493,7 @@ pub fn spawn_auto_sync_task(
 
             if !initial_done {
                 if let Some(best) = peers.first() {
-                    pull_from_peer(&node, &best.url, &api_key).await;
+                    pull_from_peer(&node, &best.url, &api_key, vpn_tunnel.as_ref()).await;
                     pull_db_from_peer(&node, &best.url).await;
                     pull_users_from_peer(&best.url, &api_key, &users).await;
                     pull_game_economy_from_peer(&node, &best.url).await;
@@ -423,7 +504,7 @@ pub fn spawn_auto_sync_task(
                 }
             } else {
                 for peer in &peers {
-                    pull_from_peer(&node, &peer.url, &api_key).await;
+                    pull_from_peer(&node, &peer.url, &api_key, vpn_tunnel.as_ref()).await;
                     pull_db_from_peer(&node, &peer.url).await;
                     pull_users_from_peer(&peer.url, &api_key, &users).await;
                     pull_game_economy_from_peer(&node, &peer.url).await;

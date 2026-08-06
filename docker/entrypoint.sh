@@ -13,6 +13,9 @@
 #   STONE_SEED_PEERS     – Komma-separierte Seed-Peer Multiaddrs
 #   STONE_HTTP_PORT      – HTTP-Port (default: 8080)
 #   STONE_P2P_PORT       – P2P-Port (default: 4001 testnet, 5001 mainnet)
+#   STONE_VPN_SERVER_PORT – VPN-Server-Port (default: 51822, 0=Client-Modus)
+#   STONE_VPN_PSK         – VPN Pre-Shared Key (auto-generiert wenn nicht gesetzt)
+#   STONE_VPN_ENABLED     – VPN aktivieren (default: 1, 0=deaktiviert)
 #   STONE_ADMIN_KEY      – Separater Admin-Key (optional, empfohlen)
 #   STONE_VALIDATOR_PASSPHRASE – Passphrase für Validator-Key-Verschlüsselung
 #   NOMAD_URL            – URL von chain.unrooted.dev (Testnet-Sammelpunkt)

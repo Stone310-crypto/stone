@@ -785,7 +785,7 @@ async fn handle_p2p_event(
                             let nn = n.clone();
                             let kk = k.clone();
                             tokio::spawn(async move {
-                                pull_from_peer(&nn, &url, &kk).await;
+                                pull_from_peer(&nn, &url, &kk, None).await;
                             })
                         }).collect();
                         for h in handles { let _ = h.await; }
@@ -2721,7 +2721,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     MasterNodeState::start_heartbeat(node.clone(), HEARTBEAT_INTERVAL);
     // WICHTIG: Kein lokaler Master-Mining-Loop im Miner-Binary.
     // Der Miner nutzt Remote-Templates + Remote-Submit gegen Master-Nodes.
-    spawn_auto_sync_task(node.clone(), api_key.clone(), users.clone(), orgs.clone(), chat_index_arc.clone());
+    spawn_auto_sync_task(node.clone(), api_key.clone(), users.clone(), orgs.clone(), chat_index_arc.clone(), None);
 
     // Peer-Discovery: Bei Bootstrap-Nodes registrieren & Health-Check starten
     bootstrap_announce(&node).await;
@@ -2928,6 +2928,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         api_key: api_key.clone(),
         admin_key,
         network: network_handle.clone(),
+        vpn_tunnel: None,
         rate_limits: Arc::new(RateLimits::new()),
         updater: Arc::new(std::sync::RwLock::new({
             let mut um = stone::updater::UpdateManager::new(&data_dir());
@@ -2951,6 +2952,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         play_drops: server::state::PlayDropTracker::new(server::state::PlayDropConfig::from_env()),
         watchdog: stone::watchdog::WatchdogState::new(),
         pop_mining: stone::pop_mining::PopMiningState::new(),
+        vpn_services: server::handlers::vpn_services::VpnServiceRegistry::new(),
     };
 
     // Post-Update Erfolg bestätigen (nach 120s gesundem Betrieb)

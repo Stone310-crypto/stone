@@ -186,6 +186,12 @@ use super::handlers::{
            handle_testnet_users, handle_submit_bug_report, handle_list_bug_reports,
            handle_my_bug_reports, handle_update_bug_report, handle_update_vpn_id,
            handle_vpn_status, handle_vpn_rotate},
+    vpn_services::{
+        list_services as vpn_list_services,
+        add_service as vpn_add_service,
+        delete_service as vpn_delete_service,
+        vpn_status,
+    },
     testnet_hub::{
         handle_hub_register, handle_hub_report, handle_hub_users, handle_hub_bug_reports,
         handle_hub_bulk_sync, handle_hub_send_message, handle_hub_send_coins,
@@ -654,6 +660,11 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/sdk/shop/catalog", get(handle_sdk_shop_catalog))
         .route("/api/v1/sdk/shop/item", post(handle_sdk_shop_create_item))
         .route("/api/v1/sdk/shop/buy", post(handle_sdk_shop_buy))
+        // ── VPN Services (Stone-VPN Dashboard Kompatibilität) ────────────
+        .route("/api/services", get(vpn_list_services).post(vpn_add_service))
+        .route("/api/services/{id}", delete(vpn_delete_service))
+        .route("/api/client/services", get(vpn_list_services))
+        .route("/api/status", get(vpn_status))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
         .layer(CompressionLayer::new().gzip(true))
         .layer(build_cors())

@@ -32,6 +32,7 @@ use stone::{
 };
 
 use server::{
+    handlers::vpn_services::VpnServiceRegistry,
     router::build_router,
     rate_limiter::RateLimits,
     state::{
@@ -160,7 +161,7 @@ async fn main() {
 
     // ── Heartbeat, Auto-Sync, Block-Timer ────────────────────────────────
     MasterNodeState::start_heartbeat(node.clone(), HEARTBEAT_INTERVAL);
-    spawn_auto_sync_task(node.clone(), api_key.clone(), users.clone(), orgs.clone(), chat_index_arc.clone());
+    spawn_auto_sync_task(node.clone(), api_key.clone(), users.clone(), orgs.clone(), chat_index_arc.clone(), None);
 
     let pop_mining_shared = stone::pop_mining::PopMiningState::new();
     MasterNodeState::start_block_timer(node.clone(), pop_mining_shared.clone());
@@ -218,21 +219,6 @@ async fn main() {
                         std::time::Duration::from_secs(10),
                         maybe_start_vpn(&Some(vpn_handle)),
                     ).await;
-
-                    // ── Mining → Gossip Bridge: geminete Blöcke broadcasten ──
-                    // Ohne diese Brücke werden lokal geminete Blöcke (Mining-Submit,
-                    // Auto-Mining) zwar committed, aber NIE ins Netz propagiert.
-                    {
-                        let (broadcast_tx, mut broadcast_rx) =
-                            tokio::sync::mpsc::unbounded_channel::<stone::blockchain::Block>();
-                        *node.block_broadcast_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(broadcast_tx);
-                        let net_bc = handle.clone();
-                        tokio::spawn(async move {
-                            while let Some(block) = broadcast_rx.recv().await {
-                                net_bc.broadcast_block(block).await;
-                            }
-                        });
-                    }
 
                     // P2P Event-Loop ──────────────────────────────────────
                     {
@@ -310,7 +296,7 @@ async fn main() {
                                             }
                                             Err(ref e) if e.starts_with("Stale:") || e.contains("Duplikat") => {}
                                             Err(ref e) if e.starts_with("Gap:") || e.contains("previous_hash") => {
-                                                eprintln!("[p2p] Block #{idx} nicht anschlussfähig ({e}) — fehlende Blöcke kommen via ChainInfo-/Range-Sync");
+                                                eprintln!("[p2p] Block #{idx} Gap — erwarte Nachfolge-Blöcke");
                                             }
                                             Err(e) => {
                                                 eprintln!("[p2p] Block #{idx} abgelehnt: {e}");
@@ -385,7 +371,7 @@ async fn main() {
                                                 }
                                                 Err(ref e) if e.starts_with("Stale:") || e.contains("Duplikat") => {}
                                                 Err(ref e) if e.starts_with("Gap:") || e.contains("previous_hash") => {
-                                                    eprintln!("[p2p] Range-Sync Block #{idx} nicht anschlussfähig ({e}) — warte auf Lückenfüllung");
+                                                    eprintln!("[p2p] Range-Sync Block #{idx} Gap — überspringe, warte auf Lückenfüllung");
                                                 }
                                                 Err(e) => {
                                                     eprintln!("[p2p] Range-Sync Block #{idx} abgelehnt: {e}");
@@ -545,7 +531,7 @@ async fn main() {
             tokio::spawn(async move {
                 // Kurz warten, damit P2P-Handshake abgeschlossen ist
                 tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-                pull_from_peer(&n, &url, &k).await;
+                pull_from_peer(&n, &url, &k, None).await;
             });
         }
     }
@@ -578,6 +564,7 @@ async fn main() {
         api_key: api_key.clone(),
         admin_key,
         network: network_handle,
+        vpn_tunnel: None,
         rate_limits,
         updater,
         orgs,
@@ -597,6 +584,7 @@ async fn main() {
         play_drops: server::state::PlayDropTracker::new(server::state::PlayDropConfig::from_env()),
         watchdog: stone::watchdog::WatchdogState::new(),
         pop_mining: pop_mining_shared,
+        vpn_services: VpnServiceRegistry::new(),
     };
 
     // ── Router + HTTP-Server ──────────────────────────────────────────────

@@ -359,9 +359,10 @@ pub async fn handle_sync(
 
     let node = state.node.clone();
     let api_key = state.api_key.clone();
+    let vpn = state.vpn_tunnel.clone();
     tokio::spawn(async move {
         for peer_url in targets {
-            pull_from_peer(&node, &peer_url, &api_key).await;
+            pull_from_peer(&node, &peer_url, &api_key, vpn.as_ref()).await;
         }
     });
 
